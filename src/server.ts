@@ -4,14 +4,15 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+dotenv.config();
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
 import { initSocket } from './socket';
 import routes from './routes';
 import { startCallCleanupInterval } from './modules/call/call.cleanup';
 
-// Load environment variables
-dotenv.config();
+
+
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -62,6 +63,12 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Request logging middleware
 app.use((req, _res, next) => {
   console.log(`📥 ${req.method} ${req.path} from ${req.ip}`);
+  console.log(`   Full URL: ${req.protocol}://${req.get('host')}${req.originalUrl}`);
+  if (req.headers.authorization) {
+    console.log(`   Auth header present: ${req.headers.authorization.substring(0, 20)}...`);
+  } else {
+    console.log(`   ⚠️  No auth header`);
+  }
   next();
 });
 
@@ -79,10 +86,14 @@ app.get('/health', (_req, res) => {
 app.use('/api/v1', routes);
 
 // 404 handler
-app.use((_req, res) => {
+app.use((req, res) => {
+  console.log(`❌ [404] Route not found: ${req.method} ${req.path}`);
+  console.log(`   Full URL: ${req.protocol}://${req.get('host')}${req.originalUrl}`);
   res.status(404).json({
     success: false,
     error: 'Route not found',
+    path: req.path,
+    method: req.method,
   });
 });
 

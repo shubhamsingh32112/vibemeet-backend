@@ -127,10 +127,55 @@ export const initSocket = (server: HTTPServer): SocketIOServer => {
     }
 
     // Handle disconnection
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async (reason) => {
       console.log(`❌ [SOCKET] Client disconnected: ${socket.id}`);
       console.log(`   User: ${firebaseUid}`);
       console.log(`   Reason: ${reason}`);
+      
+      // 🔥 FIX #1: Auto-mark ringing calls as missed when creator disconnects
+      // If creator disappears → the call is over. Telecom rule #1.
+      if (user.role === 'creator' || user.role === 'admin') {
+        try {
+          const creatorUser = await User.findById(user.userId);
+          if (creatorUser) {
+            // Find all ringing calls for this creator
+            const ringingCalls = await Call.find({
+              creatorUserId: creatorUser._id,
+              status: 'ringing',
+            }).populate('callerUserId');
+            
+            if (ringingCalls.length > 0) {
+              console.log(`🚨 [SOCKET] Creator disconnected with ${ringingCalls.length} ringing call(s) - marking as missed`);
+              
+              const io = getIO();
+              
+              for (const call of ringingCalls) {
+                // Update call to missed
+                call.status = 'missed';
+                call.endedAt = new Date();
+                await call.save();
+                
+                console.log(`   ✅ Marked call ${call.callId} as missed`);
+                
+                // Notify caller that call was missed
+                const caller = await User.findById(call.callerUserId);
+                if (caller?.firebaseUid) {
+                  io.to(caller.firebaseUid).emit('call_ended', {
+                    callId: call.callId,
+                    status: 'missed',
+                    endedBy: 'system',
+                    reason: 'creator_disconnected',
+                  });
+                  console.log(`   📡 Emitted call_ended (missed) to caller: ${caller.firebaseUid}`);
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`❌ [SOCKET] Error handling creator disconnect cleanup:`, error);
+          // Don't fail disconnect if cleanup fails
+        }
+      }
     });
 
     // Handle errors

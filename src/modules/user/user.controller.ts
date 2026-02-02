@@ -3,6 +3,106 @@ import { Response } from 'express';
 import mongoose from 'mongoose';
 import { User } from './user.model';
 import { Creator } from '../creator/creator.model';
+import { CoinTransaction } from './coin-transaction.model';
+import { randomUUID } from 'crypto';
+import { getIO } from '../../socket';
+
+export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // Only regular users can manage favorites
+    if (user.role !== 'user') {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Only users can favorite creators',
+      });
+      return;
+    }
+
+    const favoriteIds = (user.favoriteCreatorIds || []).map((id) => id.toString());
+
+    res.json({
+      success: true,
+      data: {
+        favoriteCreatorIds: favoriteIds,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get favorites error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const toggleFavoriteCreator = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { creatorId } = req.params;
+    if (!creatorId || !mongoose.Types.ObjectId.isValid(creatorId)) {
+      res.status(400).json({ success: false, error: 'Invalid creatorId' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // Only regular users can manage favorites
+    if (user.role !== 'user') {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Only users can favorite creators',
+      });
+      return;
+    }
+
+    // Ensure creator exists (can be offline; favorites are independent of online status)
+    const creatorExists = await Creator.exists({ _id: creatorId });
+    if (!creatorExists) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const creatorObjectId = new mongoose.Types.ObjectId(creatorId);
+    const current = (user.favoriteCreatorIds || []).map((id) => id.toString());
+
+    const isCurrentlyFavorite = current.includes(creatorId);
+    if (isCurrentlyFavorite) {
+      user.favoriteCreatorIds = user.favoriteCreatorIds.filter((id) => id.toString() !== creatorId);
+    } else {
+      user.favoriteCreatorIds = [...(user.favoriteCreatorIds || []), creatorObjectId];
+    }
+
+    await user.save();
+
+    const favoriteIds = (user.favoriteCreatorIds || []).map((id) => id.toString());
+    res.json({
+      success: true,
+      data: {
+        isFavorite: !isCurrentlyFavorite,
+        favoriteCreatorIds: favoriteIds,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Toggle favorite error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
 
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -557,6 +657,248 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       });
       return;
     }
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
+// Add coins to user account
+export const addCoins = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('💰 [USER] Add coins request');
+    
+    if (!req.auth) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+      });
+      return;
+    }
+
+    const { coins, transactionId } = req.body;
+
+    if (!coins || typeof coins !== 'number' || coins <= 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid coins amount. Must be a positive number',
+      });
+      return;
+    }
+
+    // Only allow regular users to add coins (not creators/admins)
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    if (user.role === 'creator' || user.role === 'admin') {
+      res.status(403).json({
+        success: false,
+        error: 'Creators and admins cannot add coins through this endpoint',
+      });
+      return;
+    }
+
+    // 🔒 IDEMPOTENCY: Generate or use provided transactionId
+    const finalTransactionId = transactionId || `manual_${randomUUID()}`;
+
+    // Check if this transaction already exists (idempotency check)
+    const existingTransaction = await CoinTransaction.findOne({ transactionId: finalTransactionId });
+    if (existingTransaction) {
+      console.log(`⚠️  [USER] Duplicate transaction detected: ${finalTransactionId}`);
+      
+      // Return the existing transaction result (idempotent response)
+      res.json({
+        success: true,
+        data: {
+          transactionId: existingTransaction.transactionId,
+          userId: user._id.toString(),
+          coinsAdded: existingTransaction.coins,
+          newCoinsBalance: user.coins,
+          message: 'Transaction already processed (idempotent)',
+        },
+      });
+      return;
+    }
+
+    // Create transaction record first (before updating user balance)
+    const transaction = new CoinTransaction({
+      transactionId: finalTransactionId,
+      userId: user._id,
+      type: 'credit',
+      coins,
+      source: 'manual',
+      description: `Added ${coins} coins`,
+      status: 'completed',
+    });
+
+    // Add coins to user account
+    const oldCoins = user.coins;
+    user.coins = (user.coins || 0) + coins;
+    
+    // Save both in a transaction (if MongoDB supports it) or sequentially
+    await transaction.save();
+    await user.save();
+
+    console.log(`✅ [USER] Coins added: ${oldCoins} → ${user.coins} (+${coins})`);
+    console.log(`   Transaction ID: ${finalTransactionId}`);
+
+    // Phase C1: Emit coins_updated after coins mutation is persisted
+    // Payload is minimal & sufficient: { userId, coins }
+    try {
+      const io = getIO();
+      io.to(user.firebaseUid).emit('coins_updated', {
+        userId: user._id.toString(),
+        coins: user.coins,
+      });
+      console.log(`📡 [SOCKET] Emitted coins_updated to user: ${user.firebaseUid}`);
+    } catch (socketError) {
+      // Don't fail the request if socket emit fails
+      console.error('⚠️  [SOCKET] Failed to emit coins_updated:', socketError);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        transactionId: finalTransactionId,
+        user: {
+          id: user._id.toString(),
+          coins: user.coins,
+          coinsAdded: coins,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Add coins error:', error);
+    
+    // Handle duplicate key error (idempotency violation - race condition)
+    if (error instanceof Error && (error.message.includes('duplicate key') || error.message.includes('E11000'))) {
+      console.log(`⚠️  [USER] Duplicate transaction ID detected (race condition)`);
+      const { transactionId } = req.body;
+      if (transactionId) {
+        try {
+          const existingTransaction = await CoinTransaction.findOne({ transactionId });
+          if (existingTransaction) {
+            const user = await User.findById(existingTransaction.userId);
+            res.json({
+              success: true,
+              data: {
+                transactionId: existingTransaction.transactionId,
+                userId: existingTransaction.userId.toString(),
+                coinsAdded: existingTransaction.coins,
+                newCoinsBalance: user?.coins || 0,
+                message: 'Transaction already processed (idempotent)',
+              },
+            });
+            return;
+          }
+        } catch (lookupError) {
+          console.error('❌ [USER] Error looking up existing transaction:', lookupError);
+        }
+      }
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
+/**
+ * Get user transaction history
+ * 
+ * 🚨 NAMING: Users use "coins", "balance", "credits", "debits"
+ * ❌ NOT "earnings" or "totalEarned" (those are for creators)
+ * 
+ * 🔒 IMMUTABILITY: Transactions are append-only
+ * - No updates except status (pending -> completed/failed)
+ * - No deletes (ever)
+ * - This ensures audit trail integrity for financial records
+ */
+export const getUserTransactions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('📋 [USER] Get transactions request');
+    
+    if (!req.auth) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+      });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    // Only regular users can view their transactions
+    if (user.role === 'creator' || user.role === 'admin') {
+      res.status(403).json({
+        success: false,
+        error: 'Creators should use /creator/transactions endpoint',
+      });
+      return;
+    }
+
+    // Get pagination params
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const skip = (page - 1) * limit;
+
+    // Get transactions for this user (indexed by userId, createdAt)
+    const transactions = await CoinTransaction.find({ userId: user._id })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .skip(skip);
+
+    const total = await CoinTransaction.countDocuments({ userId: user._id });
+
+    // Calculate summary (users: credits/debits/balance)
+    const credits = transactions.filter(t => t.type === 'credit').reduce((sum, t) => sum + t.coins, 0);
+    const debits = transactions.filter(t => t.type === 'debit').reduce((sum, t) => sum + t.coins, 0);
+
+    res.json({
+      success: true,
+      data: {
+        transactions: transactions.map(tx => ({
+          id: tx._id.toString(),
+          transactionId: tx.transactionId,
+          type: tx.type,
+          coins: tx.coins, // Users: coins (credits/debits)
+          source: tx.source,
+          description: tx.description,
+          callId: tx.callId,
+          status: tx.status,
+          createdAt: tx.createdAt.toISOString(),
+        })),
+        summary: {
+          totalCredits: credits,
+          totalDebits: debits,
+          netChange: credits - debits,
+          currentBalance: user.coins, // Users: balance
+        },
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get transactions error:', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error',

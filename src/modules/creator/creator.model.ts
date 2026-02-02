@@ -7,7 +7,8 @@ export interface ICreator extends Document {
   photo: string; // URL or path to photo
   userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
   categories: string[]; // Array of category names (optional)
-  price: number;
+  price: number; // Price per minute in coins (e.g., 60 = 60 coins per minute)
+  isOnline: boolean; // Online/offline status for creators
   createdAt: Date;
   updatedAt: Date;
 }
@@ -48,6 +49,11 @@ const creatorSchema = new Schema<ICreator>(
       type: Number,
       required: true,
       min: 0,
+    },
+    isOnline: {
+      type: Boolean,
+      default: false,
+      index: true, // Index for efficient filtering
     },
   },
   {

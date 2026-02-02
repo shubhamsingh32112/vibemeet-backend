@@ -9,6 +9,7 @@ export interface IUser extends Document {
   username?: string;
   avatar?: string; // e.g., 'a1.png' or 'fa1.png'
   categories?: string[]; // Array of category names
+  favoriteCreatorIds: mongoose.Types.ObjectId[]; // Users can favorite creators (creator _id values)
   usernameChangeCount: number; // Track how many times username was changed (max 3)
   coins: number;
   role: 'user' | 'creator' | 'admin'; // User role
@@ -60,6 +61,12 @@ const userSchema = new Schema<IUser>(
     categories: {
       type: [String],
       default: [],
+    },
+    favoriteCreatorIds: {
+      type: [Schema.Types.ObjectId],
+      ref: 'Creator',
+      default: [],
+      index: true,
     },
     usernameChangeCount: {
       type: Number,
