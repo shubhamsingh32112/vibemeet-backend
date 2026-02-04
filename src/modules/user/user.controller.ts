@@ -5,7 +5,6 @@ import { User } from './user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { randomUUID } from 'crypto';
-import { getIO } from '../../socket';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -749,19 +748,6 @@ export const addCoins = async (req: Request, res: Response): Promise<void> => {
     console.log(`✅ [USER] Coins added: ${oldCoins} → ${user.coins} (+${coins})`);
     console.log(`   Transaction ID: ${finalTransactionId}`);
 
-    // Phase C1: Emit coins_updated after coins mutation is persisted
-    // Payload is minimal & sufficient: { userId, coins }
-    try {
-      const io = getIO();
-      io.to(user.firebaseUid).emit('coins_updated', {
-        userId: user._id.toString(),
-        coins: user.coins,
-      });
-      console.log(`📡 [SOCKET] Emitted coins_updated to user: ${user.firebaseUid}`);
-    } catch (socketError) {
-      // Don't fail the request if socket emit fails
-      console.error('⚠️  [SOCKET] Failed to emit coins_updated:', socketError);
-    }
 
     res.json({
       success: true,

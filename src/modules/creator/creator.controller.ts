@@ -3,12 +3,11 @@ import { Response } from 'express';
 import mongoose from 'mongoose';
 import { Creator } from './creator.model';
 import { User } from '../user/user.model';
-import { Call } from '../call/call.model';
-import { CreatorTaskProgress } from './creator-task.model';
+import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey } from './creator-tasks.config';
-import { getIO } from '../../socket';
 import { randomUUID } from 'crypto';
+import { getStreamClient } from '../../config/stream';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -36,12 +35,39 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
     // Regular users only see online creators on homepage (offline creators are hidden)
     const isAdmin = currentUser && currentUser.role === 'admin';
     const query = isAdmin ? {} : { isOnline: true };
+    
+    // Debug: Log query and check all creators' status
+    if (!isAdmin) {
+      const allCreators = await Creator.find({}).select('_id name isOnline').limit(10);
+      console.log(`🔍 [CREATOR] Debug - All creators in DB (first 10):`);
+      allCreators.forEach((c) => {
+        console.log(`   - ${c._id}: name=${c.name}, isOnline=${c.isOnline} (type: ${typeof c.isOnline})`);
+      });
+      
+      // Also check the exact query that will be executed
+      console.log(`🔍 [CREATOR] Executing query: ${JSON.stringify(query)}`);
+      const queryTest = await Creator.find(query).select('_id name isOnline').limit(10);
+      console.log(`🔍 [CREATOR] Query result (first 10): ${queryTest.length} creator(s)`);
+      queryTest.forEach((c) => {
+        console.log(`   - ${c._id}: name=${c.name}, isOnline=${c.isOnline}`);
+      });
+    }
+    
     const creators = await Creator.find(query).sort({ createdAt: -1 });
     
     if (isAdmin) {
       console.log(`✅ [CREATOR] Admin request: Found ${creators.length} creator(s) (all creators, online and offline)`);
     } else {
+      console.log(`✅ [CREATOR] Query: ${JSON.stringify(query)}`);
       console.log(`✅ [CREATOR] Found ${creators.length} online creator(s) (offline creators are hidden)`);
+      if (creators.length > 0) {
+        console.log(`   Online creators: ${creators.map(c => `${c.name} (${c._id})`).join(', ')}`);
+      } else {
+        console.log(`   ⚠️  No online creators found. Checking if any creators exist...`);
+        const totalCreators = await Creator.countDocuments({});
+        const onlineCount = await Creator.countDocuments({ isOnline: true });
+        console.log(`   📊 Total creators in DB: ${totalCreators}, Online: ${onlineCount}`);
+      }
     }
 
     // Favorites are a "user-only" feature
@@ -50,11 +76,20 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
         ? new Set((currentUser.favoriteCreatorIds || []).map((id: any) => id.toString()))
         : new Set<string>();
     
-    // Map creators with their associated user IDs (pure read - no side effects)
-    const creatorsWithUserIds = creators.map((creator) => {
+    // Map creators with their associated user IDs and Firebase UIDs (pure read - no side effects)
+    // Need to get Firebase UIDs for Stream Video calls (Stream uses Firebase UIDs as user IDs)
+    const creatorsWithUserIds = await Promise.all(
+      creators.map(async (creator) => {
+        let creatorFirebaseUid: string | null = null;
+        if (creator.userId) {
+          const creatorUser = await User.findById(creator.userId);
+          creatorFirebaseUid = creatorUser?.firebaseUid || null;
+        }
+        
       return {
         id: creator._id.toString(),
-        userId: creator.userId ? creator.userId.toString() : null, // User ID for initiating calls
+          userId: creator.userId ? creator.userId.toString() : null, // MongoDB User ID
+          firebaseUid: creatorFirebaseUid, // Firebase UID for Stream Video calls
         name: creator.name,
         about: creator.about,
         photo: creator.photo,
@@ -65,7 +100,13 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
         createdAt: creator.createdAt,
         updatedAt: creator.updatedAt,
       };
-    });
+      })
+    );
+    
+    console.log(`📤 [CREATOR] Sending response with ${creatorsWithUserIds.length} creator(s)`);
+    if (creatorsWithUserIds.length > 0) {
+      console.log(`   Response creators: ${creatorsWithUserIds.map(c => `${c.name} (isOnline: ${c.isOnline})`).join(', ')}`);
+    }
     
     res.json({
       success: true,
@@ -493,20 +534,29 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
     
     console.log(`✅ [CREATOR] Creator ${creator._id} online status set to: ${isOnline}`);
     
-    // Broadcast status change to all users via Socket.IO
-    // This allows users' homepages to update in real-time
+    // Emit Stream event for realtime status updates (no polling needed)
     try {
-      const io = getIO();
-      io.emit('creator_status_changed', {
-        creatorId: creator._id.toString(),
-        userId: creator.userId.toString(),
-        isOnline: creator.isOnline,
-        name: creator.name,
+      const streamClient = getStreamClient();
+      // System channel for creator status updates
+      // Channel is lazily created by Stream on first sendEvent() call
+      const channel = streamClient.channel('messaging', 'creator-status');
+      
+      // Send custom event for creator status change
+      // Stream automatically creates the channel if it doesn't exist
+      // user_id is REQUIRED for server-side auth (events must have an actor)
+      // Type cast is needed because TypeScript doesn't know about custom event types
+      // Custom event types CANNOT contain dots (.) - use underscores instead
+      await channel.sendEvent({
+        type: 'creator_status_changed' as any, // NO DOTS - custom events cannot use dots
+        creator_id: creator._id.toString(),
+        isOnline: isOnline,
+        user_id: currentUser.firebaseUid, // REQUIRED for server-side auth
       });
-      console.log(`📡 [SOCKET] Broadcasted creator_status_changed: ${creator._id} is now ${isOnline ? 'online' : 'offline'}`);
-    } catch (socketError) {
-      // Don't fail the request if socket emit fails
-      console.error('⚠️  [SOCKET] Failed to broadcast creator status change:', socketError);
+      
+      console.log(`📡 [STREAM] Creator status event emitted: ${creator._id} -> ${isOnline}`);
+    } catch (streamError) {
+      // Don't fail the request if Stream event fails
+      console.error('⚠️  [STREAM] Failed to emit creator status event:', streamError);
     }
     
     res.json({
@@ -571,100 +621,18 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Get all ended calls for this creator
-    const endedCalls = await Call.find({
-      creatorUserId: currentUser._id,
-      status: 'ended',
-      duration: { $gt: 0 }, // Only calls with duration > 0
-      acceptedAt: { $exists: true }, // Only calls that were accepted
-    })
-      .populate('callerUserId', 'username')
-      .sort({ endedAt: -1 }) // Most recent first
-      .limit(100); // Limit to last 100 calls for performance
-
-    console.log(`📊 [CREATOR] Found ${endedCalls.length} ended call(s) for earnings calculation`);
-
-    // 🔒 CRITICAL: Use snapshot data from calls to prevent historical earnings changes
-    // If price or revenue share changes, historical earnings remain accurate
-    let totalEarnings = 0;
-    let totalMinutes = 0;
-    let callsWithSnapshots = 0;
-    let callsWithoutSnapshots = 0;
-    
-    const callBreakdown = endedCalls.map((call) => {
-      // Safely handle duration
-      const durationSeconds = call.duration || 0;
-      const durationMinutes = durationSeconds / 60; // Convert seconds to minutes
-      
-      // Use snapshot data if available (newer calls), otherwise fallback to calculation
-      let callEarnings = 0;
-      if (call.userPaidCoins != null && call.creatorShareAtCallTime != null) {
-        // Use snapshot: creator earns their share of what user paid
-        callEarnings = call.userPaidCoins * call.creatorShareAtCallTime;
-        callsWithSnapshots++;
-      } else {
-        // Fallback for old calls without snapshots: calculate from snapshot price
-        // This is a migration path - all new calls will have snapshots
-        const pricePerMinute = call.priceAtCallTime || creator.price || 0;
-        const sharePercentage = call.creatorShareAtCallTime || 0.30; // Default 30%
-        // 🚨 CRITICAL: Use Math.ceil to match user deduction logic (consistent rounding)
-        // User pays: Math.ceil(price * durationMinutes)
-        // Creator earns: (what user paid) * sharePercentage
-        const userPaidForCall = Math.ceil(pricePerMinute * durationMinutes);
-        callEarnings = userPaidForCall * sharePercentage;
-        callsWithoutSnapshots++;
-        console.log(`⚠️  [CREATOR] Call ${call.callId} missing snapshot, using fallback calculation`);
-      }
-      
-      totalEarnings += callEarnings;
-      totalMinutes += durationMinutes;
-
-      // Safely get caller username
-      let callerUsername = 'Unknown';
-      if (call.callerUserId && typeof call.callerUserId === 'object') {
-        callerUsername = (call.callerUserId as any)?.username || 'Unknown';
-      }
-
-      return {
-        callId: call.callId,
-        callerUsername: callerUsername,
-        duration: durationSeconds, // Duration in seconds
-        durationFormatted: durationSeconds > 0 ? formatCallDuration(durationSeconds) : '0s',
-        durationMinutes: Math.round(durationMinutes * 100) / 100, // Round to 2 decimals
-        earnings: Math.round(callEarnings * 100) / 100, // Round to 2 decimals
-        endedAt: call.endedAt?.toISOString() || null,
-      };
-    });
-
-    // Round total earnings to 2 decimals
-    totalEarnings = Math.round(totalEarnings * 100) / 100;
-    
-    // Calculate average earnings per minute from historical calls (for reference)
-    const avgEarningsPerMinute = totalMinutes > 0 ? totalEarnings / totalMinutes : 0;
-    
-    // 🚨 FIX: Calculate CURRENT earnings per minute based on current price (not historical average)
-    // This is what the creator will earn for NEW calls at their current price
-    const CREATOR_SHARE_PERCENTAGE = 0.30; // 30% of what user pays
-    const currentEarningsPerMinute = creator.price * CREATOR_SHARE_PERCENTAGE;
-
-    console.log(`💰 [CREATOR] Total earnings: ${totalEarnings} coins from ${totalMinutes.toFixed(2)} minutes`);
-    console.log(`   Calls with snapshots: ${callsWithSnapshots}, without: ${callsWithoutSnapshots}`);
-    console.log(`   Current price: ${creator.price} coins/min → Current earnings: ${currentEarningsPerMinute.toFixed(2)} coins/min (30%)`);
-    console.log(`   Historical average: ${avgEarningsPerMinute.toFixed(2)} coins/min`);
-
+    // Call functionality removed - return zero earnings
     res.json({
       success: true,
       data: {
-        totalEarnings, // Total earnings (derived from historical calls with snapshots)
-        totalMinutes: Math.round(totalMinutes * 100) / 100,
-        totalCalls: endedCalls.length,
-        avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100, // Historical average (for reference)
-        earningsPerMinute: Math.round(currentEarningsPerMinute * 100) / 100, // CURRENT rate based on current price
-        currentPrice: creator.price, // Creator's current price per minute (for percentage calculation)
-        creatorSharePercentage: CREATOR_SHARE_PERCENTAGE, // Creator's share (0.30 = 30%)
-        calls: callBreakdown,
-        // Note: This is earnings, not withdrawable balance
-        // pendingPayout and paidOut will be added when payout system is implemented
+        totalEarnings: 0,
+        totalMinutes: 0,
+        totalCalls: 0,
+        avgEarningsPerMinute: 0,
+        earningsPerMinute: 0,
+        currentPrice: creator.price,
+        creatorSharePercentage: 0.30,
+        calls: [],
       },
     });
   } catch (error) {
@@ -739,64 +707,10 @@ export const getCreatorTransactions = async (req: Request, res: Response): Promi
     const limit = parseInt(req.query.limit as string) || 50;
     const skip = (page - 1) * limit;
 
-    // Get all ended calls for this creator (these are the "transactions" - earnings)
-    const endedCalls = await Call.find({
-      creatorUserId: currentUser._id,
-      status: 'ended',
-      duration: { $gt: 0 },
-      acceptedAt: { $exists: true },
-      isSettled: true, // Only settled calls
-    })
-      .populate('callerUserId', 'username avatar')
-      .sort({ endedAt: -1 })
-      .limit(limit)
-      .skip(skip);
-
-    const total = await Call.countDocuments({
-      creatorUserId: currentUser._id,
-      status: 'ended',
-      duration: { $gt: 0 },
-      acceptedAt: { $exists: true },
-      isSettled: true,
-    });
-
-    // Calculate earnings for each call
-    const transactions = endedCalls.map((call) => {
-      const durationSeconds = call.duration || 0;
-      const durationMinutes = durationSeconds / 60;
-      
-      // Use snapshot data if available
-      let earnings = 0;
-      if (call.userPaidCoins != null && call.creatorShareAtCallTime != null) {
-        earnings = call.userPaidCoins * call.creatorShareAtCallTime;
-      } else {
-        // Fallback for legacy calls
-        const pricePerMinute = call.priceAtCallTime || creator.price || 0;
-        const sharePercentage = call.creatorShareAtCallTime || 0.30;
-        const userPaidForCall = Math.ceil(pricePerMinute * durationMinutes);
-        earnings = userPaidForCall * sharePercentage;
-      }
-
-      const caller = call.callerUserId as any;
-      return {
-        id: call._id.toString(),
-        transactionId: `call_${call.callId}`,
-        type: 'credit', // Creators earn (credit)
-        // 🚨 NAMING: Use "earnedAmount" not "coins" for creators
-        earnedAmount: Math.round(earnings * 100) / 100,
-        source: 'video_call',
-        description: `Video call with ${caller?.username || 'user'}`,
-        callId: call.callId,
-        duration: durationSeconds,
-        durationFormatted: durationSeconds > 0 ? formatCallDuration(durationSeconds) : '0s',
-        callerUsername: caller?.username || 'Unknown',
-        createdAt: call.endedAt?.toISOString() || call.createdAt.toISOString(),
-      };
-    });
-
-    // Calculate total earnings
-    // 🚨 NAMING: totalEarned (not totalCoins, not balance)
-    const totalEarned = transactions.reduce((sum, tx) => sum + tx.earnedAmount, 0);
+    // Call functionality removed - return empty transactions
+    const transactions: any[] = [];
+    const total = 0;
+    const totalEarned = 0;
 
     res.json({
       success: true,
@@ -828,17 +742,6 @@ export const getCreatorTransactions = async (req: Request, res: Response): Promi
 };
 
 // Helper function to format call duration
-function formatCallDuration(seconds: number): string {
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (remainingSeconds === 0) {
-    return `${minutes}m`;
-  }
-  return `${minutes}m ${remainingSeconds}s`;
-}
 
 /**
  * Get creator tasks progress
@@ -877,24 +780,8 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Calculate total minutes from ended calls
-    // Reuse same logic as getCreatorEarnings
-    const endedCalls = await Call.find({
-      creatorUserId: currentUser._id,
-      status: 'ended',
-      duration: { $gt: 0 }, // Only calls with duration > 0
-      acceptedAt: { $exists: true }, // Only calls that were accepted
-    });
-
-    // Sum duration in minutes
-    let totalMinutes = 0;
-    for (const call of endedCalls) {
-      const durationSeconds = call.duration || 0;
-      const durationMinutes = durationSeconds / 60;
-      totalMinutes += durationMinutes;
-    }
-
-    console.log(`📊 [CREATOR] Total minutes: ${totalMinutes.toFixed(2)}`);
+    // Call functionality removed - return zero minutes
+    const totalMinutes = 0;
 
     // Get existing task progress records
     const taskProgressRecords = await CreatorTaskProgress.find({
@@ -902,7 +789,7 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
     });
 
     // Create a map of taskKey -> progress record
-    const progressMap = new Map<string, CreatorTaskProgress>();
+    const progressMap = new Map<string, ICreatorTaskProgress>();
     for (const record of taskProgressRecords) {
       progressMap.set(record.taskKey, record);
     }
@@ -999,20 +886,8 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Calculate total minutes (same logic as getCreatorTasks)
-    const endedCalls = await Call.find({
-      creatorUserId: currentUser._id,
-      status: 'ended',
-      duration: { $gt: 0 },
-      acceptedAt: { $exists: true },
-    });
-
-    let totalMinutes = 0;
-    for (const call of endedCalls) {
-      const durationSeconds = call.duration || 0;
-      const durationMinutes = durationSeconds / 60;
-      totalMinutes += durationMinutes;
-    }
+    // Call functionality removed - return zero minutes
+    const totalMinutes = 0;
 
     // Check if task is completed
     if (totalMinutes < taskDef.thresholdMinutes) {
@@ -1135,17 +1010,6 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       coinsAfter: currentUser.coins,
     }));
 
-    // Emit coins_updated socket event (same pattern as addCoins)
-    try {
-      const io = getIO();
-      io.to(currentUser.firebaseUid).emit('coins_updated', {
-        userId: currentUser._id.toString(),
-        coins: currentUser.coins,
-      });
-      console.log(`📡 [SOCKET] Emitted coins_updated to creator: ${currentUser.firebaseUid}`);
-    } catch (socketError) {
-      console.error('⚠️  [SOCKET] Failed to emit coins_updated:', socketError);
-    }
 
     res.json({
       success: true,

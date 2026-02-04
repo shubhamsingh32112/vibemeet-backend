@@ -1,5 +1,4 @@
 import express from 'express';
-import http from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -7,9 +6,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
-import { initSocket } from './socket';
 import routes from './routes';
-import { startCallCleanupInterval } from './modules/call/call.cleanup';
 
 
 
@@ -51,9 +48,7 @@ const statusLimiter = rateLimit({
   },
 });
 
-// Apply status limiter first (more specific)
-app.use('/api/v1/calls', statusLimiter);
-// Apply general limiter to all other API routes
+// Apply general limiter to all API routes
 app.use('/api/', generalLimiter);
 
 // Body parsing middleware - increase limit for base64 images
@@ -115,22 +110,12 @@ const startServer = async () => {
     // Connect to MongoDB
     await connectDatabase();
     
-    // Start call cleanup interval (prevents zombie calls)
-    startCallCleanupInterval();
-    
-    // Create HTTP server (required for Socket.IO)
-    const server = http.createServer(app);
-    
-    // Initialize Socket.IO
-    initSocket(server);
-    
     // Start server - listen on all interfaces (0.0.0.0) for USB/WiFi debugging
-    server.listen(PORT, '0.0.0.0', () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📡 Listening on all interfaces (0.0.0.0:${PORT})`);
       console.log(`\n📍 Access URLs:`);
       console.log(`   HTTP:     http://localhost:${PORT}/health`);
-      console.log(`   WebSocket: ws://localhost:${PORT}`);
       console.log(`   Network:  http://YOUR_DESKTOP_IP:${PORT}/health`);
       console.log(`\n📱 Frontend Configuration (USB Debugging):`);
       console.log(`   Find your desktop IP: ipconfig (Windows) or ifconfig (Mac/Linux)`);
@@ -138,7 +123,6 @@ const startServer = async () => {
       console.log(`   Example: http://192.168.1.10:${PORT}/api/v1`);
       console.log(`\n✅ Backend is ready to accept connections from your Flutter app`);
       console.log(`💡 Make sure your desktop and phone are on the same WiFi network`);
-      console.log(`🔌 Socket.IO is ready for real-time events`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
