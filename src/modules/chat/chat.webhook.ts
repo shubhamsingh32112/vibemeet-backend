@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { getStreamClient } from '../../config/stream';
 import { User } from '../user/user.model';
+import { CoinTransaction } from '../user/coin-transaction.model';
 
 /**
  * Stream Chat webhook handler for message validation
@@ -125,6 +126,69 @@ export const handleStreamWebhook = async (req: Request, res: Response): Promise<
           error: 'Attachments not allowed for users. Only creators can send media.',
         });
         return;
+      }
+      
+      // PHASE 0: Chat billing - First 3 messages free, then 5 coins per message
+      // 🔥 CRITICAL: Only users pay for messages
+      // Creators receive messages for free - they don't need coins to receive texts
+      // Only apply to text messages from users (not creators, not voice messages)
+      if (message.text && message.text.trim().length > 0) {
+        const user = await User.findOne({ firebaseUid: userId });
+        if (!user) {
+          console.error(`❌ [WEBHOOK] User not found: ${userId}`);
+          res.status(404).json({ error: 'User not found' });
+          return;
+        }
+        
+        // 🔥 Only bill regular users (not creators or admins)
+        // Creators can receive messages for free - no coins required
+        if (user.role === 'user') {
+          // Check if user has used free messages
+          const freeMessagesRemaining = 3 - (user.freeTextUsed || 0);
+          
+          if (freeMessagesRemaining > 0) {
+            // Free message - just increment counter
+            user.freeTextUsed = (user.freeTextUsed || 0) + 1;
+            await user.save();
+            console.log(`✅ [WEBHOOK] Free message (${user.freeTextUsed}/3 used)`);
+          } else {
+            // Paid message - check coins
+            const coinsRequired = 5;
+            
+            // PHASE 8: Standardized error code
+            if (user.coins < coinsRequired) {
+              console.log(`❌ [WEBHOOK] Message rejected: Insufficient coins`);
+              console.log(`   User: ${userId}, Coins: ${user.coins}, Required: ${coinsRequired}`);
+              res.status(403).json({ 
+                error: 'INSUFFICIENT_COINS_CHAT',
+                message: 'Insufficient coins to send message. Buy coins to continue.',
+                coinsRequired,
+                coinsAvailable: user.coins,
+              });
+              return;
+            }
+            
+            // Deduct coins
+            const transactionId = `chat_${message.id}_${Date.now()}`;
+            const transaction = new CoinTransaction({
+              transactionId,
+              userId: user._id,
+              type: 'debit',
+              coins: coinsRequired,
+              source: 'chat_message',
+              description: `Chat message (5 coins per message after first 3 free)`,
+              status: 'completed',
+            });
+            await transaction.save();
+            
+            // Update user balance
+            user.coins = Math.max(0, user.coins - coinsRequired);
+            await user.save();
+            
+            console.log(`✅ [WEBHOOK] Message billed: ${coinsRequired} coins deducted`);
+            console.log(`   User balance: ${user.coins} coins`);
+          }
+        }
       }
       
       // Message is valid

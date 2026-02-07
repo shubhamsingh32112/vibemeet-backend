@@ -8,6 +8,7 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey } from './creator-tasks.config';
 import { randomUUID } from 'crypto';
 import { getStreamClient } from '../../config/stream';
+import { getBatchAvailability } from '../availability/availability.service';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -31,44 +32,13 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
       return;
     }
     
-    // Admins see ALL creators (online and offline)
-    // Regular users only see online creators on homepage (offline creators are hidden)
-    const isAdmin = currentUser && currentUser.role === 'admin';
-    const query = isAdmin ? {} : { isOnline: true };
+    // 🔥 FIX: Return ALL creators regardless of isOnline status
+    // Availability is determined by Redis (real-time), NOT MongoDB isOnline (stale toggle)
+    // Cards always render. Status badge shows Online/Busy from Redis.
+    // Busy creators are visible but their call button is disabled.
+    const creators = await Creator.find({}).sort({ createdAt: -1 });
     
-    // Debug: Log query and check all creators' status
-    if (!isAdmin) {
-      const allCreators = await Creator.find({}).select('_id name isOnline').limit(10);
-      console.log(`🔍 [CREATOR] Debug - All creators in DB (first 10):`);
-      allCreators.forEach((c) => {
-        console.log(`   - ${c._id}: name=${c.name}, isOnline=${c.isOnline} (type: ${typeof c.isOnline})`);
-      });
-      
-      // Also check the exact query that will be executed
-      console.log(`🔍 [CREATOR] Executing query: ${JSON.stringify(query)}`);
-      const queryTest = await Creator.find(query).select('_id name isOnline').limit(10);
-      console.log(`🔍 [CREATOR] Query result (first 10): ${queryTest.length} creator(s)`);
-      queryTest.forEach((c) => {
-        console.log(`   - ${c._id}: name=${c.name}, isOnline=${c.isOnline}`);
-      });
-    }
-    
-    const creators = await Creator.find(query).sort({ createdAt: -1 });
-    
-    if (isAdmin) {
-      console.log(`✅ [CREATOR] Admin request: Found ${creators.length} creator(s) (all creators, online and offline)`);
-    } else {
-      console.log(`✅ [CREATOR] Query: ${JSON.stringify(query)}`);
-      console.log(`✅ [CREATOR] Found ${creators.length} online creator(s) (offline creators are hidden)`);
-      if (creators.length > 0) {
-        console.log(`   Online creators: ${creators.map(c => `${c.name} (${c._id})`).join(', ')}`);
-      } else {
-        console.log(`   ⚠️  No online creators found. Checking if any creators exist...`);
-        const totalCreators = await Creator.countDocuments({});
-        const onlineCount = await Creator.countDocuments({ isOnline: true });
-        console.log(`   📊 Total creators in DB: ${totalCreators}, Online: ${onlineCount}`);
-      }
-    }
+    console.log(`✅ [CREATOR] Found ${creators.length} creator(s)`);
 
     // Favorites are a "user-only" feature
     const favoriteSet =
@@ -86,32 +56,48 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           creatorFirebaseUid = creatorUser?.firebaseUid || null;
         }
         
-      return {
-        id: creator._id.toString(),
+        return {
+          id: creator._id.toString(),
           userId: creator.userId ? creator.userId.toString() : null, // MongoDB User ID
           firebaseUid: creatorFirebaseUid, // Firebase UID for Stream Video calls
-        name: creator.name,
-        about: creator.about,
-        photo: creator.photo,
-        categories: creator.categories,
-        price: creator.price,
-        isOnline: creator.isOnline,
-        isFavorite: favoriteSet.has(creator._id.toString()),
-        createdAt: creator.createdAt,
-        updatedAt: creator.updatedAt,
-      };
+          name: creator.name,
+          about: creator.about,
+          photo: creator.photo,
+          categories: creator.categories,
+          price: creator.price,
+          isOnline: creator.isOnline,
+          isFavorite: favoriteSet.has(creator._id.toString()),
+          createdAt: creator.createdAt,
+          updatedAt: creator.updatedAt,
+        };
       })
     );
     
-    console.log(`📤 [CREATOR] Sending response with ${creatorsWithUserIds.length} creator(s)`);
-    if (creatorsWithUserIds.length > 0) {
-      console.log(`   Response creators: ${creatorsWithUserIds.map(c => `${c.name} (isOnline: ${c.isOnline})`).join(', ')}`);
-    }
+    // 🔥 FIX: Batch-query Redis for real-time availability
+    // This is the AUTHORITATIVE source — not MongoDB isOnline
+    // Missing/expired Redis keys → 'busy' (safe default)
+    const firebaseUids = creatorsWithUserIds
+      .map(c => c.firebaseUid)
+      .filter((uid): uid is string => uid !== null);
+    
+    const availabilityMap = firebaseUids.length > 0
+      ? await getBatchAvailability(firebaseUids)
+      : {};
+    
+    // Enrich each creator with their Redis availability
+    const creatorsWithAvailability = creatorsWithUserIds.map(creator => ({
+      ...creator,
+      availability: creator.firebaseUid
+        ? (availabilityMap[creator.firebaseUid] ?? 'busy')
+        : 'busy',
+    }));
+    
+    console.log(`📤 [CREATOR] Sending ${creatorsWithAvailability.length} creator(s) with availability`);
     
     res.json({
       success: true,
       data: {
-        creators: creatorsWithUserIds,
+        creators: creatorsWithAvailability,
       },
     });
   } catch (error) {
@@ -528,35 +514,30 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
       return;
     }
     
-    // Update online status
+    // Update MongoDB for legacy support (optional - not used for presence)
     creator.isOnline = isOnline;
     await creator.save();
     
-    console.log(`✅ [CREATOR] Creator ${creator._id} online status set to: ${isOnline}`);
+    console.log(`✅ [CREATOR] Creator ${creator._id} availability set to: ${isOnline}`);
     
-    // Emit Stream event for realtime status updates (no polling needed)
+    // 🔥 CRITICAL: Update Stream user's available field (business intent)
+    // Presence (online/offline) is automatic via WebSocket connection
+    // Available is the creator's intent to accept calls
     try {
       const streamClient = getStreamClient();
-      // System channel for creator status updates
-      // Channel is lazily created by Stream on first sendEvent() call
-      const channel = streamClient.channel('messaging', 'creator-status');
       
-      // Send custom event for creator status change
-      // Stream automatically creates the channel if it doesn't exist
-      // user_id is REQUIRED for server-side auth (events must have an actor)
-      // Type cast is needed because TypeScript doesn't know about custom event types
-      // Custom event types CANNOT contain dots (.) - use underscores instead
-      await channel.sendEvent({
-        type: 'creator_status_changed' as any, // NO DOTS - custom events cannot use dots
-        creator_id: creator._id.toString(),
-        isOnline: isOnline,
-        user_id: currentUser.firebaseUid, // REQUIRED for server-side auth
+      // Update Stream user's extraData with available flag
+      await streamClient.partialUpdateUser({
+        id: currentUser.firebaseUid, // Stream user ID = Firebase UID
+        set: {
+          available: isOnline, // Business intent flag
+        },
       });
       
-      console.log(`📡 [STREAM] Creator status event emitted: ${creator._id} -> ${isOnline}`);
+      console.log(`✅ [STREAM] Creator available flag updated: ${currentUser.firebaseUid} -> ${isOnline}`);
     } catch (streamError) {
-      // Don't fail the request if Stream event fails
-      console.error('⚠️  [STREAM] Failed to emit creator status event:', streamError);
+      // Don't fail the request if Stream update fails
+      console.error('⚠️  [STREAM] Failed to update Stream user available flag:', streamError);
     }
     
     res.json({

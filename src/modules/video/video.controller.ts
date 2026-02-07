@@ -3,6 +3,7 @@ import { Response } from 'express';
 import axios from 'axios';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
+import { Call } from './call.model';
 import { generateStreamVideoToken, generateCallId, generateServerSideToken } from '../../config/stream-video';
 
 /**
@@ -142,10 +143,24 @@ export const initiateCall = async (req: Request, res: Response): Promise<void> =
     }
 
     // CRITICAL: Only users (not creators) can initiate calls
+    // 🔥 Creators don't need coins to receive calls - they can receive calls for free
     if (user.role !== 'user') {
       res.status(403).json({
         success: false,
         error: 'Only users can initiate calls. Creators cannot call other creators.',
+      });
+      return;
+    }
+
+    // PHASE 8: Standardized error code - User must have ≥ 10 coins to start a call
+    // 🔥 Only applies to users (not creators) - creators receive calls for free
+    if (user.coins < 10) {
+      res.status(403).json({
+        success: false,
+        error: 'INSUFFICIENT_COINS_MIN_10',
+        message: 'Minimum 10 coins required to start a call',
+        coinsRequired: 10,
+        coinsAvailable: user.coins,
       });
       return;
     }
@@ -175,6 +190,15 @@ export const initiateCall = async (req: Request, res: Response): Promise<void> =
       res.status(400).json({
         success: false,
         error: 'Target user is not a creator',
+      });
+      return;
+    }
+
+    // Check if creator is already in a call
+    if (creator.currentCallId) {
+      res.status(409).json({
+        success: false,
+        error: 'Creator is already in a call',
       });
       return;
     }
@@ -250,6 +274,20 @@ export const initiateCall = async (req: Request, res: Response): Promise<void> =
 
       console.log('✅ [VIDEO] Call ready:', JSON.stringify(response.data, null, 2));
 
+      // Create or update call record in database
+      const callRecord = await Call.findOneAndUpdate(
+        { callId },
+        {
+          callId,
+          callerUserId: user._id,
+          creatorUserId: creatorUser._id,
+          status: 'ringing',
+        },
+        { upsert: true, new: true }
+      );
+
+      console.log(`✅ [VIDEO] Call record created/updated: ${callRecord._id}`);
+
       res.json({
         success: true,
         data: {
@@ -293,6 +331,140 @@ export const initiateCall = async (req: Request, res: Response): Promise<void> =
       console.error(`   Response data: ${JSON.stringify(error.response.data, null, 2)}`);
     }
     
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error?.message || 'An unexpected error occurred',
+    });
+  }
+};
+
+/**
+ * POST /api/v1/video/call/accept
+ * Accept a call (creator side)
+ * 
+ * This locks the creator's availability and snapshots pricing data.
+ * 
+ * Input:
+ * {
+ *   "callId": "call_id_string"
+ * }
+ */
+export const acceptCall = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+      });
+      return;
+    }
+
+    const firebaseUid = req.auth.firebaseUid;
+    const { callId } = req.body;
+
+    if (!callId) {
+      res.status(400).json({
+        success: false,
+        error: 'callId is required',
+      });
+      return;
+    }
+
+    // Get current user (should be creator)
+    const user = await User.findOne({ firebaseUid });
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    // Find call record
+    const call = await Call.findOne({ callId });
+    if (!call) {
+      res.status(404).json({
+        success: false,
+        error: 'Call not found',
+      });
+      return;
+    }
+
+    // Verify user is the creator for this call
+    if (call.creatorUserId.toString() !== user._id.toString()) {
+      res.status(403).json({
+        success: false,
+        error: 'Only the creator can accept this call',
+      });
+      return;
+    }
+
+    // Check call status
+    if (call.status !== 'ringing') {
+      res.status(400).json({
+        success: false,
+        error: `Call is not in ringing state. Current status: ${call.status}`,
+      });
+      return;
+    }
+
+    // Get creator profile
+    const creator = await Creator.findOne({ userId: user._id });
+    if (!creator) {
+      res.status(404).json({
+        success: false,
+        error: 'Creator profile not found',
+      });
+      return;
+    }
+
+    // Check if creator is already in a call
+    if (creator.currentCallId && creator.currentCallId !== callId) {
+      res.status(409).json({
+        success: false,
+        error: 'Creator is already in another call',
+      });
+      return;
+    }
+
+    // Get caller to check coins
+    const caller = await User.findById(call.callerUserId);
+    if (!caller) {
+      res.status(404).json({
+        success: false,
+        error: 'Caller not found',
+      });
+      return;
+    }
+
+    // SNAPSHOT: Store pricing data at call time
+    call.priceAtCallTime = creator.price;
+    call.creatorShareAtCallTime = 0.30; // 30% default (configurable)
+    call.acceptedAt = new Date();
+    call.status = 'accepted';
+
+    // LOCK: Set creator availability
+    creator.isOnline = false; // Creator is busy
+    creator.currentCallId = callId; // Lock creator to this call
+
+    await call.save();
+    await creator.save();
+
+    console.log(`✅ [VIDEO] Call ${callId} accepted by creator ${user._id}`);
+    console.log(`   Price snapshot: ${call.priceAtCallTime} coins/min`);
+    console.log(`   Creator share: ${call.creatorShareAtCallTime * 100}%`);
+
+    res.json({
+      success: true,
+      data: {
+        callId,
+        priceAtCallTime: call.priceAtCallTime,
+        creatorShareAtCallTime: call.creatorShareAtCallTime,
+      },
+    });
+  } catch (error: any) {
+    console.error('❌ [VIDEO] Error accepting call:', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error',

@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { getStreamClient, ensureStreamUser } from '../../config/stream';
 import { User } from '../user/user.model';
 import { getChatPolicyForRole } from './chat.policy';
+import { Call } from '../video/call.model';
 
 /**
  * Generate deterministic channel ID for User-Creator pair
@@ -191,6 +192,35 @@ export const createOrGetChannel = async (req: Request, res: Response): Promise<v
       username: otherUser.username, // Store username as single source of truth
     });
 
+    // CRITICAL: Enforce "Chat allowed only after 1 call" rule
+    // Check if there's at least one completed call between these two users
+    // A completed call is one that was accepted and ended (status: 'ended')
+    const completedCallsCount = await Call.countDocuments({
+      $or: [
+        // User called creator
+        {
+          callerUserId: currentUser._id,
+          creatorUserId: otherUser._id,
+          status: 'ended',
+          durationSeconds: { $gt: 0 }, // Must have actual duration
+        },
+        // Creator called user (if roles are reversed)
+        {
+          callerUserId: otherUser._id,
+          creatorUserId: currentUser._id,
+          status: 'ended',
+          durationSeconds: { $gt: 0 },
+        },
+      ],
+    });
+
+    if (completedCallsCount < 1) {
+      res.status(403).json({
+        success: false,
+        error: 'Chat is only available after completing at least one call',
+      });
+      return;
+    }
 
     // Generate deterministic channel ID using Firebase UIDs (sorted)
     const channelId = generateChannelId(currentUserFirebaseUid, otherUserFirebaseUid);

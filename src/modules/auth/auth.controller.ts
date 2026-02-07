@@ -27,16 +27,22 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     // ✅ Create user ONLY here (never in middleware)
     if (!user) {
       console.log('📝 [AUTH] Creating new user in database (first login)...');
+      // 🔥 CRITICAL: Only regular users get free coins (not creators)
+      // New users get 30 free coins and 3 free chats on first login
+      // Creators don't need coins to receive calls/texts, so they don't get free coins
       user = await User.create({
         firebaseUid: req.auth.firebaseUid,
         phone: req.auth.phone,
         email: req.auth.email,
-        role: 'user',
+        role: 'user', // Default to 'user' - creators are promoted later via admin
         categories: [], // onboarding pending
-        coins: 0,
+        coins: 30, // ✅ New users get 30 free coins on first login (only for regular users)
+        freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
       });
       console.log('✅ [AUTH] New user created');
       console.log(`   User ID: ${user._id}`);
+      console.log(`   Initial coins: 30 (free coins for new users)`);
+      console.log(`   Free chats: 3 (freeTextUsed initialized to 0)`);
     } else {
       // Keep user contact info in sync (DB writes are OK here)
       const needsUpdate =

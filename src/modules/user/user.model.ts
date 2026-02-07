@@ -12,6 +12,7 @@ export interface IUser extends Document {
   favoriteCreatorIds: mongoose.Types.ObjectId[]; // Users can favorite creators (creator _id values)
   usernameChangeCount: number; // Track how many times username was changed (max 3)
   coins: number;
+  freeTextUsed: number; // Count of free text messages used (first 3 are free)
   role: 'user' | 'creator' | 'admin'; // User role
   createdAt: Date;
   updatedAt: Date;
@@ -37,6 +38,11 @@ const userSchema = new Schema<IUser>(
       trim: true,
     },
     coins: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    freeTextUsed: {
       type: Number,
       default: 0,
       min: 0,

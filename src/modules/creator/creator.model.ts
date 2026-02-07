@@ -9,6 +9,8 @@ export interface ICreator extends Document {
   categories: string[]; // Array of category names (optional)
   price: number; // Price per minute in coins (e.g., 60 = 60 coins per minute)
   isOnline: boolean; // Online/offline status for creators
+  currentCallId?: string; // Current active call ID (locks creator from accepting other calls)
+  earningsCoins: number; // Total creator earnings from video calls
   createdAt: Date;
   updatedAt: Date;
 }
@@ -54,6 +56,16 @@ const creatorSchema = new Schema<ICreator>(
       type: Boolean,
       default: false,
       index: true, // Index for efficient filtering
+    },
+    currentCallId: {
+      type: String,
+      sparse: true,
+      index: true, // Index for efficient lookup of creators in calls
+    },
+    earningsCoins: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
   },
   {
