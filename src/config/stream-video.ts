@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 /**
  * Stream Video configuration and utilities
@@ -85,12 +86,29 @@ export const generateServerSideToken = (): string => {
 
 /**
  * Generate deterministic call ID for User-Creator pair
- * Format: userId_creatorId
+ * 
+ * IMPROVEMENT: Uses hash format to avoid leaking internal IDs
+ * - Old format: firebaseUid_mongoObjectId (leaks Mongo ObjectId)
+ * - New format: call_<sha256(firebaseUid:creatorId)> (no leakage)
+ * 
+ * Benefits:
+ * - Same determinism (same pair = same ID)
+ * - No internal ID leakage
+ * - Easier to rotate later if needed
  * 
  * @param userId - User's Firebase UID
  * @param creatorId - Creator's MongoDB ObjectId (as string)
- * @returns Deterministic call ID
+ * @returns Deterministic call ID (hashed format)
  */
 export const generateCallId = (userId: string, creatorId: string): string => {
-  return `${userId}_${creatorId}`;
+  // Create SHA256 hash of the user-creator pair
+  const hash = crypto
+    .createHash('sha256')
+    .update(`${userId}:${creatorId}`)
+    .digest('hex')
+    .slice(0, 32); // 32 chars is plenty for uniqueness
+  
+  // Prefix with 'call_' identifier
+  // Total length: 6 (prefix) + 32 (hash) = 38 chars (well under any limits)
+  return `call_${hash}`;
 };
