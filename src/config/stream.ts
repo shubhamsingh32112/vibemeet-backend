@@ -28,6 +28,60 @@ export const getStreamClient = (): StreamChat => {
 };
 
 /**
+ * Configure Firebase Cloud Messaging (FCM) push notifications on Stream.
+ *
+ * This uploads a minimal Firebase service-account credential JSON to Stream
+ * so that Stream can send FCM pushes on behalf of this app.
+ *
+ * Required env vars (same ones used for firebase-admin):
+ *   FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+ *
+ * Call once at server startup. Idempotent — safe to call on every boot.
+ */
+export const configureStreamPush = async (): Promise<void> => {
+  try {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+    if (!projectId || !clientEmail || !privateKey) {
+      console.warn(
+        '⚠️ [STREAM PUSH] Firebase credentials missing in env — push notifications will NOT work.\n' +
+        '   Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY in .env'
+      );
+      return;
+    }
+
+    const client = getStreamClient();
+
+    // Build a minimal service-account JSON that Google / Stream can use
+    const credentialsJson = JSON.stringify({
+      type: 'service_account',
+      project_id: projectId,
+      private_key: privateKey,
+      client_email: clientEmail,
+      token_uri: 'https://oauth2.googleapis.com/token',
+    });
+
+    await client.updateAppSettings({
+      push_config: {
+        version: 'v2',
+      },
+      firebase_config: {
+        credentials_json: credentialsJson,
+        notification_template: `{"title":"{{ sender.name }}","body":"{{ truncate message.text 250 }}","click_action":"FLUTTER_NOTIFICATION_CLICK","sound":"default"}`,
+        data_template: `{"sender":"stream.chat","type":"{{ type }}","id":"{{ message.id }}","channel_type":"{{ channel.type }}","channel_id":"{{ channel.id }}","channel_name":"{{ channel.name }}","message_text":"{{ truncate message.text 250 }}"}`,
+      },
+    });
+
+    console.log('✅ [STREAM PUSH] Firebase push notifications configured on Stream');
+  } catch (error) {
+    console.error('❌ [STREAM PUSH] Failed to configure push notifications:', error);
+    // Don't throw — push config failure shouldn't block server startup
+  }
+};
+
+/**
  * Ensure Stream user exists (idempotent)
  * Maps Firebase UID → Stream user ID
  * 

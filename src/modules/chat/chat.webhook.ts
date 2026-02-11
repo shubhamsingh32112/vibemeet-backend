@@ -1,18 +1,23 @@
 import type { Request, Response } from 'express';
-import { getStreamClient } from '../../config/stream';
 import { User } from '../user/user.model';
-import { CoinTransaction } from '../user/coin-transaction.model';
+import {
+  ChatMessageQuota,
+  FREE_MESSAGES_PER_CREATOR,
+  COST_PER_MESSAGE,
+} from './chat-message-quota.model';
 
 /**
- * Stream Chat webhook handler for message validation
- * 
- * This is the AUTHORITATIVE layer that enforces chat rules server-side.
- * Frontend validation is for UX only - this prevents bypasses.
- * 
- * Webhook endpoint: POST /api/v1/chat/webhook
- * 
- * Stream will call this on message.new events.
- * Return 200 to allow, 403 to reject.
+ * Stream Chat webhook handler.
+ *
+ * Acts as a **backup** enforcement layer.  The primary enforcement is the
+ * `POST /api/v1/chat/pre-send` endpoint that the frontend calls before
+ * every message.  This webhook catches edge-cases (e.g. bypassed clients).
+ *
+ * NOTE: For this to reject messages Stream must be configured in
+ * "blocking webhook" mode.  In notification-only mode the message is
+ * already delivered and this handler is purely observational.
+ *
+ * Endpoint: POST /api/v1/chat/webhook
  */
 
 interface StreamWebhookPayload {
@@ -38,179 +43,101 @@ interface StreamWebhookPayload {
 }
 
 /**
- * Validate text message (only digits 0-5 allowed)
- */
-const validateTextMessage = (text: string | undefined): boolean => {
-  if (!text) return true; // Empty messages are allowed
-  
-  // Only digits 0-5 and spaces allowed
-  const ALLOWED_TEXT_REGEX = /^[0-5\s]*$/;
-  return ALLOWED_TEXT_REGEX.test(text);
-};
-
-/**
- * Validate attachments (only creators can send)
+ * Validate attachments — only creators can send images / videos.
+ * Voice messages are allowed for everyone.
  */
 const validateAttachments = async (
   attachments: Array<{ type: string; [key: string]: unknown }> | undefined,
   userId: string
 ): Promise<boolean> => {
-  if (!attachments || attachments.length === 0) return true; // No attachments is fine
-  
-  // Voice messages are allowed for all users (they're attachments but bypass text rules)
-  const hasOnlyVoice = attachments.every(att => att.type === 'audio' || att.type === 'voice');
-  if (hasOnlyVoice) return true; // Voice messages are always allowed
-  
-  // For other attachments (images, videos), check user role
+  if (!attachments || attachments.length === 0) return true;
+
+  const hasOnlyVoice = attachments.every(
+    (att) => att.type === 'audio' || att.type === 'voice'
+  );
+  if (hasOnlyVoice) return true;
+
   try {
-    // Get user from database to check role
     const user = await User.findOne({ firebaseUid: userId });
-    if (!user) {
-      console.error(`❌ [WEBHOOK] User not found: ${userId}`);
-      return false;
-    }
-    
-    // Only creators and admins can send media attachments
-    if (user.role !== 'creator' && user.role !== 'admin') {
-      console.log(`❌ [WEBHOOK] User ${userId} (role: ${user.role}) attempted to send media attachments`);
-      return false;
-    }
-    
-    return true;
-  } catch (error) {
-    console.error(`❌ [WEBHOOK] Error validating attachments:`, error);
+    if (!user) return false;
+    return user.role === 'creator' || user.role === 'admin';
+  } catch {
     return false;
   }
 };
 
-/**
- * Stream webhook handler
- * 
- * Stream sends webhook events for various actions.
- * We handle message.new to validate messages before they're sent.
- */
-export const handleStreamWebhook = async (req: Request, res: Response): Promise<void> => {
+export const handleStreamWebhook = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
   try {
     const payload = req.body as StreamWebhookPayload;
-    
-    console.log(`📥 [WEBHOOK] Received webhook: ${payload.type}`);
-    
-    // Handle message.new events (message validation)
+
+    console.log(`📥 [WEBHOOK] Received: ${payload.type}`);
+
     if (payload.type === 'message.new' && payload.message) {
       const message = payload.message;
       const userId = message.user?.id;
-      
+
       if (!userId) {
-        console.error('❌ [WEBHOOK] Message missing user ID');
         res.status(400).json({ error: 'Missing user ID' });
         return;
       }
-      
-      // Validate text message
-      if (message.text && !validateTextMessage(message.text)) {
-        console.log(`❌ [WEBHOOK] Message rejected: Invalid text pattern`);
-        console.log(`   Text: "${message.text}"`);
-        console.log(`   User: ${userId}`);
-        res.status(403).json({ 
-          error: 'Message violates chat rules: Only numbers 0 to 5 are allowed',
-        });
-        return;
-      }
-      
-      // Validate attachments
-      const attachmentsValid = await validateAttachments(message.attachments, userId);
+
+      // ── Attachment validation (images/videos only for creators) ────
+      const attachmentsValid = await validateAttachments(
+        message.attachments,
+        userId
+      );
       if (!attachmentsValid) {
-        console.log(`❌ [WEBHOOK] Message rejected: Attachments not allowed for user`);
-        console.log(`   User: ${userId}`);
-        res.status(403).json({ 
-          error: 'Attachments not allowed for users. Only creators can send media.',
+        console.log(`❌ [WEBHOOK] Rejected: Attachments not allowed for user ${userId}`);
+        res.status(403).json({
+          error: 'Only creators can send media attachments.',
         });
         return;
       }
-      
-      // PHASE 0: Chat billing - First 3 messages free, then 5 coins per message
-      // 🔥 CRITICAL: Only users pay for messages
-      // Creators receive messages for free - they don't need coins to receive texts
-      // Only apply to text messages from users (not creators, not voice messages)
-      if (message.text && message.text.trim().length > 0) {
-        const user = await User.findOne({ firebaseUid: userId });
-        if (!user) {
-          console.error(`❌ [WEBHOOK] User not found: ${userId}`);
-          res.status(404).json({ error: 'User not found' });
-          return;
-        }
-        
-        // 🔥 Only bill regular users (not creators or admins)
-        // Creators can receive messages for free - no coins required
-        if (user.role === 'user') {
-          // Check if user has used free messages
-          const freeMessagesRemaining = 3 - (user.freeTextUsed || 0);
-          
-          if (freeMessagesRemaining > 0) {
-            // Free message - just increment counter
-            user.freeTextUsed = (user.freeTextUsed || 0) + 1;
-            await user.save();
-            console.log(`✅ [WEBHOOK] Free message (${user.freeTextUsed}/3 used)`);
-          } else {
-            // Paid message - check coins
-            const coinsRequired = 5;
-            
-            // PHASE 8: Standardized error code
-            if (user.coins < coinsRequired) {
-              console.log(`❌ [WEBHOOK] Message rejected: Insufficient coins`);
-              console.log(`   User: ${userId}, Coins: ${user.coins}, Required: ${coinsRequired}`);
-              res.status(403).json({ 
-                error: 'INSUFFICIENT_COINS_CHAT',
-                message: 'Insufficient coins to send message. Buy coins to continue.',
-                coinsRequired,
-                coinsAvailable: user.coins,
-              });
-              return;
-            }
-            
-            // Deduct coins
-            const transactionId = `chat_${message.id}_${Date.now()}`;
-            const transaction = new CoinTransaction({
-              transactionId,
-              userId: user._id,
-              type: 'debit',
-              coins: coinsRequired,
-              source: 'chat_message',
-              description: `Chat message (5 coins per message after first 3 free)`,
-              status: 'completed',
+
+      // ── Quota / coin backup check (catches bypassed clients) ───────
+      const user = await User.findOne({ firebaseUid: userId });
+      if (user && user.role === 'user' && payload.channel?.id) {
+        const channelId = payload.channel.id;
+
+        // Resolve creator UID from channel members
+        // The channel members aren't in the webhook payload, so we look
+        // up the quota record (if it exists).  If it doesn't exist this
+        // is likely the very first message and pre-send already created
+        // the record, so we trust it.
+        const quota = await ChatMessageQuota.findOne({
+          userFirebaseUid: userId,
+          channelId,
+        });
+
+        if (quota && quota.freeMessagesSent >= FREE_MESSAGES_PER_CREATOR) {
+          // Beyond free quota — user should have been charged via pre-send.
+          // As a safety net, verify they still have coins.
+          if (user.coins < COST_PER_MESSAGE) {
+            console.log(
+              `❌ [WEBHOOK] Rejected: User ${userId} has ${user.coins} coins ` +
+              `(needs ${COST_PER_MESSAGE}) for channel ${channelId}`
+            );
+            res.status(403).json({
+              error: `Insufficient coins. You need ${COST_PER_MESSAGE} coins to send a message.`,
             });
-            await transaction.save();
-            
-            // Update user balance
-            user.coins = Math.max(0, user.coins - coinsRequired);
-            await user.save();
-            
-            console.log(`✅ [WEBHOOK] Message billed: ${coinsRequired} coins deducted`);
-            console.log(`   User balance: ${user.coins} coins`);
+            return;
           }
         }
       }
-      
-      // Message is valid
-      console.log(`✅ [WEBHOOK] Message validated successfully`);
+
+      // ── All good ───────────────────────────────────────────────────
+      console.log(`✅ [WEBHOOK] Message validated`);
       res.status(200).json({ success: true });
       return;
     }
-    
-    // For other webhook types, just acknowledge
+
+    // Other event types — acknowledge
     res.status(200).json({ success: true });
   } catch (error) {
-    console.error('❌ [WEBHOOK] Error processing webhook:', error);
+    console.error('❌ [WEBHOOK] Error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
-};
-
-/**
- * Verify webhook signature (optional but recommended)
- * Stream can send a signature header to verify authenticity
- */
-export const verifyWebhookSignature = (req: Request): boolean => {
-  // TODO: Implement signature verification if Stream provides it
-  // For now, we'll rely on network security (HTTPS, IP whitelist, etc.)
-  return true;
 };

@@ -4,7 +4,9 @@ import mongoose from 'mongoose';
 import { User } from './user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
+import { CallHistory } from '../billing/call-history.model';
 import { randomUUID } from 'crypto';
+import { invalidateAdminCaches } from '../../config/redis';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -142,6 +144,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           price: creator.price,
           // User-specific data (coins, role, etc.)
           coins: user.coins,
+          welcomeBonusClaimed: user.welcomeBonusClaimed,
           role: user.role,
           userId: user._id.toString(), // Reference to user document
           // Additional user fields that might be useful
@@ -168,6 +171,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
             coins: user.coins,
+            welcomeBonusClaimed: user.welcomeBonusClaimed,
             role: user.role,
             createdAt: user.createdAt,
             updatedAt: user.updatedAt,
@@ -487,6 +491,9 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       
       console.log(`✅ [USER] User ${targetUser._id} promoted to creator. Creator profile: ${createdCreator._id}`);
 
+      // Invalidate admin caches after promotion
+      invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
+
       res.status(201).json({
         success: true,
         data: {
@@ -660,6 +667,70 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+// Claim welcome bonus (30 coins for new users only)
+export const claimWelcomeBonus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('🎁 [USER] Claim welcome bonus request');
+
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // Only regular users can claim (not creators/admins)
+    if (user.role !== 'user') {
+      res.status(403).json({ success: false, error: 'Only regular users can claim welcome bonus' });
+      return;
+    }
+
+    // Check if already claimed
+    if (user.welcomeBonusClaimed) {
+      res.status(400).json({ success: false, error: 'Welcome bonus already claimed' });
+      return;
+    }
+
+    const WELCOME_BONUS = 30;
+
+    // Create transaction record
+    const transaction = new CoinTransaction({
+      transactionId: `welcome_bonus_${user._id}`,
+      userId: user._id,
+      type: 'credit',
+      coins: WELCOME_BONUS,
+      source: 'admin',
+      description: 'Welcome bonus - 30 free coins',
+      status: 'completed',
+    });
+
+    // Update user
+    user.coins = (user.coins || 0) + WELCOME_BONUS;
+    user.welcomeBonusClaimed = true;
+
+    await transaction.save();
+    await user.save();
+
+    console.log(`✅ [USER] Welcome bonus claimed: ${user._id} now has ${user.coins} coins`);
+
+    res.json({
+      success: true,
+      data: {
+        coins: user.coins,
+        bonusAmount: WELCOME_BONUS,
+        welcomeBonusClaimed: true,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Claim welcome bonus error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
@@ -889,5 +960,65 @@ export const getUserTransactions = async (req: Request, res: Response): Promise<
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// CALL HISTORY
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /user/call-history
+ *
+ * Returns the authenticated user's call history, sorted by most recent first.
+ * Works for both regular users and creators (each sees their own records).
+ *
+ * Query params:
+ *   page   (default 1)
+ *   limit  (default 20, max 50)
+ */
+export const getCallHistory = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('📋 [USER] Get call history request');
+
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const skip = (page - 1) * limit;
+
+    const [calls, total] = await Promise.all([
+      CallHistory.find({ ownerUserId: user._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      CallHistory.countDocuments({ ownerUserId: user._id }),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        calls,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get call history error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

@@ -1,5 +1,10 @@
 import { Router } from 'express';
-import { getChatToken, createOrGetChannel } from './chat.controller';
+import {
+  getChatToken,
+  createOrGetChannel,
+  preSendMessage,
+  getMessageQuota,
+} from './chat.controller';
 import { handleStreamWebhook } from './chat.webhook';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 
@@ -8,11 +13,17 @@ const router = Router();
 // Get Stream Chat token
 router.post('/token', verifyFirebaseToken, getChatToken);
 
-// Create or get channel
+// Create or get channel (returns quota info)
 router.post('/channel', verifyFirebaseToken, createOrGetChannel);
 
-// Stream webhook endpoint (no auth required - Stream will call this directly)
-// Note: In production, you should verify webhook signature or use IP whitelist
+// Pre-send check — frontend calls this BEFORE every user message
+// Validates quota, deducts coins if needed
+router.post('/pre-send', verifyFirebaseToken, preSendMessage);
+
+// Get message quota for a channel (free remaining, cost)
+router.get('/quota/:channelId', verifyFirebaseToken, getMessageQuota);
+
+// Stream webhook endpoint (no auth required - Stream calls this directly)
 router.post('/webhook', handleStreamWebhook);
 
 export default router;

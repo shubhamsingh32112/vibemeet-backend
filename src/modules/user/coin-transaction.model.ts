@@ -19,7 +19,7 @@ export interface ICoinTransaction extends Document {
   userId: mongoose.Types.ObjectId; // User involved in transaction
   type: 'credit' | 'debit'; // credit = coins added, debit = coins deducted
   coins: number; // Amount of coins (always positive, type indicates direction)
-  source: 'manual' | 'payment_gateway' | 'admin' | 'video_call'; // Source of the transaction
+  source: 'manual' | 'payment_gateway' | 'admin' | 'video_call' | 'chat_message'; // Source of the transaction
   description?: string; // Human-readable description
   callId?: string; // If transaction is from a video call
   paymentGatewayTransactionId?: string; // External payment gateway transaction ID (if applicable)
@@ -54,7 +54,7 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
     },
     source: {
       type: String,
-      enum: ['manual', 'payment_gateway', 'admin', 'video_call'],
+      enum: ['manual', 'payment_gateway', 'admin', 'video_call', 'chat_message'],
       default: 'manual',
     },
     description: {

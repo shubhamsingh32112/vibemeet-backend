@@ -5,10 +5,18 @@ import { Creator } from './creator.model';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
+import { CallHistory } from '../billing/call-history.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey } from './creator-tasks.config';
-import { randomUUID } from 'crypto';
-import { getStreamClient } from '../../config/stream';
+import { getIO } from '../../config/socket';
+import { setCreatorAvailability } from '../availability/availability.gateway';
 import { getBatchAvailability } from '../availability/availability.service';
+import {
+  getRedis,
+  creatorDashboardKey,
+  CREATOR_DASHBOARD_TTL,
+  invalidateCreatorDashboard,
+  invalidateAdminCaches,
+} from '../../config/redis';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -32,13 +40,13 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
       return;
     }
     
-    // 🔥 FIX: Return ALL creators regardless of isOnline status
-    // Availability is determined by Redis (real-time), NOT MongoDB isOnline (stale toggle)
-    // Cards always render. Status badge shows Online/Busy from Redis.
-    // Busy creators are visible but their call button is disabled.
+    // Return ALL creators regardless of online status.
+    // Availability (online/busy) is managed via Redis + Socket.IO in real-time.
+    // The REST endpoint always returns every creator; the frontend shows
+    // online/busy tags based on the Socket.IO availability provider.
     const creators = await Creator.find({}).sort({ createdAt: -1 });
     
-    console.log(`✅ [CREATOR] Found ${creators.length} creator(s)`);
+    console.log(`✅ [CREATOR] Found ${creators.length} creator(s) (all creators returned, availability via Redis)`);
 
     // Favorites are a "user-only" feature
     const favoriteSet =
@@ -441,6 +449,9 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
       if (userId) {
         console.log(`   ✅ User ${userId} downgraded to 'user' role`);
       }
+
+      // Invalidate admin caches after creator deletion
+      invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
       
       res.json({
         success: true,
@@ -520,24 +531,20 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
     
     console.log(`✅ [CREATOR] Creator ${creator._id} availability set to: ${isOnline}`);
     
-    // 🔥 CRITICAL: Update Stream user's available field (business intent)
-    // Presence (online/offline) is automatic via WebSocket connection
-    // Available is the creator's intent to accept calls
+    // Update Redis + broadcast via Socket.IO for instant real-time availability
     try {
-      const streamClient = getStreamClient();
-      
-      // Update Stream user's extraData with available flag
-      await streamClient.partialUpdateUser({
-        id: currentUser.firebaseUid, // Stream user ID = Firebase UID
-        set: {
-          available: isOnline, // Business intent flag
-        },
-      });
-      
-      console.log(`✅ [STREAM] Creator available flag updated: ${currentUser.firebaseUid} -> ${isOnline}`);
-    } catch (streamError) {
-      // Don't fail the request if Stream update fails
-      console.error('⚠️  [STREAM] Failed to update Stream user available flag:', streamError);
+      const io = getIO();
+      await setCreatorAvailability(
+        io,
+        currentUser.firebaseUid,
+        isOnline ? 'online' : 'busy'
+      );
+      console.log(
+        `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'busy'}`
+      );
+    } catch (availabilityError) {
+      // Don't fail the request if Redis/Socket broadcast fails
+      console.error('⚠️  [REDIS+SOCKET] Failed to update availability:', availabilityError);
     }
     
     res.json({
@@ -602,18 +609,51 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Call functionality removed - return zero earnings
+    // Query actual earnings from CallHistory where this creator was the owner
+    const callRecords = await CallHistory.find({
+      ownerUserId: currentUser._id,
+      ownerRole: 'creator',
+      durationSeconds: { $gt: 0 },
+    }).sort({ createdAt: -1 });
+
+    const totalEarnings = callRecords.reduce((sum, call) => sum + (call.coinsEarned || 0), 0);
+    const totalSeconds = callRecords.reduce((sum, call) => sum + call.durationSeconds, 0);
+    const totalMinutes = totalSeconds / 60;
+    const totalCalls = callRecords.length;
+    const avgEarningsPerMinute = totalMinutes > 0 ? totalEarnings / totalMinutes : 0;
+    // Current rate: creator earns 0.30 coins/sec = 18 coins/min
+    const earningsPerMinute = 0.30 * 60; // 18 coins/min
+
+    // Format call records for response
+    const calls = callRecords.slice(0, 50).map((call) => {
+      const mins = call.durationSeconds / 60;
+      const formatted = call.durationSeconds >= 60
+        ? `${Math.floor(call.durationSeconds / 60)}m ${call.durationSeconds % 60}s`
+        : `${call.durationSeconds}s`;
+      return {
+        callId: call.callId,
+        callerUsername: call.otherName || 'User',
+        duration: call.durationSeconds,
+        durationFormatted: formatted,
+        durationMinutes: Math.round(mins * 100) / 100,
+        earnings: call.coinsEarned,
+        endedAt: call.createdAt.toISOString(),
+      };
+    });
+
+    console.log(`✅ [CREATOR] Earnings: ${totalEarnings} coins from ${totalCalls} calls (${totalMinutes.toFixed(1)} mins)`);
+
     res.json({
       success: true,
       data: {
-        totalEarnings: 0,
-        totalMinutes: 0,
-        totalCalls: 0,
-        avgEarningsPerMinute: 0,
-        earningsPerMinute: 0,
+        totalEarnings,
+        totalMinutes: Math.round(totalMinutes * 100) / 100,
+        totalCalls,
+        avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
+        earningsPerMinute,
         currentPrice: creator.price,
         creatorSharePercentage: 0.30,
-        calls: [],
+        calls,
       },
     });
   } catch (error) {
@@ -688,15 +728,35 @@ export const getCreatorTransactions = async (req: Request, res: Response): Promi
     const limit = parseInt(req.query.limit as string) || 50;
     const skip = (page - 1) * limit;
 
-    // Call functionality removed - return empty transactions
-    const transactions: any[] = [];
-    const total = 0;
-    const totalEarned = 0;
+    // Query actual transactions from CoinTransaction where this creator is the user
+    const transactions = await CoinTransaction.find({ userId: currentUser._id })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .skip(skip);
+
+    const total = await CoinTransaction.countDocuments({ userId: currentUser._id });
+
+    // Calculate total earned from credit transactions
+    const totalEarnedResult = await CoinTransaction.aggregate([
+      { $match: { userId: currentUser._id, type: 'credit', status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$coins' } } },
+    ]);
+    const totalEarned = totalEarnedResult.length > 0 ? totalEarnedResult[0].total : 0;
 
     res.json({
       success: true,
       data: {
-        transactions,
+        transactions: transactions.map(tx => ({
+          id: tx._id.toString(),
+          transactionId: tx.transactionId,
+          type: tx.type,
+          coins: tx.coins,
+          source: tx.source,
+          description: tx.description,
+          callId: tx.callId,
+          status: tx.status,
+          createdAt: tx.createdAt.toISOString(),
+        })),
         summary: {
           // 🚨 NAMING: totalEarned (NOT balance, NOT coins, NOT withdrawable)
           // This is earnings history, not available for withdrawal
@@ -761,8 +821,23 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Call functionality removed - return zero minutes
-    const totalMinutes = 0;
+    // Compute total minutes from actual call history
+    const callAgg = await CallHistory.aggregate([
+      {
+        $match: {
+          ownerUserId: currentUser._id,
+          ownerRole: 'creator',
+          durationSeconds: { $gt: 0 },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSeconds: { $sum: '$durationSeconds' },
+        },
+      },
+    ]);
+    const totalMinutes = callAgg.length > 0 ? callAgg[0].totalSeconds / 60 : 0;
 
     // Get existing task progress records
     const taskProgressRecords = await CreatorTaskProgress.find({
@@ -867,8 +942,23 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Call functionality removed - return zero minutes
-    const totalMinutes = 0;
+    // Compute total minutes from actual call history
+    const claimCallAgg = await CallHistory.aggregate([
+      {
+        $match: {
+          ownerUserId: currentUser._id,
+          ownerRole: 'creator',
+          durationSeconds: { $gt: 0 },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSeconds: { $sum: '$durationSeconds' },
+        },
+      },
+    ]);
+    const totalMinutes = claimCallAgg.length > 0 ? claimCallAgg[0].totalSeconds / 60 : 0;
 
     // Check if task is completed
     if (totalMinutes < taskDef.thresholdMinutes) {
@@ -992,6 +1082,20 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
     }));
 
 
+    // Invalidate dashboard cache so next fetch gets fresh data
+    await invalidateCreatorDashboard(currentUser._id.toString());
+
+    // Emit real-time update to the creator via Socket.IO
+    try {
+      emitCreatorDataUpdated(currentUser.firebaseUid, {
+        reason: 'task_claimed',
+        taskKey,
+        newCoinsBalance: currentUser.coins,
+      });
+    } catch (emitErr) {
+      console.error('⚠️ [CREATOR] Failed to emit data_updated:', emitErr);
+    }
+
     res.json({
       success: true,
       data: {
@@ -1009,3 +1113,198 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
     });
   }
 };
+
+// ══════════════════════════════════════════════════════════════════════════
+// CREATOR DASHBOARD — Single endpoint returning all creator data (cached)
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /creator/dashboard
+ *
+ * Returns a consolidated view of the creator's data:
+ * - Earnings summary (total, per-minute, call count)
+ * - Task progress (all tasks with completion/claim status)
+ * - Current coins balance
+ * - Creator profile info (price, online status)
+ *
+ * 🔥 CACHED in Redis for 60 seconds. Invalidated after:
+ * - Billing settlement (call ends)
+ * - Task reward claim
+ */
+export const getCreatorDashboard = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('📊 [CREATOR] Dashboard request');
+
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Only creators can access dashboard' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    // ── Try Redis cache first ────────────────────────────────────────────
+    const cacheKey = creatorDashboardKey(currentUser._id.toString());
+    try {
+      const redis = getRedis();
+      const cached = await redis.get<string>(cacheKey);
+      if (cached) {
+        const data = typeof cached === 'string' ? JSON.parse(cached) : cached;
+        // Update coins in cached data (coins can change outside of cache invalidation)
+        data.coins = currentUser.coins;
+        console.log('⚡ [CREATOR] Dashboard served from Redis cache');
+        res.json({ success: true, data });
+        return;
+      }
+    } catch (cacheErr) {
+      console.error('⚠️ [CREATOR] Redis cache read failed:', cacheErr);
+    }
+
+    // ── Build dashboard data from DB ─────────────────────────────────────
+
+    // 1. Earnings from call history
+    const callRecords = await CallHistory.find({
+      ownerUserId: currentUser._id,
+      ownerRole: 'creator',
+      durationSeconds: { $gt: 0 },
+    }).sort({ createdAt: -1 });
+
+    const totalEarnings = callRecords.reduce((sum, c) => sum + (c.coinsEarned || 0), 0);
+    const totalSeconds = callRecords.reduce((sum, c) => sum + c.durationSeconds, 0);
+    const totalMinutes = totalSeconds / 60;
+    const totalCalls = callRecords.length;
+    const earningsPerMinute = 0.30 * 60; // 18 coins/min (0.30/sec)
+    const avgEarningsPerMinute = totalMinutes > 0 ? totalEarnings / totalMinutes : 0;
+
+    const recentCalls = callRecords.slice(0, 20).map((call) => {
+      const formatted = call.durationSeconds >= 60
+        ? `${Math.floor(call.durationSeconds / 60)}m ${call.durationSeconds % 60}s`
+        : `${call.durationSeconds}s`;
+      return {
+        callId: call.callId,
+        callerUsername: call.otherName || 'User',
+        duration: call.durationSeconds,
+        durationFormatted: formatted,
+        durationMinutes: Math.round((call.durationSeconds / 60) * 100) / 100,
+        earnings: call.coinsEarned,
+        endedAt: call.createdAt.toISOString(),
+      };
+    });
+
+    // 2. Task progress
+    const taskProgressRecords = await CreatorTaskProgress.find({
+      creatorUserId: currentUser._id,
+    });
+    const progressMap = new Map<string, ICreatorTaskProgress>();
+    for (const record of taskProgressRecords) {
+      progressMap.set(record.taskKey, record);
+    }
+
+    const tasks = CREATOR_TASKS.map((taskDef) => {
+      const progress = progressMap.get(taskDef.key);
+      const isCompleted = totalMinutes >= taskDef.thresholdMinutes;
+      const isClaimed = progress?.claimedAt != null;
+      const progressMinutes = Math.min(totalMinutes, taskDef.thresholdMinutes);
+      return {
+        taskKey: taskDef.key,
+        thresholdMinutes: taskDef.thresholdMinutes,
+        rewardCoins: taskDef.rewardCoins,
+        progressMinutes: Math.round(progressMinutes * 100) / 100,
+        isCompleted,
+        isClaimed,
+      };
+    });
+
+    // 3. Compose response
+    const dashboardData = {
+      // Earnings
+      earnings: {
+        totalEarnings,
+        totalMinutes: Math.round(totalMinutes * 100) / 100,
+        totalCalls,
+        avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
+        earningsPerMinute,
+        currentPrice: creator.price,
+        creatorSharePercentage: 0.30,
+        calls: recentCalls,
+      },
+      // Tasks
+      tasks: {
+        totalMinutes: Math.round(totalMinutes * 100) / 100,
+        items: tasks,
+      },
+      // Account
+      coins: currentUser.coins,
+      creatorProfile: {
+        id: creator._id.toString(),
+        name: creator.name,
+        price: creator.price,
+        isOnline: creator.isOnline,
+      },
+    };
+
+    // ── Cache in Redis ───────────────────────────────────────────────────
+    try {
+      const redis = getRedis();
+      await redis.set(cacheKey, JSON.stringify(dashboardData), { ex: CREATOR_DASHBOARD_TTL });
+      console.log('💾 [CREATOR] Dashboard cached in Redis');
+    } catch (cacheErr) {
+      console.error('⚠️ [CREATOR] Redis cache write failed:', cacheErr);
+    }
+
+    console.log(`✅ [CREATOR] Dashboard: ${totalEarnings} earnings, ${totalCalls} calls, ${tasks.length} tasks, ${currentUser.coins} coins`);
+
+    res.json({ success: true, data: dashboardData });
+  } catch (error) {
+    console.error('❌ [CREATOR] Dashboard error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// REAL-TIME SYNC — Emit creator:data_updated via Socket.IO
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Emit `creator:data_updated` to a specific creator's socket room.
+ *
+ * Called after:
+ * - Billing settlement (call ends → earnings/coins changed)
+ * - Task reward claim (coins changed, task state changed)
+ *
+ * The frontend listens for this event and refreshes all creator data.
+ */
+export function emitCreatorDataUpdated(
+  creatorFirebaseUid: string,
+  payload: {
+    reason: string;
+    [key: string]: any;
+  }
+): void {
+  try {
+    const io = getIO();
+    io.to(`user:${creatorFirebaseUid}`).emit('creator:data_updated', {
+      ...payload,
+      timestamp: new Date().toISOString(),
+    });
+    console.log(
+      `📡 [CREATOR] Emitted creator:data_updated to ${creatorFirebaseUid} (reason: ${payload.reason})`
+    );
+  } catch (err) {
+    console.error('⚠️ [CREATOR] Failed to emit creator:data_updated:', err);
+  }
+}

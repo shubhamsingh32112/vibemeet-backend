@@ -13,6 +13,7 @@ export interface IUser extends Document {
   usernameChangeCount: number; // Track how many times username was changed (max 3)
   coins: number;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
+  welcomeBonusClaimed: boolean; // Whether user has claimed the 30-coin welcome bonus
   role: 'user' | 'creator' | 'admin'; // User role
   createdAt: Date;
   updatedAt: Date;
@@ -79,6 +80,10 @@ const userSchema = new Schema<IUser>(
       default: 0,
       min: 0,
       max: 3,
+    },
+    welcomeBonusClaimed: {
+      type: Boolean,
+      default: false,
     },
     role: {
       type: String,

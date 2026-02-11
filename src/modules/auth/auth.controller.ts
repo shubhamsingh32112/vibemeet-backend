@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import { Response } from 'express';
+import jwt from 'jsonwebtoken';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 
@@ -84,6 +85,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           price: creator.price,
           // User-specific data (coins, role, etc.)
           coins: user.coins,
+          welcomeBonusClaimed: user.welcomeBonusClaimed,
           role: user.role,
           userId: user._id.toString(), // Reference to user document
           // Additional user fields that might be useful
@@ -111,6 +113,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
             coins: user.coins,
+            welcomeBonusClaimed: user.welcomeBonusClaimed,
             role: user.role,
           },
           creator: null,
@@ -142,5 +145,74 @@ export const logout = async (_req: Request, res: Response): Promise<void> => {
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+/**
+ * Admin login — email + password based (no Firebase token required)
+ * Validates against ADMIN_EMAIL / ADMIN_PASSWORD env vars and returns a JWT.
+ */
+export const adminLogin = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      res.status(400).json({ success: false, error: 'Email and password are required' });
+      return;
+    }
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    const jwtSecret = process.env.JWT_SECRET;
+
+    if (!adminEmail || !adminPassword || !jwtSecret) {
+      console.error('❌ [AUTH] ADMIN_EMAIL, ADMIN_PASSWORD, or JWT_SECRET not set in env');
+      res.status(500).json({ success: false, error: 'Server misconfigured' });
+      return;
+    }
+
+    if (email !== adminEmail || password !== adminPassword) {
+      console.log(`❌ [AUTH] Admin login failed for email: ${email}`);
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    // Look up (or create) the admin user in the database
+    let adminUser = await User.findOne({ email: adminEmail, role: 'admin' });
+
+    if (!adminUser) {
+      // If there's no admin user row yet, create one with a placeholder firebaseUid
+      adminUser = await User.create({
+        firebaseUid: `admin_${Date.now()}`,
+        email: adminEmail,
+        role: 'admin',
+        coins: 0,
+      });
+      console.log('📝 [AUTH] Created admin user in database');
+    }
+
+    const token = jwt.sign(
+      { userId: adminUser._id.toString(), role: 'admin', email: adminEmail },
+      jwtSecret,
+      { expiresIn: '7d' }
+    );
+
+    console.log(`✅ [AUTH] Admin login successful for ${email}`);
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: adminUser._id.toString(),
+          email: adminUser.email,
+          role: adminUser.role,
+          firebaseUid: adminUser.firebaseUid,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [AUTH] Admin login error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

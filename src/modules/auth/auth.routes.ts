@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import { login, logout } from './auth.controller';
-import { adminLogin } from './admin-auth.controller';
+import { login, logout, adminLogin } from './auth.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 
 const router = Router();
@@ -9,7 +8,7 @@ const router = Router();
 router.post('/login', verifyFirebaseToken, login);
 router.post('/logout', verifyFirebaseToken, logout);
 
-// Direct admin login (no Firebase client needed)
+// Admin login — email + password (no Firebase token)
 router.post('/admin-login', adminLogin);
 
 export default router;

@@ -11,6 +11,7 @@ import {
   getCreatorTransactions,
   getCreatorTasks,
   claimTaskReward,
+  getCreatorDashboard,
 } from './creator.controller';
 
 const router = Router();
@@ -18,6 +19,7 @@ const router = Router();
 // Routes that require authentication to check user role
 router.get('/', verifyFirebaseToken, getAllCreators);
 // IMPORTANT: Specific routes must come before parameterized routes
+router.get('/dashboard', verifyFirebaseToken, getCreatorDashboard); // Consolidated creator dashboard (cached)
 router.get('/earnings', verifyFirebaseToken, getCreatorEarnings); // Get creator earnings summary
 router.get('/transactions', verifyFirebaseToken, getCreatorTransactions); // Get creator transaction history
 router.get('/tasks', verifyFirebaseToken, getCreatorTasks); // Get creator tasks progress

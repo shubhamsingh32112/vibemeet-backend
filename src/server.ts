@@ -9,29 +9,15 @@ dotenv.config();
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
 import { isRedisConfigured } from './config/redis';
+import { configureStreamPush } from './config/stream';
+import { setIO } from './config/socket';
+import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
+import { setupBillingGateway, cleanupBillingIntervals } from './modules/billing/billing.gateway';
 import routes from './routes';
 import { clearAllCreatorBusyStates } from './modules/video/video.webhook';
-import { registerAvailabilitySocket } from './modules/availability/availability.socket';
-
-
-
 
 const app = express();
-const httpServer = createServer(app);
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-
-// Initialize Socket.IO with CORS for Flutter clients
-const io = new SocketIOServer(httpServer, {
-  cors: {
-    origin: '*', // Allow all origins for mobile clients
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-  // Connection settings for mobile clients
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  transports: ['websocket', 'polling'], // Prefer WebSocket, fallback to polling
-});
 
 // Security middleware
 app.use(helmet({
@@ -135,6 +121,31 @@ const startServer = async () => {
     
     // Connect to MongoDB
     await connectDatabase();
+
+    // Configure Stream Chat push notifications (FCM)
+    await configureStreamPush();
+    
+    // Create HTTP server and attach Socket.IO
+    const httpServer = createServer(app);
+    const io = new SocketIOServer(httpServer, {
+      cors: {
+        origin: process.env.CORS_ORIGIN || '*',
+        methods: ['GET', 'POST'],
+      },
+      pingTimeout: 60000,
+      pingInterval: 25000,
+      transports: ['websocket', 'polling'],
+    });
+
+    // Store IO instance globally (so controllers can broadcast)
+    setIO(io);
+
+    // Set up Socket.IO gateways
+    setupAvailabilityGateway(io);
+    console.log('📡 Socket.IO availability gateway ready');
+
+    setupBillingGateway(io);
+    console.log('💰 Socket.IO billing gateway ready');
     
     // 🔴 Check Redis configuration (Upstash - serverless, no init needed)
     if (isRedisConfigured()) {
@@ -143,11 +154,6 @@ const startServer = async () => {
       console.warn('⚠️  [REDIS] Upstash Redis NOT configured - availability will fail');
       console.warn('   Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN env vars');
     }
-    
-    // 🔌 Register Socket.IO availability handlers
-    // This is the SINGLE SOURCE OF TRUTH for creator availability
-    registerAvailabilitySocket(io);
-    console.log('🔌 [SOCKET.IO] Availability socket handlers registered');
     
     // Start server - listen on all interfaces (0.0.0.0) for USB/WiFi debugging
     httpServer.listen(PORT, '0.0.0.0', () => {
@@ -172,8 +178,6 @@ const startServer = async () => {
 };
 
 // Process cleanup handlers - clear stuck busy states on crash/redeploy
-// Note: Redis (Upstash) is stateless HTTP - no connection to close
-// Note: Redis TTL (120s) handles ghost online users automatically
 process.on('uncaughtException', async (error) => {
   console.error('🚨 [PROCESS] Uncaught exception:', error);
   await clearAllCreatorBusyStates();
@@ -181,17 +185,16 @@ process.on('uncaughtException', async (error) => {
 });
 
 process.on('SIGTERM', async () => {
-  console.log('🛑 [PROCESS] SIGTERM received - clearing Stream busy states');
+  console.log('🛑 [PROCESS] SIGTERM received — cleaning up');
   await clearAllCreatorBusyStates();
-  // Redis availability persists (that's the point - survives restarts)
-  // TTL handles cleanup automatically
+  cleanupBillingIntervals();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  console.log('🛑 [PROCESS] SIGINT received - clearing Stream busy states');
+  console.log('🛑 [PROCESS] SIGINT received — cleaning up');
   await clearAllCreatorBusyStates();
-  // Redis availability persists (that's the point)
+  cleanupBillingIntervals();
   process.exit(0);
 });
 

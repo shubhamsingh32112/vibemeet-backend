@@ -1,45 +1,40 @@
 /**
- * Chat Policy - Centralized rules for chat behavior
- * 
- * This is the single source of truth for chat rules.
- * Backend assigns policy → Stream user/channel metadata
- * Frontend reads policy → configures UI
+ * Chat Policy — Centralised rules for chat behaviour.
+ *
+ * Pricing:
+ *   - Users get 3 free messages per creator, then 5 coins per message.
+ *   - Creators always chat for free.
+ *
+ * Content rules:
+ *   - Text: any text allowed for all roles.
+ *   - Images/videos: creators & admins only.
+ *   - Voice: all roles.
  */
+
+export const FREE_MESSAGES_PER_CREATOR = 3;
+export const COST_PER_MESSAGE_COINS = 5;
 
 export interface ChatPolicy {
   allowText: boolean;
   allowImages: boolean;
   allowVideos: boolean;
   allowVoice: boolean;
-  allowedTextPattern?: RegExp;
 }
 
-/**
- * Default chat policy
- * - Text: Only digits 0-5 allowed
- * - Images: Only creators
- * - Videos: Only creators
- * - Voice: All users
- */
 export const DEFAULT_CHAT_POLICY: ChatPolicy = {
   allowText: true,
-  allowImages: false, // Only creators can send images
-  allowVideos: false, // Only creators can send videos
-  allowVoice: true, // All users can send voice messages
-  allowedTextPattern: /^[0-5\s]*$/, // Only digits 0-5 and spaces
+  allowImages: false, // Only creators
+  allowVideos: false, // Only creators
+  allowVoice: true,   // All roles
 };
 
-/**
- * Get chat policy for a user role
- */
-export const getChatPolicyForRole = (role: 'user' | 'creator' | 'admin'): ChatPolicy => {
+export const getChatPolicyForRole = (
+  role: 'user' | 'creator' | 'admin',
+): ChatPolicy => {
   const policy = { ...DEFAULT_CHAT_POLICY };
-  
-  // Creators and admins can send media
   if (role === 'creator' || role === 'admin') {
     policy.allowImages = true;
     policy.allowVideos = true;
   }
-  
   return policy;
 };
