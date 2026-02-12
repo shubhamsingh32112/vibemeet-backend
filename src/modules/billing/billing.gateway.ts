@@ -562,6 +562,53 @@ async function settleCall(io: Server, callId: string): Promise<void> {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// HTTP FALLBACK HANDLERS (called from billing.routes.ts)
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * HTTP-invocable version of handleCallStarted.
+ * Used by the REST API fallback when the client's Socket.IO is not connected.
+ */
+export async function handleCallStartedHttp(
+  io: Server,
+  userFirebaseUid: string,
+  data: { callId: string; creatorFirebaseUid: string; creatorMongoId: string }
+): Promise<void> {
+  console.log(`🌐 [BILLING HTTP] handleCallStartedHttp for ${data.callId}`);
+  await handleCallStarted(io, userFirebaseUid, data);
+
+  // If call:ended arrived while we were setting up, settle now
+  if (pendingCallEnds.has(data.callId)) {
+    pendingCallEnds.delete(data.callId);
+    console.log(`💰 [BILLING HTTP] Deferred settlement for ${data.callId}`);
+    await settleCall(io, data.callId);
+  }
+}
+
+/**
+ * HTTP-invocable version of settleCall.
+ * Used by the REST API fallback when the client's Socket.IO is not connected.
+ */
+export async function settleCallHttp(
+  io: Server,
+  callId: string
+): Promise<void> {
+  console.log(`🌐 [BILLING HTTP] settleCallHttp for ${callId}`);
+
+  const redis = getRedis();
+  const sessionExists = await redis.get(callSessionKey(callId));
+
+  if (!sessionExists && !activeBillingIntervals.has(callId)) {
+    pendingCallEnds.add(callId);
+    console.log(`⏳ [BILLING HTTP] Deferring call:ended for ${callId} (session not ready)`);
+    setTimeout(() => pendingCallEnds.delete(callId), 60_000);
+    return;
+  }
+
+  await settleCall(io, callId);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // CLEANUP (called on server shutdown)
 // ══════════════════════════════════════════════════════════════════════════
 export function cleanupBillingIntervals(): void {
