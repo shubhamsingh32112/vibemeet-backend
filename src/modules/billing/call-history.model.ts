@@ -15,6 +15,7 @@ export interface ICallHistory extends Document {
   callId: string;                    // Stream Video call ID
   ownerUserId: mongoose.Types.ObjectId; // The user who owns this record
   otherUserId: mongoose.Types.ObjectId; // The other party's User._id
+  otherCreatorId?: mongoose.Types.ObjectId; // Creator._id (only when other party is a creator)
   otherName: string;                 // Display name of the other party
   otherAvatar?: string;              // Avatar URL/path of the other party
   otherFirebaseUid: string;          // Firebase UID of the other party (for chat channel creation)
@@ -22,6 +23,9 @@ export interface ICallHistory extends Document {
   durationSeconds: number;           // Call duration in seconds
   coinsDeducted: number;             // Coins deducted (user) or 0 (creator)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
+  ratingStars?: number;              // 1-5 star rating submitted by user for creator
+  ratingComment?: string;            // Optional feedback message
+  ratedAt?: Date;                    // Timestamp for rating submission
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,6 +47,11 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: Schema.Types.ObjectId,
       ref: 'User',
       required: true,
+    },
+    otherCreatorId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Creator',
+      sparse: true,
     },
     otherName: {
       type: String,
@@ -77,6 +86,22 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: Number,
       default: 0,
       min: 0,
+    },
+    ratingStars: {
+      type: Number,
+      min: 1,
+      max: 5,
+      sparse: true,
+    },
+    ratingComment: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      sparse: true,
+    },
+    ratedAt: {
+      type: Date,
+      sparse: true,
     },
   },
   {

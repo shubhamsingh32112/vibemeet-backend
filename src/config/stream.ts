@@ -96,6 +96,7 @@ export const ensureStreamUser = async (
     image?: string;
     appRole?: 'user' | 'creator' | 'admin';
     username?: string; // Username from MongoDB (single source of truth)
+    mongoId?: string; // MongoDB _id so frontend can start calls without extra lookups
   }
 ): Promise<void> => {
   try {
@@ -103,7 +104,7 @@ export const ensureStreamUser = async (
     
     // Do NOT set role - Stream roles are separate from app roles
     // Stream will default to "user" role which is correct for all users
-    // Store app role and username in extraData for business logic
+    // Store app role, username and mongoId in extraData for business logic
     await client.upsertUser({
       id: firebaseUid,
       name: userData.name || 'User',
@@ -112,6 +113,7 @@ export const ensureStreamUser = async (
       extraData: {
         appRole: userData.appRole || 'user', // Store app role in metadata
         username: userData.username, // Store username as single source of truth
+        ...(userData.mongoId ? { mongoId: userData.mongoId } : {}), // MongoDB _id for call initiation
       },
     });
 

@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
+import { featureFlags } from '../../config/feature-flags';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from './billing.gateway';
+import { logger } from '../../utils/logger';
 
 const router = Router();
 
@@ -33,7 +35,13 @@ router.post('/call-started', verifyFirebaseToken, async (req: Request, res: Resp
       return;
     }
 
-    console.log(`🌐 [BILLING REST] call-started from ${firebaseUid} for call ${callId}`);
+    logger.info('billing.http.call_started.request', { firebaseUid, callId });
+
+    if (featureFlags.billingHttpMock) {
+      logger.warn('billing.http.call_started.mocked', { callId });
+      res.json({ success: true, message: 'Billing started' });
+      return;
+    }
 
     const io = getIO();
     await handleCallStartedHttp(io, firebaseUid, {
@@ -44,7 +52,7 @@ router.post('/call-started', verifyFirebaseToken, async (req: Request, res: Resp
 
     res.json({ success: true, message: 'Billing started' });
   } catch (err: any) {
-    console.error('❌ [BILLING REST] call-started error:', err);
+    logger.error('billing.http.call_started.failed', { err });
     res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
@@ -68,14 +76,20 @@ router.post('/call-ended', verifyFirebaseToken, async (req: Request, res: Respon
       return;
     }
 
-    console.log(`🌐 [BILLING REST] call-ended from ${firebaseUid} for call ${callId}`);
+    logger.info('billing.http.call_ended.request', { firebaseUid, callId });
+
+    if (featureFlags.billingHttpMock) {
+      logger.warn('billing.http.call_ended.mocked', { callId });
+      res.json({ success: true, message: 'Billing ended / settled' });
+      return;
+    }
 
     const io = getIO();
     await settleCallHttp(io, callId);
 
     res.json({ success: true, message: 'Billing ended / settled' });
   } catch (err: any) {
-    console.error('❌ [BILLING REST] call-ended error:', err);
+    logger.error('billing.http.call_ended.failed', { err });
     res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });

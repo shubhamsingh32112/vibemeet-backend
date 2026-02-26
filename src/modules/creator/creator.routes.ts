@@ -12,6 +12,8 @@ import {
   getCreatorTasks,
   claimTaskReward,
   getCreatorDashboard,
+  requestWithdrawal,
+  getMyWithdrawals,
 } from './creator.controller';
 
 const router = Router();
@@ -24,6 +26,8 @@ router.get('/earnings', verifyFirebaseToken, getCreatorEarnings); // Get creator
 router.get('/transactions', verifyFirebaseToken, getCreatorTransactions); // Get creator transaction history
 router.get('/tasks', verifyFirebaseToken, getCreatorTasks); // Get creator tasks progress
 router.post('/tasks/:taskKey/claim', verifyFirebaseToken, claimTaskReward); // Claim task reward
+router.post('/withdraw', verifyFirebaseToken, requestWithdrawal); // Request withdrawal
+router.get('/withdrawals', verifyFirebaseToken, getMyWithdrawals); // Get my withdrawal history
 router.get('/:id', getCreatorById);
 
 // Protected routes (require authentication)

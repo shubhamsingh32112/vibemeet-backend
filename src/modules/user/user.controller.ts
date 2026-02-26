@@ -1,12 +1,20 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
+import {
+  userProfileResponseDtoSchema,
+  UserProfileResponseDto,
+} from '../../contracts/canonical.dto';
+import { sendCompatibleResponse } from '../../contracts/compatibility';
 import { User } from './user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { randomUUID } from 'crypto';
 import { invalidateAdminCaches } from '../../config/redis';
+import { getIO } from '../../config/socket';
+import { verifyUserBalance } from '../../utils/balance-integrity';
+import { getFirebaseAdmin } from '../../config/firebase';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -105,6 +113,97 @@ export const toggleFavoriteCreator = async (req: Request, res: Response): Promis
   }
 };
 
+export const getBlockedCreatorsCount = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // This count is shown in account settings for regular users.
+    const blockedCreatorCount = (user.blockedCreatorIds || []).length;
+
+    res.json({
+      success: true,
+      data: {
+        blockedCreatorCount,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get blocked creators count error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const deleteAccount = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { reasons, note } = req.body as { reasons?: unknown; note?: unknown };
+    const reasonList = Array.isArray(reasons)
+      ? reasons.filter((r): r is string => typeof r === 'string' && r.trim().length > 0).map((r) => r.trim())
+      : [];
+
+    if (reasonList.length === 0) {
+      res.status(400).json({ success: false, error: 'Please select at least one reason' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: user._id });
+
+    // Log deletion request details for audit/debug visibility.
+    console.log('🗑️ [USER] Delete account request accepted');
+    console.log(`   User ID: ${user._id.toString()}`);
+    console.log(`   Firebase UID: ${user.firebaseUid}`);
+    console.log(`   Role: ${user.role}`);
+    console.log(`   Reasons: ${reasonList.join(', ')}`);
+    if (typeof note === 'string' && note.trim()) {
+      console.log(`   Note: ${note.trim()}`);
+    }
+
+    await Promise.all([
+      CoinTransaction.deleteMany({ userId: user._id }),
+      CallHistory.deleteMany({ ownerUserId: user._id }),
+      creator ? Creator.deleteOne({ _id: creator._id }) : Promise.resolve(),
+      User.deleteOne({ _id: user._id }),
+    ]);
+
+    try {
+      const firebaseAdmin = getFirebaseAdmin();
+      await firebaseAdmin.auth().deleteUser(user.firebaseUid);
+      console.log(`✅ [USER] Firebase account deleted: ${user.firebaseUid}`);
+    } catch (firebaseError) {
+      console.error('⚠️ [USER] Failed to delete Firebase auth user:', firebaseError);
+      // Data is already removed from DB. Return success and log this for ops follow-up.
+    }
+
+    res.json({
+      success: true,
+      data: {
+        message: 'Account deleted successfully',
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Delete account error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.auth) {
@@ -130,54 +229,118 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     // If creator exists, return creator details as primary data
     if (creator) {
-      res.json({
-        success: true,
-        data: {
-          // Primary data from creator collection
+      const legacyData = {
+        // Primary data from creator collection
+        id: creator._id.toString(),
+        name: creator.name,
+        about: creator.about,
+        photo: creator.photo,
+        email: user.email, // Use user's email (identity comes from user)
+        phone: user.phone, // Use user's phone (identity comes from user)
+        categories: creator.categories,
+        price: creator.price,
+        // User-specific data (coins, role, etc.)
+        coins: user.coins,
+        welcomeBonusClaimed: user.welcomeBonusClaimed,
+        role: user.role,
+        userId: user._id.toString(), // Reference to user document
+        // Additional user fields that might be useful
+        gender: user.gender,
+        username: user.username,
+        avatar: user.avatar,
+        usernameChangeCount: user.usernameChangeCount,
+        blockedCreatorCount: (user.blockedCreatorIds || []).length,
+        createdAt: creator.createdAt,
+        updatedAt: creator.updatedAt,
+      };
+      const normalizedData: UserProfileResponseDto = {
+        user: {
+          id: user._id.toString(),
+          firebaseUid: user.firebaseUid,
+          role: user.role,
+          email: user.email ?? null,
+          phone: user.phone ?? null,
+          gender: user.gender ?? null,
+          username: user.username ?? null,
+          avatar: user.avatar ?? null,
+          categories: user.categories ?? [],
+          coins: user.coins,
+          welcomeBonusClaimed: Boolean(user.welcomeBonusClaimed),
+          usernameChangeCount: user.usernameChangeCount,
+          blockedCreatorCount: (user.blockedCreatorIds || []).length,
+          createdAt: user.createdAt?.toISOString(),
+          updatedAt: user.updatedAt?.toISOString(),
+        },
+        creator: {
           id: creator._id.toString(),
+          userId: creator.userId?.toString() ?? null,
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          email: user.email, // Use user's email (identity comes from user)
-          phone: user.phone, // Use user's phone (identity comes from user)
-          categories: creator.categories,
+          categories: creator.categories ?? [],
           price: creator.price,
-          // User-specific data (coins, role, etc.)
-          coins: user.coins,
-          welcomeBonusClaimed: user.welcomeBonusClaimed,
-          role: user.role,
-          userId: user._id.toString(), // Reference to user document
-          // Additional user fields that might be useful
-          gender: user.gender,
-          username: user.username,
-          avatar: user.avatar,
-          usernameChangeCount: user.usernameChangeCount,
-          createdAt: creator.createdAt,
-          updatedAt: creator.updatedAt,
+          isOnline: creator.isOnline,
+          createdAt: creator.createdAt?.toISOString(),
+          updatedAt: creator.updatedAt?.toISOString(),
         },
+      };
+
+      sendCompatibleResponse({
+        req,
+        res,
+        legacyData,
+        normalizedData,
+        validator: userProfileResponseDtoSchema,
+        deprecations: ['Flat creator-first shape in `data` is legacy; migrate to `normalized.user` and `normalized.creator`.'],
       });
     } else {
       // Regular user
-      res.json({
-        success: true,
-        data: {
-          user: {
-            id: user._id.toString(),
-            email: user.email,
-            phone: user.phone,
-            gender: user.gender,
-            username: user.username,
-            avatar: user.avatar,
-            categories: user.categories,
-            usernameChangeCount: user.usernameChangeCount,
-            coins: user.coins,
-            welcomeBonusClaimed: user.welcomeBonusClaimed,
-            role: user.role,
-            createdAt: user.createdAt,
-            updatedAt: user.updatedAt,
-          },
-          creator: null,
+      const legacyData = {
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+          phone: user.phone,
+          gender: user.gender,
+          username: user.username,
+          avatar: user.avatar,
+          categories: user.categories,
+          usernameChangeCount: user.usernameChangeCount,
+          coins: user.coins,
+          welcomeBonusClaimed: user.welcomeBonusClaimed,
+          blockedCreatorCount: (user.blockedCreatorIds || []).length,
+          role: user.role,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt,
         },
+        creator: null,
+      };
+      const normalizedData: UserProfileResponseDto = {
+        user: {
+          id: user._id.toString(),
+          firebaseUid: user.firebaseUid,
+          role: user.role,
+          email: user.email ?? null,
+          phone: user.phone ?? null,
+          gender: user.gender ?? null,
+          username: user.username ?? null,
+          avatar: user.avatar ?? null,
+          categories: user.categories ?? [],
+          coins: user.coins,
+          welcomeBonusClaimed: Boolean(user.welcomeBonusClaimed),
+          usernameChangeCount: user.usernameChangeCount,
+          blockedCreatorCount: (user.blockedCreatorIds || []).length,
+          createdAt: user.createdAt?.toISOString(),
+          updatedAt: user.updatedAt?.toISOString(),
+        },
+        creator: null,
+      };
+      sendCompatibleResponse({
+        req,
+        res,
+        legacyData,
+        normalizedData,
+        validator: userProfileResponseDtoSchema,
+        deprecations: ['Legacy `data.user` remains supported; normalized contract is under `normalized`.'],
       });
     }
   } catch (error) {
@@ -720,6 +883,21 @@ export const claimWelcomeBonus = async (req: Request, res: Response): Promise<vo
 
     console.log(`✅ [USER] Welcome bonus claimed: ${user._id} now has ${user.coins} coins`);
 
+    // Balance integrity check (fire-and-forget)
+    verifyUserBalance(user._id).catch(() => {});
+
+    // Emit coins_updated socket event so all open screens update in real-time
+    try {
+      const io = getIO();
+      io.to(`user:${user.firebaseUid}`).emit('coins_updated', {
+        userId: user._id.toString(),
+        coins: user.coins,
+      });
+      console.log(`📡 [USER] Emitted coins_updated to ${user.firebaseUid} (${user.coins} coins)`);
+    } catch (socketErr) {
+      console.error('⚠️ [USER] Failed to emit coins_updated:', socketErr);
+    }
+
     res.json({
       success: true,
       data: {
@@ -819,6 +997,21 @@ export const addCoins = async (req: Request, res: Response): Promise<void> => {
     console.log(`✅ [USER] Coins added: ${oldCoins} → ${user.coins} (+${coins})`);
     console.log(`   Transaction ID: ${finalTransactionId}`);
 
+    // Balance integrity check (fire-and-forget)
+    verifyUserBalance(user._id).catch(() => {});
+
+    // Emit coins_updated socket event so all open screens update in real-time
+    try {
+      const io = getIO();
+      io.to(`user:${user.firebaseUid}`).emit('coins_updated', {
+        userId: user._id.toString(),
+        coins: user.coins,
+      });
+      console.log(`📡 [USER] Emitted coins_updated to ${user.firebaseUid} (${user.coins} coins)`);
+    } catch (socketErr) {
+      // Non-fatal — the HTTP response still carries the new balance
+      console.error('⚠️ [USER] Failed to emit coins_updated:', socketErr);
+    }
 
     res.json({
       success: true,

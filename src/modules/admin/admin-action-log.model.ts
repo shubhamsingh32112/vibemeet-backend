@@ -13,7 +13,7 @@ export interface IAdminActionLog extends Document {
   action: string; // e.g. 'COIN_ADJUSTMENT', 'FORCE_OFFLINE', 'CALL_REFUND', 'CREATOR_DELETE'
 
   /** What entity was affected */
-  targetType: 'user' | 'creator' | 'call';
+  targetType: 'user' | 'creator' | 'call' | 'withdrawal' | 'support' | 'wallet_pricing';
   targetId: string;
 
   /** Structured metadata about the action */
@@ -38,7 +38,7 @@ const adminActionLogSchema = new Schema<IAdminActionLog>(
     targetType: {
       type: String,
       required: true,
-      enum: ['user', 'creator', 'call'],
+      enum: ['user', 'creator', 'call', 'withdrawal', 'support', 'wallet_pricing'],
     },
     targetId: { type: String, required: true, index: true },
     details: { type: Schema.Types.Mixed, default: {} },

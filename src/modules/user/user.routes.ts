@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getMe, updateProfile, getAllUsers, searchUsers, promoteToCreator, addCoins, claimWelcomeBonus, getUserTransactions, getCallHistory, getFavoriteCreators, toggleFavoriteCreator } from './user.controller';
+import { getMe, updateProfile, getAllUsers, searchUsers, promoteToCreator, addCoins, claimWelcomeBonus, getUserTransactions, getCallHistory, getFavoriteCreators, toggleFavoriteCreator, getBlockedCreatorsCount, deleteAccount } from './user.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 
 const router = Router();
@@ -14,6 +14,8 @@ router.get('/transactions', verifyFirebaseToken, getUserTransactions); // Get us
 router.get('/call-history', verifyFirebaseToken, getCallHistory); // Get call history (users + creators)
 router.get('/favorites', verifyFirebaseToken, getFavoriteCreators); // Get favorite creators (user only)
 router.post('/favorites/:creatorId', verifyFirebaseToken, toggleFavoriteCreator); // Toggle favorite (user only)
+router.get('/blocked-creators/count', verifyFirebaseToken, getBlockedCreatorsCount); // Get blocked creators count (user account settings)
+router.post('/delete-account', verifyFirebaseToken, deleteAccount); // Delete user account permanently
 router.post('/:id/promote-to-creator', verifyFirebaseToken, promoteToCreator); // Admin only - promote user to creator
 
 export default router;

@@ -1,8 +1,11 @@
 import type { Request } from 'express';
 import { Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { requireEnv } from '../config/env';
+import { featureFlags } from '../config/feature-flags';
 import { getFirebaseAdmin } from '../config/firebase';
 import { User } from '../modules/user/user.model';
+import { logger } from '../utils/logger';
 
 /**
  * Verifies either a Firebase ID token (mobile app) or a custom admin JWT (admin website).
@@ -14,14 +17,25 @@ export const verifyFirebaseToken = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    console.log('🔐 [AUTH MIDDLEWARE] Verifying token...');
-    console.log(`   Path: ${req.path}`);
-    console.log(`   IP: ${req.ip}`);
-    
+    logger.info('auth.middleware.verify.started', { path: req.path, ip: req.ip });
+
+    if (featureFlags.authBypassForTests) {
+      const testFirebaseUid = (req.header('x-test-firebase-uid') || '').trim();
+      if (testFirebaseUid) {
+        req.auth = {
+          firebaseUid: testFirebaseUid,
+          email: req.header('x-test-email') || undefined,
+        };
+        logger.warn('auth.middleware.test_bypass.used', { firebaseUid: testFirebaseUid });
+        next();
+        return;
+      }
+    }
+
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      console.log('❌ [AUTH MIDDLEWARE] No authorization header');
+      logger.warn('auth.middleware.verify.missing_header');
       res.status(401).json({
         success: false,
         error: 'Unauthorized: No token provided',
@@ -30,10 +44,10 @@ export const verifyFirebaseToken = async (
     }
 
     const token = authHeader.split('Bearer ')[1];
-    console.log(`   Token length: ${token.length} characters`);
+    logger.debug('auth.middleware.verify.token_received', { tokenLength: token.length });
 
     // --- Try Admin JWT first (short tokens, ~236 chars) ---
-    const jwtSecret = process.env.JWT_SECRET;
+    const jwtSecret = requireEnv('JWT_SECRET');
     if (jwtSecret) {
       try {
         const decoded = jwt.verify(token, jwtSecret) as {
@@ -46,16 +60,16 @@ export const verifyFirebaseToken = async (
           // Look up the admin user to get their firebaseUid
           const adminUser = await User.findById(decoded.userId);
           if (adminUser && adminUser.role === 'admin') {
-            console.log('✅ [AUTH MIDDLEWARE] Admin JWT verified');
-            console.log(`   Admin ID: ${adminUser._id}`);
-            console.log(`   Email: ${adminUser.email || 'N/A'}`);
+            logger.info('auth.middleware.verify.admin_jwt_success', {
+              adminId: adminUser._id.toString(),
+              email: adminUser.email || 'N/A',
+            });
 
             req.auth = {
               firebaseUid: adminUser.firebaseUid,
               email: adminUser.email,
             };
 
-            console.log('✅ [AUTH MIDDLEWARE] Admin authentication successful');
             next();
             return;
           }
@@ -67,13 +81,14 @@ export const verifyFirebaseToken = async (
 
     // --- Firebase ID token verification (Flutter app) ---
     const admin = getFirebaseAdmin();
-    
-    console.log('🔄 [AUTH MIDDLEWARE] Verifying token with Firebase Admin...');
+
+    logger.info('auth.middleware.verify.firebase_verification_started');
     const decodedToken = await admin.auth().verifyIdToken(token);
-    console.log('✅ [AUTH MIDDLEWARE] Firebase token verified');
-    console.log(`   Firebase UID: ${decodedToken.uid}`);
-    console.log(`   Email: ${decodedToken.email || 'N/A'}`);
-    console.log(`   Phone: ${decodedToken.phone_number || 'N/A'}`);
+    logger.info('auth.middleware.verify.firebase_success', {
+      firebaseUid: decodedToken.uid,
+      email: decodedToken.email || 'N/A',
+      phone: decodedToken.phone_number || 'N/A',
+    });
 
     req.auth = {
       firebaseUid: decodedToken.uid,
@@ -81,14 +96,12 @@ export const verifyFirebaseToken = async (
       phone: decodedToken.phone_number,
     };
 
-    console.log('✅ [AUTH MIDDLEWARE] Authentication successful');
     next();
   } catch (error) {
-    console.error('❌ [AUTH MIDDLEWARE] Token verification error:', error);
-    if (error instanceof Error) {
-      console.error(`   Error message: ${error.message}`);
-      console.error(`   Error stack: ${error.stack}`);
-    }
+    logger.error('auth.middleware.verify.failed', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     res.status(401).json({
       success: false,
       error: 'Unauthorized: Invalid or expired token',

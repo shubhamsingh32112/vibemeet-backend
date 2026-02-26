@@ -7,14 +7,24 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 dotenv.config();
 import { connectDatabase } from './config/database';
+import { validateRuntimeEnv } from './config/env';
 import { initializeFirebase } from './config/firebase';
 import { isRedisConfigured } from './config/redis';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
+import { withRequestContext } from './middlewares/request-context.middleware';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
 import { setupBillingGateway, cleanupBillingIntervals } from './modules/billing/billing.gateway';
+import { setupAdminGateway } from './modules/admin/admin.gateway';
+import { getReadinessReport } from './modules/system/readiness.service';
+import { runSourceOfTruthReconciliation } from './modules/system/source-of-truth.service';
 import routes from './routes';
 import { clearAllCreatorBusyStates } from './modules/video/video.webhook';
+import { isRazorpayConfigured } from './config/razorpay';
+import { CreatorTaskProgress } from './modules/creator/creator-task.model';
+import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
+import { logger } from './utils/logger';
+import { featureFlags } from './config/feature-flags';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -58,20 +68,33 @@ const statusLimiter = rateLimit({
 
 // Apply general limiter to all API routes
 app.use('/api/', generalLimiter);
+// Apply stricter limiter specifically for status endpoints.
+app.use('/api/', statusLimiter);
 
 // Body parsing middleware - increase limit for base64 images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Request logging middleware
-app.use((req, _res, next) => {
-  console.log(`📥 ${req.method} ${req.path} from ${req.ip}`);
-  console.log(`   Full URL: ${req.protocol}://${req.get('host')}${req.originalUrl}`);
-  if (req.headers.authorization) {
-    console.log(`   Auth header present: ${req.headers.authorization.substring(0, 20)}...`);
-  } else {
-    console.log(`   ⚠️  No auth header`);
-  }
+// Correlation and request logging middleware
+app.use(withRequestContext);
+app.use((req, res, next) => {
+  const start = Date.now();
+  logger.info('http.request.received', {
+    method: req.method,
+    path: req.path,
+    ip: req.ip,
+    hasAuthorizationHeader: Boolean(req.headers.authorization),
+  });
+
+  res.on('finish', () => {
+    logger.info('http.request.completed', {
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - start,
+    });
+  });
+
   next();
 });
 
@@ -89,13 +112,20 @@ app.get('/health', (_req, res) => {
   });
 });
 
+app.get('/readiness', async (_req, res) => {
+  const readiness = await getReadinessReport();
+  res.status(readiness.status === 'ready' ? 200 : 503).json(readiness);
+});
+
 // API routes
 app.use('/api/v1', routes);
 
 // 404 handler
 app.use((req, res) => {
-  console.log(`❌ [404] Route not found: ${req.method} ${req.path}`);
-  console.log(`   Full URL: ${req.protocol}://${req.get('host')}${req.originalUrl}`);
+  logger.warn('http.route.not_found', {
+    method: req.method,
+    path: req.path,
+  });
   res.status(404).json({
     success: false,
     error: 'Route not found',
@@ -106,7 +136,10 @@ app.use((req, res) => {
 
 // Error handling middleware
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('Unhandled error:', err);
+  logger.error('http.unhandled_error', {
+    message: err.message,
+    stack: err.stack,
+  });
   res.status(500).json({
     success: false,
     error: 'Internal server error',
@@ -116,11 +149,38 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 // Initialize services and start server
 const startServer = async () => {
   try {
+    validateRuntimeEnv();
+
     // Initialize Firebase Admin
     initializeFirebase();
     
     // Connect to MongoDB
     await connectDatabase();
+
+    // ── Drop old unique index if it exists (migration: daily task reset) ──
+    // The old index { creatorUserId: 1, taskKey: 1 } must be replaced by
+    // { creatorUserId: 1, taskKey: 1, periodStart: 1 } for daily resets.
+    try {
+      const collection = CreatorTaskProgress.collection;
+      const indexes = await collection.indexes();
+      const oldIndex = indexes.find(
+        (idx: any) =>
+          idx.key?.creatorUserId === 1 &&
+          idx.key?.taskKey === 1 &&
+          !idx.key?.periodStart &&
+          idx.unique === true,
+      );
+      if (oldIndex) {
+        logger.info('migration.creator_task_progress.drop_old_index');
+        await collection.dropIndex(oldIndex.name!);
+        logger.info('migration.creator_task_progress.old_index_dropped');
+      }
+    } catch (migrationErr) {
+      // Ignore if collection doesn't exist yet or index already dropped
+      logger.info('migration.creator_task_progress.index_check_skipped', {
+        message: (migrationErr as Error).message,
+      });
+    }
 
     // Configure Stream Chat push notifications (FCM)
     await configureStreamPush();
@@ -142,60 +202,97 @@ const startServer = async () => {
 
     // Set up Socket.IO gateways
     setupAvailabilityGateway(io);
-    console.log('📡 Socket.IO availability gateway ready');
+    logger.info('socket.gateway.availability.ready');
 
     setupBillingGateway(io);
-    console.log('💰 Socket.IO billing gateway ready');
+    logger.info('socket.gateway.billing.ready');
+
+    setupAdminGateway(io);
+    logger.info('socket.gateway.admin.ready');
     
     // 🔴 Check Redis configuration (Upstash - serverless, no init needed)
     if (isRedisConfigured()) {
-      console.log('✅ [REDIS] Upstash Redis configured');
+      logger.info('dependencies.redis.configured');
     } else {
-      console.warn('⚠️  [REDIS] Upstash Redis NOT configured - availability will fail');
-      console.warn('   Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN env vars');
+      logger.warn('dependencies.redis.not_configured');
+    }
+
+    // 💳 Check Razorpay configuration
+    if (isRazorpayConfigured()) {
+      logger.info('dependencies.razorpay.configured');
+    } else {
+      logger.warn('dependencies.razorpay.not_configured');
     }
     
     // Start server - listen on all interfaces (0.0.0.0) for USB/WiFi debugging
     httpServer.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 Server running on port ${PORT}`);
-      console.log(`📡 Listening on all interfaces (0.0.0.0:${PORT})`);
-      console.log(`🔌 Socket.IO ready on same port`);
-      console.log(`\n📍 Access URLs:`);
-      console.log(`   HTTP:     http://localhost:${PORT}/health`);
-      console.log(`   Socket:   ws://localhost:${PORT}`);
-      console.log(`   Network:  http://YOUR_DESKTOP_IP:${PORT}/health`);
-      console.log(`\n📱 Frontend Configuration (USB Debugging):`);
-      console.log(`   Find your desktop IP: ipconfig (Windows) or ifconfig (Mac/Linux)`);
-      console.log(`   Update baseUrl in: frontend/lib/core/constants/app_constants.dart`);
-      console.log(`   Example: http://192.168.1.10:${PORT}/api/v1`);
-      console.log(`\n✅ Backend is ready to accept connections from your Flutter app`);
-      console.log(`💡 Make sure your desktop and phone are on the same WiFi network`);
+      logger.info('server.started', {
+        port: PORT,
+        bind: `0.0.0.0:${PORT}`,
+        healthUrl: `http://localhost:${PORT}/health`,
+        readinessUrl: `http://localhost:${PORT}/readiness`,
+      });
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.error('server.start_failed', { error });
     process.exit(1);
   }
 };
 
+// ── Daily task progress cleanup (remove records older than 7 days) ────
+// Runs every 6 hours. Old CreatorTaskProgress records are irrelevant
+// because task queries filter by the current period's periodStart.
+// This is purely for database hygiene.
+async function cleanupOldTaskProgress(): Promise<void> {
+  try {
+    const { periodStart } = getDailyPeriodBounds();
+    // Keep records from the last 7 days for auditing, delete older ones
+    const cutoff = new Date(periodStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const result = await CreatorTaskProgress.deleteMany({
+      periodStart: { $lt: cutoff },
+    });
+    if (result.deletedCount > 0) {
+      logger.info('tasks.cleanup.completed', {
+        deletedCount: result.deletedCount,
+        cutoff: cutoff.toISOString(),
+      });
+    }
+  } catch (err) {
+    logger.error('tasks.cleanup.failed', { err });
+  }
+}
+
+// Run cleanup every 6 hours
+setInterval(cleanupOldTaskProgress, 6 * 60 * 60 * 1000);
+
 // Process cleanup handlers - clear stuck busy states on crash/redeploy
 process.on('uncaughtException', async (error) => {
-  console.error('🚨 [PROCESS] Uncaught exception:', error);
+  logger.error('process.uncaught_exception', { error });
   await clearAllCreatorBusyStates();
   process.exit(1);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('🛑 [PROCESS] SIGTERM received — cleaning up');
+  logger.warn('process.sigterm');
   await clearAllCreatorBusyStates();
   cleanupBillingIntervals();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  console.log('🛑 [PROCESS] SIGINT received — cleaning up');
+  logger.warn('process.sigint');
   await clearAllCreatorBusyStates();
   cleanupBillingIntervals();
   process.exit(0);
 });
 
 startServer();
+
+// ── Source-of-truth reconciliation scheduler (Phase 4) ──────────────────
+// Runs in shadow/repair mode based on feature flags.
+setInterval(() => {
+  if (!featureFlags.sourceOfTruthReconciliationEnabled) return;
+  runSourceOfTruthReconciliation('scheduled').catch((error) => {
+    logger.warn('sot.reconciliation.scheduler_failed', { error });
+  });
+}, 5 * 60 * 1000);

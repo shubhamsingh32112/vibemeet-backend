@@ -10,6 +10,7 @@ export interface IUser extends Document {
   avatar?: string; // e.g., 'a1.png' or 'fa1.png'
   categories?: string[]; // Array of category names
   favoriteCreatorIds: mongoose.Types.ObjectId[]; // Users can favorite creators (creator _id values)
+  blockedCreatorIds: mongoose.Types.ObjectId[]; // Users can block creators (creator _id values)
   usernameChangeCount: number; // Track how many times username was changed (max 3)
   coins: number;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
@@ -70,6 +71,12 @@ const userSchema = new Schema<IUser>(
       default: [],
     },
     favoriteCreatorIds: {
+      type: [Schema.Types.ObjectId],
+      ref: 'Creator',
+      default: [],
+      index: true,
+    },
+    blockedCreatorIds: {
       type: [Schema.Types.ObjectId],
       ref: 'Creator',
       default: [],

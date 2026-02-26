@@ -6,6 +6,7 @@ export interface ICreatorTaskProgress extends Document {
   taskKey: string; // e.g. "minutes_200"
   thresholdMinutes: number; // 200, 350, 480, etc.
   rewardCoins: number; // 100, 150, 300
+  periodStart: Date; // Start of the daily period this record belongs to
   completedAt?: Date; // when threshold reached
   claimedAt?: Date; // when reward claimed
   createdAt: Date;
@@ -35,6 +36,11 @@ const creatorTaskProgressSchema = new Schema<ICreatorTaskProgress>(
       required: true,
       min: 0,
     },
+    periodStart: {
+      type: Date,
+      required: true,
+      index: true,
+    },
     completedAt: {
       type: Date,
       sparse: true,
@@ -49,11 +55,16 @@ const creatorTaskProgressSchema = new Schema<ICreatorTaskProgress>(
   }
 );
 
-// Compound unique index: one task progress per creator per task
-creatorTaskProgressSchema.index({ creatorUserId: 1, taskKey: 1 }, { unique: true });
+// Compound unique index: one task progress per creator per task per daily period
+creatorTaskProgressSchema.index(
+  { creatorUserId: 1, taskKey: 1, periodStart: 1 },
+  { unique: true },
+);
 
-// Index for efficient queries by creator and claim status
-creatorTaskProgressSchema.index({ creatorUserId: 1, claimedAt: 1 });
+// Index for efficient queries by creator and period
+creatorTaskProgressSchema.index({ creatorUserId: 1, periodStart: 1 });
+
+// periodStart already has field-level index above; avoid duplicate index definition warnings.
 
 export const CreatorTaskProgress = mongoose.model<ICreatorTaskProgress>(
   'CreatorTaskProgress',

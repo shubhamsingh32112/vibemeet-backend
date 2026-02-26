@@ -46,6 +46,40 @@ export const callUserCoinsKey = (callId: string): string =>
 export const callCreatorEarningsKey = (callId: string): string =>
   `${CALL_CREATOR_EARNINGS_PREFIX}${callId}`;
 
+// Billing domain shadow/coordinator keys
+export const BILLING_SHADOW_SESSION_PREFIX = 'billing:shadow:session:';
+export const BILLING_SHADOW_TICK_LEASE_PREFIX = 'billing:shadow:lease:';
+export const BILLING_SHADOW_SETTLE_LOCK_PREFIX = 'billing:shadow:settle_lock:';
+export const BILLING_SHADOW_SETTLE_AUDIT_PREFIX = 'billing:shadow:settle_audit:';
+export const BILLING_SHADOW_REPORT_PREFIX = 'billing:shadow:report:';
+export const BILLING_METRICS_PREFIX = 'billing:metrics:';
+export const SOT_REPORT_PREFIX = 'sot:reconciliation:';
+export const SOT_LOCK_PREFIX = 'sot:lock:';
+
+export const billingShadowSessionKey = (callId: string): string =>
+  `${BILLING_SHADOW_SESSION_PREFIX}${callId}`;
+
+export const billingShadowTickLeaseKey = (callId: string): string =>
+  `${BILLING_SHADOW_TICK_LEASE_PREFIX}${callId}`;
+
+export const billingShadowSettleLockKey = (callId: string): string =>
+  `${BILLING_SHADOW_SETTLE_LOCK_PREFIX}${callId}`;
+
+export const billingShadowSettleAuditKey = (callId: string): string =>
+  `${BILLING_SHADOW_SETTLE_AUDIT_PREFIX}${callId}`;
+
+export const billingShadowReportKey = (callId: string): string =>
+  `${BILLING_SHADOW_REPORT_PREFIX}${callId}`;
+
+export const billingMetricKey = (metricName: string): string =>
+  `${BILLING_METRICS_PREFIX}${metricName}`;
+
+export const sourceOfTruthReportKey = (): string =>
+  `${SOT_REPORT_PREFIX}latest`;
+
+export const sourceOfTruthLockKey = (): string =>
+  `${SOT_LOCK_PREFIX}reconciliation`;
+
 // Creator dashboard cache Redis key helpers
 export const CREATOR_DASHBOARD_PREFIX = 'creator:dashboard:';
 export const CREATOR_DASHBOARD_TTL = 60; // 60 seconds cache

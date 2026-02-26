@@ -12,6 +12,7 @@ import {
   FREE_MESSAGES_PER_CREATOR,
   COST_PER_MESSAGE,
 } from './chat-message-quota.model';
+import { verifyUserBalance } from '../../utils/balance-integrity';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -91,6 +92,7 @@ export const getChatToken = async (
       image: user.avatar,
       appRole: user.role,
       username: user.username,
+      mongoId: user._id.toString(),
     });
 
     const token = client.createToken(firebaseUid);
@@ -159,12 +161,14 @@ export const createOrGetChannel = async (
       image: currentUser.avatar,
       appRole: currentUser.role,
       username: currentUser.username,
+      mongoId: currentUser._id.toString(),
     });
     await ensureStreamUser(otherUid, {
       name: displayNameFor(otherUser),
       image: otherUser.avatar,
       appRole: otherUser.role,
       username: otherUser.username,
+      mongoId: otherUser._id.toString(),
     });
 
     // ── Create / get channel ──────────────────────────────────────────
@@ -474,6 +478,9 @@ export const preSendMessage = async (
     await redis.set(lockKey, JSON.stringify(responsePayload!), {
       ex: PRESEND_LOCK_TTL,
     });
+
+    // Balance integrity check (fire-and-forget)
+    verifyUserBalance(user._id).catch(() => {});
 
     res.json(responsePayload!);
   } catch (error) {
