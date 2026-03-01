@@ -85,30 +85,23 @@ export const generateServerSideToken = (): string => {
 };
 
 /**
- * Generate deterministic call ID for User-Creator pair
+ * Generate call ID matching frontend format
  * 
- * IMPROVEMENT: Uses hash format to avoid leaking internal IDs
- * - Old format: firebaseUid_mongoObjectId (leaks Mongo ObjectId)
- * - New format: call_<sha256(firebaseUid:creatorId)> (no leakage)
+ * 🔥 FIX 2: Updated to match frontend format: userId_creatorId_timestamp
  * 
- * Benefits:
- * - Same determinism (same pair = same ID)
- * - No internal ID leakage
- * - Easier to rotate later if needed
+ * IMPORTANT: Frontend is the primary source of call IDs (creates calls via Stream SDK).
+ * This function is only used in legacy REST endpoint (initiateCall).
+ * 
+ * Frontend format: userId_creatorId_timestamp (e.g., "abc123_def456_1703001234")
+ * - Includes timestamp for uniqueness per call attempt
+ * - Total length: ~63 chars (well under Stream's 64-char limit)
  * 
  * @param userId - User's Firebase UID
  * @param creatorId - Creator's MongoDB ObjectId (as string)
- * @returns Deterministic call ID (hashed format)
+ * @returns Call ID in format: userId_creatorId_timestamp
  */
 export const generateCallId = (userId: string, creatorId: string): string => {
-  // Create SHA256 hash of the user-creator pair
-  const hash = crypto
-    .createHash('sha256')
-    .update(`${userId}:${creatorId}`)
-    .digest('hex')
-    .slice(0, 32); // 32 chars is plenty for uniqueness
-  
-  // Prefix with 'call_' identifier
-  // Total length: 6 (prefix) + 32 (hash) = 38 chars (well under any limits)
-  return `call_${hash}`;
+  // 🔥 FIX 2: Match frontend format: userId_creatorId_timestamp
+  const timestamp = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
+  return `${userId}_${creatorId}_${timestamp}`;
 };

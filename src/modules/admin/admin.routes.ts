@@ -9,7 +9,6 @@ import {
   getWalletPricing,
   getCallsAdmin,
   getSystemHealth,
-  getSourceOfTruthDrift,
   adjustUserCoins,
   forceCreatorOffline,
   refundCall,
@@ -44,7 +43,6 @@ router.get('/wallet-pricing', getWalletPricing);
 router.get('/calls', getCallsAdmin);
 router.get('/calls/:callId/refund-preview', getRefundPreview);
 router.get('/system/health', getSystemHealth);
-router.get('/system/drift', getSourceOfTruthDrift);
 router.get('/realtime-metrics', getRealtimeMetrics);
 router.get('/actions/log', getAdminActionLog);
 

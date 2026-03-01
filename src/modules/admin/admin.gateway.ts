@@ -1,8 +1,6 @@
 import { Server as SocketIOServer, Namespace } from 'socket.io';
-import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
-import { logger } from '../../utils/logger';
-import { runWithRequestContext } from '../../utils/request-context';
+import { logInfo, logWarning, logDebug } from '../../utils/logger';
 
 let adminNamespace: Namespace | null = null;
 
@@ -22,34 +20,14 @@ export function setupAdminGateway(io: SocketIOServer): void {
   adminNamespace = io.of('/admin');
 
   adminNamespace.on('connection', (socket) => {
-    runWithRequestContext(
-      {
-        requestId: `ws-${socket.id}-admin-connection-${randomUUID()}`,
-        source: 'socket',
-        path: '/admin',
-        socketId: socket.id,
-      },
-      () => {
-        logger.info('admin.socket.connected');
-      },
-    );
+    logDebug('Admin dashboard connected', { socketId: socket.id });
 
     socket.on('disconnect', (reason) => {
-      runWithRequestContext(
-        {
-          requestId: `ws-${socket.id}-admin-disconnect-${randomUUID()}`,
-          source: 'socket',
-          path: '/admin',
-          socketId: socket.id,
-        },
-        () => {
-          logger.info('admin.socket.disconnected', { reason });
-        },
-      );
+      logDebug('Admin dashboard disconnected', { socketId: socket.id, reason });
     });
   });
 
-  logger.info('admin.socket.namespace_ready');
+  logInfo('Admin namespace /admin ready');
 }
 
 /**
@@ -73,6 +51,6 @@ export function emitToAdmin(event: string, data: any): void {
     }
   } catch (err) {
     // Silent fail — admin dashboard is optional
-    logger.warn('admin.socket.emit_failed', { event, err });
+    logWarning('Failed to emit admin event', { event, error: err });
   }
 }

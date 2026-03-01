@@ -1,4 +1,5 @@
 import { StreamChat } from 'stream-chat';
+import { logInfo, logWarning, logError, logDebug } from '../utils/logger';
 
 /**
  * Stream Chat client singleton
@@ -21,7 +22,7 @@ export const getStreamClient = (): StreamChat => {
     }
 
     streamClient = StreamChat.getInstance(apiKey, apiSecret);
-    console.log('✅ [STREAM] Stream Chat client initialized');
+    logInfo('Stream Chat client initialized');
   }
 
   return streamClient;
@@ -45,10 +46,9 @@ export const configureStreamPush = async (): Promise<void> => {
     const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
     if (!projectId || !clientEmail || !privateKey) {
-      console.warn(
-        '⚠️ [STREAM PUSH] Firebase credentials missing in env — push notifications will NOT work.\n' +
-        '   Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY in .env'
-      );
+      logWarning('Firebase credentials missing - push notifications will NOT work', {
+        requiredEnvVars: ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY'],
+      });
       return;
     }
 
@@ -74,9 +74,9 @@ export const configureStreamPush = async (): Promise<void> => {
       },
     });
 
-    console.log('✅ [STREAM PUSH] Firebase push notifications configured on Stream');
+    logInfo('Firebase push notifications configured on Stream');
   } catch (error) {
-    console.error('❌ [STREAM PUSH] Failed to configure push notifications:', error);
+    logError('Failed to configure Stream push notifications', error);
     // Don't throw — push config failure shouldn't block server startup
   }
 };
@@ -117,9 +117,16 @@ export const ensureStreamUser = async (
       },
     });
 
-    console.log(`✅ [STREAM] User ensured: ${firebaseUid} (appRole: ${userData.appRole || 'user'}, username: ${userData.username || 'N/A'})`);
+    logDebug('Stream user ensured', {
+      firebaseUid,
+      appRole: userData.appRole || 'user',
+      username: userData.username || null,
+    });
   } catch (error) {
-    console.error(`❌ [STREAM] Failed to ensure user ${firebaseUid}:`, error);
+    logError('Failed to ensure Stream user', error, {
+      firebaseUid,
+      appRole: userData.appRole,
+    });
     throw error;
   }
 };

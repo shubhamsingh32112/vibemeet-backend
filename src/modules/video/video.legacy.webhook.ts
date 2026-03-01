@@ -82,9 +82,25 @@ function generateUserCreatorChannelId(uid1: string, uid2: string): string {
 function formatDurationLabel(totalSeconds: number): string {
   const mins = Math.floor(totalSeconds / 60);
   const secs = totalSeconds % 60;
-  if (mins <= 0) return `${secs}s`;
-  if (secs <= 0) return `${mins}m`;
-  return `${mins}m ${secs}s`;
+  
+  // Show duration in minutes format (e.g., "5 minutes", "1 minute", "30 seconds")
+  if (mins <= 0) {
+    return `${secs} second${secs === 1 ? '' : 's'}`;
+  }
+  if (secs === 0) {
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  // Show both minutes and seconds for calls under 1 hour
+  if (mins < 60) {
+    return `${mins} minute${mins === 1 ? '' : 's'} ${secs} second${secs === 1 ? '' : 's'}`;
+  }
+  // For calls over 1 hour, show hours and minutes
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  if (remainingMins === 0) {
+    return `${hours} hour${hours === 1 ? '' : 's'}`;
+  }
+  return `${hours} hour${hours === 1 ? '' : 's'} ${remainingMins} minute${remainingMins === 1 ? '' : 's'}`;
 }
 
 async function postCallActivityToChat(params: {

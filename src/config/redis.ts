@@ -1,4 +1,5 @@
 import { Redis } from '@upstash/redis';
+import { logInfo, logError } from '../utils/logger';
 
 let redis: Redis | null = null;
 
@@ -14,7 +15,9 @@ export const getRedis = (): Redis => {
     }
 
     redis = new Redis({ url, token });
-    console.log('✅ [REDIS] Upstash Redis client initialized');
+    logInfo('Upstash Redis client initialized', {
+      url: url ? 'configured' : 'missing',
+    });
   }
   return redis;
 };
@@ -46,39 +49,62 @@ export const callUserCoinsKey = (callId: string): string =>
 export const callCreatorEarningsKey = (callId: string): string =>
   `${CALL_CREATOR_EARNINGS_PREFIX}${callId}`;
 
-// Billing domain shadow/coordinator keys
-export const BILLING_SHADOW_SESSION_PREFIX = 'billing:shadow:session:';
-export const BILLING_SHADOW_TICK_LEASE_PREFIX = 'billing:shadow:lease:';
-export const BILLING_SHADOW_SETTLE_LOCK_PREFIX = 'billing:shadow:settle_lock:';
-export const BILLING_SHADOW_SETTLE_AUDIT_PREFIX = 'billing:shadow:settle_audit:';
-export const BILLING_SHADOW_REPORT_PREFIX = 'billing:shadow:report:';
-export const BILLING_METRICS_PREFIX = 'billing:metrics:';
-export const SOT_REPORT_PREFIX = 'sot:reconciliation:';
-export const SOT_LOCK_PREFIX = 'sot:lock:';
+// Idempotency keys for billing ticks
+export const IDEMPOTENCY_PREFIX = 'idempotency:billing:';
+export const idempotencyKey = (callId: string, timestamp: number, second: number): string =>
+  `${IDEMPOTENCY_PREFIX}${callId}:${timestamp}:${second}`;
 
-export const billingShadowSessionKey = (callId: string): string =>
-  `${BILLING_SHADOW_SESSION_PREFIX}${callId}`;
+// Active billing calls tracking (sorted set - score = next billing timestamp in ms)
+export const ACTIVE_BILLING_CALLS_KEY = 'billing:active_calls';
 
-export const billingShadowTickLeaseKey = (callId: string): string =>
-  `${BILLING_SHADOW_TICK_LEASE_PREFIX}${callId}`;
+// 🔥 FIX 1: In-memory state maps moved to Redis
+// Active calls by user (firebaseUid → callId)
+export const ACTIVE_CALL_BY_USER_PREFIX = 'active:call:user:';
+export const activeCallByUserKey = (firebaseUid: string): string =>
+  `${ACTIVE_CALL_BY_USER_PREFIX}${firebaseUid}`;
 
-export const billingShadowSettleLockKey = (callId: string): string =>
-  `${BILLING_SHADOW_SETTLE_LOCK_PREFIX}${callId}`;
+// Pending call ends (calls waiting for session to be created)
+export const PENDING_CALL_ENDS_KEY = 'pending:call:ends';
+export const pendingCallEndKey = (callId: string): string =>
+  `${PENDING_CALL_ENDS_KEY}:${callId}`;
 
-export const billingShadowSettleAuditKey = (callId: string): string =>
-  `${BILLING_SHADOW_SETTLE_AUDIT_PREFIX}${callId}`;
+// Settled calls tracking (to prevent duplicate settlements)
+export const SETTLED_CALL_PREFIX = 'settled:call:';
+export const settledCallKey = (callId: string): string =>
+  `${SETTLED_CALL_PREFIX}${callId}`;
 
-export const billingShadowReportKey = (callId: string): string =>
-  `${BILLING_SHADOW_REPORT_PREFIX}${callId}`;
+// TTLs for state maps
+export const ACTIVE_CALL_BY_USER_TTL = 7200; // 2 hours (same as call session)
+export const PENDING_CALL_END_TTL = 60; // 60 seconds
+export const SETTLED_CALL_TTL = 300; // 5 minutes
 
-export const billingMetricKey = (metricName: string): string =>
-  `${BILLING_METRICS_PREFIX}${metricName}`;
+// 🔥 FIX 3: Distributed lock for batch processor
+export const BATCH_PROCESSOR_LOCK_KEY = 'lock:billing:batch_processor';
+export const BATCH_PROCESSOR_LOCK_TTL = 2; // 2 seconds (renewed each tick)
 
-export const sourceOfTruthReportKey = (): string =>
-  `${SOT_REPORT_PREFIX}latest`;
+// 🔥 FIX 5: Dead letter queue for failed billing ticks
+export const DLQ_BILLING_PREFIX = 'dlq:billing:failed:';
+export const dlqBillingKey = (callId: string, timestamp: number): string =>
+  `${DLQ_BILLING_PREFIX}${callId}:${timestamp}`;
+export const DLQ_BILLING_TTL = 86400; // 24 hours
 
-export const sourceOfTruthLockKey = (): string =>
-  `${SOT_LOCK_PREFIX}reconciliation`;
+// Webhook idempotency keys (to prevent duplicate processing)
+export const WEBHOOK_IDEMPOTENCY_PREFIX = 'idempotency:webhook:';
+export const webhookIdKey = (eventId: string): string =>
+  `${WEBHOOK_IDEMPOTENCY_PREFIX}${eventId}`;
+export const WEBHOOK_IDEMPOTENCY_TTL = 60 * 60; // 1 hour
+
+// Reconciliation job tracking
+export const RECONCILIATION_LAST_RUN_KEY = 'reconciliation:last_run';
+export const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+// 🔥 FIX 6: Monitoring persistence to Redis
+export const METRICS_PREFIX = 'metrics:';
+export const metricsKey = (metricName: string): string => `${METRICS_PREFIX}${metricName}`;
+export const ERRORS_RECENT_KEY = 'errors:recent';
+export const ERRORS_RECENT_TTL = 86400; // 24 hours
+export const METRICS_PERSIST_INTERVAL_MS = 30 * 1000; // 30 seconds
+export const METRICS_RETENTION_COUNT = 1000; // Keep last 1000 metrics per type
 
 // Creator dashboard cache Redis key helpers
 export const CREATOR_DASHBOARD_PREFIX = 'creator:dashboard:';
@@ -95,9 +121,30 @@ export const invalidateCreatorDashboard = async (userId: string): Promise<void> 
   try {
     const redis = getRedis();
     await redis.del(creatorDashboardKey(userId));
-    console.log(`🗑️ [REDIS] Invalidated dashboard cache for creator ${userId}`);
+    logInfo('Invalidated creator dashboard cache', { userId });
   } catch (err) {
-    console.error(`⚠️ [REDIS] Failed to invalidate dashboard cache for ${userId}:`, err);
+    logError('Failed to invalidate creator dashboard cache', err, { userId });
+  }
+};
+
+// 🔥 SCALABILITY FIX: Creator tasks cache Redis key helpers
+export const CREATOR_TASKS_PREFIX = 'creator:tasks:';
+export const CREATOR_TASKS_TTL = 30; // 30 seconds cache (shorter than dashboard for more real-time updates)
+
+export const creatorTasksKey = (userId: string): string =>
+  `${CREATOR_TASKS_PREFIX}${userId}`;
+
+/**
+ * Invalidate creator tasks cache.
+ * Called after billing settlement (when CallHistory is created) and task claim.
+ */
+export const invalidateCreatorTasks = async (userId: string): Promise<void> => {
+  try {
+    const redis = getRedis();
+    await redis.del(creatorTasksKey(userId));
+    logInfo('Invalidated creator tasks cache', { userId });
+  } catch (err) {
+    logError('Failed to invalidate creator tasks cache', err, { userId });
   }
 };
 
@@ -122,8 +169,11 @@ export const invalidateAdminCaches = async (
       ? sections.map(adminCacheKey)
       : ['overview', 'creators_performance', 'coins'].map(adminCacheKey);
     await Promise.all(keys.map((k) => redis.del(k)));
-    console.log(`🗑️ [REDIS] Invalidated admin caches: ${sections.length > 0 ? sections.join(', ') : 'all'}`);
+    logInfo('Invalidated admin caches', {
+      sections: sections.length > 0 ? sections : ['all'],
+      keysCount: keys.length,
+    });
   } catch (err) {
-    console.error('⚠️ [REDIS] Failed to invalidate admin caches:', err);
+    logError('Failed to invalidate admin caches', err, { sections });
   }
 };

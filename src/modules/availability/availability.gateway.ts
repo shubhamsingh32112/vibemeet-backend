@@ -1,11 +1,9 @@
 import { Server, Socket } from 'socket.io';
-import { randomUUID } from 'crypto';
 import { getRedis, availabilityKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { User } from '../user/user.model';
-import { logger } from '../../utils/logger';
-import { runWithRequestContext } from '../../utils/request-context';
+import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 
 // Keep this aligned with the availability service TTL.
 const AVAILABILITY_TTL_SECONDS = 120;
@@ -49,10 +47,12 @@ export function setupAvailabilityGateway(io: Server): void {
       const decodedToken = await admin.auth().verifyIdToken(token);
       socket.data.firebaseUid = decodedToken.uid;
       socket.data.email = decodedToken.email;
-      logger.info('availability.socket.authenticated', { firebaseUid: decodedToken.uid });
+      logDebug('Socket authenticated', { firebaseUid: decodedToken.uid });
       next();
     } catch (err) {
-      logger.error('availability.socket.authentication_failed', { err });
+      logError('Socket authentication failed', err, {
+        socketId: socket.id,
+      });
       next(new Error('Authentication error: Invalid token'));
     }
   });
@@ -61,23 +61,13 @@ export function setupAvailabilityGateway(io: Server): void {
   io.on('connection', async (socket: Socket) => {
     const firebaseUid = socket.data.firebaseUid as string | undefined;
     let isCreator = false;
-    const withSocketContext = <T>(event: string, callback: () => T): T =>
-      runWithRequestContext(
-        {
-          requestId: `ws-${socket.id}-${event}-${randomUUID()}`,
-          source: 'socket',
-          path: event,
-          socketId: socket.id,
-        },
-        callback,
-      );
 
     if (firebaseUid) {
       try {
         const user = await User.findOne({ firebaseUid }).select('role').lean();
         isCreator = user?.role === 'creator' || user?.role === 'admin';
       } catch (err) {
-        logger.error('availability.socket.role_resolve_failed', { firebaseUid, err });
+        logError('Failed to resolve user role for socket', err, { firebaseUid, socketId: socket.id });
       }
     }
     socket.data.isCreator = isCreator;
@@ -86,11 +76,10 @@ export function setupAvailabilityGateway(io: Server): void {
       creatorSocketCounts.set(firebaseUid, (creatorSocketCounts.get(firebaseUid) ?? 0) + 1);
     }
 
-    withSocketContext('connection', () => {
-      logger.info('availability.socket.connected', {
-        firebaseUid: socket.data.firebaseUid,
-        creator: isCreator,
-      });
+    logDebug('Socket client connected', {
+      socketId: socket.id,
+      firebaseUid: socket.data.firebaseUid,
+      isCreator,
     });
 
     // ── availability:get ────────────────────────────────────────────────
@@ -100,7 +89,7 @@ export function setupAvailabilityGateway(io: Server): void {
         try {
           const creatorIds = normalizeCreatorIds(data);
           if (creatorIds.length === 0) {
-            logger.warn('availability.socket.get.invalid_payload');
+            logWarning('Invalid availability:get payload', { socketId: socket.id });
             socket.emit('availability:batch', {});
             return;
           }
@@ -120,12 +109,13 @@ export function setupAvailabilityGateway(io: Server): void {
             result[creatorIds[i]] = val === 'online' ? 'online' : 'busy';
           }
 
-          logger.info('availability.socket.batch_sent', {
-            creatorsCount: Object.keys(result).length,
+          logDebug('Availability batch fetched', {
+            socketId: socket.id,
+            creatorCount: Object.keys(result).length,
           });
           socket.emit('availability:batch', result);
         } catch (err) {
-          logger.error('availability.socket.batch_failed', { err });
+          logError('Error handling availability:get', err, { socketId: socket.id });
           socket.emit('availability:batch', {});
         }
       }
@@ -136,22 +126,22 @@ export function setupAvailabilityGateway(io: Server): void {
       const uid = socket.data.firebaseUid as string | undefined;
       const creator = Boolean(socket.data.isCreator);
       if (!uid || !creator) {
-        logger.warn('availability.socket.creator_online_unauthorized');
+        logWarning('Unauthorized creator:online request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
       await setCreatorAvailability(io, uid, 'online');
-      logger.info('availability.socket.creator_online', { firebaseUid: uid });
+      logInfo('Creator set to online', { firebaseUid: uid });
     });
 
     socket.on('creator:offline', async () => {
       const uid = socket.data.firebaseUid as string | undefined;
       const creator = Boolean(socket.data.isCreator);
       if (!uid || !creator) {
-        logger.warn('availability.socket.creator_offline_unauthorized');
+        logWarning('Unauthorized creator:offline request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
       await setCreatorAvailability(io, uid, 'busy');
-      logger.info('availability.socket.creator_offline', { firebaseUid: uid });
+      logInfo('Creator set to offline', { firebaseUid: uid });
     });
 
     socket.on('disconnect', async (reason) => {
@@ -163,14 +153,16 @@ export function setupAvailabilityGateway(io: Server): void {
         if (nextCount === 0) {
           creatorSocketCounts.delete(uid);
           await setCreatorAvailability(io, uid, 'busy');
-          logger.info('availability.socket.creator_disconnected_marked_busy', { firebaseUid: uid });
+          logInfo('Creator disconnected - set to busy', { firebaseUid: uid });
         } else {
           creatorSocketCounts.set(uid, nextCount);
         }
       }
 
-      withSocketContext('disconnect', () => {
-        logger.info('availability.socket.disconnected', { reason });
+      logDebug('Socket client disconnected', {
+        socketId: socket.id,
+        firebaseUid: socket.data.firebaseUid,
+        reason,
       });
     });
   });
@@ -212,7 +204,7 @@ export async function setCreatorAvailability(
     status,
   });
 
-  logger.info('availability.status.broadcasted', {
+  logDebug('Broadcast creator status', {
     creatorFirebaseUid,
     status,
   });

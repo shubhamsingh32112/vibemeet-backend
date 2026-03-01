@@ -1,65 +1,47 @@
 import { z } from 'zod';
 
-const isoDateString = z.string().datetime().or(z.string());
+/**
+ * CANONICAL DTOs & Zod schemas used by legacy controllers.
+ *
+ * These are intentionally minimal and model only the fields that are
+ * actually used by the current controllers.
+ */
 
-export const userProfileDtoSchema = z.object({
-  id: z.string(),
-  firebaseUid: z.string().optional(),
-  role: z.enum(['user', 'creator', 'admin']),
-  email: z.string().nullable().optional(),
-  phone: z.string().nullable().optional(),
-  gender: z.enum(['male', 'female', 'other']).nullable().optional(),
-  username: z.string().nullable().optional(),
-  avatar: z.string().nullable().optional(),
-  categories: z.array(z.string()).default([]),
-  coins: z.number(),
-  welcomeBonusClaimed: z.boolean().optional(),
-  usernameChangeCount: z.number().optional(),
-  blockedCreatorCount: z.number().optional(),
-  createdAt: isoDateString.optional(),
-  updatedAt: isoDateString.optional(),
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Creator DTOs
+// ─────────────────────────────────────────────────────────────────────────────
 
-export const creatorProfileDtoSchema = z.object({
+export const creatorSummarySchema = z.object({
   id: z.string(),
   userId: z.string().nullable().optional(),
   firebaseUid: z.string().nullable().optional(),
-  name: z.string(),
+  name: z.string().nullable().optional(),
   about: z.string().nullable().optional(),
   photo: z.string().nullable().optional(),
-  categories: z.array(z.string()).default([]),
-  price: z.number(),
-  isOnline: z.boolean().optional(),
-  availability: z.enum(['online', 'busy']).optional(),
+  categories: z.array(z.string()).optional(),
+  price: z.number().nullable().optional(),
+  isOnline: z.boolean().nullable().optional(),
+  availability: z.string().optional(),
   isFavorite: z.boolean().optional(),
-  createdAt: isoDateString.optional(),
-  updatedAt: isoDateString.optional(),
+  createdAt: z.string().nullable().optional(),
+  updatedAt: z.string().nullable().optional(),
 });
 
-export const authResponseDtoSchema = z.object({
-  session: z.object({
-    authenticated: z.boolean(),
-    needsOnboarding: z.boolean(),
-  }),
-  user: userProfileDtoSchema,
-  creator: creatorProfileDtoSchema.nullable(),
-  adminToken: z.string().optional(),
+export const creatorListResponseDtoSchema = z.object({
+  creators: z.array(creatorSummarySchema),
 });
 
-export const walletPackageDtoSchema = z.object({
-  coins: z.number(),
-  priceInr: z.number(),
-  oldPriceInr: z.number().optional(),
-  badge: z.string().optional(),
-  sortOrder: z.number(),
+export type CreatorListResponseDto = z.infer<typeof creatorListResponseDtoSchema>;
+
+export const creatorProfileResponseDtoSchema = z.object({
+  creator: creatorSummarySchema,
 });
 
-export const walletPackagesResponseDtoSchema = z.object({
-  pricingTier: z.enum(['tier1', 'tier2']),
-  hasPurchasedCoinPackage: z.boolean(),
-  packages: z.array(walletPackageDtoSchema),
-  pricingUpdatedAt: isoDateString,
-});
+export type CreatorProfileResponseDto = z.infer<typeof creatorProfileResponseDtoSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payment DTOs
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const paymentVerifyResponseDtoSchema = z.object({
   status: z.enum(['verified', 'already_verified']),
@@ -69,23 +51,22 @@ export const paymentVerifyResponseDtoSchema = z.object({
   coinsAdded: z.number(),
 });
 
-export const creatorListResponseDtoSchema = z.object({
-  creators: z.array(creatorProfileDtoSchema),
-});
-
-export const creatorProfileResponseDtoSchema = z.object({
-  creator: creatorProfileDtoSchema,
-});
-
-export const userProfileResponseDtoSchema = z.object({
-  user: userProfileDtoSchema,
-  creator: creatorProfileDtoSchema.nullable(),
-});
-
-export type AuthResponseDto = z.infer<typeof authResponseDtoSchema>;
-export type UserProfileResponseDto = z.infer<typeof userProfileResponseDtoSchema>;
-export type CreatorListResponseDto = z.infer<typeof creatorListResponseDtoSchema>;
-export type CreatorProfileResponseDto = z.infer<typeof creatorProfileResponseDtoSchema>;
-export type WalletPackagesResponseDto = z.infer<typeof walletPackagesResponseDtoSchema>;
 export type PaymentVerifyResponseDto = z.infer<typeof paymentVerifyResponseDtoSchema>;
+
+export const walletPackageSchema = z.object({
+  coins: z.number(),
+  priceInr: z.number(),
+  oldPriceInr: z.number().nullable().optional(),
+  badge: z.string().nullable().optional(),
+  sortOrder: z.number().nullable().optional(),
+});
+
+export const walletPackagesResponseDtoSchema = z.object({
+  pricingTier: z.string(),
+  hasPurchasedCoinPackage: z.boolean(),
+  packages: z.array(walletPackageSchema),
+  pricingUpdatedAt: z.string(),
+});
+
+export type WalletPackagesResponseDto = z.infer<typeof walletPackagesResponseDtoSchema>;
 

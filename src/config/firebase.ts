@@ -1,4 +1,5 @@
 import * as admin from 'firebase-admin';
+import { logInfo, logError } from '../utils/logger';
 
 let firebaseApp: admin.app.App | null = null;
 
@@ -23,9 +24,13 @@ export const initializeFirebase = (): void => {
         clientEmail,
       }),
     });
-    console.log('✅ Firebase Admin initialized successfully');
+    logInfo('Firebase Admin initialized successfully', {
+      projectId,
+    });
   } catch (error) {
-    console.error('❌ Firebase Admin initialization error:', error);
+    logError('Firebase Admin initialization error', error, {
+      projectId: projectId || 'missing',
+    });
     throw error;
   }
 };

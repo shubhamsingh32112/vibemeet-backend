@@ -1411,11 +1411,41 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    const { amount } = req.body;
+    const { amount, name, number, upi, accountNumber, ifsc } = req.body;
 
     if (typeof amount !== 'number' || amount <= 0) {
       res.status(400).json({ success: false, error: 'Amount must be a positive number' });
       return;
+    }
+
+    // Validate required withdrawal details
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'Name is required' });
+      return;
+    }
+
+    if (!number || typeof number !== 'string' || number.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'Phone number is required' });
+      return;
+    }
+
+    // At least one payment method must be provided (UPI or Bank Account)
+    if ((!upi || upi.trim().length === 0) && 
+        ((!accountNumber || accountNumber.trim().length === 0) || 
+         (!ifsc || ifsc.trim().length === 0))) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Either UPI ID or both Account Number and IFSC are required' 
+      });
+      return;
+    }
+
+    // If bank account is provided, both account number and IFSC are required
+    if (accountNumber && accountNumber.trim().length > 0) {
+      if (!ifsc || ifsc.trim().length === 0) {
+        res.status(400).json({ success: false, error: 'IFSC code is required when account number is provided' });
+        return;
+      }
     }
 
     if (amount < 100) {
@@ -1431,33 +1461,36 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Check for existing pending withdrawal
-    const existingPending = await Withdrawal.findOne({
-      creatorUserId: currentUser._id,
-      status: 'pending',
-    });
-
-    if (existingPending) {
-      res.status(409).json({
-        success: false,
-        error: 'You already have a pending withdrawal request. Please wait for it to be processed.',
-      });
-      return;
-    }
-
-    // Phase 9: Withdrawal cooldown — 1 per 24 hours
+    // Optimized: Single query to check both pending withdrawal and cooldown
+    // This reduces database round trips from 2 to 1, improving performance under load
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const recentWithdrawal = await Withdrawal.findOne({
+    const existingWithdrawal = await Withdrawal.findOne({
       creatorUserId: currentUser._id,
-      requestedAt: { $gte: oneDayAgo },
-    });
+      $or: [
+        { status: 'pending' }, // Check for pending withdrawal
+        { requestedAt: { $gte: oneDayAgo } }, // Check for recent withdrawal (cooldown)
+      ],
+    })
+      .sort({ requestedAt: -1 }) // Get most recent first
+      .limit(1)
+      .lean(); // Use lean() for better performance (returns plain JS object)
 
-    if (recentWithdrawal) {
-      res.status(429).json({
-        success: false,
-        error: 'You can only request one withdrawal per 24 hours. Please try again later.',
-      });
-      return;
+    if (existingWithdrawal) {
+      if (existingWithdrawal.status === 'pending') {
+        res.status(409).json({
+          success: false,
+          error: 'You already have a pending withdrawal request. Please wait for it to be processed.',
+        });
+        return;
+      }
+      // Check if it's within cooldown period
+      if (existingWithdrawal.requestedAt >= oneDayAgo) {
+        res.status(429).json({
+          success: false,
+          error: 'You can only request one withdrawal per 24 hours. Please try again later.',
+        });
+        return;
+      }
     }
 
     // Create withdrawal record — coins NOT deducted yet
@@ -1466,6 +1499,11 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       amount,
       status: 'pending',
       requestedAt: new Date(),
+      name: name.trim(),
+      number: number.trim(),
+      upi: upi?.trim() || undefined,
+      accountNumber: accountNumber?.trim() || undefined,
+      ifsc: ifsc?.trim() || undefined,
     });
 
     console.log(`✅ [CREATOR] Withdrawal requested: ${withdrawal._id} for ${amount} coins by user ${currentUser._id}`);
@@ -1531,6 +1569,11 @@ export const getMyWithdrawals = async (req: Request, res: Response): Promise<voi
           requestedAt: w.requestedAt,
           processedAt: w.processedAt || null,
           notes: w.notes || null,
+          name: (w as any).name || null,
+          number: (w as any).number || null,
+          upi: (w as any).upi || null,
+          accountNumber: (w as any).accountNumber || null,
+          ifsc: (w as any).ifsc || null,
           createdAt: w.createdAt,
         })),
       },

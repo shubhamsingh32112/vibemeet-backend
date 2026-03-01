@@ -1,9 +1,9 @@
 import { Router, Request, Response } from 'express';
-import { featureFlags } from '../../config/feature-flags';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
+import { billingLimiter } from '../../middlewares/rate-limit.middleware';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from './billing.gateway';
-import { logger } from '../../utils/logger';
+import { logInfo, logError, logDebug } from '../../utils/logger';
 
 const router = Router();
 
@@ -17,7 +17,8 @@ const router = Router();
  */
 
 // POST /api/v1/billing/call-started
-router.post('/call-started', verifyFirebaseToken, async (req: Request, res: Response) => {
+// 🔥 FIX 11: Rate limiting - 30 billing events per minute per user
+router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Request, res: Response) => {
   try {
     const firebaseUid = req.auth?.firebaseUid;
     if (!firebaseUid) {
@@ -35,13 +36,11 @@ router.post('/call-started', verifyFirebaseToken, async (req: Request, res: Resp
       return;
     }
 
-    logger.info('billing.http.call_started.request', { firebaseUid, callId });
-
-    if (featureFlags.billingHttpMock) {
-      logger.warn('billing.http.call_started.mocked', { callId });
-      res.json({ success: true, message: 'Billing started' });
-      return;
-    }
+    logDebug('Billing REST: call-started', {
+      firebaseUid,
+      callId,
+      creatorFirebaseUid,
+    });
 
     const io = getIO();
     await handleCallStartedHttp(io, firebaseUid, {
@@ -52,13 +51,17 @@ router.post('/call-started', verifyFirebaseToken, async (req: Request, res: Resp
 
     res.json({ success: true, message: 'Billing started' });
   } catch (err: any) {
-    logger.error('billing.http.call_started.failed', { err });
+    logError('Billing REST: call-started error', err, {
+      firebaseUid: req.auth?.firebaseUid,
+      callId: req.body.callId,
+    });
     res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
 
 // POST /api/v1/billing/call-ended
-router.post('/call-ended', verifyFirebaseToken, async (req: Request, res: Response) => {
+// 🔥 FIX 11: Rate limiting - 30 billing events per minute per user
+router.post('/call-ended', verifyFirebaseToken, billingLimiter, async (req: Request, res: Response) => {
   try {
     const firebaseUid = req.auth?.firebaseUid;
     if (!firebaseUid) {
@@ -76,20 +79,20 @@ router.post('/call-ended', verifyFirebaseToken, async (req: Request, res: Respon
       return;
     }
 
-    logger.info('billing.http.call_ended.request', { firebaseUid, callId });
-
-    if (featureFlags.billingHttpMock) {
-      logger.warn('billing.http.call_ended.mocked', { callId });
-      res.json({ success: true, message: 'Billing ended / settled' });
-      return;
-    }
+    logDebug('Billing REST: call-ended', {
+      firebaseUid,
+      callId,
+    });
 
     const io = getIO();
     await settleCallHttp(io, callId);
 
     res.json({ success: true, message: 'Billing ended / settled' });
   } catch (err: any) {
-    logger.error('billing.http.call_ended.failed', { err });
+    logError('Billing REST: call-ended error', err, {
+      firebaseUid: req.auth?.firebaseUid,
+      callId: req.body.callId,
+    });
     res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });

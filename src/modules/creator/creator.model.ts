@@ -8,6 +8,7 @@ export interface ICreator extends Document {
   userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
   categories: string[]; // Array of category names (optional)
   price: number; // Price per minute in coins (e.g., 60 = 60 coins per minute)
+  age?: number; // Creator's age (optional)
   isOnline: boolean; // Online/offline status for creators
   currentCallId?: string; // Current active call ID (locks creator from accepting other calls)
   earningsCoins: number; // Total creator earnings from video calls
@@ -51,6 +52,12 @@ const creatorSchema = new Schema<ICreator>(
       type: Number,
       required: true,
       min: 0,
+    },
+    age: {
+      type: Number,
+      sparse: true,
+      min: 18,
+      max: 100,
     },
     isOnline: {
       type: Boolean,

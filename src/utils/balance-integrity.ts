@@ -31,17 +31,6 @@ export interface BalanceCheckResult {
 export async function verifyUserBalance(
   userId: string | mongoose.Types.ObjectId
 ): Promise<BalanceCheckResult> {
-  if (mongoose.connection.readyState !== 1) {
-    // Ignore checks during shutdown/tests teardown when Mongo has disconnected.
-    return {
-      userId: userId.toString(),
-      actualBalance: 0,
-      expectedBalance: 0,
-      mismatch: false,
-      discrepancy: 0,
-    };
-  }
-
   try {
     const user = await User.findById(userId).lean();
     if (!user) {
@@ -92,16 +81,7 @@ export async function verifyUserBalance(
       discrepancy,
     };
   } catch (err) {
-    const errName = err instanceof Error ? err.name : '';
-    const errMsg = err instanceof Error ? err.message : String(err);
-    const isShutdownNoise =
-      errName === 'MongoClientClosedError' ||
-      errMsg.includes('client was closed') ||
-      errMsg.includes('Connection pool for');
-
-    if (!isShutdownNoise) {
-      console.error(`⚠️ [BALANCE CHECK] Error checking user ${userId}:`, err);
-    }
+    console.error(`⚠️ [BALANCE CHECK] Error checking user ${userId}:`, err);
     return {
       userId: userId.toString(),
       actualBalance: 0,

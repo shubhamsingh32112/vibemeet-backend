@@ -1,23 +1,21 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import jwt from 'jsonwebtoken';
-import { requireEnv } from '../../config/env';
-import { authResponseDtoSchema, AuthResponseDto } from '../../contracts/canonical.dto';
-import { sendCompatibleResponse } from '../../contracts/compatibility';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
-import { logger } from '../../utils/logger';
+import { DeletedUserPhone } from '../user/deleted-user-phone.model';
+import { logInfo, logError, logDebug } from '../../utils/logger';
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
-    logger.info('auth.login.request_received', {
+    logDebug('Login request received', {
       ip: req.ip,
-      firebaseUid: req.auth?.firebaseUid || 'Not provided',
+      firebaseUid: req.auth?.firebaseUid || 'not-provided',
     });
     
     // User is already verified by middleware
     if (!req.auth) {
-      logger.warn('auth.login.unauthorized_missing_auth');
+      logInfo('Login failed: no user in request', { ip: req.ip });
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
@@ -25,26 +23,48 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    logger.info('auth.login.lookup_user', { firebaseUid: req.auth.firebaseUid });
+    const firebaseUid = req.auth.firebaseUid;
+    logDebug('Looking up user in database', { firebaseUid });
 
-    let user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    let user = await User.findOne({ firebaseUid });
 
-    // ✅ Create user ONLY here (never in middleware)
-    if (!user) {
-      logger.info('auth.login.creating_new_user');
-      // 🔥 CRITICAL: Only regular users get free coins (not creators)
-      // New users get 30 free coins and 3 free chats on first login
-      // Creators don't need coins to receive calls/texts, so they don't get free coins
-      user = await User.create({
-        firebaseUid: req.auth.firebaseUid,
-        phone: req.auth.phone,
-        email: req.auth.email,
-        role: 'user', // Default to 'user' - creators are promoted later via admin
-        categories: [], // onboarding pending
-        coins: 30, // ✅ New users get 30 free coins on first login (only for regular users)
-        freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
-      });
-      logger.info('auth.login.new_user_created', { userId: user._id.toString() });
+      // ✅ Create user ONLY here (never in middleware)
+      if (!user) {
+        logInfo('Creating new user (first login)', { firebaseUid });
+        
+        // Check if this phone number was previously deleted and had claimed welcome bonus
+        let welcomeBonusClaimed = false;
+        if (req.auth.phone) {
+          const deletedPhone = await DeletedUserPhone.findOne({ phone: req.auth.phone });
+          if (deletedPhone && deletedPhone.welcomeBonusClaimed) {
+            welcomeBonusClaimed = true;
+            logInfo('Phone number found in deleted users - welcome bonus already claimed', {
+              phone: req.auth.phone,
+              deletedAt: deletedPhone.deletedAt,
+            });
+          }
+        }
+        
+        // 🔥 CRITICAL: Only regular users can claim welcome bonus (not creators)
+        // New users start with 0 coins - they get 30 free coins when they accept the welcome bonus popup
+        // Creators don't need coins to receive calls/texts, so they don't get free coins
+        user = await User.create({
+          firebaseUid: req.auth.firebaseUid,
+          phone: req.auth.phone,
+          email: req.auth.email,
+          role: 'user', // Default to 'user' - creators are promoted later via admin
+          categories: [], // onboarding pending
+          coins: 0, // ✅ New users start with 0 coins - 30 coins are added when they accept the welcome bonus popup
+          freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
+          welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Set to true if phone number previously claimed bonus
+        });
+        logInfo('New user created', {
+          userId: user._id.toString(),
+          firebaseUid,
+          initialCoins: 0,
+          freeTextUsed: 0,
+          welcomeBonusClaimed: welcomeBonusClaimed,
+        });
     } else {
       // Keep user contact info in sync (DB writes are OK here)
       const needsUpdate =
@@ -55,11 +75,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         if (req.auth.email) user.email = req.auth.email;
         if (req.auth.phone) user.phone = req.auth.phone;
         await user.save();
+        logDebug('User contact info updated', { userId: user._id.toString() });
       }
     }
 
-    logger.info('auth.login.user_ready', {
+    logInfo('User login successful', {
       userId: user._id.toString(),
+      firebaseUid,
+      email: user.email || null,
+      phone: user.phone || null,
       role: user.role,
       coins: user.coins,
     });
@@ -71,129 +95,62 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     // If creator exists, return creator details as primary data
     if (creator) {
-      const legacyData = {
-        // Primary data from creator collection
-        id: creator._id.toString(),
-        name: creator.name,
-        about: creator.about,
-        photo: creator.photo,
-        email: user.email, // Use user's email (identity comes from user)
-        phone: user.phone, // Use user's phone (identity comes from user)
-        categories: creator.categories,
-        price: creator.price,
-        // User-specific data (coins, role, etc.)
-        coins: user.coins,
-        welcomeBonusClaimed: user.welcomeBonusClaimed,
-        role: user.role,
-        userId: user._id.toString(), // Reference to user document
-        // Additional user fields that might be useful
-        gender: user.gender,
-        username: user.username,
-        avatar: user.avatar,
-        usernameChangeCount: user.usernameChangeCount,
-        createdAt: creator.createdAt,
-        updatedAt: creator.updatedAt,
-        needsOnboarding: false, // Creators don't need onboarding
-      };
-
-      const normalizedData: AuthResponseDto = {
-        session: {
-          authenticated: true,
-          needsOnboarding: false,
-        },
-        user: {
-          id: user._id.toString(),
-          firebaseUid: user.firebaseUid,
-          role: user.role,
-          email: user.email ?? null,
-          phone: user.phone ?? null,
-          gender: user.gender ?? null,
-          username: user.username ?? null,
-          avatar: user.avatar ?? null,
-          categories: user.categories ?? [],
-          coins: user.coins,
-          welcomeBonusClaimed: Boolean(user.welcomeBonusClaimed),
-          usernameChangeCount: user.usernameChangeCount,
-          createdAt: user.createdAt?.toISOString(),
-          updatedAt: user.updatedAt?.toISOString(),
-        },
-        creator: {
+      res.json({
+        success: true,
+        data: {
+          // Primary data from creator collection
           id: creator._id.toString(),
-          userId: creator.userId?.toString() ?? null,
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          categories: creator.categories ?? [],
+          email: user.email, // Use user's email (identity comes from user)
+          phone: user.phone, // Use user's phone (identity comes from user)
+          categories: creator.categories,
           price: creator.price,
-          isOnline: creator.isOnline,
-          createdAt: creator.createdAt?.toISOString(),
-          updatedAt: creator.updatedAt?.toISOString(),
-        },
-      };
-
-      sendCompatibleResponse({
-        req,
-        res,
-        legacyData,
-        normalizedData,
-        validator: authResponseDtoSchema,
-        deprecations: ['`data.id` + flat creator/user fields are legacy; migrate to `normalized.user` and `normalized.creator`.'],
-      });
-    } else {
-      // Regular user login
-      const legacyData = {
-        user: {
-          id: user._id.toString(),
-          email: user.email,
-          phone: user.phone,
-          gender: user.gender,
-          username: user.username,
-          avatar: user.avatar,
-          categories: user.categories,
-          usernameChangeCount: user.usernameChangeCount,
+          age: creator.age,
+          // User-specific data (coins, role, etc.)
           coins: user.coins,
           welcomeBonusClaimed: user.welcomeBonusClaimed,
           role: user.role,
+          userId: user._id.toString(), // Reference to user document
+          // Additional user fields that might be useful
+          gender: user.gender,
+          username: user.username,
+          avatar: user.avatar,
+          usernameChangeCount: user.usernameChangeCount,
+          createdAt: creator.createdAt,
+          updatedAt: creator.updatedAt,
+          needsOnboarding: false, // Creators don't need onboarding
         },
-        creator: null,
-        needsOnboarding,
-      };
-      const normalizedData: AuthResponseDto = {
-        session: {
-          authenticated: true,
+      });
+    } else {
+      // Regular user login
+      res.json({
+        success: true,
+        data: {
+          user: {
+            id: user._id.toString(),
+            email: user.email,
+            phone: user.phone,
+            gender: user.gender,
+            username: user.username,
+            avatar: user.avatar,
+            categories: user.categories,
+            usernameChangeCount: user.usernameChangeCount,
+            coins: user.coins,
+            welcomeBonusClaimed: user.welcomeBonusClaimed,
+            role: user.role,
+          },
+          creator: null,
           needsOnboarding,
         },
-        user: {
-          id: user._id.toString(),
-          firebaseUid: user.firebaseUid,
-          role: user.role,
-          email: user.email ?? null,
-          phone: user.phone ?? null,
-          gender: user.gender ?? null,
-          username: user.username ?? null,
-          avatar: user.avatar ?? null,
-          categories: user.categories ?? [],
-          coins: user.coins,
-          welcomeBonusClaimed: Boolean(user.welcomeBonusClaimed),
-          usernameChangeCount: user.usernameChangeCount,
-          createdAt: user.createdAt?.toISOString(),
-          updatedAt: user.updatedAt?.toISOString(),
-        },
-        creator: null,
-      };
-
-      sendCompatibleResponse({
-        req,
-        res,
-        legacyData,
-        normalizedData,
-        validator: authResponseDtoSchema,
-        deprecations: ['`data.user`/`data.creator` stays supported during migration; adopt `normalized` contract.'],
       });
     }
-    logger.info('auth.login.response_sent');
   } catch (error) {
-    logger.error('auth.login.failed', { error });
+    logError('Login error', error, {
+      firebaseUid: req.auth?.firebaseUid,
+      ip: req.ip,
+    });
     res.status(500).json({
       success: false,
       error: 'Internal server error',
@@ -210,7 +167,7 @@ export const logout = async (_req: Request, res: Response): Promise<void> => {
       message: 'Logged out successfully',
     });
   } catch (error) {
-    console.error('Logout error:', error);
+    logError('Logout error', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error',
@@ -222,7 +179,7 @@ export const logout = async (_req: Request, res: Response): Promise<void> => {
  * Admin login — plain email + password (NO Firebase involved).
  *
  * Checks credentials against ADMIN_EMAIL / ADMIN_PASSWORD env vars
- * and returns a custom JWT.
+ * (with sensible defaults) and returns a custom JWT.
  */
 export const adminLogin = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -235,14 +192,14 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
     }
 
     // Read credentials from env (trimmed to avoid \r / whitespace issues on Windows)
-    const adminEmail = requireEnv('ADMIN_EMAIL');
-    const adminPassword = requireEnv('ADMIN_PASSWORD');
-    const jwtSecret = requireEnv('JWT_SECRET');
+    const adminEmail = (process.env.ADMIN_EMAIL || 'admin@matchvibe.com').trim();
+    const adminPassword = (process.env.ADMIN_PASSWORD || 'admin@matchvibe').trim();
+    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
 
-    logger.info('auth.admin_login.attempt', { email });
+    logDebug('Admin login attempt', { email });
 
     if (email !== adminEmail || password !== adminPassword) {
-      logger.warn('auth.admin_login.invalid_credentials', { email });
+      logInfo('Admin login failed: invalid credentials', { email, ip: req.ip });
       res.status(401).json({ success: false, error: 'Invalid email or password' });
       return;
     }
@@ -257,7 +214,7 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
         role: 'admin',
         coins: 0,
       });
-      logger.warn('auth.admin_login.admin_user_bootstrapped', { email: adminEmail });
+      logInfo('Admin user created in database', { userId: adminUser._id.toString(), email: adminEmail });
     }
 
     const token = jwt.sign(
@@ -266,51 +223,28 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
       { expiresIn: '7d' },
     );
 
-    logger.info('auth.admin_login.success', { email });
+    logInfo('Admin login successful', {
+      userId: adminUser._id.toString(),
+      email: adminEmail,
+      ip: req.ip,
+    });
 
-    const legacyData = {
-      token,
-      user: {
-        id: adminUser._id.toString(),
-        email: adminUser.email,
-        role: adminUser.role,
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: adminUser._id.toString(),
+          email: adminUser.email,
+          role: adminUser.role,
+        },
       },
-    };
-    const normalizedData: AuthResponseDto = {
-      session: {
-        authenticated: true,
-        needsOnboarding: false,
-      },
-      user: {
-        id: adminUser._id.toString(),
-        firebaseUid: adminUser.firebaseUid,
-        role: adminUser.role,
-        email: adminUser.email ?? null,
-        phone: adminUser.phone ?? null,
-        gender: adminUser.gender ?? null,
-        username: adminUser.username ?? null,
-        avatar: adminUser.avatar ?? null,
-        categories: adminUser.categories ?? [],
-        coins: adminUser.coins ?? 0,
-        welcomeBonusClaimed: Boolean(adminUser.welcomeBonusClaimed),
-        usernameChangeCount: adminUser.usernameChangeCount ?? 0,
-        createdAt: adminUser.createdAt?.toISOString(),
-        updatedAt: adminUser.updatedAt?.toISOString(),
-      },
-      creator: null,
-      adminToken: token,
-    };
-
-    sendCompatibleResponse({
-      req,
-      res,
-      legacyData,
-      normalizedData,
-      validator: authResponseDtoSchema,
-      deprecations: ['Legacy admin token field remains at `data.token`; normalized field is `normalized.adminToken`.'],
     });
   } catch (error) {
-    logger.error('auth.admin_login.failed', { error });
+    logError('Admin login error', error, {
+      email: req.body.email,
+      ip: req.ip,
+    });
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

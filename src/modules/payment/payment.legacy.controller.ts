@@ -16,7 +16,7 @@ import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getIO } from '../../config/socket';
-import { logger } from '../../utils/logger';
+import logger from '../../utils/logger';
 import {
   PricingTier,
   getEffectivePackPrice,

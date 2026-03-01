@@ -1,12 +1,24 @@
 import { Server } from 'socket.io';
-import { randomUUID } from 'crypto';
+import mongoose from 'mongoose';
 import {
   getRedis,
   callSessionKey,
   callUserCoinsKey,
   callCreatorEarningsKey,
   invalidateCreatorDashboard,
+  invalidateCreatorTasks,
   invalidateAdminCaches,
+  ACTIVE_BILLING_CALLS_KEY,
+  // 🔥 FIX 1: Redis keys for state maps
+  activeCallByUserKey,
+  pendingCallEndKey,
+  settledCallKey,
+  ACTIVE_CALL_BY_USER_TTL,
+  PENDING_CALL_END_TTL,
+  SETTLED_CALL_TTL,
+  // 🔥 FIX 3: Distributed lock for batch processor
+  BATCH_PROCESSOR_LOCK_KEY,
+  BATCH_PROCESSOR_LOCK_TTL,
 } from '../../config/redis';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -17,30 +29,23 @@ import { verifyUserBalance } from '../../utils/balance-integrity';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { getStreamClient } from '../../config/stream';
 import crypto from 'crypto';
-import { logger } from '../../utils/logger';
-import { runWithRequestContext } from '../../utils/request-context';
-import { billingDomainService, BillingLegacySettlementSnapshot } from './billing-domain.service';
+import { recordBillingMetric } from '../../utils/monitoring';
+import { billingService } from './billing.service';
+import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
+import { checkCallRateLimit } from '../../utils/rate-limit.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────
-const CREATOR_EARNINGS_PER_SECOND = 0.3; // Creator earns 0.30 coins/sec (18 coins/min)
-const CALL_SESSION_TTL = 7200; // 2-hour TTL safety net for Redis keys
+// 🔥 FIX: Batch-based billing - no per-call intervals
+// Single global processor handles all calls in batches
+let globalBillingProcessor: NodeJS.Timeout | null = null;
+const BILLING_BATCH_SIZE = 50; // Process up to 50 calls per tick
+const BILLING_TICK_INTERVAL = 1000; // 1 second
 
-// ── In-memory interval registry ───────────────────────────────────────────
-const activeBillingIntervals: Map<string, NodeJS.Timeout> = new Map();
-
-// ── Map firebaseUid → callId for disconnect-based settlement ─────────────
-const activeCallsByUser: Map<string, string> = new Map();
-
-// ── Deferred call-end tracking ────────────────────────────────────────────
-// When `call:ended` arrives BEFORE `handleCallStarted` finishes writing the
-// Redis session, we can't settle yet.  Store the callId here so that once
-// `handleCallStarted` completes it can settle immediately.
-const pendingCallEnds = new Set<string>();
-
-// ── In-memory settled tracking (extra safety net) ─────────────────────────
-// Even with the Redis NX lock, keep a local set so we can skip settlement
-// attempts immediately without a Redis round-trip.
-const settledCalls = new Set<string>();
+// 🔥 FIX 1: In-memory state maps moved to Redis
+// All state is now stored in Redis for persistence and distribution across servers
+// - activeCallsByUser → Redis keys: active:call:user:{firebaseUid}
+// - pendingCallEnds → Redis keys: pending:call:ends:{callId}
+// - settledCalls → Redis keys: settled:call:{callId}
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface CallSession {
@@ -73,9 +78,25 @@ function generateUserCreatorChannelId(uid1: string, uid2: string): string {
 function formatDurationLabel(totalSeconds: number): string {
   const mins = Math.floor(totalSeconds / 60);
   const secs = totalSeconds % 60;
-  if (mins <= 0) return `${secs}s`;
-  if (secs <= 0) return `${mins}m`;
-  return `${mins}m ${secs}s`;
+  
+  // Show duration in minutes format (e.g., "5 minutes", "1 minute", "30 seconds")
+  if (mins <= 0) {
+    return `${secs} second${secs === 1 ? '' : 's'}`;
+  }
+  if (secs === 0) {
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  // Show both minutes and seconds for calls under 1 hour
+  if (mins < 60) {
+    return `${mins} minute${mins === 1 ? '' : 's'} ${secs} second${secs === 1 ? '' : 's'}`;
+  }
+  // For calls over 1 hour, show hours and minutes
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  if (remainingMins === 0) {
+    return `${hours} hour${hours === 1 ? '' : 's'}`;
+  }
+  return `${hours} hour${hours === 1 ? '' : 's'} ${remainingMins} minute${remainingMins === 1 ? '' : 's'}`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -108,22 +129,9 @@ export function setupBillingGateway(io: Server): void {
     const firebaseUid: string | undefined = socket.data.firebaseUid;
     if (!firebaseUid) return;
 
-    const withSocketContext = <T>(event: string, callback: () => T): T =>
-      runWithRequestContext(
-        {
-          requestId: `ws-${socket.id}-${event}-${randomUUID()}`,
-          source: 'socket',
-          path: event,
-          socketId: socket.id,
-        },
-        callback,
-      );
-
     // ── Join personal room so billing can target this user ──────────
     socket.join(`user:${firebaseUid}`);
-    withSocketContext('connection', () => {
-      logger.info('billing.socket.connected', { firebaseUid });
-    });
+    logDebug('User joined billing room', { firebaseUid, room: `user:${firebaseUid}` });
 
     // ── call:started ────────────────────────────────────────────────
     socket.on(
@@ -132,23 +140,75 @@ export function setupBillingGateway(io: Server): void {
         callId: string;
         creatorFirebaseUid: string;
         creatorMongoId: string;
+        userFirebaseUid?: string; // Optional: for creator-initiated calls, specifies the user who pays
       }) => {
         try {
-          await withSocketContext('call:started', async () => {
-            logger.info('billing.socket.call_started.received', { callId: data.callId, firebaseUid });
-            await handleCallStarted(io, firebaseUid, data);
+          // For creator-initiated calls, userFirebaseUid is the target user who pays
+          // For user-initiated calls, firebaseUid (socket owner) is the user who pays
+          const payerFirebaseUid = data.userFirebaseUid || firebaseUid;
+          
+          logInfo('call:started received', { 
+            callId: data.callId, 
+            socketFirebaseUid: firebaseUid,
+            payerFirebaseUid,
+            isCreatorInitiated: !!data.userFirebaseUid,
           });
+          
+          // 🔥 FIX 40: Check per-user rate limit before starting billing
+          // Check rate limit for the payer (user), not the socket owner
+          const rateLimitCheck = await checkCallRateLimit(payerFirebaseUid);
+          if (!rateLimitCheck.allowed) {
+            logWarning('Call rate limit exceeded', {
+              payerFirebaseUid,
+              callId: data.callId,
+              count: rateLimitCheck.limit - rateLimitCheck.remaining,
+              limit: rateLimitCheck.limit,
+              resetAt: new Date(rateLimitCheck.resetAt).toISOString(),
+            });
+            
+            // Record rate limit metric
+            recordBillingMetric('rate_limit_exceeded', 1, { firebaseUid: payerFirebaseUid, callId: data.callId });
+            
+            // Emit error to user
+            io.to(`user:${payerFirebaseUid}`).emit('billing:error', {
+              callId: data.callId,
+              error: 'RATE_LIMIT_EXCEEDED',
+              message: `Too many call attempts. Please wait before trying again.`,
+              rateLimit: {
+                limit: rateLimitCheck.limit,
+                remaining: rateLimitCheck.remaining,
+                resetAt: rateLimitCheck.resetAt,
+                windowSeconds: rateLimitCheck.windowSeconds,
+              },
+            });
+            return;
+          }
+          
+          logDebug('Rate limit check passed', {
+            payerFirebaseUid,
+            callId: data.callId,
+            remaining: rateLimitCheck.remaining,
+            limit: rateLimitCheck.limit,
+          });
+          
+          // 🔥 FIX 18: Use BillingService instead of direct function call
+          // Pass payerFirebaseUid (the user who pays) instead of socket firebaseUid
+          await billingService.startBillingSession(io, payerFirebaseUid, data);
 
-          // If call:ended arrived while we were setting up, settle now
-          if (pendingCallEnds.has(data.callId)) {
-            pendingCallEnds.delete(data.callId);
-            logger.info('billing.socket.call_ended.deferred_settlement', { callId: data.callId });
+          // 🔥 FIX 1: Check Redis for pending call end
+          const redis = getRedis();
+          const pendingEndKey = pendingCallEndKey(data.callId);
+          const hasPendingEnd = await redis.get(pendingEndKey);
+          if (hasPendingEnd) {
+            await redis.del(pendingEndKey);
+            logInfo('Deferred settlement for call', { callId: data.callId });
             await settleCall(io, data.callId);
           }
         } catch (err) {
-          logger.error('billing.socket.call_started.failed', { err, callId: data.callId });
-          // Clean up pending end if start failed
-          pendingCallEnds.delete(data.callId);
+          logError('Error in call:started', err, { callId: data.callId, firebaseUid });
+          // 🔥 FIX 1: Clean up pending end from Redis if start failed
+          const redis = getRedis();
+          await redis.del(pendingCallEndKey(data.callId)).catch(() => {});
           socket.emit('billing:error', {
             callId: data.callId,
             message: 'Failed to start billing',
@@ -160,26 +220,116 @@ export function setupBillingGateway(io: Server): void {
     // ── call:ended ──────────────────────────────────────────────────
     socket.on('call:ended', async (data: { callId: string }) => {
       try {
-        await withSocketContext('call:ended', async () => {
-          logger.info('billing.socket.call_ended.received', { callId: data.callId, firebaseUid });
-        });
+        logInfo('call:ended received', { callId: data.callId, firebaseUid });
 
         // Check if the session exists yet (handleCallStarted may still be running)
         const redis = getRedis();
         const sessionExists = await redis.get(callSessionKey(data.callId));
 
-        if (!sessionExists && !activeBillingIntervals.has(data.callId)) {
-          // Session not created yet — defer settlement until handleCallStarted finishes
-          pendingCallEnds.add(data.callId);
-          logger.info('billing.socket.call_ended.deferred', { callId: data.callId });
-          // Safety: clean up after 60s in case call:started never completes
-          setTimeout(() => pendingCallEnds.delete(data.callId), 60_000);
+        // 🔥 FIX: Check if call is in active billing set instead of activeBillingIntervals
+        const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, data.callId);
+        
+        if (!sessionExists && !isInActiveBilling) {
+          // 🔥 FIX 1: Session not created yet — defer settlement until handleCallStarted finishes
+          // Store in Redis with TTL for automatic cleanup
+          await redis.set(pendingCallEndKey(data.callId), '1', {
+            ex: PENDING_CALL_END_TTL,
+          });
+          logInfo('Deferring call:ended (session not ready)', { callId: data.callId });
           return;
         }
 
         await settleCall(io, data.callId);
       } catch (err) {
-        logger.error('billing.socket.call_ended.failed', { err, callId: data.callId });
+        logError('Error in call:ended', err, { callId: data.callId, firebaseUid });
+      }
+    });
+
+    // ── billing:recover-state ───────────────────────────────────────
+    // 🔥 FIX: State recovery handler for frontend to recover active calls after restart
+    socket.on('billing:recover-state', async () => {
+      try {
+        logInfo('State recovery requested', { firebaseUid });
+        const redis = getRedis();
+        
+        // Get active call ID for this user
+        const callId = await redis.get<string>(activeCallByUserKey(firebaseUid));
+        
+        if (!callId) {
+          // No active call for this user
+          socket.emit('billing:recover-state:response', {
+            success: true,
+            activeCalls: [],
+          });
+          return;
+        }
+        
+        // Verify call is still active in billing system
+        const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
+        if (!isInActiveBilling) {
+          // Call is no longer active, clean up
+          await redis.del(activeCallByUserKey(firebaseUid));
+          socket.emit('billing:recover-state:response', {
+            success: true,
+            activeCalls: [],
+          });
+          return;
+        }
+        
+        // Get session details
+        const sessionRaw = await redis.get<string>(callSessionKey(callId));
+        if (!sessionRaw) {
+          // Session expired, clean up
+          await redis.del(activeCallByUserKey(firebaseUid));
+          socket.emit('billing:recover-state:response', {
+            success: true,
+            activeCalls: [],
+          });
+          return;
+        }
+        
+        const session: CallSession = typeof sessionRaw === 'string' 
+          ? JSON.parse(sessionRaw) 
+          : (sessionRaw as any);
+        
+        // Get current coins and earnings
+        const [coinsRaw, earningsRaw] = await Promise.all([
+          redis.get<string>(callUserCoinsKey(callId)),
+          redis.get<string>(callCreatorEarningsKey(callId)),
+        ]);
+        
+        const coins = parseFloat((coinsRaw as string) || '0');
+        const earnings = parseFloat((earningsRaw as string) || '0');
+        const remainingSeconds = Math.floor(coins / session.pricePerSecond);
+        
+        // Return active call details
+        socket.emit('billing:recover-state:response', {
+          success: true,
+          activeCalls: [{
+            callId: session.callId,
+            coins: Math.floor(coins),
+            coinsExact: parseFloat(coins.toFixed(4)),
+            pricePerSecond: session.pricePerSecond,
+            elapsedSeconds: session.elapsedSeconds,
+            remainingSeconds,
+            earnings: Math.round(earnings * 100) / 100,
+          }],
+        });
+        
+        logInfo('State recovery completed', { 
+          firebaseUid, 
+          callId, 
+          elapsedSeconds: session.elapsedSeconds 
+        });
+        
+        recordBillingMetric('state_recovery', 1, { callId, firebaseUid });
+      } catch (err) {
+        logError('State recovery failed', err, { firebaseUid });
+        socket.emit('billing:recover-state:response', {
+          success: false,
+          error: 'Failed to recover state',
+          activeCalls: [],
+        });
       }
     });
 
@@ -188,16 +338,16 @@ export function setupBillingGateway(io: Server): void {
     // immediately so coins stop being deducted.  settleCall is
     // idempotent — duplicate calls are safe.
     socket.on('disconnect', async (reason) => {
-      withSocketContext('disconnect', () => {
-        logger.info('billing.socket.disconnected', { firebaseUid, reason });
-      });
-      const callId = activeCallsByUser.get(firebaseUid);
+      logInfo('Socket disconnected', { firebaseUid, reason });
+      // 🔥 FIX 1: Get callId from Redis instead of in-memory map
+      const redis = getRedis();
+      const callId = await redis.get<string>(activeCallByUserKey(firebaseUid));
       if (callId) {
-        logger.info('billing.socket.disconnect_autosettle', { callId, firebaseUid });
+        logInfo('Auto-settling call due to disconnect', { callId, firebaseUid });
         try {
           await settleCall(io, callId);
         } catch (err) {
-          logger.error('billing.socket.disconnect_autosettle_failed', { callId, err });
+          logError('Auto-settle failed', err, { callId, firebaseUid });
         }
       }
     });
@@ -208,6 +358,10 @@ export function setupBillingGateway(io: Server): void {
 // CALL LIFECYCLE
 // ══════════════════════════════════════════════════════════════════════════
 
+/**
+ * 🔥 FIX: Batch-based billing - register call in Redis instead of starting per-call interval
+ * Delegates to BillingService and registers call for batch processing
+ */
 async function handleCallStarted(
   io: Server,
   userFirebaseUid: string,
@@ -217,226 +371,206 @@ async function handleCallStarted(
     creatorMongoId: string;
   }
 ): Promise<void> {
+  // 🔥 FIX 18: Use BillingService for business logic
+  await billingService.startBillingSession(io, userFirebaseUid, data);
+  
+  // 🔥 FIX 1: Track both participants in Redis so we can auto-settle on socket disconnect
   const redis = getRedis();
-  const { callId, creatorFirebaseUid, creatorMongoId } = data;
-
-  // Idempotency — if session already running, skip
-  const existingSession = await redis.get(callSessionKey(callId));
-  if (existingSession) {
-    console.log(`⚠️  [BILLING] Session already exists for call ${callId}`);
-    return;
-  }
-
-  // Fetch user from Mongo
-  const user = await User.findOne({ firebaseUid: userFirebaseUid });
-  if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
-
-  // Fetch creator to get price per minute
-  // Try by Creator._id first, then fall back to Creator.userId (User._id)
-  // because call history stores the User._id, not the Creator._id.
-  let creator = await Creator.findById(creatorMongoId);
-  if (!creator) {
-    creator = await Creator.findOne({ userId: creatorMongoId });
-  }
-  if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
-
-  const pricePerMinute = creator.price; // e.g. 60 coins/min
-  const pricePerSecond = pricePerMinute / 60; // e.g. 1 coin/sec
-
-  // Check user has enough coins for at least 1 second
-  if (user.coins < pricePerSecond) {
-    io.to(`user:${userFirebaseUid}`).emit('call:force-end', {
-      callId,
-      reason: 'insufficient_coins',
-      remainingCoins: user.coins,
-    });
-    return;
-  }
-
-  // Build session — always use the resolved Creator._id so settlement lookups
-  // work correctly even when the frontend passed a User._id from call history.
-  const session: CallSession = {
-    callId,
-    userFirebaseUid,
-    creatorFirebaseUid,
-    userMongoId: user._id.toString(),
-    creatorMongoId: creator._id.toString(),
-    pricePerMinute,
-    pricePerSecond,
-    startTime: Date.now(),
-    elapsedSeconds: 0,
-  };
-
-  // Seed Redis (3 keys per call)
   await Promise.all([
-    redis.set(callSessionKey(callId), JSON.stringify(session), {
-      ex: CALL_SESSION_TTL,
+    redis.set(activeCallByUserKey(userFirebaseUid), data.callId, {
+      ex: ACTIVE_CALL_BY_USER_TTL,
     }),
-    redis.set(callUserCoinsKey(callId), user.coins.toString(), {
-      ex: CALL_SESSION_TTL,
-    }),
-    redis.set(callCreatorEarningsKey(callId), '0', {
-      ex: CALL_SESSION_TTL,
+    redis.set(activeCallByUserKey(data.creatorFirebaseUid), data.callId, {
+      ex: ACTIVE_CALL_BY_USER_TTL,
     }),
   ]);
-
-  const maxSeconds = Math.floor(user.coins / pricePerSecond);
-
-  // Notify both parties that billing started
-  io.to(`user:${userFirebaseUid}`).emit('billing:started', {
-    callId,
-    coins: user.coins,
-    pricePerSecond,
-    maxSeconds,
+  
+  // 🔥 FIX: Register call in Redis sorted set for batch processing
+  // Score = next billing time in milliseconds
+  const nextBillingTime = Date.now() + BILLING_TICK_INTERVAL;
+  await redis.zadd(ACTIVE_BILLING_CALLS_KEY, {
+    score: nextBillingTime,
+    member: data.callId,
   });
-
-  io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
-    callId,
-    earnings: 0,
-    pricePerSecond: CREATOR_EARNINGS_PER_SECOND,
-  });
-
-  // Track both participants so we can auto-settle on socket disconnect
-  activeCallsByUser.set(userFirebaseUid, callId);
-  activeCallsByUser.set(creatorFirebaseUid, callId);
-
-  // Start the 1-second billing loop
-  startBillingLoop(io, callId);
-
-  await billingDomainService.onCallStarted({
-    callId,
-    userFirebaseUid: session.userFirebaseUid,
-    creatorFirebaseUid: session.creatorFirebaseUid,
-    userMongoId: session.userMongoId,
-    creatorMongoId: session.creatorMongoId,
-    pricePerMinute: session.pricePerMinute,
-    pricePerSecond: session.pricePerSecond,
-    startingUserCoins: user.coins,
-  });
-
-  console.log(
-    `💰 [BILLING] Session started: call=${callId}  rate=${pricePerSecond}/sec  userCoins=${user.coins}  maxSec=${maxSeconds}`
-  );
+  
+  logDebug('Registered call for batch billing', { callId: data.callId, nextBillingTime });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 1-SECOND BILLING LOOP
+// BATCH-BASED BILLING PROCESSOR (NO POLLING PER CALL)
 // ══════════════════════════════════════════════════════════════════════════
 
-function startBillingLoop(io: Server, callId: string): void {
-  // Clear stale interval if any
-  const existing = activeBillingIntervals.get(callId);
-  if (existing) clearInterval(existing);
-
-  const interval = setInterval(async () => {
-    try {
-      await processBillingTick(io, callId);
-    } catch (err) {
-      console.error(`❌ [BILLING] Tick error for ${callId}:`, err);
-      // If we fail 3 consecutive ticks the TTL on Redis will eventually
-      // expire the session.  Don't stop the loop on transient errors.
+/**
+ * 🔥 FIX: Single global billing processor that processes all active calls in batches
+ * Replaces per-call setInterval polling with efficient batch processing
+ * 
+ * 🔥 FIX 3: Added distributed locking to prevent multiple servers from processing same calls
+ * 
+ * How it works:
+ * 1. Try to acquire distributed lock (only one server processes at a time)
+ * 2. Calls register themselves in Redis sorted set with next billing time
+ * 3. Single processor runs every 1 second
+ * 4. Processor reads all calls due for billing (score <= now)
+ * 5. Processes calls in batches (up to BILLING_BATCH_SIZE per tick)
+ * 6. Updates next billing time in sorted set after processing
+ */
+async function processBillingBatch(io: Server): Promise<void> {
+  let redis;
+  try {
+    redis = getRedis();
+  } catch (err) {
+    // 🔥 FIX: Log error when Redis is unavailable
+    logError('Failed to get Redis client for batch processor', err);
+    recordBillingMetric('batch_processor_redis_error', 1, {});
+    return;
+  }
+  
+  // 🔥 FIX 3: Acquire distributed lock (only one server processes batches at a time)
+  let lockAcquired = false;
+  try {
+    const lockResult = await redis.set(BATCH_PROCESSOR_LOCK_KEY, '1', {
+      nx: true,
+      ex: BATCH_PROCESSOR_LOCK_TTL,
+    });
+    lockAcquired = lockResult === 'OK';
+  } catch (err) {
+    // 🔥 FIX: Log error when lock acquisition fails (Redis outage)
+    logError('Failed to acquire batch processor lock', err, {
+      lockKey: BATCH_PROCESSOR_LOCK_KEY,
+    });
+    recordBillingMetric('batch_processor_lock_failed', 1, {});
+    // Don't return - check if it's a transient error or circuit breaker issue
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ETIMEDOUT')) {
+      // Redis is down - this is critical, alert
+      logError('CRITICAL: Redis unavailable - billing stopped', err, {
+        alert: true,
+        impact: 'Billing operations stopped',
+      });
+      recordBillingMetric('batch_processor_redis_down', 1, {});
     }
-  }, 1000);
-
-  activeBillingIntervals.set(callId, interval);
-}
-
-function stopBillingLoop(callId: string): void {
-  const interval = activeBillingIntervals.get(callId);
-  if (interval) {
-    clearInterval(interval);
-    activeBillingIntervals.delete(callId);
-    console.log(`⏹️  [BILLING] Stopped loop for ${callId}`);
-  }
-}
-
-async function processBillingTick(
-  io: Server,
-  callId: string
-): Promise<void> {
-  const redis = getRedis();
-
-  // ── Read session ────────────────────────────────────────────────────
-  const sessionRaw = await redis.get<string>(callSessionKey(callId));
-  if (!sessionRaw) {
-    stopBillingLoop(callId);
     return;
   }
-
-  const session: CallSession =
-    typeof sessionRaw === 'string' ? JSON.parse(sessionRaw) : (sessionRaw as any);
-
-  // ── Read current coins & earnings ──────────────────────────────────
-  const [coinsRaw, earningsRaw] = await Promise.all([
-    redis.get<string>(callUserCoinsKey(callId)),
-    redis.get<string>(callCreatorEarningsKey(callId)),
-  ]);
-
-  if (coinsRaw === null) {
-    stopBillingLoop(callId);
+  
+  if (!lockAcquired) {
+    // Another server is processing batches, skip this tick
+    // This is normal in multi-server deployments, only log at debug level
+    logDebug('Batch processor lock not acquired, skipping tick', {});
     return;
   }
-
-  let coins = parseFloat(coinsRaw as string);
-  let earnings = parseFloat((earningsRaw as string) || '0');
-  const deduction = session.pricePerSecond;
-
-  // ── Check affordability ────────────────────────────────────────────
-  if (coins < deduction) {
-    console.log(
-      `💰 [BILLING] User out of coins for call ${callId} (has ${coins}, needs ${deduction}). Force-ending.`
+  
+  const now = Date.now();
+  
+  try {
+    // Get all calls due for billing (score <= now)
+    // Limit to BILLING_BATCH_SIZE to prevent overload
+    // Upstash Redis uses zrange with byScore option instead of zrangebyscore
+    const callsDue = await redis.zrange(
+      ACTIVE_BILLING_CALLS_KEY,
+      0,
+      now,
+      { byScore: true, offset: 0, count: BILLING_BATCH_SIZE }
     );
-
-    io.to(`user:${session.userFirebaseUid}`).emit('call:force-end', {
-      callId,
-      reason: 'insufficient_coins',
-      remainingCoins: Math.floor(coins),
+    
+    // Handle both string array and object array responses
+    const callIds: string[] = Array.isArray(callsDue)
+      ? callsDue.map((item: any) => 
+          typeof item === 'string' ? item : (item?.member || item?.value || String(item))
+        )
+      : [];
+    
+    if (callIds.length === 0) {
+      return; // No calls to process
+    }
+    
+    logDebug('Processing billing batch', { count: callIds.length });
+    
+    // Process calls in parallel (but limit concurrency)
+    const processingPromises = callIds.map(async (callId: string) => {
+      try {
+        // Process billing tick
+        const processed = await billingService.processBillingTick(io, callId);
+        
+        if (processed) {
+          // Update next billing time (1 second from now)
+          const nextBillingTime = now + BILLING_TICK_INTERVAL;
+          await redis.zadd(ACTIVE_BILLING_CALLS_KEY, {
+            score: nextBillingTime,
+            member: callId,
+          });
+        } else {
+          // Session doesn't exist or settlement needed - remove from active calls
+          await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
+          logDebug('Removed call from active billing (settlement needed)', { callId });
+        }
+      } catch (err) {
+        logError('Error processing billing tick in batch', err, { callId });
+        // Don't remove from set on error - will retry next tick
+        // If session expired, processBillingTick will return false next time
+      }
     });
-    io.to(`user:${session.creatorFirebaseUid}`).emit('call:force-end', {
-      callId,
-      reason: 'user_out_of_coins',
+    
+    await Promise.all(processingPromises);
+    
+    // Record batch processing metric
+    recordBillingMetric('batch_processed', callIds.length, {
+      batchSize: callIds.length.toString(),
     });
+    
+  } catch (err) {
+    logError('Error in billing batch processor', err);
+  } finally {
+    // 🔥 FIX 3: Release lock (though TTL will handle it automatically)
+    // We delete it explicitly for cleaner code, but TTL is the safety net
+    await redis.del(BATCH_PROCESSOR_LOCK_KEY).catch(() => {});
+  }
+}
 
-    await settleCall(io, callId);
+/**
+ * Start the global billing processor (called once on server startup)
+ */
+export function startGlobalBillingProcessor(io: Server): void {
+  if (globalBillingProcessor) {
+    logWarning('Global billing processor already running', {});
     return;
   }
-
-  // ── Apply tick ─────────────────────────────────────────────────────
-  coins -= deduction;
-  earnings += CREATOR_EARNINGS_PER_SECOND;
-  session.elapsedSeconds += 1;
-
-  // ── Persist to Redis ───────────────────────────────────────────────
-  await Promise.all([
-    redis.set(callUserCoinsKey(callId), coins.toString(), {
-      ex: CALL_SESSION_TTL,
-    }),
-    redis.set(callCreatorEarningsKey(callId), earnings.toString(), {
-      ex: CALL_SESSION_TTL,
-    }),
-    redis.set(callSessionKey(callId), JSON.stringify(session), {
-      ex: CALL_SESSION_TTL,
-    }),
-  ]);
-
-  const remainingSeconds = Math.floor(coins / session.pricePerSecond);
-
-  // ── Emit live updates ──────────────────────────────────────────────
-  io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
-    callId,
-    coins: Math.floor(coins),
-    coinsExact: parseFloat(coins.toFixed(4)),
-    elapsedSeconds: session.elapsedSeconds,
-    remainingSeconds,
+  
+  logInfo('Starting global billing batch processor', {
+    interval: BILLING_TICK_INTERVAL,
+    batchSize: BILLING_BATCH_SIZE,
   });
-
-  io.to(`user:${session.creatorFirebaseUid}`).emit('billing:update', {
-    callId,
-    earnings: parseFloat(earnings.toFixed(2)),
-    elapsedSeconds: session.elapsedSeconds,
+  
+  // Process immediately on start (for any calls already in Redis)
+  processBillingBatch(io).catch((err) => {
+    logError('Error in initial billing batch', err);
   });
+  
+  // Then process every second
+  globalBillingProcessor = setInterval(() => {
+    processBillingBatch(io).catch((err) => {
+      logError('Error in scheduled billing batch', err);
+    });
+  }, BILLING_TICK_INTERVAL);
+}
 
-  await billingDomainService.onTick(callId);
+/**
+ * Stop the global billing processor (called on server shutdown)
+ */
+export function stopGlobalBillingProcessor(): void {
+  if (globalBillingProcessor) {
+    clearInterval(globalBillingProcessor);
+    globalBillingProcessor = null;
+    logInfo('Stopped global billing batch processor', {});
+  }
+}
+
+/**
+ * Remove call from active billing (called when call ends)
+ */
+async function removeCallFromBilling(callId: string): Promise<void> {
+  const redis = getRedis();
+  await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
+  logDebug('Removed call from active billing', { callId });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -456,18 +590,18 @@ const settleLockKey = (callId: string): string => `${SETTLE_LOCK_PREFIX}${callId
  * for creator, REST API fallback).
  */
 async function settleCall(io: Server, callId: string): Promise<void> {
-  await billingDomainService.recordSettlementAttempt();
-
-  // Stop loop immediately
-  stopBillingLoop(callId);
-
-  // ── Fast in-memory check ───────────────────────────────────────────
-  if (settledCalls.has(callId)) {
-    console.log(`⚠️  [BILLING] Call ${callId} already settled (in-memory) — skipping`);
-    return;
-  }
+  // 🔥 FIX: Remove from active billing immediately (replaces stopBillingLoop)
+  await removeCallFromBilling(callId);
 
   const redis = getRedis();
+
+  // 🔥 FIX 1 & 4: Check Redis for settled call (removed in-memory check)
+  const settledKey = settledCallKey(callId);
+  const alreadySettled = await redis.get(settledKey);
+  if (alreadySettled) {
+    logWarning('Call already settled (Redis) — skipping', { callId });
+    return;
+  }
 
   // ── Atomic settlement lock (NX = only if not exists) ───────────────
   // Only the FIRST caller acquires the lock; every subsequent caller
@@ -477,20 +611,19 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     ex: 60,
   });
   if (!lockAcquired) {
-    await billingDomainService.recordSettlementConflict(callId, 'legacy_settle_lock_exists');
-    console.log(`⚠️  [BILLING] Settlement already in progress / completed for ${callId} — skipping`);
+    logWarning('Settlement already in progress / completed — skipping', { callId });
     return;
   }
 
-  // Mark settled in memory so future attempts skip immediately
-  settledCalls.add(callId);
-  // Clean up from memory after 5 minutes (safety net)
-  setTimeout(() => settledCalls.delete(callId), 5 * 60 * 1000);
+  // 🔥 FIX 1: Mark settled in Redis (replaces in-memory set)
+  await redis.set(settledKey, '1', {
+    ex: SETTLED_CALL_TTL,
+  });
 
   // ── Read final state from Redis ────────────────────────────────────
   const sessionRaw = await redis.get<string>(callSessionKey(callId));
   if (!sessionRaw) {
-    console.log(`⚠️  [BILLING] No session to settle for ${callId}`);
+    logWarning('No session to settle', { callId });
     // Clean up the lock since there's nothing to settle
     await redis.del(settleLockKey(callId));
     return;
@@ -505,22 +638,17 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   ]);
 
   const finalCoins = parseFloat((finalCoinsRaw as string) || '0');
-  const finalEarnings = parseFloat((finalEarningsRaw as string) || '0');
+  // Earnings are stored as integer micro-coins in Redis to avoid floating point drift
+  const earningsMicros = parseInt((finalEarningsRaw as string) || '0', 10) || 0;
+  const finalEarnings = earningsMicros / 10000;
   const totalDeducted = session.elapsedSeconds * session.pricePerSecond;
-  let legacySnapshot: BillingLegacySettlementSnapshot | null = {
+
+  logInfo('Settling call', {
     callId,
     elapsedSeconds: session.elapsedSeconds,
-    finalCoins,
-    finalEarnings,
-    totalDeducted,
-  };
-
-  console.log(
-    `💰 [BILLING] Settling call ${callId}: ` +
-      `${session.elapsedSeconds}s elapsed, ` +
-      `deducted ~${totalDeducted.toFixed(2)} coins, ` +
-      `creator earned ${finalEarnings.toFixed(2)}`
-  );
+    totalDeducted: totalDeducted.toFixed(2),
+    creatorEarnings: finalEarnings.toFixed(2),
+  });
 
   // ── Clean up Redis billing keys BEFORE writing to MongoDB ──────────
   // This ensures that even if another settleCall somehow slips through,
@@ -531,25 +659,31 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     redis.del(callCreatorEarningsKey(callId)),
   ]);
 
-  // Clean up user → call tracking immediately
-  activeCallsByUser.delete(session.userFirebaseUid);
-  activeCallsByUser.delete(session.creatorFirebaseUid);
+  // 🔥 FIX 1: Clean up user → call tracking from Redis immediately
+  await Promise.all([
+    redis.del(activeCallByUserKey(session.userFirebaseUid)),
+    redis.del(activeCallByUserKey(session.creatorFirebaseUid)),
+  ]);
+
+  // 🔥 CRITICAL FIX: MongoDB Transaction for Financial Operations
+  // Wrap all MongoDB operations in a transaction to ensure atomicity
+  // This prevents partial updates that could lead to financial inconsistencies
+  const dbSession = await mongoose.startSession();
+  dbSession.startTransaction();
 
   try {
-    // 1️⃣  Update user coin balance in MongoDB
-    const user = await User.findById(session.userMongoId);
-    if (user) {
-      user.coins = Math.max(0, Math.floor(finalCoins));
-      await user.save();
+    // ── Transactional MongoDB Operations ────────────────────────────────
+    // All operations below use { session: dbSession } to ensure atomicity
 
-      // Emit coins_updated so the user's UI updates the coin balance
-      io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
-        userId: user._id.toString(),
-        coins: user.coins,
-      });
+    // 1️⃣  Update user coin balance in MongoDB (within transaction)
+    const user = await User.findById(session.userMongoId).session(dbSession);
+    if (!user) {
+      throw new Error(`User not found: ${session.userMongoId}`);
     }
+    user.coins = Math.max(0, Math.floor(finalCoins));
+    await user.save({ session: dbSession });
 
-    // 2️⃣  Write debit transaction — idempotent by callId
+    // 2️⃣  Write debit transaction — idempotent by callId (within transaction)
     //     Use findOneAndUpdate with upsert so a duplicate settlement
     //     for the same callId simply overwrites (instead of inserting).
     if (totalDeducted > 0) {
@@ -565,145 +699,163 @@ async function settleCall(io: Server, callId: string): Promise<void> {
           callId,
           status: 'completed',
         },
-        { upsert: true, new: true }
+        { upsert: true, new: true, session: dbSession }
       );
     }
 
-    // 3️⃣  Credit creator's coin balance + write credit transaction
+    // 3️⃣  Credit creator's coin balance + write credit transaction (within transaction)
+    let creatorUser: typeof User | null = null;
     if (finalEarnings > 0) {
-      const creator = await Creator.findById(session.creatorMongoId);
-      if (creator) {
-        const creatorUser = await User.findById(creator.userId);
-        if (creatorUser) {
-          creatorUser.coins = (creatorUser.coins || 0) + Math.floor(finalEarnings);
-          await creatorUser.save();
-
-          // Idempotent credit transaction by callId
-          await CoinTransaction.findOneAndUpdate(
-            { callId, userId: creator.userId, type: 'credit' },
-            {
-              transactionId: `call_credit_${callId}`,
-              userId: creator.userId,
-              type: 'credit',
-              coins: Math.floor(finalEarnings),
-              source: 'video_call',
-              description: `Earned from video call (${session.elapsedSeconds}s)`,
-              callId,
-              status: 'completed',
-            },
-            { upsert: true, new: true }
-          );
-
-          // Emit coins_updated so the creator's UI updates the coin balance
-          io.to(`user:${session.creatorFirebaseUid}`).emit('coins_updated', {
-            userId: creatorUser._id.toString(),
-            coins: creatorUser.coins,
-          });
-        }
+      const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
+      if (!creator) {
+        throw new Error(`Creator not found: ${session.creatorMongoId}`);
       }
+      
+      creatorUser = await User.findById(creator.userId).session(dbSession);
+      if (!creatorUser) {
+        throw new Error(`Creator user not found: ${creator.userId}`);
+      }
+
+      // 🔥 FIX 7: Round earnings to 2 decimal places to avoid floating point errors
+      const roundedEarnings = Math.round(finalEarnings * 100) / 100;
+      const earningsCoins = Math.round(roundedEarnings); // Integer coins for balance
+      creatorUser.coins = Math.round((creatorUser.coins || 0) + earningsCoins);
+      await creatorUser.save({ session: dbSession });
+
+      // Idempotent credit transaction by callId
+      // 🔥 FIX 7: Use rounded earnings for transaction
+      await CoinTransaction.findOneAndUpdate(
+        { callId, userId: creator.userId, type: 'credit' },
+        {
+          transactionId: `call_credit_${callId}`,
+          userId: creator.userId,
+          type: 'credit',
+          coins: earningsCoins,
+          source: 'video_call',
+          description: `Earned from video call (${session.elapsedSeconds}s)`,
+          callId,
+          status: 'completed',
+        },
+        { upsert: true, new: true, session: dbSession }
+      );
     }
 
-    // 4️⃣  Save call history records (one per party) ─────────────
-    try {
-      const creatorDoc = await Creator.findById(session.creatorMongoId);
-      const userDoc = await User.findById(session.userMongoId);
-      const creatorUserDoc = creatorDoc
-        ? await User.findById(creatorDoc.userId)
-        : null;
+    // 4️⃣  Save call history records (one per party) within transaction
+    //     This ensures call history is consistent with financial transactions
+    const creatorDoc = await Creator.findById(session.creatorMongoId).session(dbSession);
+    const userDoc = await User.findById(session.userMongoId).session(dbSession);
+    const creatorUserDoc = creatorDoc
+      ? await User.findById(creatorDoc.userId).session(dbSession)
+      : null;
 
-      // Resolve display names
-      const userName =
-        userDoc?.username || userDoc?.phone || userDoc?.email || 'User';
-      const creatorName = creatorDoc?.name || 'Creator';
-      const userAvatar = userDoc?.avatar;
-      const creatorAvatar = creatorDoc?.photo;
-      const creatorOwnerUserId = creatorDoc?.userId; // Mongo _id of the creator's User doc
-      const creatorFirebaseUid =
-        creatorUserDoc?.firebaseUid || session.creatorFirebaseUid;
+    // Resolve display names
+    const userName =
+      userDoc?.username || userDoc?.phone || userDoc?.email || 'User';
+    const creatorName = creatorDoc?.name || 'Creator';
+    const userAvatar = userDoc?.avatar;
+    const creatorAvatar = creatorDoc?.photo;
+    const creatorOwnerUserId = creatorDoc?.userId; // Mongo _id of the creator's User doc
+    const creatorFirebaseUid =
+      creatorUserDoc?.firebaseUid || session.creatorFirebaseUid;
 
-      // Record for the USER: "I called <creator>"
+    // Record for the USER: "I called <creator>"
+    await CallHistory.findOneAndUpdate(
+      { callId, ownerUserId: session.userMongoId },
+      {
+        callId,
+        ownerUserId: session.userMongoId,
+        otherUserId: creatorOwnerUserId || session.creatorMongoId,
+        otherCreatorId: creatorDoc?._id, // Creator._id for call initiation from Recents
+        otherName: creatorName,
+        otherAvatar: creatorAvatar,
+        otherFirebaseUid: creatorFirebaseUid,
+        ownerRole: 'user',
+        durationSeconds: session.elapsedSeconds,
+        coinsDeducted: Math.ceil(totalDeducted),
+        coinsEarned: 0,
+      },
+      { upsert: true, new: true, session: dbSession }
+    );
+
+    // Record for the CREATOR: "I was called by <user>"
+    if (creatorOwnerUserId) {
       await CallHistory.findOneAndUpdate(
-        { callId, ownerUserId: session.userMongoId },
+        { callId, ownerUserId: creatorOwnerUserId },
         {
           callId,
-          ownerUserId: session.userMongoId,
-          otherUserId: creatorOwnerUserId || session.creatorMongoId,
-          otherCreatorId: creatorDoc?._id, // Creator._id for call initiation from Recents
-          otherName: creatorName,
-          otherAvatar: creatorAvatar,
-          otherFirebaseUid: creatorFirebaseUid,
-          ownerRole: 'user',
+          ownerUserId: creatorOwnerUserId,
+          otherUserId: session.userMongoId,
+          otherName: userName,
+          otherAvatar: userAvatar,
+          otherFirebaseUid: session.userFirebaseUid,
+          ownerRole: 'creator',
           durationSeconds: session.elapsedSeconds,
-          coinsDeducted: Math.ceil(totalDeducted),
-          coinsEarned: 0,
+          coinsDeducted: 0,
+          coinsEarned: Math.floor(finalEarnings),
         },
-        { upsert: true, new: true }
+        { upsert: true, new: true, session: dbSession }
       );
+    }
 
-      // Record for the CREATOR: "I was called by <user>"
-      if (creatorOwnerUserId) {
-        await CallHistory.findOneAndUpdate(
-          { callId, ownerUserId: creatorOwnerUserId },
-          {
-            callId,
-            ownerUserId: creatorOwnerUserId,
-            otherUserId: session.userMongoId,
-            otherName: userName,
-            otherAvatar: userAvatar,
-            otherFirebaseUid: session.userFirebaseUid,
-            ownerRole: 'creator',
-            durationSeconds: session.elapsedSeconds,
-            coinsDeducted: 0,
-            coinsEarned: Math.floor(finalEarnings),
-          },
-          { upsert: true, new: true }
-        );
-      }
 
-      console.log(`📋 [BILLING] Call history saved for ${callId}`);
+    // ── Commit Transaction ──────────────────────────────────────────────
+    // All MongoDB operations succeeded, commit the transaction
+    await dbSession.commitTransaction();
+    logInfo('Settlement transaction committed', { callId });
 
-      // 4.5️⃣ Add call activity message to user↔creator chat
-      // This makes completed calls visible in the chat timeline.
+    // ── Non-Transactional Operations (after successful transaction) ─────
+    // These operations are not critical for financial consistency and can fail
+    // without affecting the settlement integrity
+
+    // Emit coins_updated so the user's UI updates the coin balance
+    io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
+      userId: user._id.toString(),
+      coins: user.coins,
+    });
+
+    // Emit coins_updated so the creator's UI updates the coin balance
+    if (creatorUser) {
+      io.to(`user:${session.creatorFirebaseUid}`).emit('coins_updated', {
+        userId: creatorUser._id.toString(),
+        coins: creatorUser.coins,
+      });
+    }
+
+    // 4.5️⃣ Add call activity message to user↔creator chat
+    // This makes completed calls visible in the chat timeline.
+    try {
+      const streamClient = getStreamClient();
+      const channelId = generateUserCreatorChannelId(
+        session.userFirebaseUid,
+        session.creatorFirebaseUid,
+      );
+      const channelName = creatorName;
+
+      const channel = streamClient.channel('messaging', channelId, {
+        members: [session.userFirebaseUid, session.creatorFirebaseUid],
+        created_by_id: session.userFirebaseUid,
+        name: channelName,
+      });
+
+      // Channel may already exist; create ensures first-time call users still get a chat thread.
       try {
-        const streamClient = getStreamClient();
-        const channelId = generateUserCreatorChannelId(
-          session.userFirebaseUid,
-          session.creatorFirebaseUid,
-        );
-        const channelName = creatorName;
-
-        const channel = streamClient.channel('messaging', channelId, {
-          members: [session.userFirebaseUid, session.creatorFirebaseUid],
-          created_by_id: session.userFirebaseUid,
-          name: channelName,
-        });
-
-        // Channel may already exist; create ensures first-time call users still get a chat thread.
-        try {
-          await channel.create();
-        } catch (_) {
-          // Ignore "already exists" and other non-fatal create errors; sendMessage may still work.
-        }
-
-        const durationLabel = formatDurationLabel(session.elapsedSeconds);
-        const coinsSpent = Math.ceil(totalDeducted);
-        await channel.sendMessage({
-          id: `call_activity_${callId}`,
-          type: 'system',
-          text: `Video call completed (${durationLabel}) • ${coinsSpent} coin${coinsSpent === 1 ? '' : 's'} spent`,
-        });
-
-        console.log(`💬 [BILLING] Chat call activity message posted for ${callId}`);
-      } catch (chatErr) {
-        // Non-fatal — settlement remains successful.
-        console.error(`⚠️ [BILLING] Failed to post call activity in chat for ${callId}:`, chatErr);
+        await channel.create();
+      } catch (_) {
+        // Ignore "already exists" and other non-fatal create errors; sendMessage may still work.
       }
-    } catch (historyErr) {
-      // Non-fatal — billing settlement still succeeded
-      console.error(
-        `⚠️ [BILLING] Failed to save call history for ${callId}:`,
-        historyErr
-      );
+
+      const durationLabel = formatDurationLabel(session.elapsedSeconds);
+      const coinsSpent = Math.ceil(totalDeducted);
+      await channel.sendMessage({
+        id: `call_activity_${callId}`,
+        type: 'system',
+        text: `Video call completed (${durationLabel}) • ${coinsSpent} coin${coinsSpent === 1 ? '' : 's'} spent`,
+      });
+
+      logInfo('Chat call activity message posted', { callId });
+    } catch (chatErr) {
+      // Non-fatal — settlement remains successful.
+      logError('Failed to post call activity in chat', chatErr, { callId });
     }
 
     // 5️⃣  Invalidate caches BEFORE emitting events to clients.
@@ -713,11 +865,14 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     try {
       const creatorDoc2 = await Creator.findById(session.creatorMongoId);
       if (creatorDoc2) {
+        // 🔥 SCALABILITY FIX: Invalidate both tasks and dashboard cache
+        // Tasks cache needs invalidation because CallHistory is created, affecting task progress
+        await invalidateCreatorTasks(creatorDoc2.userId.toString());
         await invalidateCreatorDashboard(creatorDoc2.userId.toString());
       }
       await invalidateAdminCaches('overview', 'coins', 'creators_performance');
     } catch (cacheErr) {
-      console.error(`⚠️ [BILLING] Failed to invalidate caches for ${callId}:`, cacheErr);
+      logError('Failed to invalidate caches', cacheErr, { callId });
     }
 
     // 6️⃣  Notify both parties of final settlement
@@ -728,9 +883,12 @@ async function settleCall(io: Server, callId: string): Promise<void> {
       durationSeconds: session.elapsedSeconds,
     });
 
+    // 🔥 FIX 7: Round final earnings to integer for settlement
+    const finalEarningsRounded = Math.round(finalEarnings);
+    
     io.to(`user:${session.creatorFirebaseUid}`).emit('billing:settled', {
       callId,
-      totalEarned: Math.floor(finalEarnings),
+      totalEarned: finalEarningsRounded,
       durationSeconds: session.elapsedSeconds,
     });
 
@@ -741,12 +899,12 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         emitCreatorDataUpdated(session.creatorFirebaseUid, {
           reason: 'call_settled',
           callId,
-          totalEarned: Math.floor(finalEarnings),
+          totalEarned: finalEarningsRounded,
           durationSeconds: session.elapsedSeconds,
         });
       }
     } catch (emitErr) {
-      console.error(`⚠️ [BILLING] Failed to emit creator data update for ${callId}:`, emitErr);
+      logError('Failed to emit creator data update', emitErr, { callId });
     }
 
     // Balance integrity checks (fire-and-forget)
@@ -761,24 +919,28 @@ async function settleCall(io: Server, callId: string): Promise<void> {
       creatorFirebaseUid: session.creatorFirebaseUid,
       durationSeconds: session.elapsedSeconds,
       coinsDeducted: Math.floor(totalDeducted),
-      creatorEarned: Math.floor(finalEarnings),
+      creatorEarned: finalEarningsRounded,
     });
 
-    console.log(`✅ [BILLING] Settlement complete for call ${callId}`);
+    logInfo('Settlement complete', { callId });
   } catch (err) {
-    legacySnapshot = null;
-    console.error(`❌ [BILLING] Settlement failed for ${callId}:`, err);
-  } finally {
-    if (legacySnapshot) {
-      await billingDomainService.settleShadowAndCompare({
-        ...legacySnapshot,
-        totalDeducted: Number(legacySnapshot.totalDeducted.toFixed(4)),
-        finalCoins: Number(legacySnapshot.finalCoins.toFixed(4)),
-        finalEarnings: Number(legacySnapshot.finalEarnings.toFixed(4)),
-        elapsedSeconds: legacySnapshot.elapsedSeconds,
-      });
+    // ── Transaction Rollback on Error ───────────────────────────────────
+    // If any MongoDB operation fails, rollback the entire transaction
+    // This ensures no partial updates occur
+    try {
+      await dbSession.abortTransaction();
+      logError('Settlement transaction aborted', err, { callId });
+      recordBillingMetric('settlement_transaction_failed', 1, { callId });
+    } catch (abortErr) {
+      logError('Failed to abort transaction', abortErr, { callId });
     }
-
+    
+    // Re-throw error so it's logged by outer catch block
+    throw err;
+  } finally {
+    // Always end the database session
+    await dbSession.endSession();
+    
     // 8️⃣  Clean up lock key (allow re-settlement if the process crashed
     //     before this point — the 60 s TTL handles that case too).
     await redis.del(settleLockKey(callId)).catch(() => {});
@@ -798,13 +960,16 @@ export async function handleCallStartedHttp(
   userFirebaseUid: string,
   data: { callId: string; creatorFirebaseUid: string; creatorMongoId: string }
 ): Promise<void> {
-  console.log(`🌐 [BILLING HTTP] handleCallStartedHttp for ${data.callId}`);
+  logInfo('handleCallStartedHttp', { callId: data.callId, userFirebaseUid });
   await handleCallStarted(io, userFirebaseUid, data);
 
-  // If call:ended arrived while we were setting up, settle now
-  if (pendingCallEnds.has(data.callId)) {
-    pendingCallEnds.delete(data.callId);
-    console.log(`💰 [BILLING HTTP] Deferred settlement for ${data.callId}`);
+  // 🔥 FIX 1: Check Redis for pending call end
+  const redis = getRedis();
+  const pendingEndKey = pendingCallEndKey(data.callId);
+  const hasPendingEnd = await redis.get<string>(pendingEndKey);
+  if (hasPendingEnd) {
+    await redis.del(pendingEndKey);
+    logInfo('Deferred settlement (HTTP)', { callId: data.callId });
     await settleCall(io, data.callId);
   }
 }
@@ -817,15 +982,20 @@ export async function settleCallHttp(
   io: Server,
   callId: string
 ): Promise<void> {
-  console.log(`🌐 [BILLING HTTP] settleCallHttp for ${callId}`);
+  logInfo('settleCallHttp', { callId });
 
   const redis = getRedis();
   const sessionExists = await redis.get(callSessionKey(callId));
 
-  if (!sessionExists && !activeBillingIntervals.has(callId)) {
-    pendingCallEnds.add(callId);
-    console.log(`⏳ [BILLING HTTP] Deferring call:ended for ${callId} (session not ready)`);
-    setTimeout(() => pendingCallEnds.delete(callId), 60_000);
+  // 🔥 FIX: Check if call is in active billing set instead of activeBillingIntervals
+  const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
+  
+  if (!sessionExists && !isInActiveBilling) {
+    // 🔥 FIX 1: Store in Redis with TTL for automatic cleanup
+    await redis.set(pendingCallEndKey(callId), '1', {
+      ex: PENDING_CALL_END_TTL,
+    });
+    logInfo('Deferring call:ended (HTTP, session not ready)', { callId });
     return;
   }
 
@@ -836,12 +1006,12 @@ export async function settleCallHttp(
 // CLEANUP (called on server shutdown)
 // ══════════════════════════════════════════════════════════════════════════
 export function cleanupBillingIntervals(): void {
-  for (const [callId, interval] of activeBillingIntervals.entries()) {
-    clearInterval(interval);
-    console.log(`🧹 [BILLING] Cleaned up interval for ${callId}`);
-  }
-  activeBillingIntervals.clear();
-  activeCallsByUser.clear();
-  pendingCallEnds.clear();
-  settledCalls.clear();
+  // 🔥 FIX: Stop global billing processor instead of per-call intervals
+  stopGlobalBillingProcessor();
+  
+  // 🔥 FIX 1: No need to clear in-memory state (moved to Redis)
+  // Redis keys have TTLs and will expire automatically
+  // Active calls will be cleaned up when they settle or expire
+  
+  logInfo('Cleaned up billing system', {});
 }

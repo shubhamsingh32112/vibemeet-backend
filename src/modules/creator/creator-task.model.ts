@@ -64,7 +64,8 @@ creatorTaskProgressSchema.index(
 // Index for efficient queries by creator and period
 creatorTaskProgressSchema.index({ creatorUserId: 1, periodStart: 1 });
 
-// periodStart already has field-level index above; avoid duplicate index definition warnings.
+// Index for cleanup of old periods
+creatorTaskProgressSchema.index({ periodStart: 1 });
 
 export const CreatorTaskProgress = mongoose.model<ICreatorTaskProgress>(
   'CreatorTaskProgress',

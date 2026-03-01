@@ -1,11 +1,9 @@
 import type { Request } from 'express';
 import { Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { requireEnv } from '../config/env';
-import { featureFlags } from '../config/feature-flags';
 import { getFirebaseAdmin } from '../config/firebase';
 import { User } from '../modules/user/user.model';
-import { logger } from '../utils/logger';
+import { logError, logInfo, logDebug, logWarning } from '../utils/logger';
 
 /**
  * Verifies either a Firebase ID token (mobile app) or a custom admin JWT (admin website).
@@ -17,25 +15,12 @@ export const verifyFirebaseToken = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    logger.info('auth.middleware.verify.started', { path: req.path, ip: req.ip });
-
-    if (featureFlags.authBypassForTests) {
-      const testFirebaseUid = (req.header('x-test-firebase-uid') || '').trim();
-      if (testFirebaseUid) {
-        req.auth = {
-          firebaseUid: testFirebaseUid,
-          email: req.header('x-test-email') || undefined,
-        };
-        logger.warn('auth.middleware.test_bypass.used', { firebaseUid: testFirebaseUid });
-        next();
-        return;
-      }
-    }
-
+    logDebug('Verifying token', { path: req.path, ip: req.ip });
+    
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      logger.warn('auth.middleware.verify.missing_header');
+      logWarning('No authorization header', { path: req.path, ip: req.ip });
       res.status(401).json({
         success: false,
         error: 'Unauthorized: No token provided',
@@ -44,10 +29,10 @@ export const verifyFirebaseToken = async (
     }
 
     const token = authHeader.split('Bearer ')[1];
-    logger.debug('auth.middleware.verify.token_received', { tokenLength: token.length });
+    logDebug('Token received', { path: req.path, tokenLength: token.length });
 
     // --- Try Admin JWT first (short tokens, ~236 chars) ---
-    const jwtSecret = requireEnv('JWT_SECRET');
+    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
     if (jwtSecret) {
       try {
         const decoded = jwt.verify(token, jwtSecret) as {
@@ -60,9 +45,10 @@ export const verifyFirebaseToken = async (
           // Look up the admin user to get their firebaseUid
           const adminUser = await User.findById(decoded.userId);
           if (adminUser && adminUser.role === 'admin') {
-            logger.info('auth.middleware.verify.admin_jwt_success', {
+            logInfo('Admin JWT verified', {
               adminId: adminUser._id.toString(),
               email: adminUser.email || 'N/A',
+              path: req.path,
             });
 
             req.auth = {
@@ -70,6 +56,7 @@ export const verifyFirebaseToken = async (
               email: adminUser.email,
             };
 
+            logInfo('Admin authentication successful', { path: req.path });
             next();
             return;
           }
@@ -81,13 +68,14 @@ export const verifyFirebaseToken = async (
 
     // --- Firebase ID token verification (Flutter app) ---
     const admin = getFirebaseAdmin();
-
-    logger.info('auth.middleware.verify.firebase_verification_started');
+    
+    logDebug('Verifying token with Firebase Admin', { path: req.path });
     const decodedToken = await admin.auth().verifyIdToken(token);
-    logger.info('auth.middleware.verify.firebase_success', {
+    logInfo('Firebase token verified', {
       firebaseUid: decodedToken.uid,
       email: decodedToken.email || 'N/A',
       phone: decodedToken.phone_number || 'N/A',
+      path: req.path,
     });
 
     req.auth = {
@@ -96,11 +84,12 @@ export const verifyFirebaseToken = async (
       phone: decodedToken.phone_number,
     };
 
+    logInfo('Authentication successful', { path: req.path });
     next();
   } catch (error) {
-    logger.error('auth.middleware.verify.failed', {
-      message: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined,
+    logError('Token verification error', error, {
+      path: req.path,
+      ip: req.ip,
     });
     res.status(401).json({
       success: false,

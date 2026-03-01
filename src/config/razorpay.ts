@@ -1,4 +1,5 @@
 import Razorpay from 'razorpay';
+import { logInfo } from '../utils/logger';
 
 let razorpayInstance: InstanceType<typeof Razorpay> | null = null;
 
@@ -23,7 +24,7 @@ export function getRazorpayInstance(): InstanceType<typeof Razorpay> {
     key_secret: keySecret,
   });
 
-  console.log('✅ [RAZORPAY] Instance initialized');
+  logInfo('Razorpay instance initialized');
   return razorpayInstance;
 }
 

@@ -1639,7 +1639,8 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           creatorName: resolved.creator?.name || resolved.user?.username || 'Unknown',
           creatorEmail: resolved.user?.email || null,
           creatorPhone: resolved.user?.phone || null,
-          creatorCurrentBalance: resolved.creator?.earningsCoins ?? resolved.user?.coins ?? 0,
+          // Use User.coins as primary source (actual balance), fallback to Creator.earningsCoins if user not found
+          creatorCurrentBalance: resolved.user?.coins ?? resolved.creator?.earningsCoins ?? 0,
           amount: w.amount,
           status: w.status,
           requestedAt: (w as any).requestedAt || w.createdAt,
@@ -1648,6 +1649,12 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           notes: w.notes || (w as any).note || null,
           transactionId: w.transactionId || null,
           createdAt: w.createdAt,
+          // Withdrawal details
+          name: (w as any).name || null,
+          number: (w as any).number || null,
+          upi: (w as any).upi || null,
+          accountNumber: (w as any).accountNumber || null,
+          ifsc: (w as any).ifsc || null,
         };
       })
     );
@@ -1776,8 +1783,9 @@ export const approveWithdrawal = async (req: Request, res: Response): Promise<vo
     // Find the Creator document to update earningsCoins
     const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
 
-    // Verify balance is sufficient (check Creator.earningsCoins first, fallback to User.coins)
-    const availableBalance = creatorDoc?.earningsCoins ?? creatorUser.coins;
+    // Verify balance is sufficient (use User.coins as primary source - actual available balance)
+    // Creator.earningsCoins is a separate tracking field that may be 0 or out of sync
+    const availableBalance = creatorUser.coins;
     if (availableBalance < withdrawal.amount) {
       res.status(400).json({
         success: false,
@@ -1837,6 +1845,31 @@ export const approveWithdrawal = async (req: Request, res: Response): Promise<vo
 
     // Balance integrity check (fire-and-forget)
     verifyUserBalance(creatorUser._id).catch(() => {});
+
+    // Emit coins_updated socket event so creator's app updates instantly
+    try {
+      const io = getIO();
+      io.to(`user:${creatorUser.firebaseUid}`).emit('coins_updated', {
+        userId: creatorUser._id.toString(),
+        coins: creatorUser.coins,
+      });
+      console.log(`📡 [ADMIN] Emitted coins_updated to ${creatorUser.firebaseUid} (${creatorUser.coins} coins)`);
+    } catch (socketErr) {
+      console.error('⚠️ [ADMIN] Failed to emit coins_updated:', socketErr);
+    }
+
+    // Emit creator:data_updated to refresh creator dashboard (earnings, tasks, etc.)
+    try {
+      const { emitCreatorDataUpdated } = require('../creator/creator.controller');
+      emitCreatorDataUpdated(creatorUser.firebaseUid, {
+        reason: 'withdrawal_approved',
+        coins: creatorUser.coins,
+        withdrawalAmount: withdrawal.amount,
+        withdrawalId: withdrawal._id.toString(),
+      });
+    } catch (emitErr) {
+      console.error('⚠️ [ADMIN] Failed to emit creator:data_updated:', emitErr);
+    }
 
     // Invalidate caches
     await invalidateAdminCaches('overview', 'coins', 'creators_performance');
@@ -2087,10 +2120,15 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
       data: {
         tickets: tickets.map((t) => {
           const user = userMap.get(t.userId.toString());
+          // Better fallback: try username, email, phone, or userId
+          const displayName = user?.username || 
+                             user?.email || 
+                             user?.phone || 
+                             (user ? `User ${t.userId.toString().substring(0, 8)}` : 'Unknown');
           return {
             id: t._id.toString(),
             userId: t.userId.toString(),
-            username: user?.username || user?.email || 'Unknown',
+            username: displayName,
             email: user?.email || null,
             phone: user?.phone || null,
             userRole: user?.role || null,

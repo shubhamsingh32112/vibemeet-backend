@@ -115,4 +115,14 @@ callHistorySchema.index({ ownerUserId: 1, createdAt: -1 });
 // Prevent duplicate records (one per party per call)
 callHistorySchema.index({ callId: 1, ownerUserId: 1 }, { unique: true });
 
+// 🔥 SCALABILITY FIX: Compound index for creator task progress queries
+// Optimizes aggregation queries that filter by ownerUserId, ownerRole, and createdAt
+// Used in: getCreatorTasks, getCreatorDashboard, claimTaskReward
+callHistorySchema.index({ 
+  ownerUserId: 1, 
+  ownerRole: 1, 
+  createdAt: 1,
+  durationSeconds: 1 
+});
+
 export const CallHistory = mongoose.model<ICallHistory>('CallHistory', callHistorySchema);

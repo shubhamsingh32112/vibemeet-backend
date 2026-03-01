@@ -23,6 +23,12 @@ export interface IWithdrawal extends Document {
   adminUserId?: mongoose.Types.ObjectId;
   notes?: string;
   transactionId?: string; // Links to CoinTransaction on approval
+  // Withdrawal details
+  name?: string;
+  number?: string;
+  upi?: string;
+  accountNumber?: string;
+  ifsc?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -67,6 +73,22 @@ const withdrawalSchema = new Schema<IWithdrawal>(
       type: String,
       index: true,
     },
+    // Withdrawal details
+    name: {
+      type: String,
+    },
+    number: {
+      type: String,
+    },
+    upi: {
+      type: String,
+    },
+    accountNumber: {
+      type: String,
+    },
+    ifsc: {
+      type: String,
+    },
   },
   {
     timestamps: true,
@@ -77,5 +99,7 @@ const withdrawalSchema = new Schema<IWithdrawal>(
 withdrawalSchema.index({ creatorUserId: 1, status: 1 });
 withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });
+// Index for cooldown check: find recent withdrawals by creator
+withdrawalSchema.index({ creatorUserId: 1, requestedAt: -1 });
 
 export const Withdrawal = mongoose.model<IWithdrawal>('Withdrawal', withdrawalSchema);
