@@ -3,7 +3,7 @@ import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { billingLimiter } from '../../middlewares/rate-limit.middleware';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from './billing.gateway';
-import { logInfo, logError, logDebug } from '../../utils/logger';
+import { logError, logDebug } from '../../utils/logger';
 
 const router = Router();
 

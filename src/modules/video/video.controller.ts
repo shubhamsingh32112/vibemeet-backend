@@ -1,12 +1,9 @@
 import type { Request } from 'express';
 import { Response } from 'express';
-import axios from 'axios';
 import { User } from '../user/user.model';
-import { Creator } from '../creator/creator.model';
-import { Call } from './call.model';
 import { generateStreamVideoToken } from '../../config/stream-video';
 import { videoCallService, VideoCallError } from './video.service';
-import { logWarning, logInfo, logDebug } from '../../utils/logger';
+import { logDebug } from '../../utils/logger';
 
 /**
  * POST /api/v1/video/token

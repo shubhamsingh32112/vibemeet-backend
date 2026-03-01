@@ -5,7 +5,6 @@ import { verifyStreamWebhookSignature } from '../../middlewares/webhook-signatur
 import { callInitiateLimiter, callAcceptLimiter, webhookLimiter } from '../../middlewares/rate-limit.middleware';
 import { handleStreamVideoWebhook } from './video.webhook';
 import { User } from '../user/user.model';
-import { getRedis, callSessionKey } from '../../config/redis';
 
 const router = Router();
 
@@ -32,8 +31,6 @@ router.get('/calls/active', verifyFirebaseToken, async (req: Request, res: Respo
       return;
     }
 
-    const redis = getRedis();
-    
     // Get user from database
     const user = await User.findOne({ firebaseUid });
     if (!user) {

@@ -6,7 +6,7 @@ import {
   generateCallId,
   generateServerSideToken,
 } from '../../config/stream-video';
-import { CREATOR_SHARE_PERCENTAGE, MIN_COINS_TO_CALL } from '../../config/pricing.config';
+import { MIN_COINS_TO_CALL } from '../../config/pricing.config';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { logWarning, logInfo } from '../../utils/logger';
 import { acquireCreatorCallLock } from './creator-call-lock.service';
@@ -198,7 +198,7 @@ export class VideoCallService {
       // Use existing circuit breaker + monitoring utilities
       // (require used to avoid circular import at module top-level)
       const { streamVideoCircuitBreaker } = require('../../utils/circuit-breaker');
-      const { recordAPIMetric, monitoring } = require('../../utils/monitoring');
+      const { recordAPIMetric } = require('../../utils/monitoring');
 
       const startTime = Date.now();
       const response = await streamVideoCircuitBreaker.execute(async () => {

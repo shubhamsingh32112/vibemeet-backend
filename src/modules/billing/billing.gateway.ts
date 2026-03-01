@@ -20,7 +20,7 @@ import {
   BATCH_PROCESSOR_LOCK_KEY,
   BATCH_PROCESSOR_LOCK_TTL,
 } from '../../config/redis';
-import { User } from '../user/user.model';
+import { User, IUser } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from './call-history.model';
@@ -704,7 +704,7 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     }
 
     // 3️⃣  Credit creator's coin balance + write credit transaction (within transaction)
-    let creatorUser: typeof User | null = null;
+    let creatorUser: (mongoose.Document<unknown, {}, IUser> & IUser) | null = null;
     if (finalEarnings > 0) {
       const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
       if (!creator) {

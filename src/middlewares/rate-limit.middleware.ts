@@ -1,5 +1,5 @@
 import rateLimit from 'express-rate-limit';
-import type { Request, Response } from 'express';
+import type { Request } from 'express';
 
 /**
  * 🔥 FIX 11: Rate Limiting for Video Calling Endpoints
@@ -24,7 +24,7 @@ export const callInitiateLimiter = rateLimit({
     const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
     return `call_initiate:${firebaseUid}`;
   },
-  skip: (req: Request): boolean => {
+  skip: (_req: Request): boolean => {
     // Skip rate limiting in development if needed
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
@@ -95,7 +95,7 @@ export const withdrawalLimiter = rateLimit({
     const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
     return `withdrawal:${firebaseUid}`;
   },
-  skip: (req: Request): boolean => {
+  skip: (_req: Request): boolean => {
     // Skip rate limiting in development if needed
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
@@ -117,7 +117,7 @@ export const tasksLimiter = rateLimit({
     const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
     return `tasks:${firebaseUid}`;
   },
-  skip: (req: Request): boolean => {
+  skip: (_req: Request): boolean => {
     // Skip rate limiting in development if needed
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },

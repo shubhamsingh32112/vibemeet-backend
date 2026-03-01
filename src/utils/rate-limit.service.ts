@@ -1,5 +1,5 @@
 import { getRedis } from '../config/redis';
-import logger, { logWarning, logInfo, logError, logDebug } from './logger';
+import logger, { logWarning, logInfo, logDebug } from './logger';
 import { recordBillingMetric } from './monitoring';
 
 /**

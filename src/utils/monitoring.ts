@@ -198,7 +198,6 @@ class MonitoringService {
   private async persistToRedis(): Promise<void> {
     try {
       const redis = getRedis();
-      const now = Date.now();
 
       // Persist metrics by name (sorted set - score = timestamp)
       const metricsByName: Record<string, Metric[]> = {};

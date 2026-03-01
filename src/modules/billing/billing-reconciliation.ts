@@ -6,9 +6,9 @@
  */
 
 import { Server } from 'socket.io';
-import { getRedis, dlqBillingKey, DLQ_BILLING_PREFIX, RECONCILIATION_LAST_RUN_KEY, RECONCILIATION_INTERVAL_MS, ACTIVE_BILLING_CALLS_KEY, callSessionKey } from '../../config/redis';
+import { getRedis, DLQ_BILLING_PREFIX, RECONCILIATION_LAST_RUN_KEY, RECONCILIATION_INTERVAL_MS, ACTIVE_BILLING_CALLS_KEY, callSessionKey } from '../../config/redis';
 import { billingService } from './billing.service';
-import logger, { logInfo, logError, logWarning } from '../../utils/logger';
+import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;

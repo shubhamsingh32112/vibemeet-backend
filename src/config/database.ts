@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { mongoPoolMonitor } from '../utils/mongo-pool-monitor';
-import logger, { logInfo, logError } from '../utils/logger';
+import { logInfo, logError } from '../utils/logger';
 
 /**
  * 🔥 FIX 8: MongoDB Connection Pooling Configuration
