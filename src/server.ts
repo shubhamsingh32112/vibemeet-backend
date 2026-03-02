@@ -27,6 +27,7 @@ import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { logRateLimitConfig } from './utils/rate-limit.service';
 import { requestQueueMiddleware, getRequestQueueStats } from './middlewares/request-queue.middleware';
 import { mongoPoolMonitor } from './utils/mongo-pool-monitor';
+import mongoose from 'mongoose';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -144,14 +145,21 @@ app.get('/ready', async (_req, res) => {
 
   // MongoDB readiness
   try {
-    // Lazy import to avoid circular deps at startup
-    const mongoose = await import('mongoose');
-    const state = mongoose.connection.readyState;
-    // 1 = connected, 2 = connecting (treat as not-ready)
-    checks.mongo = {
-      ok: state === 1,
-      error: state === 1 ? undefined : `mongo_state_${state}`,
-    };
+    // Check if mongoose connection exists and is ready
+    if (!mongoose.connection || mongoose.connection.readyState === undefined) {
+      checks.mongo = {
+        ok: false,
+        error: 'mongoose_not_initialized',
+      };
+    } else {
+      const state = mongoose.connection.readyState;
+      // 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
+      // Only state 1 (connected) is considered ready
+      checks.mongo = {
+        ok: state === 1,
+        error: state === 1 ? undefined : `mongo_state_${state}`,
+      };
+    }
   } catch (err: any) {
     checks.mongo = {
       ok: false,
