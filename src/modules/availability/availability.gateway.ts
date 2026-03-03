@@ -32,11 +32,6 @@ const userSocketCounts = new Map<string, number>();
 // Track heartbeat intervals for users
 const userHeartbeatIntervals = new Map<string, NodeJS.Timeout>();
 
-// Redis key prefix for user availability
-const USER_AVAILABILITY_KEY_PREFIX = 'user:availability:';
-const userAvailabilityKey = (firebaseUid: string): string =>
-  `${USER_AVAILABILITY_KEY_PREFIX}${firebaseUid}`;
-
 function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefined): string[] {
   if (Array.isArray(data)) {
     return data.filter((id): id is string => typeof id === 'string');
