@@ -82,7 +82,7 @@ export const getRedis = (): Redis => {
       });
     });
     
-    redis.on('reconnecting', (delay) => {
+    redis.on('reconnecting', (delay: number) => {
       logWarning('Redis reconnecting', { delay });
     });
   }
