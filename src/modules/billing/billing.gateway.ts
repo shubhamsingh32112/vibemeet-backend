@@ -13,7 +13,6 @@ import {
   activeCallByUserKey,
   pendingCallEndKey,
   settledCallKey,
-  ACTIVE_CALL_BY_USER_TTL,
   PENDING_CALL_END_TTL,
   SETTLED_CALL_TTL,
   // 🔥 FIX 3: Distributed lock for batch processor

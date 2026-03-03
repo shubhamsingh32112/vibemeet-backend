@@ -24,7 +24,6 @@ import { getFirebaseAdmin } from '../../config/firebase';
 import { User } from '../user/user.model';
 import {
   setAvailability,
-  getAvailability,
   refreshAvailability,
   getBatchAvailability,
   CreatorAvailability,
