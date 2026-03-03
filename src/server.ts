@@ -167,15 +167,24 @@ app.get('/ready', async (_req, res) => {
     };
   }
 
-  // Redis readiness (configuration + simple ping)
+  // Redis readiness (configuration + write/read test)
   try {
     if (!isRedisConfigured()) {
       checks.redis = { ok: false, error: 'not_configured' };
     } else {
       const { getRedis } = await import('./config/redis');
       const redis = getRedis();
-      await redis.setex('healthcheck:ready', 30, Date.now().toString());
-      checks.redis = { ok: true };
+      
+      // Test write/read operations (not just ping)
+      const testKey = `healthcheck:ready:${Date.now()}`;
+      await redis.setex(testKey, 10, 'test');
+      const value = await redis.get(testKey);
+      await redis.del(testKey);
+      
+      checks.redis = {
+        ok: value === 'test',
+        error: value === 'test' ? undefined : 'read_write_test_failed',
+      };
     }
   } catch (err: any) {
     checks.redis = {
@@ -314,11 +323,43 @@ const startServer = async () => {
     setupAdminGateway(io);
     logInfo('Socket.IO admin gateway ready');
     
-    // 🔴 Check Redis configuration (Railway Redis)
+    // 🔴 Check Redis configuration (Railway Redis) - CRITICAL for billing
     if (isRedisConfigured()) {
-      logInfo('Railway Redis configured');
+      try {
+        const { getRedis } = await import('./config/redis');
+        const redis = getRedis();
+        
+        // Test Redis connection with ping
+        await redis.ping();
+        logInfo('Railway Redis connected successfully');
+        
+        // Test write/read operations
+        const testKey = `healthcheck:startup:${Date.now()}`;
+        await redis.setex(testKey, 10, 'test');
+        const value = await redis.get(testKey);
+        await redis.del(testKey);
+        
+        if (value !== 'test') {
+          logError('CRITICAL: Redis write/read test failed', new Error('Read value mismatch'), {
+            alert: true,
+            impact: 'Billing will not work correctly',
+          });
+        } else {
+          logInfo('Railway Redis health check passed');
+        }
+      } catch (err) {
+        logError('CRITICAL: Redis connection failed', err, {
+          alert: true,
+          impact: 'Billing will not work - coins will not be deducted, creators will not earn',
+          requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
+        });
+        // Optionally: throw error to prevent server start
+        // throw new Error('Redis connection required for billing');
+      }
     } else {
-      logWarning('Railway Redis NOT configured - availability will fail', {
+      logError('CRITICAL: Redis not configured', {
+        alert: true,
+        impact: 'Billing will not work - coins will not be deducted, creators will not earn',
         requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
       });
     }

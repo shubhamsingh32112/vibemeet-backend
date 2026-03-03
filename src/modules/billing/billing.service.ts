@@ -119,11 +119,39 @@ export class BillingService {
     };
 
     // Seed Redis
-    await Promise.all([
-      redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
-      redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, user.coins.toString()),
-      redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0'),
-    ]);
+    try {
+      await Promise.all([
+        redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
+        redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, user.coins.toString()),
+        redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0'),
+      ]);
+      
+      logInfo('Billing session started - Redis keys seeded', {
+        callId,
+        redisKeys: {
+          session: callSessionKey(callId),
+          coins: callUserCoinsKey(callId),
+          earnings: callCreatorEarningsKey(callId),
+        },
+        initialCoins: user.coins,
+      });
+    } catch (redisError) {
+      logError('CRITICAL: Failed to start billing session in Redis', redisError, {
+        callId,
+        userFirebaseUid,
+        alert: true,
+        impact: 'Billing will not work for this call',
+      });
+      
+      // Emit error to client
+      io.to(`user:${userFirebaseUid}`).emit('billing:error', {
+        callId,
+        error: 'REDIS_UNAVAILABLE',
+        message: 'Billing system unavailable. Please try again.',
+      });
+      
+      throw redisError; // Prevent call from starting without billing
+    }
 
     const maxSeconds = Math.floor(user.coins / pricePerSecond);
 
@@ -191,8 +219,19 @@ export class BillingService {
     const redis = getRedis();
 
     // Read session
-    const sessionRaw = await redis.get(callSessionKey(callId));
+    let sessionRaw: string | null;
+    try {
+      sessionRaw = await redis.get(callSessionKey(callId));
+    } catch (redisError) {
+      logError('CRITICAL: Redis error reading session', redisError, {
+        callId,
+        alert: true,
+      });
+      throw redisError; // Will be caught by retry wrapper
+    }
+    
     if (!sessionRaw) {
+      logWarning('Session not found in Redis', { callId });
       return false; // Session doesn't exist
     }
 
@@ -322,12 +361,38 @@ export class BillingService {
     }
 
     // Persist to Redis
-    await Promise.all([
-      redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, coins.toString()),
-      redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, earningsMicros.toString()),
-      redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
-      redis.setex(idempotencyKeyValue, 300, '1'),
-    ]);
+    try {
+      await Promise.all([
+        redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, coins.toString()),
+        redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, earningsMicros.toString()),
+        redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
+        redis.setex(idempotencyKeyValue, 300, '1'),
+      ]);
+      
+      logInfo('Billing tick processed - Redis updated', {
+        callId,
+        elapsedSeconds: session.elapsedSeconds,
+        coinsBefore: parseFloat(coinsRaw as string),
+        coinsAfter: coins,
+        earningsBefore: earningsMicros / EARNINGS_MICRO_FACTOR,
+        earningsAfter: (earningsMicros + earningsIncrementMicros) / EARNINGS_MICRO_FACTOR,
+      });
+    } catch (redisError) {
+      logError('CRITICAL: Redis error during billing tick', redisError, {
+        callId,
+        elapsedSeconds: session.elapsedSeconds,
+        alert: true,
+      });
+      
+      // Emit error to clients
+      io.to(`user:${session.userFirebaseUid}`).emit('billing:error', {
+        callId,
+        error: 'REDIS_ERROR',
+        message: 'Billing update failed. Call will be settled when it ends.',
+      });
+      
+      throw redisError; // Will be caught by retry wrapper and added to DLQ
+    }
 
     const remainingSeconds = Math.floor(coins / session.pricePerSecond);
 

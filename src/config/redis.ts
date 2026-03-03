@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import { logInfo, logError } from '../utils/logger';
+import { logInfo, logError, logWarning } from '../utils/logger';
 
 let redis: Redis | null = null;
 
@@ -7,6 +7,16 @@ export const getRedis = (): Redis => {
   if (!redis) {
     // Railway Redis connection - supports both REDIS_URL and individual variables
     const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
+    
+    if (!redisUrl && !process.env.REDISHOST) {
+      const error = new Error(
+        'CRITICAL: Redis not configured. Billing will not work.\n' +
+        'Required: REDIS_URL, REDIS_PUBLIC_URL, or REDISHOST environment variable.\n' +
+        'Railway Redis: Add Redis service and configure environment variables.'
+      );
+      logError('Redis configuration missing', error, { alert: true });
+      throw error;
+    }
     
     if (redisUrl) {
       // Use connection URL if provided
@@ -16,6 +26,8 @@ export const getRedis = (): Redis => {
           return delay;
         },
         maxRetriesPerRequest: 3,
+        enableReadyCheck: true,
+        connectTimeout: 10000,
       });
       logInfo('Railway Redis client initialized from URL', {
         url: redisUrl.replace(/:[^:@]+@/, ':****@'), // Mask password in logs
@@ -27,12 +39,6 @@ export const getRedis = (): Redis => {
       const password = process.env.REDIS_PASSWORD || process.env.REDISPASSWORD;
       const username = process.env.REDISUSER;
 
-      if (!host) {
-        throw new Error(
-          'Missing Redis configuration. Provide either REDIS_URL/REDIS_PUBLIC_URL or REDISHOST environment variable'
-        );
-      }
-
       redis = new Redis({
         host,
         port,
@@ -43,6 +49,8 @@ export const getRedis = (): Redis => {
           return delay;
         },
         maxRetriesPerRequest: 3,
+        enableReadyCheck: true,
+        connectTimeout: 10000,
       });
       logInfo('Railway Redis client initialized from individual parameters', {
         host,
@@ -50,6 +58,33 @@ export const getRedis = (): Redis => {
         username: username || 'default',
       });
     }
+    
+    // 🔥 FIX: Add event listeners for connection monitoring
+    redis.on('connect', () => {
+      logInfo('Redis connected successfully');
+    });
+    
+    redis.on('ready', () => {
+      logInfo('Redis ready to accept commands');
+    });
+    
+    redis.on('error', (err) => {
+      logError('CRITICAL: Redis connection error', err, {
+        alert: true,
+        impact: 'Billing operations will fail',
+      });
+    });
+    
+    redis.on('close', () => {
+      logWarning('Redis connection closed', {
+        alert: true,
+        impact: 'Billing operations will fail',
+      });
+    });
+    
+    redis.on('reconnecting', (delay) => {
+      logWarning('Redis reconnecting', { delay });
+    });
   }
   return redis;
 };

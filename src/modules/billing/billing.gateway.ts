@@ -605,21 +605,58 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
 
   // ── Read final state from Redis ────────────────────────────────────
-  const sessionRaw = await redis.get(callSessionKey(callId));
+  logInfo('Settling call - reading from Redis', {
+    callId,
+    redisKeys: {
+      session: callSessionKey(callId),
+      coins: callUserCoinsKey(callId),
+      earnings: callCreatorEarningsKey(callId),
+    },
+  });
+  
+  let sessionRaw: string | null;
+  try {
+    sessionRaw = await redis.get(callSessionKey(callId));
+  } catch (redisError) {
+    logError('CRITICAL: Redis error reading session during settlement', redisError, {
+      callId,
+      alert: true,
+    });
+    // Clean up lock and return - cannot settle without session
+    await redis.del(settleLockKey(callId)).catch(() => {});
+    return;
+  }
+  
   if (!sessionRaw) {
-    logWarning('No session to settle', { callId });
+    logWarning('No session in Redis for settlement - call may have already been settled or expired', { 
+      callId,
+      impact: 'Settlement skipped - no billing data available',
+    });
     // Clean up the lock since there's nothing to settle
-    await redis.del(settleLockKey(callId));
+    await redis.del(settleLockKey(callId)).catch(() => {});
     return;
   }
 
   const session: CallSession =
     typeof sessionRaw === 'string' ? JSON.parse(sessionRaw) : (sessionRaw as any);
 
-  const [finalCoinsRaw, finalEarningsRaw] = await Promise.all([
-    redis.get(callUserCoinsKey(callId)),
-    redis.get(callCreatorEarningsKey(callId)),
-  ]);
+  let finalCoinsRaw: string | null;
+  let finalEarningsRaw: string | null;
+  
+  try {
+    [finalCoinsRaw, finalEarningsRaw] = await Promise.all([
+      redis.get(callUserCoinsKey(callId)),
+      redis.get(callCreatorEarningsKey(callId)),
+    ]);
+  } catch (redisError) {
+    logError('CRITICAL: Redis error reading coins/earnings during settlement', redisError, {
+      callId,
+      alert: true,
+    });
+    // Clean up lock and return - cannot settle without accurate data
+    await redis.del(settleLockKey(callId)).catch(() => {});
+    return;
+  }
 
   const finalCoins = parseFloat((finalCoinsRaw as string) || '0');
   // Earnings are stored as integer micro-coins in Redis to avoid floating point drift
@@ -627,11 +664,18 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   const finalEarnings = earningsMicros / 10000;
   const totalDeducted = session.elapsedSeconds * session.pricePerSecond;
 
-  logInfo('Settling call', {
+  logInfo('Settling call - Redis values read', {
     callId,
     elapsedSeconds: session.elapsedSeconds,
+    finalCoins,
+    finalEarnings,
     totalDeducted: totalDeducted.toFixed(2),
     creatorEarnings: finalEarnings.toFixed(2),
+    redisValues: {
+      coinsRaw: finalCoinsRaw,
+      earningsRaw: finalEarningsRaw,
+      earningsMicros,
+    },
   });
 
   // ── Clean up Redis billing keys BEFORE writing to MongoDB ──────────
@@ -703,8 +747,18 @@ async function settleCall(io: Server, callId: string): Promise<void> {
       // 🔥 FIX 7: Round earnings to 2 decimal places to avoid floating point errors
       const roundedEarnings = Math.round(finalEarnings * 100) / 100;
       const earningsCoins = Math.round(roundedEarnings); // Integer coins for balance
-      creatorUser.coins = Math.round((creatorUser.coins || 0) + earningsCoins);
+      const creatorCoinsBefore = creatorUser.coins || 0;
+      creatorUser.coins = Math.round(creatorCoinsBefore + earningsCoins);
       await creatorUser.save({ session: dbSession });
+      
+      logInfo('Settling call - Creator coins updated', {
+        callId,
+        creatorMongoId: session.creatorMongoId,
+        creatorUserId: creator.userId,
+        coinsBefore: creatorCoinsBefore,
+        coinsAfter: creatorUser.coins,
+        coinsEarned: earningsCoins,
+      });
 
       // Idempotent credit transaction by callId
       // 🔥 FIX 7: Use rounded earnings for transaction
