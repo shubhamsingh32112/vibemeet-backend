@@ -466,6 +466,21 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
       console.log(`   - ${u.firebaseUid}: role=${u.role}, username=${u.username || 'N/A'}`);
     });
 
+    // 🔥 SCALABILITY: Add pagination support
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500); // Default 100, max 500
+    const page = parseInt(req.query.page as string) || 1;
+    const skip = (page - 1) * limit;
+
+    // Get total count for pagination
+    const total = await User.countDocuments({
+      $or: [
+        { role: 'user' },
+        { role: { $exists: false } },
+        { role: null },
+      ],
+      firebaseUid: { $ne: req.auth.firebaseUid },
+    });
+
     // Get all users who are not creators (role === 'user' or role is null/undefined)
     // Exclude the current user
     // Note: Users created before role field was added might have null role
@@ -478,9 +493,16 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
       firebaseUid: { $ne: req.auth.firebaseUid },
     })
       .select('username avatar gender categories createdAt firebaseUid')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .skip(skip);
 
-    console.log(`✅ [USER] Found ${users.length} users with role 'user'`);
+    console.log(`✅ [USER] Found ${users.length} users with role 'user' (page ${page}, limit ${limit}, total ${total})`);
+
+    // 🔥 NEW: Get online status from Redis for all users
+    const { getBatchUserAvailability } = await import('../availability/user-availability.service');
+    const firebaseUids = users.map(u => u.firebaseUid).filter(Boolean) as string[];
+    const availabilityMap = await getBatchUserAvailability(firebaseUids);
 
     res.json({
       success: true,
@@ -493,7 +515,15 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
           categories: user.categories || [],
           firebaseUid: user.firebaseUid, // Include firebaseUid for video calls
           createdAt: user.createdAt,
+          // 🔥 NEW: Include online status from Redis
+          availability: user.firebaseUid ? (availabilityMap[user.firebaseUid] || 'offline') : 'offline',
         })),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
       },
     });
   } catch (error) {

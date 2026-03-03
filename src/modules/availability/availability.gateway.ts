@@ -4,14 +4,38 @@ import { getFirebaseAdmin } from '../../config/firebase';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { User } from '../user/user.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
+import {
+  setUserAvailability,
+  refreshUserAvailability,
+  getBatchUserAvailability,
+} from './user-availability.service';
 
 // Keep this aligned with the availability service TTL.
 const AVAILABILITY_TTL_SECONDS = 120;
+
+// Heartbeat interval (in ms) - must be less than TTL (120s)
+const HEARTBEAT_INTERVAL = 60000; // 60 seconds
 
 // Track how many active sockets each creator currently has.
 // This prevents marking a creator "busy" when one tab/device disconnects
 // but another is still connected.
 const creatorSocketCounts = new Map<string, number>();
+
+// Track heartbeat intervals for cleanup
+const creatorHeartbeatIntervals = new Map<string, NodeJS.Timeout>();
+
+// Track how many active sockets each user currently has.
+// This prevents marking a user "offline" when one tab/device disconnects
+// but another is still connected.
+const userSocketCounts = new Map<string, number>();
+
+// Track heartbeat intervals for users
+const userHeartbeatIntervals = new Map<string, NodeJS.Timeout>();
+
+// Redis key prefix for user availability
+const USER_AVAILABILITY_KEY_PREFIX = 'user:availability:';
+const userAvailabilityKey = (firebaseUid: string): string =>
+  `${USER_AVAILABILITY_KEY_PREFIX}${firebaseUid}`;
 
 function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefined): string[] {
   if (Array.isArray(data)) {
@@ -61,25 +85,90 @@ export function setupAvailabilityGateway(io: Server): void {
   io.on('connection', async (socket: Socket) => {
     const firebaseUid = socket.data.firebaseUid as string | undefined;
     let isCreator = false;
+    let isUser = false;
 
     if (firebaseUid) {
       try {
         const user = await User.findOne({ firebaseUid }).select('role').lean();
         isCreator = user?.role === 'creator' || user?.role === 'admin';
+        isUser = user?.role === 'user' || !user?.role || user?.role === null;
       } catch (err) {
         logError('Failed to resolve user role for socket', err, { firebaseUid, socketId: socket.id });
       }
     }
     socket.data.isCreator = isCreator;
+    socket.data.isUser = isUser;
 
+    // Handle creator connection
     if (firebaseUid && isCreator) {
-      creatorSocketCounts.set(firebaseUid, (creatorSocketCounts.get(firebaseUid) ?? 0) + 1);
+      // 🔥 SCALABILITY: Join creators room for targeted broadcasting
+      socket.join('creators');
+      
+      const currentCount = creatorSocketCounts.get(firebaseUid) ?? 0;
+      creatorSocketCounts.set(firebaseUid, currentCount + 1);
+      
+      // 🔥 FIX: Automatically set creator online when first device connects
+      // Product requirement: creators are automatically online when app opens
+      if (currentCount === 0) {
+        await setCreatorAvailability(io, firebaseUid, 'online');
+        logInfo('Creator automatically set to online on connect', { firebaseUid });
+        
+        // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
+        // Heartbeat runs every 60s, TTL is 120s - ensures status persists even with network hiccups
+        const heartbeatInterval = setInterval(async () => {
+          try {
+            const redis = getRedis();
+            const status = await redis.get(availabilityKey(firebaseUid));
+            if (status === 'online') {
+              await redis.setex(availabilityKey(firebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
+              logDebug('Heartbeat refreshed TTL', { firebaseUid });
+            }
+          } catch (err) {
+            logError('Heartbeat failed', err, { firebaseUid });
+          }
+        }, HEARTBEAT_INTERVAL);
+        
+        // Store interval for cleanup
+        creatorHeartbeatIntervals.set(firebaseUid, heartbeatInterval);
+      }
+    }
+
+    // Handle regular user connection
+    if (firebaseUid && isUser) {
+      const currentCount = userSocketCounts.get(firebaseUid) ?? 0;
+      userSocketCounts.set(firebaseUid, currentCount + 1);
+      
+      // 🔥 NEW: Automatically set user online when first device connects
+      // Product requirement: users are automatically online when app opens
+      if (currentCount === 0) {
+        await setUserAvailability(firebaseUid, 'online');
+        
+        // 🔥 SCALABILITY: Broadcast only to creators (not all clients)
+        // Regular users don't need to know about other users' online status
+        io.to('creators').emit('user:status', { firebaseUid, status: 'online' });
+        
+        logInfo('User automatically set to online on connect', { firebaseUid });
+        
+        // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
+        const heartbeatInterval = setInterval(async () => {
+          try {
+            await refreshUserAvailability(firebaseUid);
+            logDebug('User heartbeat refreshed TTL', { firebaseUid });
+          } catch (err) {
+            logError('User heartbeat failed', err, { firebaseUid });
+          }
+        }, HEARTBEAT_INTERVAL);
+        
+        // Store interval for cleanup
+        userHeartbeatIntervals.set(firebaseUid, heartbeatInterval);
+      }
     }
 
     logDebug('Socket client connected', {
       socketId: socket.id,
       firebaseUid: socket.data.firebaseUid,
       isCreator,
+      isUser,
     });
 
     // ── availability:get ────────────────────────────────────────────────
@@ -144,18 +233,102 @@ export function setupAvailabilityGateway(io: Server): void {
       logInfo('Creator set to offline', { firebaseUid: uid });
     });
 
+    // User online handler
+    socket.on('user:online', async () => {
+      const uid = socket.data.firebaseUid as string | undefined;
+      const isUser = Boolean(socket.data.isUser);
+      if (!uid || !isUser) {
+        logWarning('Unauthorized user:online request', { socketId: socket.id, firebaseUid: uid });
+        return;
+      }
+      await setUserAvailability(uid, 'online');
+      // 🔥 SCALABILITY: Broadcast only to creators
+      io.to('creators').emit('user:status', { firebaseUid: uid, status: 'online' });
+      logInfo('User set to online', { firebaseUid: uid });
+    });
+
+    // User offline handler
+    socket.on('user:offline', async () => {
+      const uid = socket.data.firebaseUid as string | undefined;
+      const isUser = Boolean(socket.data.isUser);
+      if (!uid || !isUser) {
+        logWarning('Unauthorized user:offline request', { socketId: socket.id, firebaseUid: uid });
+        return;
+      }
+      await setUserAvailability(uid, 'offline');
+      // 🔥 SCALABILITY: Broadcast only to creators
+      io.to('creators').emit('user:status', { firebaseUid: uid, status: 'offline' });
+      logInfo('User set to offline', { firebaseUid: uid });
+    });
+
+    // User availability batch request
+    socket.on('user:availability:get', async (firebaseUids: string[]) => {
+      try {
+        if (!Array.isArray(firebaseUids)) {
+          socket.emit('user:availability:batch', {});
+          return;
+        }
+        
+        const availability = await getBatchUserAvailability(firebaseUids);
+        socket.emit('user:availability:batch', availability);
+        logDebug('User availability batch fetched', {
+          socketId: socket.id,
+          userCount: Object.keys(availability).length,
+        });
+      } catch (err) {
+        logError('Error handling user:availability:get', err, { socketId: socket.id });
+        socket.emit('user:availability:batch', {});
+      }
+    });
+
     socket.on('disconnect', async (reason) => {
       const uid = socket.data.firebaseUid as string | undefined;
       const creator = Boolean(socket.data.isCreator);
+      const isUser = Boolean(socket.data.isUser);
 
+      // Handle creator disconnect
       if (uid && creator) {
         const nextCount = Math.max((creatorSocketCounts.get(uid) ?? 1) - 1, 0);
         if (nextCount === 0) {
+          // 🔥 AUTOMATIC OFFLINE: Mark creator as offline when all devices disconnect
+          // Product requirement: creators are automatically offline when app closes
           creatorSocketCounts.delete(uid);
+          
+          // Stop heartbeat
+          const heartbeatInterval = creatorHeartbeatIntervals.get(uid);
+          if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            creatorHeartbeatIntervals.delete(uid);
+          }
+          
           await setCreatorAvailability(io, uid, 'busy');
-          logInfo('Creator disconnected - set to busy', { firebaseUid: uid });
+          logInfo('Creator disconnected - automatically set to offline', { firebaseUid: uid });
         } else {
           creatorSocketCounts.set(uid, nextCount);
+        }
+      }
+
+      // Handle user disconnect
+      if (uid && isUser) {
+        const nextCount = Math.max((userSocketCounts.get(uid) ?? 1) - 1, 0);
+        if (nextCount === 0) {
+          // 🔥 AUTOMATIC OFFLINE: Mark user as offline when all devices disconnect
+          // Product requirement: users are automatically offline when app closes
+          userSocketCounts.delete(uid);
+          
+          // Stop heartbeat
+          const heartbeatInterval = userHeartbeatIntervals.get(uid);
+          if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            userHeartbeatIntervals.delete(uid);
+          }
+          
+          await setUserAvailability(uid, 'offline');
+          // 🔥 SCALABILITY: Broadcast only to creators
+          io.to('creators').emit('user:status', { firebaseUid: uid, status: 'offline' });
+          logInfo('User disconnected - automatically set to offline', { firebaseUid: uid });
+        } else {
+          userSocketCounts.set(uid, nextCount);
         }
       }
 

@@ -502,11 +502,15 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
   }
 };
 
-// Set creator online status (Creator only - can set their own status)
+// Set creator online status (DEPRECATED - Status is now automatic)
+// 🔥 NOTE: Creator status is now AUTOMATIC based on socket connection
+// - When creator opens app → socket connects → automatically online
+// - When creator closes app → socket disconnects → automatically offline
+// This endpoint is kept for backward compatibility but status is managed automatically
 export const setCreatorOnlineStatus = async (req: Request, res: Response): Promise<void> => {
   try {
     const { isOnline } = req.body;
-    console.log(`🔄 [CREATOR] Set online status request: ${isOnline}`);
+    console.log(`🔄 [CREATOR] Set online status request (DEPRECATED - status is automatic): ${isOnline}`);
     
     if (!req.auth) {
       res.status(401).json({

@@ -22,6 +22,10 @@ import { verifyUserBalance } from '../../utils/balance-integrity';
 const PRESEND_LOCK_PREFIX = 'chat:presend:';
 /** How long an idempotency lock lives (seconds). Covers retries + slow networks. */
 const PRESEND_LOCK_TTL = 60;
+/** Redis prefix for channel creator cache */
+const CHANNEL_CREATOR_PREFIX = 'chat:channel:creator:';
+/** How long channel creator cache lives (1 hour - channels don't change members often) */
+const CHANNEL_CREATOR_TTL = 3600;
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -201,6 +205,21 @@ export const createOrGetChannel = async (
 
     await channel.watch();
 
+    // ── Cache creator UID in Redis for fast pre-send lookups ──────────
+    // Determine which user is the creator (for caching)
+    const creatorUid =
+      otherUser.role === 'creator' || otherUser.role === 'admin'
+        ? otherUid
+        : currentUser.role === 'creator' || currentUser.role === 'admin'
+          ? currentUid
+          : null;
+    
+    if (creatorUid) {
+      const channelCreatorKey = `${CHANNEL_CREATOR_PREFIX}${channelId}`;
+      const redis = getRedis();
+      await redis.setex(channelCreatorKey, CHANNEL_CREATOR_TTL, creatorUid);
+    }
+
     // ── Compute quota for the current user ────────────────────────────
     let freeRemaining = FREE_MESSAGES_PER_CREATOR;
     let costPerMessage = 0;
@@ -339,21 +358,45 @@ export const preSendMessage = async (
       return;
     }
 
-    // ── Resolve creator from channel members ──────────────────────────
-    const client = getStreamClient();
-    const channel = client.channel('messaging', channelId);
-    const channelState = await channel.watch();
+    // ── Resolve creator from channel (optimized with Redis cache) ──────
+    // Try cache first to avoid expensive channel.watch() call
+    const channelCreatorKey = `${CHANNEL_CREATOR_PREFIX}${channelId}`;
+    let creatorFirebaseUid: string | null = await redis.get(channelCreatorKey);
 
-    const memberIds: string[] = Object.keys(channelState.members || {});
-    const creatorFirebaseUid = memberIds.find(
-      (id) => id !== user.firebaseUid,
-    );
+    if (!creatorFirebaseUid) {
+      // Cache miss - fetch from Stream API (slow, but cached for next time)
+      const client = getStreamClient();
+      const channel = client.channel('messaging', channelId);
+      
+      try {
+        const channelState = await channel.watch();
+        const memberIds: string[] = Object.keys(channelState.members || {});
+        creatorFirebaseUid = memberIds.find(
+          (id) => id !== user.firebaseUid,
+        ) || null;
+
+        // Cache the creator UID for future requests (1 hour TTL)
+        if (creatorFirebaseUid) {
+          await redis.setex(channelCreatorKey, CHANNEL_CREATOR_TTL, creatorFirebaseUid);
+        }
+      } catch (watchError) {
+        console.error('❌ [CHAT] Failed to watch channel:', watchError);
+        // Fallback: try to get creator from quota if it exists
+        const existingQuota = await ChatMessageQuota.findOne({
+          userFirebaseUid: user.firebaseUid,
+          channelId,
+        });
+        if (existingQuota) {
+          creatorFirebaseUid = existingQuota.creatorFirebaseUid;
+        }
+      }
+    }
 
     if (!creatorFirebaseUid) {
       await redis.del(lockKey); // release lock
       res
         .status(400)
-        .json({ success: false, error: 'Cannot determine channel members' });
+        .json({ success: false, error: 'Cannot determine channel creator' });
       return;
     }
 
@@ -367,10 +410,10 @@ export const preSendMessage = async (
         const txnUser = await User.findById(user._id).session(session);
         if (!txnUser) throw new Error('User not found inside transaction');
 
-        // Get or create quota
+        // Get or create quota (using compound index for efficiency)
         let quota = await ChatMessageQuota.findOne({
           userFirebaseUid: txnUser.firebaseUid,
-          creatorFirebaseUid,
+          creatorFirebaseUid, // Use compound index: { userFirebaseUid: 1, creatorFirebaseUid: 1 }
         }).session(session);
 
         if (!quota) {
@@ -531,10 +574,24 @@ export const getMessageQuota = async (
       return;
     }
 
-    const quota = await ChatMessageQuota.findOne({
-      userFirebaseUid: user.firebaseUid,
-      channelId,
-    });
+    // Try to get creator UID from cache for efficient compound index lookup
+    const channelCreatorKey = `${CHANNEL_CREATOR_PREFIX}${channelId}`;
+    const redis = getRedis();
+    const creatorFirebaseUid = await redis.get(channelCreatorKey);
+    
+    // Use compound index if we have creatorFirebaseUid, otherwise fallback to channelId
+    const quota = creatorFirebaseUid
+      ? await ChatMessageQuota.findOne({
+          userFirebaseUid: user.firebaseUid,
+          creatorFirebaseUid, // Use compound index: { userFirebaseUid: 1, creatorFirebaseUid: 1 }
+        })
+      : await ChatMessageQuota.findOne({
+          userFirebaseUid: user.firebaseUid,
+          channelId, // Fallback: channelId is also indexed
+        });
+    
+    // If quota exists, we can use creatorFirebaseUid from it for compound index lookup
+    // This is more efficient, but we need creatorFirebaseUid first (handled above)
 
     const sent = quota?.freeMessagesSent ?? 0;
     const freeRemaining = Math.max(0, FREE_MESSAGES_PER_CREATOR - sent);
