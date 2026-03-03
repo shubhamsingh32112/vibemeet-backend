@@ -300,6 +300,9 @@ export function setupBillingGateway(io: Server): void {
         const earnings = parseFloat((earningsRaw as string) || '0');
         const remainingSeconds = Math.floor(coins / session.pricePerSecond);
         
+        // 🔥 FIX: Include server timestamps for accurate timer recovery
+        const serverTimestamp = Date.now();
+        
         // Return active call details
         socket.emit('billing:recover-state:response', {
           success: true,
@@ -311,6 +314,8 @@ export function setupBillingGateway(io: Server): void {
             elapsedSeconds: session.elapsedSeconds,
             remainingSeconds,
             earnings: Math.round(earnings * 100) / 100,
+            serverTimestamp, // Server time for sync
+            callStartTime: session.startTime, // Call start timestamp
           }],
         });
         

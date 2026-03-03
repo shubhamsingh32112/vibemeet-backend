@@ -127,18 +127,25 @@ export class BillingService {
 
     const maxSeconds = Math.floor(user.coins / pricePerSecond);
 
+    // 🔥 FIX: Send server timestamp with billing started event
+    const serverTimestamp = Date.now();
+    
     // Notify both parties that billing started
     io.to(`user:${userFirebaseUid}`).emit('billing:started', {
       callId,
       coins: user.coins,
       pricePerSecond,
       maxSeconds,
+      serverTimestamp, // Server time when billing started
+      callStartTime: session.startTime, // Call start timestamp
     });
 
     io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
       callId,
       earnings: 0,
       pricePerSecond: CREATOR_EARNINGS_PER_SECOND,
+      serverTimestamp, // Server time when billing started
+      callStartTime: session.startTime, // Call start timestamp
     });
 
     // 🔥 FIX 15: Record billing start metric
@@ -328,6 +335,9 @@ export class BillingService {
     recordBillingMetric('tick_processed', 1, { callId });
     recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });
 
+    // 🔥 FIX: Send server timestamp for accurate client-side timer sync
+    const serverTimestamp = Date.now();
+    
     // Emit live updates
     io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
       callId,
@@ -336,6 +346,8 @@ export class BillingService {
       elapsedSeconds: session.elapsedSeconds,
       remainingSeconds,
       durationLimit: effectiveLimit,
+      serverTimestamp, // Server time when this update was sent
+      callStartTime: session.startTime, // Call start timestamp for reference
     });
 
     const roundedEarningsDisplay = Math.round((earningsMicros / EARNINGS_MICRO_FACTOR) * 100) / 100;
@@ -345,6 +357,8 @@ export class BillingService {
       earnings: roundedEarningsDisplay,
       elapsedSeconds: session.elapsedSeconds,
       durationLimit: effectiveLimit,
+      serverTimestamp, // Server time when this update was sent
+      callStartTime: session.startTime, // Call start timestamp for reference
     });
     
     return true; // Tick processed successfully
