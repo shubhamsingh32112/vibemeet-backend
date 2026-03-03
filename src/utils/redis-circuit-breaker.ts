@@ -77,8 +77,14 @@ export async function safeRedisGet<T = any>(key: string): Promise<T | null> {
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      const value = await redis.get<T>(key);
-      return value;
+      const value = await redis.get(key);
+      if (value === null) return null;
+      // Try to parse as JSON, fallback to string
+      try {
+        return JSON.parse(value) as T;
+      } catch {
+        return value as T;
+      }
     },
     async () => {
       // Fallback to in-memory storage
@@ -104,7 +110,7 @@ export async function safeRedisSet(
     async () => {
       const redis = getRedis();
       if (options?.ex) {
-        await redis.set(key, value, { ex: options.ex });
+        await redis.setex(key, options.ex, value);
       } else {
         await redis.set(key, value);
       }
@@ -156,8 +162,13 @@ export async function safeRedisZadd(
     async () => {
       const redis = getRedis();
       const scoreMembers = Array.isArray(items) ? items : [items];
-      // Cast to any to avoid tight coupling to @upstash/redis ZADD overloads
-      const result = await (redis as any).zadd(key, ...scoreMembers);
+      // Convert to ioredis format: zadd(key, score1, member1, score2, member2, ...)
+      const args: (number | string)[] = [];
+      for (const item of scoreMembers) {
+        args.push(item.score, item.member);
+      }
+      // Use apply to spread the args array
+      const result = await (redis.zadd as any)(key, ...args);
       return result ?? 0;
     },
     async () => {
@@ -176,7 +187,12 @@ export async function safeRedisZrem(key: string, member: string | string[]): Pro
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      return await redis.zrem(key, member);
+      // ioredis zrem accepts either individual members or an array
+      if (Array.isArray(member)) {
+        return await redis.zrem(key, ...member);
+      } else {
+        return await redis.zrem(key, member);
+      }
     },
     async () => {
       // Fallback: log warning
@@ -193,7 +209,10 @@ export async function safeRedisZscore(key: string, member: string): Promise<numb
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      return await redis.zscore(key, member);
+      const result = await redis.zscore(key, member);
+      // ioredis returns string | null, convert to number | null
+      if (result === null) return null;
+      return parseFloat(result);
     },
     async () => {
       // Fallback: return null (member not found)
@@ -215,7 +234,7 @@ export async function safeRedisZrange(
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      // Cast to any to avoid tight coupling to @upstash/redis ZRANGE overloads,
+      // Cast to any to avoid tight coupling to specific Redis client ZRANGE overloads,
       // while still preserving runtime behavior.
       return await (redis as any).zrange(key, min, max, options);
     },
@@ -251,7 +270,12 @@ export async function safeRedisSadd(key: string, member: string | string[]): Pro
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      return await redis.sadd(key, member);
+      // ioredis sadd accepts either individual members or an array
+      if (Array.isArray(member)) {
+        return await redis.sadd(key, ...member);
+      } else {
+        return await redis.sadd(key, member);
+      }
     },
     async () => {
       // Fallback: log warning
@@ -268,7 +292,12 @@ export async function safeRedisSrem(key: string, member: string | string[]): Pro
   return executeWithCircuitBreaker(
     async () => {
       const redis = getRedis();
-      return await redis.srem(key, member);
+      // ioredis srem accepts either individual members or an array
+      if (Array.isArray(member)) {
+        return await redis.srem(key, ...member);
+      } else {
+        return await redis.srem(key, member);
+      }
     },
     async () => {
       // Fallback: log warning
@@ -303,7 +332,7 @@ export async function safeRedisExpire(key: string, seconds: number): Promise<boo
     async () => {
       const redis = getRedis();
       const result = await redis.expire(key, seconds);
-      // Upstash returns 1 (true) or 0 (false); normalize to boolean
+      // Redis returns 1 (true) or 0 (false); normalize to boolean
       return result === 1;
     },
     async () => {

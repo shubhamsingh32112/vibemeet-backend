@@ -101,7 +101,7 @@ export function setupAvailabilityGateway(io: Server): void {
           const keys = creatorIds.map((id) => availabilityKey(id));
 
           // MGET: one round-trip for all keys
-          const values = await redis.mget<(string | null)[]>(...keys);
+          const values = await redis.mget(...keys);
 
           // Map results — null / missing → "busy", "online" → "online"
           for (let i = 0; i < creatorIds.length; i++) {
@@ -184,9 +184,7 @@ export async function setCreatorAvailability(
   const redis = getRedis();
 
   if (status === 'online') {
-    await redis.set(availabilityKey(creatorFirebaseUid), 'online', {
-      ex: AVAILABILITY_TTL_SECONDS,
-    });
+    await redis.setex(availabilityKey(creatorFirebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
   } else {
     // Delete key — absence = busy (the universal default)
     await redis.del(availabilityKey(creatorFirebaseUid));

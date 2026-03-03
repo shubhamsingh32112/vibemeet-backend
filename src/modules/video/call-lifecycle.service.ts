@@ -99,10 +99,8 @@ export class CallLifecycleService {
       const redis = getRedis();
       const idKey = webhookIdKey(eventId);
 
-      const acquired = await redis.set(idKey, '1', {
-        nx: true,
-        ex: WEBHOOK_IDEMPOTENCY_TTL,
-      });
+      const lockResult = await redis.set(idKey, '1', 'EX', WEBHOOK_IDEMPOTENCY_TTL, 'NX');
+      const acquired = lockResult === 'OK';
 
       if (!acquired) {
         logInfo('Skipping duplicate webhook (Redis idempotent)', {

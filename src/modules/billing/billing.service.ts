@@ -120,15 +120,9 @@ export class BillingService {
 
     // Seed Redis
     await Promise.all([
-      redis.set(callSessionKey(callId), JSON.stringify(session), {
-        ex: CALL_SESSION_TTL,
-      }),
-      redis.set(callUserCoinsKey(callId), user.coins.toString(), {
-        ex: CALL_SESSION_TTL,
-      }),
-      redis.set(callCreatorEarningsKey(callId), '0', {
-        ex: CALL_SESSION_TTL,
-      }),
+      redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
+      redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, user.coins.toString()),
+      redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0'),
     ]);
 
     const maxSeconds = Math.floor(user.coins / pricePerSecond);
@@ -322,18 +316,10 @@ export class BillingService {
 
     // Persist to Redis
     await Promise.all([
-      redis.set(callUserCoinsKey(callId), coins.toString(), {
-        ex: CALL_SESSION_TTL,
-      }),
-      redis.set(callCreatorEarningsKey(callId), earningsMicros.toString(), {
-        ex: CALL_SESSION_TTL,
-      }),
-      redis.set(callSessionKey(callId), JSON.stringify(session), {
-        ex: CALL_SESSION_TTL,
-      }),
-      redis.set(idempotencyKeyValue, '1', {
-        ex: 300,
-      }),
+      redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, coins.toString()),
+      redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, earningsMicros.toString()),
+      redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
+      redis.setex(idempotencyKeyValue, 300, '1'),
     ]);
 
     const remainingSeconds = Math.floor(coins / session.pricePerSecond);
@@ -381,9 +367,7 @@ export class BillingService {
       };
       
       await Promise.all([
-        redis.set(dlqKey, JSON.stringify(errorDetails), {
-          ex: DLQ_BILLING_TTL,
-        }),
+        redis.setex(dlqKey, DLQ_BILLING_TTL, JSON.stringify(errorDetails)),
         addToDLQSet(dlqKey), // Add to set for efficient retrieval
       ]);
       

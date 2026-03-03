@@ -1361,7 +1361,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     // ── Cache in Redis ───────────────────────────────────────────────────
     try {
       const redis = getRedis();
-      await redis.set(cacheKey, JSON.stringify(dashboardData), { ex: CREATOR_DASHBOARD_TTL });
+      await redis.setex(cacheKey, CREATOR_DASHBOARD_TTL, JSON.stringify(dashboardData));
       console.log('💾 [CREATOR] Dashboard cached in Redis');
     } catch (cacheErr) {
       console.error('⚠️ [CREATOR] Redis cache write failed:', cacheErr);

@@ -174,7 +174,7 @@ app.get('/ready', async (_req, res) => {
     } else {
       const { getRedis } = await import('./config/redis');
       const redis = getRedis();
-      await redis.set('healthcheck:ready', Date.now().toString(), { ex: 30 });
+      await redis.setex('healthcheck:ready', 30, Date.now().toString());
       checks.redis = { ok: true };
     }
   } catch (err: any) {
@@ -314,12 +314,12 @@ const startServer = async () => {
     setupAdminGateway(io);
     logInfo('Socket.IO admin gateway ready');
     
-    // 🔴 Check Redis configuration (Upstash - serverless, no init needed)
+    // 🔴 Check Redis configuration (Railway Redis)
     if (isRedisConfigured()) {
-      logInfo('Upstash Redis configured');
+      logInfo('Railway Redis configured');
     } else {
-      logWarning('Upstash Redis NOT configured - availability will fail', {
-        requiredEnvVars: ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'],
+      logWarning('Railway Redis NOT configured - availability will fail', {
+        requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
       });
     }
 

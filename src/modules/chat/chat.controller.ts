@@ -306,10 +306,8 @@ export const preSendMessage = async (
 
     const redis = getRedis();
     // SET NX — only succeeds if the key does NOT already exist
-    const lockAcquired = await redis.set(lockKey, 'pending', {
-      ex: PRESEND_LOCK_TTL,
-      nx: true,
-    });
+    const lockResult = await redis.set(lockKey, 'pending', 'EX', PRESEND_LOCK_TTL, 'NX');
+    const lockAcquired = lockResult === 'OK';
 
     if (!lockAcquired) {
       // Duplicate request — return the cached result if available
@@ -475,9 +473,7 @@ export const preSendMessage = async (
     }
 
     // ── Cache result in the idempotency key ───────────────────────────
-    await redis.set(lockKey, JSON.stringify(responsePayload!), {
-      ex: PRESEND_LOCK_TTL,
-    });
+    await redis.setex(lockKey, PRESEND_LOCK_TTL, JSON.stringify(responsePayload!));
 
     // Balance integrity check (fire-and-forget)
     verifyUserBalance(user._id).catch(() => {});

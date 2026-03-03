@@ -67,8 +67,7 @@ async function processDLQ(io: Server): Promise<void> {
     await redis.set(RECONCILIATION_LAST_RUN_KEY, startTime.toString());
 
     // Get all DLQ keys (pattern match)
-    // Note: Upstash Redis doesn't support KEYS command, so we'll use a different approach
-    // We'll track DLQ items in a set for efficient retrieval
+    // Note: Railway Redis supports KEYS but it's expensive, so we use a set for efficient retrieval
     const dlqSetKey = `${DLQ_BILLING_PREFIX}set`;
 
     // Get a bounded batch of DLQ items from the set

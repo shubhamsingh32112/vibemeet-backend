@@ -214,13 +214,10 @@ class MonitoringService {
         
         // Add recent metrics to sorted set
         for (const metric of metrics.slice(-METRICS_RETENTION_COUNT)) {
-          await redis.zadd(redisKey, {
-            score: metric.timestamp,
-            member: JSON.stringify({
-              value: metric.value,
-              tags: metric.tags,
-            }),
-          });
+          await redis.zadd(redisKey, metric.timestamp, JSON.stringify({
+            value: metric.value,
+            tags: metric.tags,
+          }));
         }
 
         // Keep only last N metrics (remove old ones)
@@ -235,9 +232,7 @@ class MonitoringService {
       const recentErrors = this.errors.slice(-500); // Last 500 errors
       if (recentErrors.length > 0) {
         const errorsJson = JSON.stringify(recentErrors);
-        await redis.set(ERRORS_RECENT_KEY, errorsJson, {
-          ex: ERRORS_RECENT_TTL,
-        });
+        await redis.setex(ERRORS_RECENT_KEY, ERRORS_RECENT_TTL, errorsJson);
       }
 
       logger.debug('Persisted metrics to Redis', {

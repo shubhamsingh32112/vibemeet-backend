@@ -1,7 +1,7 @@
 /**
  * Creator Availability Service
  * 
- * BACKEND-AUTHORITATIVE availability system using Upstash Redis.
+ * BACKEND-AUTHORITATIVE availability system using Railway Redis.
  * 
  * Status semantics:
  * - 'online' = creator is available for calls
@@ -45,7 +45,7 @@ export async function setAvailability(
 
   try {
     const redis = getRedis();
-    await redis.set(`${KEY_PREFIX}${creatorId}`, status, { ex: AVAILABILITY_TTL });
+    await redis.setex(`${KEY_PREFIX}${creatorId}`, AVAILABILITY_TTL, status);
     console.log(`📡 [AVAILABILITY] Set: ${creatorId} → ${status} (TTL: ${AVAILABILITY_TTL}s)`);
   } catch (err) {
     console.error(`❌ [AVAILABILITY] Failed to set status:`, err);
@@ -64,8 +64,8 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
 
   try {
     const redis = getRedis();
-    const status = await redis.get<CreatorAvailability>(`${KEY_PREFIX}${creatorId}`);
-    return status ?? 'busy'; // Unknown = Busy
+    const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
+    return (status === 'online' ? 'online' : 'busy') as CreatorAvailability;
   } catch (err) {
     console.error(`❌ [AVAILABILITY] Failed to get status:`, err);
     return 'busy'; // Error = Busy (fail safe)
@@ -84,11 +84,11 @@ export async function refreshAvailability(creatorId: string): Promise<void> {
 
   try {
     const redis = getRedis();
-    const status = await redis.get<CreatorAvailability>(`${KEY_PREFIX}${creatorId}`);
+    const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
     
     if (status === 'online') {
       // Re-set with fresh TTL
-      await redis.set(`${KEY_PREFIX}${creatorId}`, 'online', { ex: AVAILABILITY_TTL });
+      await redis.setex(`${KEY_PREFIX}${creatorId}`, AVAILABILITY_TTL, 'online');
       console.log(`🔄 [AVAILABILITY] Refreshed TTL: ${creatorId}`);
     }
   } catch (err) {
@@ -137,7 +137,7 @@ export async function getAllOnlineCreators(): Promise<string[]> {
     const onlineCreators: string[] = [];
     
     for (const key of keys) {
-      const status = await redis.get<CreatorAvailability>(key);
+      const status = await redis.get(key);
       if (status === 'online') {
         const creatorId = key.replace(KEY_PREFIX, '');
         onlineCreators.push(creatorId);
@@ -170,12 +170,13 @@ export async function getBatchAvailability(
     const redis = getRedis();
     const result: Record<string, CreatorAvailability> = {};
     
-    // Upstash supports mget
+    // Railway Redis supports mget
     const keys = creatorIds.map(id => `${KEY_PREFIX}${id}`);
-    const values = await redis.mget<CreatorAvailability[]>(...keys);
+    const values = await redis.mget(...keys);
     
     creatorIds.forEach((id, index) => {
-      result[id] = values[index] ?? 'busy';
+      const value = values[index];
+      result[id] = (value === 'online' ? 'online' : 'busy') as CreatorAvailability;
     });
     
     return result;

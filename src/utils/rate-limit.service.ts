@@ -215,7 +215,8 @@ export async function getCallRateLimitStatus(firebaseUid: string): Promise<{
   const windowMs = CALL_RATE_LIMIT_WINDOW_SECONDS * 1000;
   
   try {
-    const count = (await redis.get<number>(key)) || 0;
+    const countStr = await redis.get(key);
+    const count = countStr ? parseInt(countStr, 10) : 0;
     const ttl = await redis.ttl(key);
     const resetAt = ttl > 0 ? now + (ttl * 1000) : now + windowMs;
     

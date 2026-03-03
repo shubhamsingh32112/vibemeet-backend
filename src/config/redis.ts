@@ -1,23 +1,55 @@
-import { Redis } from '@upstash/redis';
+import Redis from 'ioredis';
 import { logInfo, logError } from '../utils/logger';
 
 let redis: Redis | null = null;
 
 export const getRedis = (): Redis => {
   if (!redis) {
-    const url = process.env.UPSTASH_REDIS_REST_URL;
-    const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+    // Railway Redis connection - supports both REDIS_URL and individual variables
+    const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
+    
+    if (redisUrl) {
+      // Use connection URL if provided
+      redis = new Redis(redisUrl, {
+        retryStrategy: (times) => {
+          const delay = Math.min(times * 50, 2000);
+          return delay;
+        },
+        maxRetriesPerRequest: 3,
+      });
+      logInfo('Railway Redis client initialized from URL', {
+        url: redisUrl.replace(/:[^:@]+@/, ':****@'), // Mask password in logs
+      });
+    } else {
+      // Fall back to individual connection parameters
+      const host = process.env.REDISHOST;
+      const port = parseInt(process.env.REDISPORT || '6379', 10);
+      const password = process.env.REDIS_PASSWORD || process.env.REDISPASSWORD;
+      const username = process.env.REDISUSER;
 
-    if (!url || !token) {
-      throw new Error(
-        'Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN in environment variables'
-      );
+      if (!host) {
+        throw new Error(
+          'Missing Redis configuration. Provide either REDIS_URL/REDIS_PUBLIC_URL or REDISHOST environment variable'
+        );
+      }
+
+      redis = new Redis({
+        host,
+        port,
+        password,
+        username,
+        retryStrategy: (times) => {
+          const delay = Math.min(times * 50, 2000);
+          return delay;
+        },
+        maxRetriesPerRequest: 3,
+      });
+      logInfo('Railway Redis client initialized from individual parameters', {
+        host,
+        port,
+        username: username || 'default',
+      });
     }
-
-    redis = new Redis({ url, token });
-    logInfo('Upstash Redis client initialized', {
-      url: url ? 'configured' : 'missing',
-    });
   }
   return redis;
 };
@@ -26,7 +58,12 @@ export const getRedis = (): Redis => {
  * Check if Redis is configured
  */
 export function isRedisConfigured(): boolean {
-  return !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+  // Check for Railway Redis variables
+  return !!(
+    process.env.REDIS_URL ||
+    process.env.REDIS_PUBLIC_URL ||
+    process.env.REDISHOST
+  );
 }
 
 // Redis key helpers

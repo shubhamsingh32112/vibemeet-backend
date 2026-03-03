@@ -232,9 +232,7 @@ export function setupBillingGateway(io: Server): void {
         if (!sessionExists && !isInActiveBilling) {
           // 🔥 FIX 1: Session not created yet — defer settlement until handleCallStarted finishes
           // Store in Redis with TTL for automatic cleanup
-          await redis.set(pendingCallEndKey(data.callId), '1', {
-            ex: PENDING_CALL_END_TTL,
-          });
+          await redis.setex(pendingCallEndKey(data.callId), PENDING_CALL_END_TTL, '1');
           logInfo('Deferring call:ended (session not ready)', { callId: data.callId });
           return;
         }
@@ -377,21 +375,14 @@ async function handleCallStarted(
   // 🔥 FIX 1: Track both participants in Redis so we can auto-settle on socket disconnect
   const redis = getRedis();
   await Promise.all([
-    redis.set(activeCallByUserKey(userFirebaseUid), data.callId, {
-      ex: ACTIVE_CALL_BY_USER_TTL,
-    }),
-    redis.set(activeCallByUserKey(data.creatorFirebaseUid), data.callId, {
-      ex: ACTIVE_CALL_BY_USER_TTL,
-    }),
+    redis.setex(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL, data.callId),
+    redis.setex(activeCallByUserKey(data.creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL, data.callId),
   ]);
   
   // 🔥 FIX: Register call in Redis sorted set for batch processing
   // Score = next billing time in milliseconds
   const nextBillingTime = Date.now() + BILLING_TICK_INTERVAL;
-  await redis.zadd(ACTIVE_BILLING_CALLS_KEY, {
-    score: nextBillingTime,
-    member: data.callId,
-  });
+  await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, data.callId);
   
   logDebug('Registered call for batch billing', { callId: data.callId, nextBillingTime });
 }
@@ -428,10 +419,7 @@ async function processBillingBatch(io: Server): Promise<void> {
   // 🔥 FIX 3: Acquire distributed lock (only one server processes batches at a time)
   let lockAcquired = false;
   try {
-    const lockResult = await redis.set(BATCH_PROCESSOR_LOCK_KEY, '1', {
-      nx: true,
-      ex: BATCH_PROCESSOR_LOCK_TTL,
-    });
+    const lockResult = await redis.set(BATCH_PROCESSOR_LOCK_KEY, '1', 'EX', BATCH_PROCESSOR_LOCK_TTL, 'NX');
     lockAcquired = lockResult === 'OK';
   } catch (err) {
     // 🔥 FIX: Log error when lock acquisition fails (Redis outage)
@@ -464,20 +452,18 @@ async function processBillingBatch(io: Server): Promise<void> {
   try {
     // Get all calls due for billing (score <= now)
     // Limit to BILLING_BATCH_SIZE to prevent overload
-    // Upstash Redis uses zrange with byScore option instead of zrangebyscore
-    const callsDue = await redis.zrange(
+    // Use zrangebyscore for standard Redis (Railway)
+    const callsDue = await redis.zrangebyscore(
       ACTIVE_BILLING_CALLS_KEY,
       0,
       now,
-      { byScore: true, offset: 0, count: BILLING_BATCH_SIZE }
+      'LIMIT',
+      0,
+      BILLING_BATCH_SIZE
     );
     
-    // Handle both string array and object array responses
-    const callIds: string[] = Array.isArray(callsDue)
-      ? callsDue.map((item: any) => 
-          typeof item === 'string' ? item : (item?.member || item?.value || String(item))
-        )
-      : [];
+    // Standard Redis returns string array
+    const callIds: string[] = Array.isArray(callsDue) ? callsDue : [];
     
     if (callIds.length === 0) {
       return; // No calls to process
@@ -494,10 +480,7 @@ async function processBillingBatch(io: Server): Promise<void> {
         if (processed) {
           // Update next billing time (1 second from now)
           const nextBillingTime = now + BILLING_TICK_INTERVAL;
-          await redis.zadd(ACTIVE_BILLING_CALLS_KEY, {
-            score: nextBillingTime,
-            member: callId,
-          });
+          await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
         } else {
           // Session doesn't exist or settlement needed - remove from active calls
           await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
@@ -606,19 +589,15 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   // ── Atomic settlement lock (NX = only if not exists) ───────────────
   // Only the FIRST caller acquires the lock; every subsequent caller
   // bails out immediately.  The lock expires after 60 s as a safety net.
-  const lockAcquired = await redis.set(settleLockKey(callId), '1', {
-    nx: true,
-    ex: 60,
-  });
+  const lockResult = await redis.set(settleLockKey(callId), '1', 'EX', 60, 'NX');
+  const lockAcquired = lockResult === 'OK';
   if (!lockAcquired) {
     logWarning('Settlement already in progress / completed — skipping', { callId });
     return;
   }
 
   // 🔥 FIX 1: Mark settled in Redis (replaces in-memory set)
-  await redis.set(settledKey, '1', {
-    ex: SETTLED_CALL_TTL,
-  });
+  await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
 
   // ── Read final state from Redis ────────────────────────────────────
   const sessionRaw = await redis.get<string>(callSessionKey(callId));
@@ -992,9 +971,7 @@ export async function settleCallHttp(
   
   if (!sessionExists && !isInActiveBilling) {
     // 🔥 FIX 1: Store in Redis with TTL for automatic cleanup
-    await redis.set(pendingCallEndKey(callId), '1', {
-      ex: PENDING_CALL_END_TTL,
-    });
+    await redis.setex(pendingCallEndKey(callId), PENDING_CALL_END_TTL, '1');
     logInfo('Deferring call:ended (HTTP, session not ready)', { callId });
     return;
   }
