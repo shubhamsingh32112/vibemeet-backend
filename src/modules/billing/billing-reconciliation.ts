@@ -94,7 +94,7 @@ async function processDLQ(io: Server): Promise<void> {
     for (const dlqKey of dlqItems) {
       try {
         // Get error details
-        const errorDetailsRaw = await redis.get<string>(dlqKey);
+        const errorDetailsRaw = await redis.get(dlqKey);
         if (!errorDetailsRaw) {
           // Item expired or already processed, remove from set
           await redis.srem(dlqSetKey, dlqKey);

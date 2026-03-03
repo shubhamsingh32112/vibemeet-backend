@@ -184,7 +184,7 @@ export class BillingService {
     const redis = getRedis();
 
     // Read session
-    const sessionRaw = await redis.get<string>(callSessionKey(callId));
+    const sessionRaw = await redis.get(callSessionKey(callId));
     if (!sessionRaw) {
       return false; // Session doesn't exist
     }
@@ -207,8 +207,8 @@ export class BillingService {
 
     // Read current coins & earnings (earnings stored as integer micro-coins)
     const [coinsRaw, earningsRaw] = await Promise.all([
-      redis.get<string>(callUserCoinsKey(callId)),
-      redis.get<string>(callCreatorEarningsKey(callId)),
+      redis.get(callUserCoinsKey(callId)),
+      redis.get(callCreatorEarningsKey(callId)),
     ]);
 
     if (coinsRaw === null) {

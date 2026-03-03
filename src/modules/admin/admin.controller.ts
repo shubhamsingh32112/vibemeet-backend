@@ -112,7 +112,7 @@ async function getCachedOrCompute<T>(
 
   // Write-behind — don't block the response
   redis
-    .set(key, JSON.stringify(result), { ex: ADMIN_CACHE_TTL })
+    .setex(key, ADMIN_CACHE_TTL, JSON.stringify(result))
     .catch((err: any) =>
       console.warn('⚠️ [REDIS] Cache write failed:', err)
     );

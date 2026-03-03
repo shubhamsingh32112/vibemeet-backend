@@ -311,7 +311,7 @@ export const preSendMessage = async (
 
     if (!lockAcquired) {
       // Duplicate request — return the cached result if available
-      const cached = await redis.get<string>(lockKey);
+      const cached = await redis.get(lockKey);
       if (cached && cached !== 'pending') {
         console.log(
           `🔁 [CHAT] Idempotent hit for ${idempotencyKey} — returning cached result`,

@@ -1033,7 +1033,7 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
     const cacheKey = creatorTasksKey(currentUser._id.toString());
     try {
       const redis = getRedis();
-      const cached = await redis.get<string>(cacheKey);
+      const cached = await redis.get(cacheKey);
       if (cached) {
         const data = typeof cached === 'string' ? JSON.parse(cached) : cached;
         console.log('⚡ [CREATOR] Tasks served from Redis cache');
@@ -1423,7 +1423,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     const cacheKey = creatorDashboardKey(currentUser._id.toString());
     try {
       const redis = getRedis();
-      const cached = await redis.get<string>(cacheKey);
+      const cached = await redis.get(cacheKey);
       if (cached) {
         const data = typeof cached === 'string' ? JSON.parse(cached) : cached;
         // Update coins in cached data (coins can change outside of cache invalidation)

@@ -45,7 +45,7 @@ export async function verifyStartupRecovery(_io: Server): Promise<void> {
     
     for (const callId of callIds) {
       try {
-        const sessionRaw = await redis.get<string>(callSessionKey(callId));
+        const sessionRaw = await redis.get(callSessionKey(callId));
         if (sessionRaw) {
           validCalls++;
         } else {

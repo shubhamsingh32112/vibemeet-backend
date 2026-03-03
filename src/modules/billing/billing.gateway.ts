@@ -251,7 +251,7 @@ export function setupBillingGateway(io: Server): void {
         const redis = getRedis();
         
         // Get active call ID for this user
-        const callId = await redis.get<string>(activeCallByUserKey(firebaseUid));
+        const callId = await redis.get(activeCallByUserKey(firebaseUid));
         
         if (!callId) {
           // No active call for this user
@@ -275,7 +275,7 @@ export function setupBillingGateway(io: Server): void {
         }
         
         // Get session details
-        const sessionRaw = await redis.get<string>(callSessionKey(callId));
+        const sessionRaw = await redis.get(callSessionKey(callId));
         if (!sessionRaw) {
           // Session expired, clean up
           await redis.del(activeCallByUserKey(firebaseUid));
@@ -292,8 +292,8 @@ export function setupBillingGateway(io: Server): void {
         
         // Get current coins and earnings
         const [coinsRaw, earningsRaw] = await Promise.all([
-          redis.get<string>(callUserCoinsKey(callId)),
-          redis.get<string>(callCreatorEarningsKey(callId)),
+          redis.get(callUserCoinsKey(callId)),
+          redis.get(callCreatorEarningsKey(callId)),
         ]);
         
         const coins = parseFloat((coinsRaw as string) || '0');
@@ -339,7 +339,7 @@ export function setupBillingGateway(io: Server): void {
       logInfo('Socket disconnected', { firebaseUid, reason });
       // 🔥 FIX 1: Get callId from Redis instead of in-memory map
       const redis = getRedis();
-      const callId = await redis.get<string>(activeCallByUserKey(firebaseUid));
+      const callId = await redis.get(activeCallByUserKey(firebaseUid));
       if (callId) {
         logInfo('Auto-settling call due to disconnect', { callId, firebaseUid });
         try {
@@ -600,7 +600,7 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
 
   // ── Read final state from Redis ────────────────────────────────────
-  const sessionRaw = await redis.get<string>(callSessionKey(callId));
+  const sessionRaw = await redis.get(callSessionKey(callId));
   if (!sessionRaw) {
     logWarning('No session to settle', { callId });
     // Clean up the lock since there's nothing to settle
@@ -612,8 +612,8 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     typeof sessionRaw === 'string' ? JSON.parse(sessionRaw) : (sessionRaw as any);
 
   const [finalCoinsRaw, finalEarningsRaw] = await Promise.all([
-    redis.get<string>(callUserCoinsKey(callId)),
-    redis.get<string>(callCreatorEarningsKey(callId)),
+    redis.get(callUserCoinsKey(callId)),
+    redis.get(callCreatorEarningsKey(callId)),
   ]);
 
   const finalCoins = parseFloat((finalCoinsRaw as string) || '0');
@@ -945,7 +945,7 @@ export async function handleCallStartedHttp(
   // 🔥 FIX 1: Check Redis for pending call end
   const redis = getRedis();
   const pendingEndKey = pendingCallEndKey(data.callId);
-  const hasPendingEnd = await redis.get<string>(pendingEndKey);
+  const hasPendingEnd = await redis.get(pendingEndKey);
   if (hasPendingEnd) {
     await redis.del(pendingEndKey);
     logInfo('Deferred settlement (HTTP)', { callId: data.callId });
