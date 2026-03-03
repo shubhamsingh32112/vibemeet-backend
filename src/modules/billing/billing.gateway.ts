@@ -193,6 +193,7 @@ export function setupBillingGateway(io: Server): void {
           
           // 🔥 FIX 18: Use BillingService instead of direct function call
           // Pass payerFirebaseUid (the user who pays) instead of socket firebaseUid
+          // NOTE: startBillingSession now handles call registration for batch processing
           await billingService.startBillingSession(io, payerFirebaseUid, data);
 
           // 🔥 FIX 1: Check Redis for pending call end
@@ -375,21 +376,11 @@ async function handleCallStarted(
   }
 ): Promise<void> {
   // 🔥 FIX 18: Use BillingService for business logic
+  // NOTE: startBillingSession now handles call registration for batch processing internally
+  // This ensures calls are always registered regardless of entry point (socket, HTTP, webhook)
   await billingService.startBillingSession(io, userFirebaseUid, data);
   
-  // 🔥 FIX 1: Track both participants in Redis so we can auto-settle on socket disconnect
-  const redis = getRedis();
-  await Promise.all([
-    redis.setex(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL, data.callId),
-    redis.setex(activeCallByUserKey(data.creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL, data.callId),
-  ]);
-  
-  // 🔥 FIX: Register call in Redis sorted set for batch processing
-  // Score = next billing time in milliseconds
-  const nextBillingTime = Date.now() + BILLING_TICK_INTERVAL;
-  await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, data.callId);
-  
-  logDebug('Registered call for batch billing', { callId: data.callId, nextBillingTime });
+  logDebug('Call started via handleCallStarted', { callId: data.callId });
 }
 
 // ══════════════════════════════════════════════════════════════════════════

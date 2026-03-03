@@ -156,9 +156,18 @@ export function registerAvailabilitySocket(io: Server): void {
       // Join creator-specific room
       socket.join(`creator:${firebaseUid}`);
       
-      // Send current status back
-      const currentStatus = await getAvailability(firebaseUid);
-      socket.emit('creator:status', { creatorId: firebaseUid, status: currentStatus });
+      // 🔥 CRITICAL FIX: Auto-set creator to online when they connect
+      // Product requirement: creators are always online while the app is running
+      // This ensures creators appear online immediately when they reopen the app
+      await setAvailability(firebaseUid, 'online');
+      
+      // Broadcast to ALL clients that creator is now online
+      io.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
+      
+      console.log(`🟢 [SOCKET] Creator auto-set to online on connect: ${firebaseUid}`);
+      
+      // Send current status back (will be 'online' now)
+      socket.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
       
       // 🔥 Start heartbeat to refresh TTL (prevents auto-expire while connected)
       heartbeatInterval = setInterval(async () => {

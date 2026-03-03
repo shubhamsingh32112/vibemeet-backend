@@ -16,6 +16,9 @@ import {
   callUserCoinsKey,
   callCreatorEarningsKey,
   idempotencyKey,
+  ACTIVE_BILLING_CALLS_KEY,
+  activeCallByUserKey,
+  ACTIVE_CALL_BY_USER_TTL,
 } from '../../config/redis';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -179,12 +182,37 @@ export class BillingService {
     // 🔥 FIX 15: Record billing start metric
     recordBillingMetric('session_started', 1, { callId, pricePerSecond: pricePerSecond.toString() });
 
-    logInfo('Billing session started', {
-      callId,
-      pricePerSecond,
-      userCoins: user.coins,
-      maxSeconds,
-    });
+    // 🔥 CRITICAL FIX: Register call for batch billing processing
+    // This MUST be done after Redis keys are created, otherwise billing processor won't find the call
+    try {
+      // Track both participants in Redis so we can auto-settle on socket disconnect
+      await Promise.all([
+        redis.setex(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL, callId),
+        redis.setex(activeCallByUserKey(creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL, callId),
+      ]);
+      
+      // Register call in Redis sorted set for batch processing
+      // Score = next billing time in milliseconds
+      const BILLING_TICK_INTERVAL = 1000; // 1 second
+      const nextBillingTime = Date.now() + BILLING_TICK_INTERVAL;
+      await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
+      
+      logInfo('Billing session started - call registered for batch processing', {
+        callId,
+        pricePerSecond,
+        userCoins: user.coins,
+        maxSeconds,
+        nextBillingTime,
+      });
+    } catch (registrationError) {
+      logError('CRITICAL: Failed to register call for batch billing', registrationError, {
+        callId,
+        alert: true,
+        impact: 'Billing ticks will not occur - coins will not be deducted',
+      });
+      // Don't throw - session is created, but billing won't work
+      // This is logged as critical so it can be monitored
+    }
   }
 
   /**
