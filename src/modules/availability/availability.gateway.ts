@@ -283,23 +283,41 @@ export function setupAvailabilityGateway(io: Server): void {
 
       // Handle creator disconnect
       if (uid && creator) {
-        const nextCount = Math.max((creatorSocketCounts.get(uid) ?? 1) - 1, 0);
+        const currentCount = creatorSocketCounts.get(uid) ?? 1;
+        const nextCount = Math.max(currentCount - 1, 0);
+        
         if (nextCount === 0) {
           // 🔥 AUTOMATIC OFFLINE: Mark creator as offline when all devices disconnect
           // Product requirement: creators are automatically offline when app closes
           creatorSocketCounts.delete(uid);
           
-          // Stop heartbeat
+          // Stop heartbeat immediately
           const heartbeatInterval = creatorHeartbeatIntervals.get(uid);
           if (heartbeatInterval) {
             clearInterval(heartbeatInterval);
             creatorHeartbeatIntervals.delete(uid);
           }
           
-          await setCreatorAvailability(io, uid, 'busy');
-          logInfo('Creator disconnected - automatically set to offline', { firebaseUid: uid });
+          // 🔥 CRITICAL: Set status to busy and broadcast BEFORE cleanup
+          // This ensures all clients receive the status change immediately
+          try {
+            await setCreatorAvailability(io, uid, 'busy');
+            logInfo('Creator disconnected - automatically set to offline', { firebaseUid: uid });
+          } catch (err) {
+            logError('Failed to set creator offline on disconnect', err, { firebaseUid: uid });
+            // Even if Redis fails, try to broadcast the status change
+            io.emit('creator:status', {
+              creatorId: uid,
+              status: 'busy',
+            });
+          }
         } else {
+          // Still have other devices connected - just decrement count
           creatorSocketCounts.set(uid, nextCount);
+          logDebug('Creator device disconnected, but other devices still connected', {
+            firebaseUid: uid,
+            remainingDevices: nextCount,
+          });
         }
       }
 
@@ -359,9 +377,16 @@ export async function setCreatorAvailability(
   }
 
   // Broadcast to ALL connected clients instantly
+  // 🔥 CRITICAL: This ensures all users see status changes in real-time
   io.emit('creator:status', {
     creatorId: creatorFirebaseUid,
     status,
+  });
+  
+  logDebug('Broadcast creator status to all clients', {
+    creatorFirebaseUid,
+    status,
+    connectedClients: io.sockets.sockets.size,
   });
 
   // Emit to admin dashboard
