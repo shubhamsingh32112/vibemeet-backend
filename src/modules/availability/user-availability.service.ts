@@ -84,6 +84,11 @@ export async function getUserAvailability(firebaseUid: string): Promise<UserAvai
 /**
  * Refresh a user's TTL (keep-alive)
  * Call this periodically to prevent auto-expire
+ * 
+ * ⚠️ NOTE: This function should only be called from heartbeat intervals
+ * that verify the user is still connected. The heartbeat itself should
+ * check for active sockets before calling this function.
+ * 
  * @param firebaseUid - The user's Firebase UID
  */
 export async function refreshUserAvailability(firebaseUid: string): Promise<void> {
@@ -95,10 +100,16 @@ export async function refreshUserAvailability(firebaseUid: string): Promise<void
     const redis = getRedis();
     const status = await redis.get(`${KEY_PREFIX}${firebaseUid}`);
     
+    // Only refresh if status is still "online"
+    // If status is "offline" or missing, don't refresh (user is offline)
     if (status === 'online') {
       // Re-set with fresh TTL
       await redis.setex(`${KEY_PREFIX}${firebaseUid}`, AVAILABILITY_TTL, 'online');
       console.log(`🔄 [USER AVAILABILITY] Refreshed TTL: ${firebaseUid}`);
+    } else {
+      // Status is offline or missing - don't refresh
+      // This is a safety check in case heartbeat wasn't properly stopped
+      console.log(`⚠️  [USER AVAILABILITY] Skipped refresh: status is not online (${status || 'missing'}) for ${firebaseUid}`);
     }
   } catch (err) {
     console.error(`❌ [USER AVAILABILITY] Failed to refresh:`, err);
