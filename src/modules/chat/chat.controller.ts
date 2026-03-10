@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import { getStreamClient, ensureStreamUser } from '../../config/stream';
 import { getRedis } from '../../config/redis';
 import { User } from '../user/user.model';
+import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import {
   ChatMessageQuota,
@@ -615,5 +616,122 @@ export const getMessageQuota = async (
   } catch (error) {
     console.error('❌ [CHAT] Error getting quota:', error);
     res.status(500).json({ success: false, error: 'Failed to get quota' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET /api/v1/chat/channel/:channelId/creator-call-info
+//
+// Returns creator identity for video call when Stream extraData (mongoId/appRole)
+// is missing. Used so the chat video call button can always be shown for users.
+// Returns 404 if the other member is not a creator.
+// ══════════════════════════════════════════════════════════════════════════
+
+export const getCreatorCallInfo = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { channelId } = req.params;
+    if (!channelId) {
+      res
+        .status(400)
+        .json({ success: false, error: 'channelId is required' });
+      return;
+    }
+
+    const currentUser = await User.findOne({
+      firebaseUid: req.auth.firebaseUid,
+    });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // Only regular users can call creators from chat
+    if (currentUser.role !== 'user') {
+      res.status(403).json({
+        success: false,
+        error: 'Only regular users can initiate video calls from chat',
+      });
+      return;
+    }
+
+    const redis = getRedis();
+    const channelCreatorKey = `${CHANNEL_CREATOR_PREFIX}${channelId}`;
+    let otherFirebaseUid: string | null = await redis.get(channelCreatorKey);
+
+    if (!otherFirebaseUid) {
+      const client = getStreamClient();
+      const channel = client.channel('messaging', channelId);
+      try {
+        const channelState = await channel.watch();
+        const memberIds: string[] = Object.keys(channelState.members || {});
+        otherFirebaseUid =
+          memberIds.find((id) => id !== currentUser.firebaseUid) || null;
+        if (otherFirebaseUid) {
+          await redis.setex(channelCreatorKey, CHANNEL_CREATOR_TTL, otherFirebaseUid);
+        }
+      } catch (watchErr) {
+        console.error('❌ [CHAT] getCreatorCallInfo channel watch:', watchErr);
+        res.status(404).json({
+          success: false,
+          error: 'Channel not found or not accessible',
+        });
+        return;
+      }
+    }
+
+    if (!otherFirebaseUid) {
+      res.status(404).json({
+        success: false,
+        error: 'Could not resolve other channel member',
+      });
+      return;
+    }
+
+    const otherUser = await User.findOne({ firebaseUid: otherFirebaseUid });
+    if (!otherUser) {
+      res.status(404).json({
+        success: false,
+        error: 'Other user not found',
+      });
+      return;
+    }
+
+    if (otherUser.role !== 'creator' && otherUser.role !== 'admin') {
+      res.status(404).json({
+        success: false,
+        error: 'Other member is not a creator',
+      });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: otherUser._id });
+    if (!creator) {
+      res.status(404).json({
+        success: false,
+        error: 'Creator profile not found',
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        creatorFirebaseUid: otherUser.firebaseUid,
+        creatorMongoId: creator._id.toString(),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [CHAT] getCreatorCallInfo error:', error);
+    res
+      .status(500)
+      .json({ success: false, error: 'Failed to get creator call info' });
   }
 };

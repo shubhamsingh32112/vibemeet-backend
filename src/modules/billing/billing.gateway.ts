@@ -29,6 +29,7 @@ import { emitToAdmin } from '../admin/admin.gateway';
 import { getStreamClient } from '../../config/stream';
 import crypto from 'crypto';
 import { recordBillingMetric } from '../../utils/monitoring';
+import { CREATOR_EARNINGS_PER_SECOND } from '../../config/pricing.config';
 import { billingService } from './billing.service';
 import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
@@ -652,15 +653,24 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   // Earnings are stored as integer micro-coins in Redis to avoid floating point drift
   const earningsMicros = parseInt((finalEarningsRaw as string) || '0', 10) || 0;
   const finalEarnings = earningsMicros / 10000;
-  const totalDeducted = session.elapsedSeconds * session.pricePerSecond;
+
+  // 🔥 FIX: Use wall-clock duration for exact billing (60s call = exactly 60 coins deducted, 18 earned)
+  // Tick-based session.elapsedSeconds can be ±1 second off due to batch timing
+  const settlementTime = Date.now();
+  const actualDurationSeconds = Math.floor((settlementTime - session.startTime) / 1000);
+  const durationSeconds = Math.max(0, actualDurationSeconds);
+  const totalDeducted = Math.round(durationSeconds * session.pricePerSecond);
+  const totalEarnedCreator = Math.round(durationSeconds * CREATOR_EARNINGS_PER_SECOND);
 
   logInfo('Settling call - Redis values read', {
     callId,
     elapsedSeconds: session.elapsedSeconds,
+    actualDurationSeconds,
+    durationSeconds,
     finalCoins,
     finalEarnings,
-    totalDeducted: totalDeducted.toFixed(2),
-    creatorEarnings: finalEarnings.toFixed(2),
+    totalDeducted,
+    totalEarnedCreator,
     redisValues: {
       coinsRaw: finalCoinsRaw,
       earningsRaw: finalEarningsRaw,
@@ -698,7 +708,10 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     if (!user) {
       throw new Error(`User not found: ${session.userMongoId}`);
     }
-    user.coins = Math.max(0, Math.floor(finalCoins));
+    // finalCoins = balance after tick deductions; totalDeducted = wall-clock exact amount
+    const tickDeducted = Math.round(session.elapsedSeconds * session.pricePerSecond);
+    const effectiveFinalCoins = finalCoins + tickDeducted - totalDeducted;
+    user.coins = Math.max(0, Math.floor(effectiveFinalCoins));
     await user.save({ session: dbSession });
 
     // 2️⃣  Write debit transaction — idempotent by callId (within transaction)
@@ -711,9 +724,9 @@ async function settleCall(io: Server, callId: string): Promise<void> {
           transactionId: `call_debit_${callId}`,
           userId: session.userMongoId,
           type: 'debit',
-          coins: Math.ceil(totalDeducted),
+          coins: totalDeducted,
           source: 'video_call',
-          description: `Video call (${session.elapsedSeconds}s) @ ${session.pricePerMinute} coins/min`,
+          description: `Video call (${durationSeconds}s) @ ${session.pricePerMinute} coins/min`,
           callId,
           status: 'completed',
         },
@@ -723,7 +736,7 @@ async function settleCall(io: Server, callId: string): Promise<void> {
 
     // 3️⃣  Credit creator's coin balance + write credit transaction (within transaction)
     let creatorUser: (mongoose.Document<unknown, {}, IUser> & IUser) | null = null;
-    if (finalEarnings > 0) {
+    if (totalEarnedCreator > 0) {
       const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
       if (!creator) {
         throw new Error(`Creator not found: ${session.creatorMongoId}`);
@@ -734,11 +747,9 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         throw new Error(`Creator user not found: ${creator.userId}`);
       }
 
-      // 🔥 FIX 7: Round earnings to 2 decimal places to avoid floating point errors
-      const roundedEarnings = Math.round(finalEarnings * 100) / 100;
-      const earningsCoins = Math.round(roundedEarnings); // Integer coins for balance
+      // Use wall-clock exact earnings (60s call = exactly 18 coins at 30% share)
       const creatorCoinsBefore = creatorUser.coins || 0;
-      creatorUser.coins = Math.round(creatorCoinsBefore + earningsCoins);
+      creatorUser.coins = Math.round(creatorCoinsBefore + totalEarnedCreator);
       await creatorUser.save({ session: dbSession });
       
       logInfo('Settling call - Creator coins updated', {
@@ -747,20 +758,19 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         creatorUserId: creator.userId,
         coinsBefore: creatorCoinsBefore,
         coinsAfter: creatorUser.coins,
-        coinsEarned: earningsCoins,
+        coinsEarned: totalEarnedCreator,
       });
 
       // Idempotent credit transaction by callId
-      // 🔥 FIX 7: Use rounded earnings for transaction
       await CoinTransaction.findOneAndUpdate(
         { callId, userId: creator.userId, type: 'credit' },
         {
           transactionId: `call_credit_${callId}`,
           userId: creator.userId,
           type: 'credit',
-          coins: earningsCoins,
+          coins: totalEarnedCreator,
           source: 'video_call',
-          description: `Earned from video call (${session.elapsedSeconds}s)`,
+          description: `Earned from video call (${durationSeconds}s)`,
           callId,
           status: 'completed',
         },
@@ -798,8 +808,8 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         otherAvatar: creatorAvatar,
         otherFirebaseUid: creatorFirebaseUid,
         ownerRole: 'user',
-        durationSeconds: session.elapsedSeconds,
-        coinsDeducted: Math.ceil(totalDeducted),
+        durationSeconds,
+        coinsDeducted: totalDeducted,
         coinsEarned: 0,
       },
       { upsert: true, new: true, session: dbSession }
@@ -815,11 +825,11 @@ async function settleCall(io: Server, callId: string): Promise<void> {
           otherUserId: session.userMongoId,
           otherName: userName,
           otherAvatar: userAvatar,
-          otherFirebaseUid: session.userFirebaseUid,
-          ownerRole: 'creator',
-          durationSeconds: session.elapsedSeconds,
-          coinsDeducted: 0,
-          coinsEarned: Math.floor(finalEarnings),
+        otherFirebaseUid: session.userFirebaseUid,
+        ownerRole: 'creator',
+        durationSeconds,
+        coinsDeducted: 0,
+        coinsEarned: totalEarnedCreator,
         },
         { upsert: true, new: true, session: dbSession }
       );
@@ -872,8 +882,8 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         // Ignore "already exists" and other non-fatal create errors; sendMessage may still work.
       }
 
-      const durationLabel = formatDurationLabel(session.elapsedSeconds);
-      const coinsSpent = Math.ceil(totalDeducted);
+      const durationLabel = formatDurationLabel(durationSeconds);
+      const coinsSpent = totalDeducted;
       await channel.sendMessage({
         id: `call_activity_${callId}`,
         type: 'system',
@@ -906,18 +916,15 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     // 6️⃣  Notify both parties of final settlement
     io.to(`user:${session.userFirebaseUid}`).emit('billing:settled', {
       callId,
-      finalCoins: Math.floor(finalCoins),
-      totalDeducted: Math.ceil(totalDeducted),
-      durationSeconds: session.elapsedSeconds,
+      finalCoins: Math.floor(effectiveFinalCoins),
+      totalDeducted,
+      durationSeconds,
     });
-
-    // 🔥 FIX 7: Round final earnings to integer for settlement
-    const finalEarningsRounded = Math.round(finalEarnings);
     
     io.to(`user:${session.creatorFirebaseUid}`).emit('billing:settled', {
       callId,
-      totalEarned: finalEarningsRounded,
-      durationSeconds: session.elapsedSeconds,
+      totalEarned: totalEarnedCreator,
+      durationSeconds,
     });
 
     // 7️⃣  Emit real-time creator data update (triggers dashboard re-fetch)
@@ -927,8 +934,8 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         emitCreatorDataUpdated(session.creatorFirebaseUid, {
           reason: 'call_settled',
           callId,
-          totalEarned: finalEarningsRounded,
-          durationSeconds: session.elapsedSeconds,
+          totalEarned: totalEarnedCreator,
+          durationSeconds,
         });
       }
     } catch (emitErr) {
@@ -945,9 +952,9 @@ async function settleCall(io: Server, callId: string): Promise<void> {
       callId,
       userFirebaseUid: session.userFirebaseUid,
       creatorFirebaseUid: session.creatorFirebaseUid,
-      durationSeconds: session.elapsedSeconds,
-      coinsDeducted: Math.floor(totalDeducted),
-      creatorEarned: finalEarningsRounded,
+      durationSeconds,
+      coinsDeducted: totalDeducted,
+      creatorEarned: totalEarnedCreator,
     });
 
     logInfo('Settlement complete', { callId });

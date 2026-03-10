@@ -192,9 +192,9 @@ export class BillingService {
       ]);
       
       // Register call in Redis sorted set for batch processing
-      // Score = next billing time in milliseconds
+      // Score = next billing time (aligned to call timeline: first tick exactly 1s after start)
       const BILLING_TICK_INTERVAL = 1000; // 1 second
-      const nextBillingTime = Date.now() + BILLING_TICK_INTERVAL;
+      const nextBillingTime = session.startTime + BILLING_TICK_INTERVAL;
       await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
       
       logInfo('Billing session started - call registered for batch processing', {

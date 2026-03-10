@@ -4,6 +4,7 @@ import {
   createOrGetChannel,
   preSendMessage,
   getMessageQuota,
+  getCreatorCallInfo,
 } from './chat.controller';
 import { handleStreamWebhook } from './chat.webhook';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
@@ -22,6 +23,13 @@ router.post('/pre-send', verifyFirebaseToken, preSendMessage);
 
 // Get message quota for a channel (free remaining, cost)
 router.get('/quota/:channelId', verifyFirebaseToken, getMessageQuota);
+
+// Get creator call info for video call from chat (when Stream extraData is missing)
+router.get(
+  '/channel/:channelId/creator-call-info',
+  verifyFirebaseToken,
+  getCreatorCallInfo,
+);
 
 // Stream webhook endpoint (no auth required - Stream calls this directly)
 router.post('/webhook', handleStreamWebhook);
