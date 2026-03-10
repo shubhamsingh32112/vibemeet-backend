@@ -710,7 +710,7 @@ export class CallLifecycleService {
 
     // Create call record
     try {
-      const newCall = await Call.create({
+      await Call.create({
         callId,
         callerUserId: callerUser._id,
         creatorUserId: creatorUser._id,
