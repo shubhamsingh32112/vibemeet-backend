@@ -1,4 +1,5 @@
 import express from 'express';
+import compression from 'compression';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
@@ -73,6 +74,9 @@ const statusLimiter = rateLimit({
 app.use('/api/', generalLimiter);
 // Apply stricter limiter specifically for status endpoints.
 app.use('/api/', statusLimiter);
+
+// Compression - gzip responses for scalability (reduces bandwidth)
+app.use(compression());
 
 // Body parsing middleware - increase limit for base64 images
 app.use(express.json({ limit: '50mb' }));

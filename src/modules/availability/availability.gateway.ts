@@ -3,6 +3,7 @@ import { getRedis, availabilityKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { User } from '../user/user.model';
+import { Creator } from '../creator/creator.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 import {
   setUserAvailability,
@@ -204,11 +205,24 @@ export function setupAvailabilityGateway(io: Server): void {
       }
       activeSocketsByCreator.get(firebaseUid)!.add(socket.id);
       
+      // 🔥 FIX: Check if creator is on an active call before setting online
+      // If they have an active call, keep them busy (don't overwrite with online)
+      const user = await User.findOne({ firebaseUid });
+      const creator = user ? await Creator.findOne({ userId: user._id }) : null;
+      const hasActiveCall = creator?.currentCallId != null;
+      
       // 🔥 FIX: Automatically set creator online when first device connects
       // Product requirement: creators are automatically online when app opens
+      // BUT: Don't overwrite busy status if creator is on an active call
       if (currentCount === 0) {
-        await setCreatorAvailability(io, firebaseUid, 'online');
-        logInfo('Creator automatically set to online on connect', { firebaseUid });
+        if (hasActiveCall) {
+          // Creator is on a call - keep them busy
+          await setCreatorAvailability(io, firebaseUid, 'busy');
+          logInfo('Creator has active call, kept as busy on connect', { firebaseUid, callId: creator.currentCallId });
+        } else {
+          await setCreatorAvailability(io, firebaseUid, 'online');
+          logInfo('Creator automatically set to online on connect', { firebaseUid });
+        }
         
         // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
         // Heartbeat runs every 60s, TTL is 120s - ensures status persists even with network hiccups
@@ -245,11 +259,23 @@ export function setupAvailabilityGateway(io: Server): void {
               return;
             }
             
-            const redis = getRedis();
-            const status = await redis.get(availabilityKey(firebaseUid));
-            if (status === 'online') {
-              await redis.setex(availabilityKey(firebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
-              logDebug('Heartbeat refreshed TTL', { firebaseUid });
+            // 🔥 FIX: Check if creator is on an active call before refreshing
+            // If they have an active call, keep them busy (don't refresh to online)
+            const user = await User.findOne({ firebaseUid });
+            const creator = user ? await Creator.findOne({ userId: user._id }) : null;
+            const hasActiveCall = creator?.currentCallId != null;
+            
+            if (hasActiveCall) {
+              // Creator is on a call - ensure they stay busy
+              await setCreatorAvailability(io, firebaseUid, 'busy');
+              logDebug('Heartbeat: Creator on active call, kept as busy', { firebaseUid, callId: creator.currentCallId });
+            } else {
+              const redis = getRedis();
+              const status = await redis.get(availabilityKey(firebaseUid));
+              if (status === 'online') {
+                await redis.setex(availabilityKey(firebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
+                logDebug('Heartbeat refreshed TTL', { firebaseUid });
+              }
             }
           } catch (err) {
             logError('Heartbeat failed', err, { firebaseUid });
@@ -385,8 +411,21 @@ export function setupAvailabilityGateway(io: Server): void {
         logWarning('Unauthorized creator:online request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
-      await setCreatorAvailability(io, uid, 'online');
-      logInfo('Creator set to online', { firebaseUid: uid });
+      
+      // 🔥 FIX: Check if creator is on an active call before setting online
+      // If they have an active call, keep them busy (don't overwrite with online)
+      const user = await User.findOne({ firebaseUid: uid });
+      const creatorDoc = user ? await Creator.findOne({ userId: user._id }) : null;
+      const hasActiveCall = creatorDoc?.currentCallId != null;
+      
+      if (hasActiveCall) {
+        // Creator is on a call - keep them busy
+        await setCreatorAvailability(io, uid, 'busy');
+        logInfo('Creator has active call, kept as busy (creator:online event)', { firebaseUid: uid, callId: creatorDoc.currentCallId });
+      } else {
+        await setCreatorAvailability(io, uid, 'online');
+        logInfo('Creator set to online', { firebaseUid: uid });
+      }
     });
 
     socket.on('creator:offline', async () => {

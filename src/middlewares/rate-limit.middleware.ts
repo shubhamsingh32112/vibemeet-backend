@@ -122,3 +122,19 @@ export const tasksLimiter = rateLimit({
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
 });
+
+/**
+ * Rate limiter for Fast Login (unauthenticated)
+ * - 10 requests per minute per IP (scalable for ~1000 users/day, limits abuse)
+ */
+export const fastLoginLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,
+  message: 'Too many login attempts. Please wait a moment before trying again.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => `fast_login:${req.ip}`,
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});

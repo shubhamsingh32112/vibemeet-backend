@@ -1,8 +1,11 @@
 import { Server } from 'socket.io';
 import axios from 'axios';
 import { Call } from './call.model';
+import { User } from '../user/user.model';
 import { generateServerSideToken } from '../../config/stream-video';
 import { transitionCallStatus } from './call-state.service';
+import { setAvailability, getAvailability } from '../availability/availability.service';
+import { emitCreatorStatus } from '../availability/availability.socket';
 import { logInfo, logError } from '../../utils/logger';
 
 let reconciliationTimer: NodeJS.Timeout | null = null;
@@ -57,8 +60,60 @@ export function stopCallReconciliationJob(): void {
   }
 }
 
+/**
+ * 🔥 FIX: Ensure creators with active calls are marked busy
+ * This is a safety net to catch any cases where creators weren't marked busy
+ */
+async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
+  try {
+    const activeCalls = await Call.find({
+      $or: [
+        { status: { $in: ['ringing', 'accepted'] } },
+        { isSettled: { $ne: true } },
+      ],
+    })
+      .limit(200)
+      .exec();
+
+    if (!activeCalls.length) {
+      return; // No active calls
+    }
+
+    // Mark each creator busy if they have an active call
+    for (const call of activeCalls) {
+      try {
+        const creatorUser = await User.findById(call.creatorUserId);
+        if (creatorUser?.firebaseUid) {
+          // Check current status
+          const currentStatus = await getAvailability(creatorUser.firebaseUid);
+          
+          if (currentStatus !== 'busy') {
+            // Creator should be busy but isn't - fix it
+            await setAvailability(creatorUser.firebaseUid, 'busy');
+            emitCreatorStatus(creatorUser.firebaseUid, 'busy');
+            logInfo('Reconciliation: Fixed creator busy status', {
+              callId: call.callId,
+              creatorFirebaseUid: creatorUser.firebaseUid,
+              previousStatus: currentStatus,
+            });
+          }
+        }
+      } catch (err) {
+        logError('Error ensuring creator busy status in reconciliation', err, {
+          callId: call.callId,
+        });
+      }
+    }
+  } catch (err) {
+    logError('Error in ensureCreatorsWithActiveCallsAreBusy', err);
+  }
+}
+
 async function reconcileActiveCalls(): Promise<void> {
   try {
+    // 🔥 FIX: First ensure creators with active calls are marked busy
+    await ensureCreatorsWithActiveCallsAreBusy();
+
     const activeCalls = await Call.find({
       $or: [
         { status: { $in: ['ringing', 'accepted'] } },

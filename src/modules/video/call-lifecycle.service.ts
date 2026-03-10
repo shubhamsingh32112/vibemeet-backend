@@ -266,7 +266,7 @@ export class CallLifecycleService {
    * Handle call.session_started:
    * - Ensure Call exists and startedAt is set
    * - Idempotently start Redis billing via billing gateway
-   * - Ensure creator marked busy
+   * - Ensure creator marked busy (CRITICAL - this is the most reliable webhook)
    */
   private async handleSessionStarted(payload: StreamVideoWebhookPayload): Promise<void> {
     const callId = this.getCallIdFromPayload(payload);
@@ -283,9 +283,28 @@ export class CallLifecycleService {
 
     logInfo('Session started (webhook)', { callId, sessionId });
 
+    // 🔥 FIX: Create call record if it doesn't exist (for SDK-created calls)
+    // This ensures we can extract creator UID even if call wasn't created via REST API
+    await this.ensureCallRecordExists(payload, callId);
+
     const call = await Call.findOne({ callId });
     if (!call) {
-      logInfo('Call record not found for session_started', { callId });
+      logError(
+        'Call record not found for session_started after ensureCallRecordExists',
+        new Error('Call missing'),
+        { callId, payloadMembers: payload.call?.members, sessionParticipants: payload.session?.participants }
+      );
+      
+      // 🔥 FALLBACK: Try to mark creator busy even without call record
+      // Extract creator UID directly from payload
+      const creatorFirebaseUid = await this.extractCreatorFirebaseUid(payload, callId);
+      if (creatorFirebaseUid) {
+        logInfo('Marking creator busy from session_started (fallback, no call record)', {
+          callId,
+          creatorFirebaseUid,
+        });
+        await this.markCreatorBusy(creatorFirebaseUid);
+      }
       return;
     }
 
@@ -293,6 +312,17 @@ export class CallLifecycleService {
     const existingSession = await redis.get(callSessionKey(callId));
     if (existingSession) {
       logInfo('Billing already started for call (idempotent)', { callId });
+      
+      // 🔥 FIX: Still mark creator busy even if billing already started
+      // This ensures status is correct even if webhook fires multiple times
+      const creatorUser = await User.findById(call.creatorUserId);
+      if (creatorUser?.firebaseUid) {
+        logInfo('Marking creator busy (session_started, billing already started)', {
+          callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+        });
+        await this.markCreatorBusy(creatorUser.firebaseUid);
+      }
       return;
     }
 
@@ -316,9 +346,28 @@ export class CallLifecycleService {
     await call.save();
     logInfo('Call session start persisted', { callId, startedAt: call.startedAt });
 
+    // 🔥 CRITICAL: Mark creator busy when session starts (most reliable webhook)
+    // This ensures creator is marked busy even if call.ringing webhook didn't fire
     const creatorUser = await User.findById(call.creatorUserId);
     if (creatorUser?.firebaseUid) {
-      await this.markCreatorBusy(creatorUser.firebaseUid);
+      logInfo('Marking creator busy (session_started)', {
+        callId,
+        creatorFirebaseUid: creatorUser.firebaseUid,
+      });
+      const success = await this.markCreatorBusy(creatorUser.firebaseUid);
+      if (!success) {
+        logError(
+          'Failed to mark creator busy on session_started',
+          new Error('markCreatorBusy returned false'),
+          { callId, creatorFirebaseUid: creatorUser.firebaseUid }
+        );
+      }
+    } else {
+      logError(
+        'Cannot mark creator busy: creator user missing firebaseUid',
+        new Error('Missing firebaseUid'),
+        { callId, creatorUserId: call.creatorUserId }
+      );
     }
 
     const callerUser = await User.findById(call.callerUserId);
@@ -444,24 +493,40 @@ export class CallLifecycleService {
       logError(
         'call.ringing missing call ID',
         new Error('Missing callId'),
-        {}
+        { payloadType: payload.type, payloadCall: payload.call }
       );
       return;
     }
 
-    logInfo('Call ringing (webhook)', { callId });
+    logInfo('Call ringing (webhook)', { callId, payloadType: payload.type });
+
+    // 🔥 FIX: Create call record if it doesn't exist (for SDK-created calls)
+    // This ensures we can extract creator UID even if call wasn't created via REST API
+    await this.ensureCallRecordExists(payload, callId);
 
     const creatorFirebaseUid = await this.extractCreatorFirebaseUid(payload, callId);
     if (!creatorFirebaseUid) {
       logError(
         'Could not extract creator Firebase UID from ringing payload',
         new Error('Missing creator uid'),
-        { callId }
+        { 
+          callId,
+          payloadMembers: payload.call?.members,
+          payloadCallId: payload.call?.id,
+        }
       );
       return;
     }
 
-    await this.markCreatorBusy(creatorFirebaseUid);
+    logInfo('Marking creator busy (call ringing)', { callId, creatorFirebaseUid });
+    const success = await this.markCreatorBusy(creatorFirebaseUid);
+    if (!success) {
+      logError(
+        'Failed to mark creator busy on call ringing',
+        new Error('markCreatorBusy returned false'),
+        { callId, creatorFirebaseUid }
+      );
+    }
   }
 
   /**
@@ -474,24 +539,39 @@ export class CallLifecycleService {
       logError(
         'call.accepted missing call ID',
         new Error('Missing callId'),
-        {}
+        { payloadType: payload.type, payloadCall: payload.call }
       );
       return;
     }
 
-    logInfo('Call accepted (webhook)', { callId });
+    logInfo('Call accepted (webhook)', { callId, payloadType: payload.type });
+
+    // 🔥 FIX: Create call record if it doesn't exist (for SDK-created calls)
+    await this.ensureCallRecordExists(payload, callId);
 
     const creatorFirebaseUid = await this.extractCreatorFirebaseUid(payload, callId);
     if (!creatorFirebaseUid) {
       logError(
         'Could not extract creator Firebase UID from accepted payload',
         new Error('Missing creator uid'),
-        { callId }
+        { 
+          callId,
+          payloadMembers: payload.call?.members,
+          payloadCallId: payload.call?.id,
+        }
       );
       return;
     }
 
-    await this.markCreatorBusy(creatorFirebaseUid);
+    logInfo('Marking creator busy (call accepted)', { callId, creatorFirebaseUid });
+    const success = await this.markCreatorBusy(creatorFirebaseUid);
+    if (!success) {
+      logError(
+        'Failed to mark creator busy on call accepted',
+        new Error('markCreatorBusy returned false'),
+        { callId, creatorFirebaseUid }
+      );
+    }
   }
 
   /**
@@ -584,37 +664,160 @@ export class CallLifecycleService {
     }
   }
 
+  /**
+   * 🔥 FIX: Ensure call record exists in DB (for SDK-created calls)
+   * Creates call record if it doesn't exist, using webhook payload data
+   */
+  private async ensureCallRecordExists(
+    payload: StreamVideoWebhookPayload,
+    callId: string
+  ): Promise<void> {
+    const existingCall = await Call.findOne({ callId });
+    if (existingCall) {
+      return; // Call record already exists
+    }
+
+    logInfo('Call record not found, creating from webhook payload', { callId });
+
+    // Extract members from payload
+    const members = payload.call?.members || payload.session?.participants || [];
+    const callerMember = members.find((m) => m.role === 'admin') || members[0];
+    const creatorMember =
+      members.find((m) => m.role === 'call_member') ||
+      members.find((m) => m.user_id && callerMember && m.user_id !== callerMember.user_id);
+
+    if (!callerMember?.user_id || !creatorMember?.user_id) {
+      logError(
+        'Cannot create call record: missing members in payload',
+        new Error('Missing members'),
+        { callId, members }
+      );
+      return;
+    }
+
+    // Find users by Firebase UID
+    const callerUser = await User.findOne({ firebaseUid: callerMember.user_id });
+    const creatorUser = await User.findOne({ firebaseUid: creatorMember.user_id });
+
+    if (!callerUser || !creatorUser) {
+      logError(
+        'Cannot create call record: users not found',
+        new Error('Users missing'),
+        { callId, callerUid: callerMember.user_id, creatorUid: creatorMember.user_id }
+      );
+      return;
+    }
+
+    // Create call record
+    try {
+      const newCall = await Call.create({
+        callId,
+        callerUserId: callerUser._id,
+        creatorUserId: creatorUser._id,
+        status: 'ringing',
+        billedSeconds: 0,
+        userCoinsSpent: 0,
+        creatorCoinsEarned: 0,
+        isForceEnded: false,
+        isSettled: false,
+      });
+      logInfo('Call record created from webhook', { callId });
+      
+      // 🔥 FIX: Mark creator busy immediately when call record is created
+      // The post-save hook will also mark busy, but this ensures it happens even if hook fails
+      if (creatorUser.firebaseUid) {
+        await this.markCreatorBusy(creatorUser.firebaseUid);
+        logInfo('Creator marked busy after call record creation', {
+          callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+        });
+      }
+    } catch (error) {
+      // Race condition: another webhook might have created it
+      logInfo('Call record creation failed (may already exist)', { callId, error });
+      
+      // 🔥 FIX: Even if call record creation failed, try to mark creator busy
+      // This handles the case where call record exists but creator wasn't marked busy
+      if (creatorUser.firebaseUid) {
+        await this.markCreatorBusy(creatorUser.firebaseUid);
+        logInfo('Creator marked busy after call record creation failure (fallback)', {
+          callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+        });
+      }
+    }
+  }
+
   private async extractCreatorFirebaseUid(
     payload: StreamVideoWebhookPayload,
     callId: string
   ): Promise<string | null> {
+    // Method 1: Extract from call members in payload (most reliable)
     if (payload.call?.members) {
       const creatorMember = payload.call.members.find((m) => m.role === 'call_member');
       if (creatorMember?.user_id) {
+        logInfo('Extracted creator Firebase UID from webhook payload members', {
+          callId,
+          creatorFirebaseUid: creatorMember.user_id,
+        });
         return creatorMember.user_id;
       }
     }
 
+    // Also check session participants
+    if (payload.session?.participants) {
+      const creatorParticipant = payload.session.participants.find((m) => m.role === 'call_member');
+      if (creatorParticipant?.user_id) {
+        logInfo('Extracted creator Firebase UID from session participants', {
+          callId,
+          creatorFirebaseUid: creatorParticipant.user_id,
+        });
+        return creatorParticipant.user_id;
+      }
+    }
+
+    // Method 2: Find from call record in DB
     const call = await Call.findOne({ callId });
     if (call) {
       const creatorUser = await User.findById(call.creatorUserId);
       if (creatorUser?.firebaseUid) {
+        logInfo('Extracted creator Firebase UID from call record', {
+          callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+        });
         return creatorUser.firebaseUid;
       }
     }
 
+    // Method 3: Parse from call ID format
+    // Call ID format: userId_creatorMongoId_timestamp (from Flutter SDK)
+    // OR: userId_creatorMongoId (from REST API)
     const parts = callId.split('_');
     if (parts.length >= 2) {
-      const creatorMongoId = parts[parts.length - 1];
+      // Creator Mongo ID is the second-to-last part (not the last, which is timestamp)
+      // For format: userId_creatorMongoId_timestamp, creator ID is at index length-2
+      // For format: userId_creatorMongoId, creator ID is at index length-1
+      const creatorMongoId = parts.length >= 3 ? parts[parts.length - 2] : parts[parts.length - 1];
+      
       const creator = await Creator.findById(creatorMongoId);
       if (creator) {
         const creatorUser = await User.findById(creator.userId);
         if (creatorUser?.firebaseUid) {
+          logInfo('Extracted creator Firebase UID from callId parsing', {
+            callId,
+            creatorMongoId,
+            creatorFirebaseUid: creatorUser.firebaseUid,
+          });
           return creatorUser.firebaseUid;
         }
       }
     }
 
+    logError(
+      'Could not extract creator Firebase UID from webhook',
+      new Error('Creator UID extraction failed'),
+      { callId, payloadMembers: payload.call?.members, sessionParticipants: payload.session?.participants }
+    );
     return null;
   }
 

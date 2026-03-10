@@ -8,10 +8,12 @@ import {
 } from '../../config/stream-video';
 import { MIN_COINS_TO_CALL } from '../../config/pricing.config';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
-import { logWarning, logInfo } from '../../utils/logger';
+import { logWarning, logInfo, logError } from '../../utils/logger';
 import { acquireCreatorCallLock } from './creator-call-lock.service';
 import { pricingService } from './pricing.service';
 import { shouldRejectNewCallsDueToBackpressure } from './backpressure.service';
+import { setAvailability } from '../availability/availability.service';
+import { emitCreatorStatus } from '../availability/availability.socket';
 
 export class VideoCallError extends Error {
   public readonly status: number;
@@ -238,6 +240,27 @@ export class VideoCallService {
         },
         { upsert: true, new: true }
       );
+
+      // 🔥 FIX: Mark creator as busy immediately when call is initiated
+      // This ensures creator is marked busy even if webhook is delayed or fails
+      // The webhook will also mark busy (idempotent), but this provides instant feedback
+      if (creatorUser.firebaseUid) {
+        try {
+          await setAvailability(creatorUser.firebaseUid, 'busy');
+          emitCreatorStatus(creatorUser.firebaseUid, 'busy');
+          
+          logInfo('Creator marked busy on call initiation', {
+            callId,
+            creatorFirebaseUid: creatorUser.firebaseUid,
+          });
+        } catch (availabilityError) {
+          // Non-critical: Log but don't fail call creation
+          logError('Failed to mark creator busy on call initiation', availabilityError, {
+            callId,
+            creatorFirebaseUid: creatorUser.firebaseUid,
+          });
+        }
+      }
 
       return { callId, callType };
     } catch (error: any) {

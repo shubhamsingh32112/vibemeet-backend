@@ -27,10 +27,12 @@
 import { Server, Socket } from 'socket.io';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { User } from '../user/user.model';
+import { Creator } from '../creator/creator.model';
 import {
   setAvailability,
   refreshAvailability,
   getBatchAvailability,
+  getAvailability,
   CreatorAvailability,
 } from './availability.service';
 import {
@@ -195,24 +197,54 @@ export function registerAvailabilitySocket(io: Server): void {
       // Join creator-specific room
       socket.join(`creator:${firebaseUid}`);
       
-      // 🔥 AUTOMATIC ONLINE: Auto-set creator to online when they connect
-      // Product requirement: creators are automatically online when app opens
-      // No manual toggle - status is automatic based on app lifecycle
-      await setAvailability(firebaseUid, 'online');
+      // 🔥 FIX: Check if creator is on an active call before setting online
+      // If they have an active call, keep them busy (don't overwrite with online)
+      const user = await User.findOne({ firebaseUid });
+      const creator = user ? await Creator.findOne({ userId: user._id }) : null;
+      const hasActiveCall = creator?.currentCallId != null;
       
-      // Broadcast to ALL clients instantly via Socket.IO (Railway Redis ensures persistence)
-      io.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
-      
-      console.log(`🟢 [SOCKET] Creator automatically set to online on connect: ${firebaseUid}`);
-      
-      // Send current status back to creator (confirmation)
-      socket.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
+      if (hasActiveCall) {
+        // Creator is on a call - keep them busy
+        await setAvailability(firebaseUid, 'busy');
+        io.emit('creator:status', { creatorId: firebaseUid, status: 'busy' });
+        console.log(`🔴 [SOCKET] Creator has active call, kept as busy on connect: ${firebaseUid}`);
+        socket.emit('creator:status', { creatorId: firebaseUid, status: 'busy' });
+      } else {
+        // 🔥 AUTOMATIC ONLINE: Auto-set creator to online when they connect
+        // Product requirement: creators are automatically online when app opens
+        // No manual toggle - status is automatic based on app lifecycle
+        await setAvailability(firebaseUid, 'online');
+        
+        // Broadcast to ALL clients instantly via Socket.IO (Railway Redis ensures persistence)
+        io.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
+        
+        console.log(`🟢 [SOCKET] Creator automatically set to online on connect: ${firebaseUid}`);
+        
+        // Send current status back to creator (confirmation)
+        socket.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
+      }
       
       // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
       // Heartbeat runs every 60s, TTL is 120s - ensures status persists even with network hiccups
+      // 🔥 FIX: Heartbeat respects current status (won't change busy to online)
       creatorHeartbeatInterval = setInterval(async () => {
         try {
-          await refreshAvailability(firebaseUid);
+          // Only refresh if status is online (don't overwrite busy)
+          const currentStatus = await getAvailability(firebaseUid);
+          if (currentStatus === 'online') {
+            await refreshAvailability(firebaseUid);
+          }
+          // If busy, check if call is still active - if not, set to online
+          else if (currentStatus === 'busy') {
+            const user = await User.findOne({ firebaseUid });
+            const creator = user ? await Creator.findOne({ userId: user._id }) : null;
+            if (!creator?.currentCallId) {
+              // No active call - set back to online
+              await setAvailability(firebaseUid, 'online');
+              io.emit('creator:status', { creatorId: firebaseUid, status: 'online' });
+              console.log(`🟢 [SOCKET] Creator call ended, set to online: ${firebaseUid}`);
+            }
+          }
         } catch (err) {
           console.error(`❌ [SOCKET] Creator heartbeat failed for ${firebaseUid}:`, err);
         }

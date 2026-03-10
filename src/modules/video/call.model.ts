@@ -1,4 +1,8 @@
 import mongoose, { Document, Schema } from 'mongoose';
+import { setAvailability } from '../availability/availability.service';
+import { emitCreatorStatus } from '../availability/availability.socket';
+import { User } from '../user/user.model';
+import { logInfo, logError } from '../../utils/logger';
 
 export interface ICall extends Document {
   _id: mongoose.Types.ObjectId;
@@ -114,5 +118,31 @@ callSchema.index({ callerUserId: 1, creatorUserId: 1, status: 1 });
 
 // Compound index for creator earnings queries
 callSchema.index({ creatorUserId: 1, status: 1, endedAt: 1 });
+
+// 🔥 FIX: Mark creator busy when call is created or updated to ringing/accepted
+// This ensures creator is marked busy even if webhook doesn't fire
+callSchema.post('save', async function (doc: ICall) {
+  try {
+    // Only mark busy if call is in active state (ringing or accepted)
+    if (doc.status === 'ringing' || doc.status === 'accepted') {
+      const creatorUser = await User.findById(doc.creatorUserId);
+      if (creatorUser?.firebaseUid) {
+        // Mark creator busy in Redis + Socket.IO
+        await setAvailability(creatorUser.firebaseUid, 'busy');
+        emitCreatorStatus(creatorUser.firebaseUid, 'busy');
+        logInfo('Creator marked busy via Call model post-save hook', {
+          callId: doc.callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+          status: doc.status,
+        });
+      }
+    }
+  } catch (error) {
+    // Non-critical: Don't fail call save if availability update fails
+    logError('Failed to mark creator busy in Call post-save hook', error, {
+      callId: doc.callId,
+    });
+  }
+});
 
 export const Call = mongoose.model<ICall>('Call', callSchema);

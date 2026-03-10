@@ -1,10 +1,11 @@
 import { Router } from 'express';
-import { getMe, updateProfile, getAllUsers, searchUsers, promoteToCreator, addCoins, claimWelcomeBonus, getUserTransactions, getCallHistory, getFavoriteCreators, toggleFavoriteCreator, toggleBlockCreator, getBlockedCreatorsCount, deleteAccount } from './user.controller';
+import { getMe, getReferrals, updateProfile, getAllUsers, searchUsers, promoteToCreator, addCoins, claimWelcomeBonus, getUserTransactions, getCallHistory, getFavoriteCreators, toggleFavoriteCreator, toggleBlockCreator, getBlockedCreatorsCount, deleteAccount } from './user.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 
 const router = Router();
 
 router.get('/me', verifyFirebaseToken, getMe);
+router.get('/referrals', verifyFirebaseToken, getReferrals);
 router.get('/list', verifyFirebaseToken, getAllUsers);
 router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search users
 router.put('/profile', verifyFirebaseToken, updateProfile);

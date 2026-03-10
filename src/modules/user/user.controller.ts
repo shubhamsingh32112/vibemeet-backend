@@ -6,6 +6,7 @@ import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { DeletedUserPhone } from './deleted-user-phone.model';
+import { tryClaimBonusInLedger } from './identity.service';
 import { randomUUID } from 'crypto';
 import { invalidateAdminCaches } from '../../config/redis';
 import { getIO } from '../../config/socket';
@@ -387,6 +388,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           blockedCreatorCount: (user.blockedCreatorIds || []).length,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
+          referralCode: user.referralCode ?? undefined,
         },
       });
     } else {
@@ -409,6 +411,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             role: user.role,
             createdAt: user.createdAt,
             updatedAt: user.updatedAt,
+            referralCode: user.referralCode ?? undefined,
           },
           creator: null,
         },
@@ -416,6 +419,64 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     }
   } catch (error) {
     console.error('Get user error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
+/**
+ * GET /user/referrals
+ * Returns the current user's referral code and list of referred users with reward status.
+ */
+export const getReferrals = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const referralCode = user.referralCode ?? null;
+    const referralsRaw = user.referrals ?? [];
+
+    // Populate referred users for name/display
+    const referrals = await Promise.all(
+      referralsRaw.map(async (entry) => {
+        const referredUser = await User.findById(entry.user).lean();
+        const creatorProfile = referredUser
+          ? await Creator.findOne({ userId: referredUser._id }).lean()
+          : null;
+        const displayName =
+          creatorProfile?.name ??
+          referredUser?.username ??
+          referredUser?.email?.split('@')[0] ??
+          'User';
+
+        return {
+          userId: (entry.user as mongoose.Types.ObjectId).toString(),
+          name: displayName,
+          rewardGranted: entry.rewardGranted ?? false,
+          joinedAt: entry.createdAt?.toISOString?.() ?? new Date().toISOString(),
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      data: {
+        referralCode,
+        referrals,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get referrals error:', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error',
@@ -961,8 +1022,22 @@ export const claimWelcomeBonus = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Check if already claimed
+    // Check if already claimed (user flag)
     if (user.welcomeBonusClaimed) {
+      res.status(400).json({ success: false, error: 'Welcome bonus already claimed' });
+      return;
+    }
+
+    // Atomic claim in ledger — only first request succeeds; concurrent requests get false
+    const wonClaim = await tryClaimBonusInLedger({
+      deviceFingerprint: user.deviceFingerprint ?? undefined,
+      googleId: user.firebaseUid?.startsWith('fast_') ? undefined : user.firebaseUid,
+      phone: user.phone ?? undefined,
+      firstUserId: user._id,
+    });
+    if (!wonClaim) {
+      user.welcomeBonusClaimed = true;
+      await user.save();
       res.status(400).json({ success: false, error: 'Welcome bonus already claimed' });
       return;
     }

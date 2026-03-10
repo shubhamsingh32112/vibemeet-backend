@@ -13,6 +13,7 @@ import {
   getOrCreateWalletPricingConfig,
   hasCompletedCoinPurchase,
 } from './wallet-pricing.model';
+import { processReferralRewardOnPurchase } from '../user/referral.service';
 
 const CHECKOUT_SESSION_TTL_SECONDS = 15 * 60;
 const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
@@ -497,6 +498,12 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       } catch (socketErr) {
         console.error('⚠️ [PAYMENT] Failed to emit coins_updated:', socketErr);
       }
+
+      // Referral reward: grant 60 coins to referrer if purchase >= ₹100
+      const priceInr = session.priceInr ?? 0;
+      processReferralRewardOnPurchase(user._id, priceInr).catch((err) =>
+        console.error('⚠️ [PAYMENT] Referral reward error (non-fatal):', err)
+      );
     }
 
     res.json({
@@ -641,6 +648,16 @@ export const verifyPayment = async (req: Request, res: Response): Promise<void> 
     await user.save();
 
     console.log(`✅ [PAYMENT] Coins credited: ${oldBalance} → ${user.coins} (+${coinsToAdd})`);
+
+    // Referral reward: grant 60 coins to referrer if purchase >= ₹100
+    const razorpay = getRazorpayInstance();
+    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+    const priceInr = razorpayOrder?.notes?.priceInr
+      ? parseInt(String(razorpayOrder.notes.priceInr), 10)
+      : 0;
+    processReferralRewardOnPurchase(user._id, priceInr).catch((err) =>
+      console.error('⚠️ [PAYMENT] Referral reward error (non-fatal):', err)
+    );
     console.log(`   Payment ID: ${razorpay_payment_id}`);
     console.log(`   Order ID: ${razorpay_order_id}`);
 
