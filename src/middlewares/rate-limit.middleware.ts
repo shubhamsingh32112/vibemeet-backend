@@ -124,6 +124,23 @@ export const tasksLimiter = rateLimit({
 });
 
 /**
+ * Rate limiter for chat endpoints (pre-send, other-member, quota)
+ * - 60 requests per minute per user (1 msg/sec; 1000 users/day, 200 creators)
+ * - Prevents abuse while allowing normal usage
+ */
+export const chatLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,
+  message: 'Too many chat requests. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `chat:${firebaseUid}`;
+  },
+});
+
+/**
  * Rate limiter for Fast Login (unauthenticated)
  * - 10 requests per minute per IP (scalable for ~1000 users/day, limits abuse)
  */

@@ -620,6 +620,128 @@ export const getMessageQuota = async (
 };
 
 // ══════════════════════════════════════════════════════════════════════════
+// GET /api/v1/chat/channel/:channelId/other-member
+//
+// Returns the other channel member's display info (name, image) for chat header.
+// Used when Stream client state is incomplete (e.g. members not yet loaded).
+// Cached in Redis for 1 hour. Backward compatible; additive endpoint.
+// ══════════════════════════════════════════════════════════════════════════
+
+const CHANNEL_OTHER_MEMBER_PREFIX = 'chat:channel:other:';
+const CHANNEL_OTHER_MEMBER_TTL = 3600;
+
+export const getOtherMemberInfo = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { channelId } = req.params;
+    if (!channelId) {
+      res
+        .status(400)
+        .json({ success: false, error: 'channelId is required' });
+      return;
+    }
+
+    const currentUser = await User.findOne({
+      firebaseUid: req.auth.firebaseUid,
+    });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const cacheKey = `${CHANNEL_OTHER_MEMBER_PREFIX}${channelId}:${currentUser.firebaseUid}`;
+    const redis = getRedis();
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, data: JSON.parse(cached) });
+      return;
+    }
+
+    // Try creator cache first — if current user is not the creator, other = creator
+    const channelCreatorKey = `${CHANNEL_CREATOR_PREFIX}${channelId}`;
+    const cachedCreatorUid = await redis.get(channelCreatorKey);
+    let otherFirebaseUid: string | null = null;
+
+    if (cachedCreatorUid) {
+      if (cachedCreatorUid === currentUser.firebaseUid) {
+        // Current user is the creator — other is the user; must fetch from Stream
+        otherFirebaseUid = null;
+      } else {
+        otherFirebaseUid = cachedCreatorUid;
+      }
+    }
+
+    if (!otherFirebaseUid) {
+      const client = getStreamClient();
+      const channel = client.channel('messaging', channelId);
+      try {
+        const channelState = await channel.watch();
+        const memberIds: string[] = Object.keys(channelState.members || {});
+        otherFirebaseUid =
+          memberIds.find((id) => id !== currentUser.firebaseUid) || null;
+      } catch (watchErr) {
+        console.error('❌ [CHAT] getOtherMemberInfo channel watch:', watchErr);
+        res.status(404).json({
+          success: false,
+          error: 'Channel not found or not accessible',
+        });
+        return;
+      }
+    }
+
+    if (!otherFirebaseUid) {
+      res.status(404).json({
+        success: false,
+        error: 'Could not resolve other channel member',
+      });
+      return;
+    }
+
+    const otherUser = await User.findOne({ firebaseUid: otherFirebaseUid });
+    if (!otherUser) {
+      res.status(404).json({
+        success: false,
+        error: 'Other user not found',
+      });
+      return;
+    }
+
+    const isCreatorRole =
+      otherUser.role === 'creator' || otherUser.role === 'admin';
+    let creatorMongoId: string | undefined;
+    if (isCreatorRole) {
+      const creator = await Creator.findOne({ userId: otherUser._id });
+      if (creator) creatorMongoId = creator._id.toString();
+    }
+
+    const payload: Record<string, unknown> = {
+      displayName: displayNameFor(otherUser),
+      image: otherUser.avatar,
+      firebaseUid: otherUser.firebaseUid,
+      mongoId: otherUser._id.toString(),
+      appRole: otherUser.role,
+    };
+    if (creatorMongoId) payload.creatorMongoId = creatorMongoId;
+
+    await redis.setex(cacheKey, CHANNEL_OTHER_MEMBER_TTL, JSON.stringify(payload));
+
+    res.json({ success: true, data: payload });
+  } catch (error) {
+    console.error('❌ [CHAT] getOtherMemberInfo error:', error);
+    res
+      .status(500)
+      .json({ success: false, error: 'Failed to get other member info' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // GET /api/v1/chat/channel/:channelId/creator-call-info
 //
 // Returns creator identity for video call when Stream extraData (mongoId/appRole)
