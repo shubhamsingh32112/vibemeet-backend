@@ -142,15 +142,36 @@ export const chatLimiter = rateLimit({
 
 /**
  * Rate limiter for Fast Login (unauthenticated)
- * - 10 requests per minute per IP (scalable for ~1000 users/day, limits abuse)
+ * - 20 requests per minute per IP (scalable for 1000 users/day, 200 creators)
+ * - Allows peak onboarding without blocking legitimate retries
  */
 export const fastLoginLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 10,
+  max: 20,
   message: 'Too many login attempts. Please wait a moment before trying again.',
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req: Request): string => `fast_login:${req.ip}`,
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/**
+ * Rate limiter for /auth/login (authenticated endpoint - Firebase token required)
+ * - 30 requests per minute per user (prevents abuse, allows retries)
+ * - Keyed by Firebase UID when available, falls back to IP for edge cases
+ */
+export const loginLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,
+  message: 'Too many login requests. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `login:${firebaseUid}`;
+  },
   skip: (_req: Request): boolean => {
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
