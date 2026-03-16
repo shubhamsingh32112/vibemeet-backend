@@ -41,6 +41,7 @@ import {
   getBatchUserAvailability,
   UserAvailability,
 } from './user-availability.service';
+import { getIO as getGlobalIO } from '../../config/socket';
 
 // Store Socket.IO server instance for external access
 let ioInstance: Server | null = null;
@@ -65,12 +66,26 @@ export function getIO(): Server | null {
  * Can be called from webhooks or other parts of the backend
  */
 export function emitCreatorStatus(creatorId: string, status: CreatorAvailability): void {
-  if (ioInstance) {
-    ioInstance.emit('creator:status', { creatorId, status });
-    console.log(`📤 [SOCKET] Emitted creator:status - ${creatorId}: ${status}`);
-  } else {
-    console.warn('⚠️  [SOCKET] Cannot emit: Socket.IO not initialized');
+  // Prefer the locally-registered ioInstance (when registerAvailabilitySocket is used),
+  // but fall back to the global Socket.IO instance configured in server.ts.
+  let io: Server | null = ioInstance;
+  if (!io) {
+    try {
+      io = getGlobalIO();
+    } catch {
+      io = null;
+    }
   }
+
+  if (!io) {
+    console.warn(
+      `⚠️  [SOCKET] Cannot emit creator:status for ${creatorId} — Socket.IO not initialized`
+    );
+    return;
+  }
+
+  io.emit('creator:status', { creatorId, status });
+  console.log(`📤 [SOCKET] Emitted creator:status - ${creatorId}: ${status}`);
 }
 
 /**
@@ -78,12 +93,24 @@ export function emitCreatorStatus(creatorId: string, status: CreatorAvailability
  * Can be called from webhooks or other parts of the backend
  */
 export function emitUserStatus(firebaseUid: string, status: UserAvailability): void {
-  if (ioInstance) {
-    ioInstance.emit('user:status', { firebaseUid, status });
-    console.log(`📤 [SOCKET] Emitted user:status - ${firebaseUid}: ${status}`);
-  } else {
-    console.warn('⚠️  [SOCKET] Cannot emit: Socket.IO not initialized');
+  let io: Server | null = ioInstance;
+  if (!io) {
+    try {
+      io = getGlobalIO();
+    } catch {
+      io = null;
+    }
   }
+
+  if (!io) {
+    console.warn(
+      `⚠️  [SOCKET] Cannot emit user:status for ${firebaseUid} — Socket.IO not initialized`
+    );
+    return;
+  }
+
+  io.emit('user:status', { firebaseUid, status });
+  console.log(`📤 [SOCKET] Emitted user:status - ${firebaseUid}: ${status}`);
 }
 
 /**

@@ -172,5 +172,10 @@ const userSchema = new Schema<IUser>(
 
 // Index for Fast Login lookup (find user by device)
 userSchema.index({ deviceFingerprint: 1 }, { sparse: true });
+// Unique installId: at most one fast user per install (prevents wrong-user return in installId fallback).
+// Sparse so users without installId (e.g. Google sign-in) are not included.
+userSchema.index({ installId: 1 }, { unique: true, sparse: true });
+// Index for Fast Login migration (find by installId when fingerprint format changed)
+userSchema.index({ installId: 1, authProvider: 1 }, { sparse: true });
 
 export const User = mongoose.model<IUser>('User', userSchema);

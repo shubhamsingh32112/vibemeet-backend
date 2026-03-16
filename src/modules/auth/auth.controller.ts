@@ -213,15 +213,29 @@ export const fastLogin = async (req: Request, res: Response): Promise<void> => {
 
     logDebug('Fast login attempt', { ip: req.ip, hasFingerprint: true });
 
-    // Compute deterministic UID once for both lookup and create
+    // Compute deterministic UID once for both lookup and create.
+    // Use 43 hex chars (172 bits) so hash collision is negligible; 22 chars (88 bits) allowed
+    // theoretical collisions with many users when installIds also differ.
     const uidSalt = `${deviceFingerprint}:${installId}`;
-    const hash = crypto.createHash('sha256').update(uidSalt).digest('hex').slice(0, 22);
+    const hash = crypto.createHash('sha256').update(uidSalt).digest('hex').slice(0, 43);
     const firebaseUid = `fast_${hash}`;
 
-    // Lookup by deviceFingerprint OR firebaseUid — single DB round trip, uses both indexes
-    let user = await User.findOne({
-      $or: [{ deviceFingerprint }, { firebaseUid }],
-    });
+    // Lookup by firebaseUid only — uniquely identifies (deviceFingerprint, installId).
+    // Do NOT lookup by deviceFingerprint alone: same device can have multiple users (different installs),
+    // and findOne($or) could return the wrong user.
+    let user = await User.findOne({ firebaseUid });
+
+    // Migration: existing users may have been created with Build.ID as fingerprint (non-unique).
+    // After app update they send real Android ID; firebaseUid changes so we wouldn't find them.
+    // Fallback: find by installId (unique index ensures at most one fast user per installId).
+    // Only use when found user's firebaseUid differs from request (same device, fingerprint format changed).
+    if (!user) {
+      const byInstall = await User.findOne({ installId, authProvider: 'fast' });
+      if (byInstall && byInstall.firebaseUid !== firebaseUid) {
+        user = byInstall;
+        logDebug('Fast login found by installId (fingerprint format migration)', { userId: user._id.toString() });
+      }
+    }
 
     if (user) {
       // Existing Fast Login user — return custom token for their Firebase UID
@@ -254,8 +268,8 @@ export const fastLogin = async (req: Request, res: Response): Promise<void> => {
       } catch (createErr: unknown) {
         const code = (createErr as { code?: string })?.code;
         if (code === 'auth/uid-already-exists') {
-          // Race: another concurrent request created Firebase user. Find Mongo user.
-          user = await User.findOne({ $or: [{ firebaseUid }, { deviceFingerprint }] });
+          // Race: another concurrent request created Firebase user. Find Mongo user by UID only.
+          user = await User.findOne({ firebaseUid });
           if (user) {
             const customToken = await admin.auth().createCustomToken(user.firebaseUid);
             res.json({ success: true, data: { firebaseCustomToken: customToken } });
@@ -296,7 +310,7 @@ export const fastLogin = async (req: Request, res: Response): Promise<void> => {
       // E11000 duplicate key (race: another request just created user)
       const msg = String((mongoErr as Error)?.message ?? '');
       if (msg.includes('E11000') || msg.includes('duplicate key')) {
-        user = await User.findOne({ $or: [{ firebaseUid }, { deviceFingerprint }] });
+        user = await User.findOne({ firebaseUid });
         if (user) {
           const customToken = await admin.auth().createCustomToken(user.firebaseUid);
           res.json({ success: true, data: { firebaseCustomToken: customToken } });
