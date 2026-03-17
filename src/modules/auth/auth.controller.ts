@@ -14,6 +14,7 @@ import { logInfo, logError, logDebug } from '../../utils/logger';
 const FAST_LOGIN_FINGERPRINT_MAX = 256;
 
 export const login = async (req: Request, res: Response): Promise<void> => {
+  const startedAt = Date.now();
   try {
     logDebug('Login request received', {
       ip: req.ip,
@@ -110,7 +111,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     });
 
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
-    const creator = await Creator.findOne({ userId: user._id });
+    const creator = await Creator.findOne({ userId: user._id }).lean();
 
     const needsOnboarding = (user.categories ?? []).length === 0;
 
@@ -169,10 +170,19 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         },
       });
     }
+
+    logDebug('Login request completed', {
+      firebaseUid,
+      durationMs: Date.now() - startedAt,
+      role: user.role,
+      hasCreatorProfile: !!creator,
+      needsOnboarding,
+    });
   } catch (error) {
     logError('Login error', error, {
       firebaseUid: req.auth?.firebaseUid,
       ip: req.ip,
+      durationMs: Date.now() - startedAt,
     });
     res.status(500).json({
       success: false,

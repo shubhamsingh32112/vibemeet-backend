@@ -16,7 +16,20 @@ const DEFAULT_MAX_CONCURRENT = parseInt(process.env.REQUEST_QUEUE_MAX_CONCURRENT
 const DEFAULT_WAIT_TIMEOUT_MS = parseInt(process.env.REQUEST_QUEUE_WAIT_TIMEOUT_MS || '30000', 10);
 
 /** Paths that bypass the queue (always processed immediately) */
-const BYPASS_PATHS = ['/health', '/live', '/ready', '/metrics'];
+const BYPASS_PATHS = [
+  '/health',
+  '/live',
+  '/ready',
+  '/metrics',
+  // Auth is latency-sensitive; rate limiters protect it already.
+  '/api/v1/auth/login',
+  '/api/v1/auth/fast-login',
+  '/api/v1/auth/logout',
+  // Also allow suffix matching when mounted under /api/v1.
+  '/auth/login',
+  '/auth/fast-login',
+  '/auth/logout',
+];
 
 function shouldBypass(req: Request): boolean {
   const path = req.originalUrl?.split('?')[0] ?? req.path;
