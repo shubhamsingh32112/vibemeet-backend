@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { login, logout, adminLogin, fastLogin } from './auth.controller';
+import { login, logout, adminLogin, fastLoginDeprecated } from './auth.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { fastLoginLimiter, loginLimiter } from '../../middlewares/rate-limit.middleware';
 
@@ -9,8 +9,8 @@ const router = Router();
 router.post('/login', verifyFirebaseToken, loginLimiter, login);
 router.post('/logout', verifyFirebaseToken, logout);
 
-// Fast Login — device fingerprint + install ID (no auth); rate-limited by IP
-router.post('/fast-login', fastLoginLimiter, fastLogin);
+// Legacy: Fast Login removed — 410 Gone for old clients (rate-limited)
+router.post('/fast-login', fastLoginLimiter, fastLoginDeprecated);
 
 // Admin login — email + password (no Firebase token)
 router.post('/admin-login', adminLogin);

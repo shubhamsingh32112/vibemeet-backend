@@ -1,17 +1,15 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import jwt from 'jsonwebtoken';
-import crypto from 'crypto';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { checkBonusEligibility } from '../user/identity.service';
 import { assignReferralCodeToUser, applyReferralCode } from '../user/referral.service';
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
-import { getFirebaseAdmin } from '../../config/firebase';
 import { logInfo, logError, logDebug } from '../../utils/logger';
 
-/** Max length for deviceFingerprint and installId in fast-login. */
-const FAST_LOGIN_FINGERPRINT_MAX = 256;
+/** Max length for optional deviceFingerprint on POST /auth/login (bonus eligibility). */
+const DEVICE_FINGERPRINT_MAX = 256;
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
@@ -45,7 +43,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         let deviceFingerprint: string | undefined;
         if (typeof req.body?.deviceFingerprint === 'string') {
           const fp = req.body.deviceFingerprint.trim();
-          if (fp.length > 0 && fp.length <= FAST_LOGIN_FINGERPRINT_MAX) {
+          if (fp.length > 0 && fp.length <= DEVICE_FINGERPRINT_MAX) {
             deviceFingerprint = fp;
           }
         }
@@ -192,163 +190,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 };
 
 /**
- * Fast Login — device-based auth (no Google).
- * Returns a Firebase custom token so the client can sign in with signInWithCustomToken.
- * User identity remains Firebase UID; Stream, sockets, calls unchanged.
- * Rate-limited by IP (see auth.routes).
+ * Fast Login was removed. Old app builds still call this route — return 410 so clients
+ * can show a clear message instead of treating the response as success.
  */
-export const fastLogin = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const deviceFingerprint = typeof req.body?.deviceFingerprint === 'string'
-      ? req.body.deviceFingerprint.trim()
-      : '';
-    const installId = typeof req.body?.installId === 'string'
-      ? req.body.installId.trim()
-      : '';
-
-    if (!deviceFingerprint || !installId) {
-      res.status(400).json({
-        success: false,
-        error: 'deviceFingerprint and installId are required',
-      });
-      return;
-    }
-    if (deviceFingerprint.length > FAST_LOGIN_FINGERPRINT_MAX || installId.length > FAST_LOGIN_FINGERPRINT_MAX) {
-      res.status(400).json({
-        success: false,
-        error: 'deviceFingerprint and installId must be at most 256 characters',
-      });
-      return;
-    }
-
-    logDebug('Fast login attempt', { ip: req.ip, hasFingerprint: true });
-
-    // Compute deterministic UID once for both lookup and create.
-    // Use 43 hex chars (172 bits) so hash collision is negligible; 22 chars (88 bits) allowed
-    // theoretical collisions with many users when installIds also differ.
-    const uidSalt = `${deviceFingerprint}:${installId}`;
-    const hash = crypto.createHash('sha256').update(uidSalt).digest('hex').slice(0, 43);
-    const firebaseUid = `fast_${hash}`;
-
-    // Lookup by firebaseUid only — uniquely identifies (deviceFingerprint, installId).
-    // Do NOT lookup by deviceFingerprint alone: same device can have multiple users (different installs),
-    // and findOne($or) could return the wrong user.
-    let user = await User.findOne({ firebaseUid });
-
-    // Migration: existing users may have been created with Build.ID as fingerprint (non-unique).
-    // After app update they send real Android ID; firebaseUid changes so we wouldn't find them.
-    // Fallback: find by installId (unique index ensures at most one fast user per installId).
-    // Only use when found user's firebaseUid differs from request (same device, fingerprint format changed).
-    if (!user) {
-      const byInstall = await User.findOne({ installId, authProvider: 'fast' });
-      if (byInstall && byInstall.firebaseUid !== firebaseUid) {
-        user = byInstall;
-        logDebug('Fast login found by installId (fingerprint format migration)', { userId: user._id.toString() });
-      }
-    }
-
-    if (user) {
-      // Existing Fast Login user — return custom token for their Firebase UID
-      const admin = getFirebaseAdmin();
-      const customToken = await admin.auth().createCustomToken(user.firebaseUid);
-      logInfo('Fast login existing user', {
-        userId: user._id.toString(),
-        firebaseUid: user.firebaseUid,
-        ip: req.ip,
-      });
-      res.json({
-        success: true,
-        data: { firebaseCustomToken: customToken },
-      });
-      return;
-    }
-
-    // New Fast Login user: firebaseUid already computed above
-    const admin = getFirebaseAdmin();
-    try {
-      await admin.auth().getUser(firebaseUid);
-    } catch {
-      // User does not exist in Firebase — create custom user
-      try {
-        await admin.auth().createUser({
-          uid: firebaseUid,
-          displayName: 'Fast Login User',
-        });
-        logDebug('Firebase custom user created for fast login', { firebaseUid });
-      } catch (createErr: unknown) {
-        const code = (createErr as { code?: string })?.code;
-        if (code === 'auth/uid-already-exists') {
-          // Race: another concurrent request created Firebase user. Find Mongo user by UID only.
-          user = await User.findOne({ firebaseUid });
-          if (user) {
-            const customToken = await admin.auth().createCustomToken(user.firebaseUid);
-            res.json({ success: true, data: { firebaseCustomToken: customToken } });
-            return;
-          }
-        }
-        throw createErr;
-      }
-    }
-
-    // Identity-based welcome bonus eligibility (deviceFingerprint)
-    const welcomeBonusEligible = await checkBonusEligibility({
-      deviceFingerprint: deviceFingerprint,
-    });
-    const welcomeBonusClaimed = !welcomeBonusEligible;
-
-    try {
-      user = await User.create({
-        firebaseUid,
-        deviceFingerprint,
-        installId,
-        authProvider: 'fast',
-        role: 'user',
-        categories: [],
-        coins: 0,
-        freeTextUsed: 0,
-        welcomeBonusClaimed,
-      });
-
-      // Referral: assign unique code and apply referral if provided
-      await assignReferralCodeToUser(user);
-      const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
-      if (referralCodeRaw && isValidReferralCodeFormat(referralCodeRaw)) {
-        await applyReferralCode(user, referralCodeRaw);
-        await user.save();
-      }
-    } catch (mongoErr: unknown) {
-      // E11000 duplicate key (race: another request just created user)
-      const msg = String((mongoErr as Error)?.message ?? '');
-      if (msg.includes('E11000') || msg.includes('duplicate key')) {
-        user = await User.findOne({ firebaseUid });
-        if (user) {
-          const customToken = await admin.auth().createCustomToken(user.firebaseUid);
-          res.json({ success: true, data: { firebaseCustomToken: customToken } });
-          return;
-        }
-      }
-      throw mongoErr;
-    }
-
-    const customToken = await admin.auth().createCustomToken(firebaseUid);
-    logInfo('Fast login new user created', {
-      userId: user._id.toString(),
-      firebaseUid,
-      welcomeBonusClaimed,
-      ip: req.ip,
-    });
-
-    res.json({
-      success: true,
-      data: { firebaseCustomToken: customToken },
-    });
-  } catch (error) {
-    logError('Fast login error', error, { ip: req.ip });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-    });
-  }
+export const fastLoginDeprecated = (_req: Request, res: Response): void => {
+  res.status(410).json({
+    success: false,
+    error:
+      'Fast login is no longer supported. Please update the app and sign in with Google or phone.',
+  });
 };
 
 export const logout = async (_req: Request, res: Response): Promise<void> => {
