@@ -33,6 +33,18 @@ import mongoose from 'mongoose';
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
+// One hop (Railway, Heroku, Fly, nginx ingress, etc.) sets X-Forwarded-For.
+// Required so express-rate-limit can read client IPs without throwing
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR, and so req.ip is correct.
+// Set TRUST_PROXY_HOPS=0 only if the app is never behind a reverse proxy.
+const trustHops = process.env.TRUST_PROXY_HOPS;
+if (trustHops === '0' || trustHops === 'false') {
+  app.set('trust proxy', false);
+} else {
+  const n = trustHops != null && trustHops !== '' ? Number(trustHops) : 1;
+  app.set('trust proxy', Number.isFinite(n) && n >= 0 ? n : 1);
+}
+
 // Security middleware
 app.use(helmet({
   // Allow cleartext traffic for local development
