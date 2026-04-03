@@ -25,18 +25,20 @@ import { Withdrawal } from './withdrawal.model';
 import { emitToAdmin } from '../admin/admin.gateway';
 import {
   CREATOR_GALLERY_MAX_IMAGES,
+  CREATOR_GALLERY_MIN_IMAGES,
   CREATOR_GALLERY_ALLOWED_CONTENT_TYPES,
 } from './creator-gallery.constants';
 import {
+  buildPublicGalleryDownloadUrl,
   createCreatorGallerySignedUpload,
   deleteGalleryStorageObject,
-  getStorageBucketName,
   isAllowedGalleryContentType,
   parseGalleryStoragePath,
 } from './creator-gallery.storage';
-import { logError, logInfo } from '../../utils/logger';
-
-const CREATOR_GALLERY_URL_PREFIX = 'https://firebasestorage.googleapis.com/';
+import { logError, logInfo, logWarning } from '../../utils/logger';
+import { ensureStreamUser } from '../../config/stream';
+import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
+import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 
 function normalizeGalleryImages(
   galleryImages: Array<{
@@ -56,6 +58,36 @@ function normalizeGalleryImages(
       position: idx,
       createdAt: image.createdAt,
     }));
+}
+
+/** Fix legacy gallery URLs missing Firebase download tokens (403 in mobile clients). */
+async function resolveGalleryImageUrlsForApi(
+  galleryImages: Parameters<typeof normalizeGalleryImages>[0],
+): Promise<{ galleryImages: ReturnType<typeof normalizeGalleryImages>; urlsChanged: boolean }> {
+  const normalized = normalizeGalleryImages(galleryImages);
+  let urlsChanged = false;
+  const resolved = await Promise.all(
+    normalized.map(async (img) => {
+      if (!img.storagePath || img.url.includes('token=')) {
+        return img;
+      }
+      try {
+        const url = await buildPublicGalleryDownloadUrl(img.storagePath);
+        if (url !== img.url) urlsChanged = true;
+        return { ...img, url };
+      } catch (e) {
+        logWarning('Failed to resolve gallery download URL', {
+          storagePath: img.storagePath,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return img;
+      }
+    }),
+  );
+  return {
+    galleryImages: normalizeGalleryImages(resolved),
+    urlsChanged,
+  };
 }
 
 // Get all creators (for users to see - excludes other creators)
@@ -103,7 +135,14 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           const creatorUser = await User.findById(creator.userId);
           creatorFirebaseUid = creatorUser?.firebaseUid || null;
         }
-        
+
+        const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(
+          creator.galleryImages,
+        );
+        if (urlsChanged) {
+          await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
+        }
+
         return {
           id: creator._id.toString(),
           userId: creator.userId ? creator.userId.toString() : null, // MongoDB User ID
@@ -111,7 +150,7 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages,
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -174,8 +213,12 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
       });
       return;
     }
-    
-    // Pure read - no side effects, no auto-linking
+
+    const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(creator.galleryImages);
+    if (urlsChanged) {
+      await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
+    }
+
     res.json({
       success: true,
       data: {
@@ -185,7 +228,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages,
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -774,12 +817,37 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
     }
     
     await creator.save();
-    
+
+    const { galleryImages: resolvedGallery, urlsChanged } = await resolveGalleryImageUrlsForApi(
+      creator.galleryImages,
+    );
+    if (urlsChanged) {
+      await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages: resolvedGallery } });
+    }
+
+    // Keep User.avatar aligned with creator photo so legacy paths + Stream stay consistent
+    const photoInRequest = photo !== undefined && photo !== null;
+    if (photoInRequest && creator.photo?.trim()) {
+      currentUser.avatar = creator.photo.trim();
+      await currentUser.save();
+    }
+
     // Invalidate creator dashboard cache
     invalidateCreatorDashboard(currentUser._id.toString()).catch(() => {});
-    
+
+    try {
+      const freshUser = await User.findById(currentUser._id);
+      if (freshUser) {
+        const streamPayload = await getStreamUpsertPayload(freshUser);
+        await ensureStreamUser(freshUser.firebaseUid, streamPayload);
+        await invalidateOtherMemberCacheForFirebaseUid(freshUser.firebaseUid);
+      }
+    } catch (syncErr) {
+      console.error('⚠️ [CREATOR] Stream/cache sync after profile update failed:', syncErr);
+    }
+
     console.log(`✅ [CREATOR] Creator profile updated: ${creator._id}`);
-    
+
     res.json({
       success: true,
       data: {
@@ -789,7 +857,7 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages: resolvedGallery,
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
@@ -842,6 +910,11 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
       return;
     }
 
+    const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(creator.galleryImages);
+    if (urlsChanged) {
+      await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
+    }
+
     res.json({
       success: true,
       data: {
@@ -851,7 +924,7 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages,
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
@@ -964,10 +1037,20 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const encodedPath = encodeURIComponent(storagePath.trim());
-    const url = `${CREATOR_GALLERY_URL_PREFIX}v0/b/${encodeURIComponent(
-      getStorageBucketName(),
-    )}/o/${encodedPath}?alt=media`;
+    let url: string;
+    try {
+      url = await buildPublicGalleryDownloadUrl(storagePath.trim());
+    } catch (e) {
+      logError('Gallery commit: object missing or unreadable in Storage', e, {
+        storagePath: storagePath.trim(),
+        imageId: imageId.trim(),
+      });
+      res.status(400).json({
+        success: false,
+        error: 'Upload not found in storage. Finish the upload, then try commit again.',
+      });
+      return;
+    }
 
     const existingImages = normalizeGalleryImages(creator.galleryImages);
     if (!existingImages.some((img) => img.id === imageId.trim())) {
@@ -1045,6 +1128,14 @@ export const deleteGalleryImage = async (req: Request, res: Response): Promise<v
     const target = existingImages.find((img) => img.id === imageId.trim());
     if (!target) {
       res.status(404).json({ success: false, error: 'Gallery image not found' });
+      return;
+    }
+
+    if (existingImages.length <= CREATOR_GALLERY_MIN_IMAGES) {
+      res.status(400).json({
+        success: false,
+        error: `At least ${CREATOR_GALLERY_MIN_IMAGES} gallery image is required`,
+      });
       return;
     }
 

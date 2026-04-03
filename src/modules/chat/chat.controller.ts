@@ -14,6 +14,7 @@ import {
   COST_PER_MESSAGE,
 } from './chat-message-quota.model';
 import { verifyUserBalance } from '../../utils/balance-integrity';
+import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -50,22 +51,6 @@ const generateChannelId = (uid1: string, uid2: string): string => {
   return `uc_${hash}`;
 };
 
-/**
- * Resolve a display-name for a user (prefers username → email → phone → 'User').
- */
-const displayNameFor = (user: {
-  username?: string;
-  email?: string;
-  phone?: string;
-}): string =>
-  user.username && user.username.trim().length > 0
-    ? user.username
-    : user.email && user.email.trim().length > 0
-      ? user.email
-      : user.phone && user.phone.trim().length > 0
-        ? user.phone
-        : 'User';
-
 /** Check if a user role should be billed for chat */
 const isBillableRole = (role: string): boolean => role === 'user';
 
@@ -92,13 +77,8 @@ export const getChatToken = async (
       return;
     }
 
-    await ensureStreamUser(firebaseUid, {
-      name: displayNameFor(user),
-      image: user.avatar,
-      appRole: user.role,
-      username: user.username,
-      mongoId: user._id.toString(),
-    });
+    const streamPayload = await getStreamUpsertPayload(user);
+    await ensureStreamUser(firebaseUid, streamPayload);
 
     const token = client.createToken(firebaseUid);
     res.json({ success: true, data: { token } });
@@ -160,27 +140,17 @@ export const createOrGetChannel = async (
     const currentUid = currentUser.firebaseUid;
     const otherUid = otherUser.firebaseUid;
 
-    // ── Ensure both Stream users exist ────────────────────────────────
-    await ensureStreamUser(currentUid, {
-      name: displayNameFor(currentUser),
-      image: currentUser.avatar,
-      appRole: currentUser.role,
-      username: currentUser.username,
-      mongoId: currentUser._id.toString(),
-    });
-    await ensureStreamUser(otherUid, {
-      name: displayNameFor(otherUser),
-      image: otherUser.avatar,
-      appRole: otherUser.role,
-      username: otherUser.username,
-      mongoId: otherUser._id.toString(),
-    });
+    // ── Ensure both Stream users exist (name/photo reflect creator profile when applicable)
+    const currentStreamPayload = await getStreamUpsertPayload(currentUser);
+    const otherStreamPayload = await getStreamUpsertPayload(otherUser);
+    await ensureStreamUser(currentUid, currentStreamPayload);
+    await ensureStreamUser(otherUid, otherStreamPayload);
 
     // ── Create / get channel ──────────────────────────────────────────
     const channelId = generateChannelId(currentUid, otherUid);
     const client = getStreamClient();
 
-    const correctName = displayNameFor(otherUser);
+    const correctName = otherStreamPayload.name;
 
     const channel = client.channel('messaging', channelId, {
       members: [currentUid, otherUid],
@@ -190,17 +160,17 @@ export const createOrGetChannel = async (
 
     await channel.create();
 
-    // ── Normalize legacy "Chat with …" names ─────────────────────────
+    // ── Keep channel title in sync when the other user's display name changes ──
     const existingName =
       (channel.data?.name as string | undefined) ?? '';
-    if (existingName.startsWith('Chat with ')) {
+    if (existingName !== correctName) {
       try {
         await channel.update({ name: correctName } as Record<string, unknown>);
         console.log(
-          `🔄 [CHAT] Normalized channel name: "${existingName}" → "${correctName}"`,
+          `🔄 [CHAT] Updated channel name: "${existingName}" → "${correctName}"`,
         );
       } catch (nameErr) {
-        console.warn('⚠️ [CHAT] Failed to normalize channel name:', nameErr);
+        console.warn('⚠️ [CHAT] Failed to update channel name:', nameErr);
       }
     }
 
@@ -721,9 +691,10 @@ export const getOtherMemberInfo = async (
       if (creator) creatorMongoId = creator._id.toString();
     }
 
+    const otherPresentation = await getStreamUpsertPayload(otherUser);
     const payload: Record<string, unknown> = {
-      displayName: displayNameFor(otherUser),
-      image: otherUser.avatar,
+      displayName: otherPresentation.name,
+      image: otherPresentation.image,
       firebaseUid: otherUser.firebaseUid,
       mongoId: otherUser._id.toString(),
       appRole: otherUser.role,

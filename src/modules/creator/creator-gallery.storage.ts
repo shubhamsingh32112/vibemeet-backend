@@ -79,3 +79,36 @@ export async function createCreatorGallerySignedUpload(
 export async function deleteGalleryStorageObject(storagePath: string): Promise<void> {
   await getBucket().file(storagePath).delete({ ignoreNotFound: true });
 }
+
+/**
+ * Firebase client URLs need `firebaseStorageDownloadTokens` for typical Storage rules.
+ * Unsigned `?alt=media` alone returns 403 from the app. This ensures metadata + token URL.
+ */
+export async function buildPublicGalleryDownloadUrl(storagePath: string): Promise<string> {
+  const bucketName = getStorageBucketName();
+  const file = getBucket().file(storagePath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    throw new Error(`Gallery object not found: ${storagePath}`);
+  }
+
+  const [meta] = await file.getMetadata();
+  const existingRaw = meta.metadata?.firebaseStorageDownloadTokens;
+  let token: string;
+  if (typeof existingRaw === 'string' && existingRaw.trim().length > 0) {
+    token = existingRaw.split(',')[0].trim();
+  } else {
+    token = crypto.randomUUID();
+    await file.setMetadata({
+      metadata: {
+        ...(meta.metadata || {}),
+        firebaseStorageDownloadTokens: token,
+      },
+      cacheControl: 'public, max-age=31536000, immutable',
+    });
+  }
+
+  return `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(
+    bucketName,
+  )}/o/${encodeURIComponent(storagePath)}?alt=media&token=${encodeURIComponent(token)}`;
+}

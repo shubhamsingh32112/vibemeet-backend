@@ -12,6 +12,9 @@ import { invalidateAdminCaches } from '../../config/redis';
 import { getIO } from '../../config/socket';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getFirebaseAdmin } from '../../config/firebase';
+import { ensureStreamUser } from '../../config/stream';
+import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
+import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -972,6 +975,13 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
     if (updated) {
       await user.save();
       console.log(`✅ [USER] User profile updated`);
+      try {
+        const streamPayload = await getStreamUpsertPayload(user);
+        await ensureStreamUser(user.firebaseUid, streamPayload);
+        await invalidateOtherMemberCacheForFirebaseUid(user.firebaseUid);
+      } catch (syncErr) {
+        console.error('⚠️ [USER] Stream/cache sync after profile update failed:', syncErr);
+      }
     }
 
     res.json({
