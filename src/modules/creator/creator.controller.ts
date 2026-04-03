@@ -23,6 +23,40 @@ import {
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { Withdrawal } from './withdrawal.model';
 import { emitToAdmin } from '../admin/admin.gateway';
+import {
+  CREATOR_GALLERY_MAX_IMAGES,
+  CREATOR_GALLERY_ALLOWED_CONTENT_TYPES,
+} from './creator-gallery.constants';
+import {
+  createCreatorGallerySignedUpload,
+  deleteGalleryStorageObject,
+  getStorageBucketName,
+  isAllowedGalleryContentType,
+  parseGalleryStoragePath,
+} from './creator-gallery.storage';
+import { logError, logInfo } from '../../utils/logger';
+
+const CREATOR_GALLERY_URL_PREFIX = 'https://firebasestorage.googleapis.com/';
+
+function normalizeGalleryImages(
+  galleryImages: Array<{
+    id: string;
+    url: string;
+    storagePath: string;
+    position: number;
+    createdAt: Date;
+  }> = [],
+) {
+  return [...galleryImages]
+    .sort((a, b) => a.position - b.position || +new Date(a.createdAt) - +new Date(b.createdAt))
+    .map((image, idx) => ({
+      id: image.id,
+      url: image.url,
+      storagePath: image.storagePath,
+      position: idx,
+      createdAt: image.createdAt,
+    }));
+}
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -77,6 +111,7 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -150,6 +185,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -263,6 +299,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       name,
       about,
       photo,
+      galleryImages: [],
       userId: targetUser._id,
       categories: Array.isArray(categories) ? categories : [],
       price,
@@ -286,6 +323,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -385,6 +423,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -750,6 +789,7 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
@@ -776,6 +816,320 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+export const getMyCreatorProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Forbidden: Only creators can view profile' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        creator: {
+          id: creator._id.toString(),
+          userId: creator.userId.toString(),
+          name: creator.name,
+          about: creator.about,
+          photo: creator.photo,
+          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          age: creator.age,
+          categories: creator.categories,
+          price: creator.price,
+          createdAt: creator.createdAt,
+          updatedAt: creator.updatedAt,
+        },
+      },
+    });
+  } catch (error) {
+    logError('Get my creator profile error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const createGalleryUploadUrl = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Forbidden: Only creators can upload gallery images' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
+      res.status(409).json({
+        success: false,
+        error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
+      });
+      return;
+    }
+
+    const contentType = req.body?.contentType;
+    if (!isAllowedGalleryContentType(contentType)) {
+      res.status(400).json({
+        success: false,
+        error: `contentType must be one of: ${CREATOR_GALLERY_ALLOWED_CONTENT_TYPES.join(', ')}`,
+      });
+      return;
+    }
+
+    const signedUpload = await createCreatorGallerySignedUpload(creator._id.toString(), contentType);
+    logInfo('Creator gallery upload URL created', {
+      creatorId: creator._id.toString(),
+      imageId: signedUpload.imageId,
+      storagePath: signedUpload.storagePath,
+      contentType,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: signedUpload,
+    });
+  } catch (error) {
+    logError('Create gallery upload URL error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const commitGalleryImage = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Forbidden: Only creators can commit gallery images' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    const { imageId, storagePath } = req.body ?? {};
+    if (
+      typeof imageId !== 'string' ||
+      typeof storagePath !== 'string' ||
+      imageId.trim() === '' ||
+      storagePath.trim() === ''
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'imageId and storagePath are required',
+      });
+      return;
+    }
+
+    const parsed = parseGalleryStoragePath(storagePath.trim());
+    if (!parsed || parsed.creatorId !== creator._id.toString() || parsed.imageId !== imageId.trim()) {
+      res.status(422).json({ success: false, error: 'storagePath/imageId mismatch for this creator' });
+      return;
+    }
+
+    const encodedPath = encodeURIComponent(storagePath.trim());
+    const url = `${CREATOR_GALLERY_URL_PREFIX}v0/b/${encodeURIComponent(
+      getStorageBucketName(),
+    )}/o/${encodedPath}?alt=media`;
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    if (!existingImages.some((img) => img.id === imageId.trim())) {
+      if (existingImages.length >= CREATOR_GALLERY_MAX_IMAGES) {
+        res.status(409).json({
+          success: false,
+          error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
+        });
+        return;
+      }
+      existingImages.push({
+        id: imageId.trim(),
+        storagePath: storagePath.trim(),
+        url,
+        createdAt: new Date(),
+        position: existingImages.length,
+      });
+    } else {
+      for (let i = 0; i < existingImages.length; i += 1) {
+        if (existingImages[i].id === imageId.trim()) {
+          existingImages[i] = {
+            ...existingImages[i],
+            storagePath: storagePath.trim(),
+            url,
+          };
+          break;
+        }
+      }
+    }
+
+    creator.galleryImages = normalizeGalleryImages(existingImages);
+    await creator.save();
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    logError('Commit gallery image error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const deleteGalleryImage = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const { imageId } = req.params;
+    if (!imageId || imageId.trim() === '') {
+      res.status(400).json({ success: false, error: 'imageId is required' });
+      return;
+    }
+
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Forbidden: Only creators can delete gallery images' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    const target = existingImages.find((img) => img.id === imageId.trim());
+    if (!target) {
+      res.status(404).json({ success: false, error: 'Gallery image not found' });
+      return;
+    }
+
+    creator.galleryImages = normalizeGalleryImages(
+      existingImages.filter((img) => img.id !== imageId.trim()),
+    );
+    await creator.save();
+
+    deleteGalleryStorageObject(target.storagePath).catch((err) => {
+      logError('Failed to delete gallery storage object', err, {
+        creatorId: creator._id.toString(),
+        imageId: target.id,
+        storagePath: target.storagePath,
+      });
+    });
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    logError('Delete gallery image error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const reorderGalleryImages = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+      res.status(403).json({ success: false, error: 'Forbidden: Only creators can reorder gallery images' });
+      return;
+    }
+    const creator = await Creator.findOne({ userId: currentUser._id });
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    const imageIds = req.body?.imageIds;
+    if (!Array.isArray(imageIds) || imageIds.some((id) => typeof id !== 'string' || id.trim() === '')) {
+      res.status(400).json({ success: false, error: 'imageIds must be a non-empty array of strings' });
+      return;
+    }
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    if (imageIds.length !== existingImages.length) {
+      res.status(400).json({ success: false, error: 'imageIds length mismatch with existing gallery images' });
+      return;
+    }
+
+    const existingIdSet = new Set(existingImages.map((img) => img.id));
+    for (const id of imageIds) {
+      if (!existingIdSet.has(id.trim())) {
+        res.status(422).json({ success: false, error: `Unknown imageId in reorder payload: ${id}` });
+        return;
+      }
+    }
+
+    const imageMap = new Map(existingImages.map((img) => [img.id, img]));
+    creator.galleryImages = imageIds.map((id: string, index: number) => ({
+      ...imageMap.get(id.trim())!,
+      position: index,
+    }));
+    await creator.save();
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    logError('Reorder gallery images error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 

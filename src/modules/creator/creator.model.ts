@@ -1,10 +1,20 @@
 import mongoose, { Document, Schema } from 'mongoose';
+import { CREATOR_GALLERY_MAX_IMAGES } from './creator-gallery.constants';
+
+export interface ICreatorGalleryImage {
+  id: string;
+  url: string;
+  storagePath: string;
+  position: number;
+  createdAt: Date;
+}
 
 export interface ICreator extends Document {
   _id: mongoose.Types.ObjectId;
   name: string;
   about: string;
   photo: string; // URL or path to photo
+  galleryImages: ICreatorGalleryImage[];
   userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
   categories: string[]; // Array of category names (optional)
   price: number; // Price per minute in coins (e.g., 60 = 60 coins per minute)
@@ -15,6 +25,37 @@ export interface ICreator extends Document {
   createdAt: Date;
   updatedAt: Date;
 }
+
+const creatorGalleryImageSchema = new Schema<ICreatorGalleryImage>(
+  {
+    id: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    url: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    storagePath: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    position: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    createdAt: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+  },
+  { _id: false }
+);
 
 const creatorSchema = new Schema<ICreator>(
   {
@@ -36,6 +77,15 @@ const creatorSchema = new Schema<ICreator>(
       type: String,
       required: true,
       trim: true,
+    },
+    galleryImages: {
+      type: [creatorGalleryImageSchema],
+      default: [],
+      validate: {
+        validator: (images: ICreatorGalleryImage[]) =>
+          Array.isArray(images) && images.length <= CREATOR_GALLERY_MAX_IMAGES,
+        message: `galleryImages cannot exceed ${CREATOR_GALLERY_MAX_IMAGES} items`,
+      },
     },
     userId: {
       type: Schema.Types.ObjectId,

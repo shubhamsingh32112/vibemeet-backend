@@ -123,6 +123,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
+          galleryImages: [...(creator.galleryImages || [])]
+            .sort((a, b) => a.position - b.position)
+            .map((image) => ({
+              id: image.id,
+              url: image.url,
+              storagePath: image.storagePath,
+              position: image.position,
+              createdAt: image.createdAt,
+            })),
           email: user.email, // Use user's email (identity comes from user)
           phone: user.phone, // Use user's phone (identity comes from user)
           categories: creator.categories,

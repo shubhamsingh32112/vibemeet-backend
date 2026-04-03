@@ -8,6 +8,7 @@
 import { Server } from 'socket.io';
 import { getRedis, DLQ_BILLING_PREFIX, RECONCILIATION_LAST_RUN_KEY, RECONCILIATION_INTERVAL_MS, ACTIVE_BILLING_CALLS_KEY, callSessionKey } from '../../config/redis';
 import { billingService } from './billing.service';
+import { settleCall } from './billing.gateway';
 import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 
@@ -122,25 +123,30 @@ async function processDLQ(io: Server): Promise<void> {
           continue;
         }
         
-        // Call is still active, try to process the billing tick again
-        const success = await billingService.processBillingTick(io, callId);
-        
-        if (success) {
-          // Successfully retried, remove from DLQ
+        const tickResult = await billingService.processBillingTick(io, callId);
+
+        if (tickResult === 'tick_ok') {
           await Promise.all([
             redis.del(dlqKey),
             redis.srem(dlqSetKey, dlqKey),
           ]);
           retried++;
           logInfo('Successfully retried billing tick from DLQ', { callId });
+        } else if (tickResult === 'stop_needs_settlement') {
+          await settleCall(io, callId).catch((e) =>
+            logError('DLQ settleCall failed', e, { callId })
+          );
+          await Promise.all([
+            redis.del(dlqKey),
+            redis.srem(dlqSetKey, dlqKey),
+          ]);
+          processed++;
+          logInfo('Settled call from DLQ after tick stop', { callId });
         } else {
-          // Still failing, keep in DLQ (will retry next run)
-          // But check if call ended during processing
           const sessionStillExists = await redis.get(callSessionKey(callId));
           const stillInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
-          
+
           if (!sessionStillExists && !stillInActiveBilling) {
-            // Call ended during processing, remove from DLQ
             await Promise.all([
               redis.del(dlqKey),
               redis.srem(dlqSetKey, dlqKey),
@@ -149,7 +155,6 @@ async function processDLQ(io: Server): Promise<void> {
             logInfo('Removed ended call from DLQ (ended during retry)', { callId });
             recordBillingMetric('dlq_ended_call_removed', 1, { callId });
           } else {
-            // Still failing, keep in DLQ
             failed++;
             logWarning('Billing tick still failing after retry', { callId });
           }

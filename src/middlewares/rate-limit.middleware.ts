@@ -124,6 +124,25 @@ export const tasksLimiter = rateLimit({
 });
 
 /**
+ * Rate limiter for creator gallery upload-url generation.
+ * - 20 requests per minute per creator is sufficient for retries/burst uploads.
+ */
+export const creatorGalleryUploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: 'Too many gallery upload requests. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `creator_gallery_upload:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/**
  * Rate limiter for chat endpoints (pre-send, other-member, quota)
  * - 60 requests per minute per user (1 msg/sec; 1000 users/day, 200 creators)
  * - Prevents abuse while allowing normal usage

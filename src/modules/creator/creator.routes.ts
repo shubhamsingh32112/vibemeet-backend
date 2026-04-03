@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
-import { withdrawalLimiter, tasksLimiter } from '../../middlewares/rate-limit.middleware';
+import {
+  withdrawalLimiter,
+  tasksLimiter,
+  creatorGalleryUploadLimiter,
+} from '../../middlewares/rate-limit.middleware';
 import {
   getAllCreators,
   getCreatorById,
@@ -9,6 +13,11 @@ import {
   deleteCreator,
   setCreatorOnlineStatus,
   updateMyCreatorProfile,
+  getMyCreatorProfile,
+  createGalleryUploadUrl,
+  commitGalleryImage,
+  deleteGalleryImage,
+  reorderGalleryImages,
   getCreatorEarnings,
   getCreatorTransactions,
   getCreatorTasks,
@@ -30,6 +39,16 @@ router.get('/tasks', verifyFirebaseToken, tasksLimiter, getCreatorTasks); // Get
 router.post('/tasks/:taskKey/claim', verifyFirebaseToken, claimTaskReward); // Claim task reward
 router.post('/withdraw', verifyFirebaseToken, withdrawalLimiter, requestWithdrawal); // Request withdrawal (rate limited)
 router.get('/withdrawals', verifyFirebaseToken, getMyWithdrawals); // Get my withdrawal history
+router.get('/profile', verifyFirebaseToken, getMyCreatorProfile); // Get creator's own profile
+router.post(
+  '/profile/gallery/upload-url',
+  verifyFirebaseToken,
+  creatorGalleryUploadLimiter,
+  createGalleryUploadUrl,
+);
+router.post('/profile/gallery/commit', verifyFirebaseToken, commitGalleryImage);
+router.delete('/profile/gallery/:imageId', verifyFirebaseToken, deleteGalleryImage);
+router.patch('/profile/gallery/reorder', verifyFirebaseToken, reorderGalleryImages);
 router.get('/:id', getCreatorById);
 
 // Protected routes (require authentication)

@@ -48,6 +48,12 @@ import { pricingService } from '../video/pricing.service';
 const CALL_SESSION_TTL = 7200; // 2-hour TTL safety net for Redis keys
 const EARNINGS_MICRO_FACTOR = 10000; // Store creator earnings as integer micro-coins to avoid float errors
 
+/** Batch processor / DLQ: whether to re-queue, drop, or run Mongo settlement */
+export type BillingTickResult =
+  | 'tick_ok'
+  | 'stop_no_session'
+  | 'stop_needs_settlement';
+
 interface CallSession {
   callId: string;
   userFirebaseUid: string;
@@ -167,6 +173,8 @@ export class BillingService {
       coins: user.coins,
       pricePerSecond,
       maxSeconds,
+      elapsedSeconds: 0,
+      remainingSeconds: maxSeconds,
       serverTimestamp, // Server time when billing started
       callStartTime: session.startTime, // Call start timestamp
     });
@@ -175,6 +183,7 @@ export class BillingService {
       callId,
       earnings: 0,
       pricePerSecond: CREATOR_EARNINGS_PER_SECOND,
+      elapsedSeconds: 0,
       serverTimestamp, // Server time when billing started
       callStartTime: session.startTime, // Call start timestamp
     });
@@ -218,11 +227,9 @@ export class BillingService {
   /**
    * Process a billing tick (called every second)
    * 🔥 FIX 5: Wrapped with retry logic and DLQ support
-   * Returns true if tick was processed successfully, false if session doesn't exist or settlement needed
    */
-  async processBillingTick(io: Server, callId: string): Promise<boolean> {
+  async processBillingTick(io: Server, callId: string): Promise<BillingTickResult> {
     try {
-      // 🔥 FIX 5: Wrap with retry logic for transient failures
       return await retryWithBackoff(
         async () => this._processBillingTickInternal(io, callId),
         {
@@ -233,17 +240,19 @@ export class BillingService {
         }
       );
     } catch (error) {
-      // 🔥 FIX 5: If all retries failed, add to dead letter queue
       await this._addToDLQ(callId, error);
       logError('Billing tick processing failed after retries', error, { callId });
-      return false;
+      return 'stop_needs_settlement';
     }
   }
 
   /**
    * Internal billing tick processing (without retry wrapper)
    */
-  private async _processBillingTickInternal(io: Server, callId: string): Promise<boolean> {
+  private async _processBillingTickInternal(
+    io: Server,
+    callId: string
+  ): Promise<BillingTickResult> {
     const redis = getRedis();
 
     // Read session
@@ -260,7 +269,7 @@ export class BillingService {
     
     if (!sessionRaw) {
       logWarning('Session not found in Redis', { callId });
-      return false; // Session doesn't exist
+      return 'stop_no_session';
     }
 
     const session: CallSession =
@@ -276,7 +285,7 @@ export class BillingService {
         callId,
         second: session.elapsedSeconds + 1,
       });
-      return true; // Return true to indicate tick was handled (even if skipped)
+      return 'tick_ok';
     }
 
     // Read current coins & earnings (earnings stored as integer micro-coins)
@@ -286,7 +295,7 @@ export class BillingService {
     ]);
 
     if (coinsRaw === null) {
-      return false;
+      return 'stop_needs_settlement';
     }
 
     let coins = parseFloat(coinsRaw as string);
@@ -311,8 +320,7 @@ export class BillingService {
         reason: 'user_out_of_coins',
       });
 
-      // Settlement will be handled by the caller
-      return false; // Signal that settlement is needed
+      return 'stop_needs_settlement';
     }
 
     // Apply tick
@@ -384,8 +392,7 @@ export class BillingService {
         limitSeconds: effectiveLimit,
       });
       
-      // Settlement will be handled by the caller
-      return false; // Signal that settlement is needed
+      return 'stop_needs_settlement';
     }
 
     // Persist to Redis
@@ -428,10 +435,9 @@ export class BillingService {
     recordBillingMetric('tick_processed', 1, { callId });
     recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });
 
-    // 🔥 FIX: Send server timestamp for accurate client-side timer sync
     const serverTimestamp = Date.now();
-    
-    // Emit live updates
+
+    // Emit live updates — client must display balances from these payloads only (no local billing math).
     io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
       callId,
       coins: Math.floor(coins),
@@ -439,22 +445,41 @@ export class BillingService {
       elapsedSeconds: session.elapsedSeconds,
       remainingSeconds,
       durationLimit: effectiveLimit,
-      serverTimestamp, // Server time when this update was sent
-      callStartTime: session.startTime, // Call start timestamp for reference
+      serverTimestamp,
+      callStartTime: session.startTime,
     });
 
     const roundedEarningsDisplay = Math.round((earningsMicros / EARNINGS_MICRO_FACTOR) * 100) / 100;
-    
+
     io.to(`user:${session.creatorFirebaseUid}`).emit('billing:update', {
       callId,
       earnings: roundedEarningsDisplay,
       elapsedSeconds: session.elapsedSeconds,
       durationLimit: effectiveLimit,
-      serverTimestamp, // Server time when this update was sent
-      callStartTime: session.startTime, // Call start timestamp for reference
+      serverTimestamp,
+      callStartTime: session.startTime,
     });
-    
-    return true; // Tick processed successfully
+
+    // Same-second disconnect when balance cannot fund another second (includes 0 after last tick).
+    if (coins < session.pricePerSecond) {
+      logInfo('User cannot afford next second after tick — force-ending immediately', {
+        callId,
+        coinsAfterTick: coins,
+        pricePerSecond: session.pricePerSecond,
+      });
+      io.to(`user:${session.userFirebaseUid}`).emit('call:force-end', {
+        callId,
+        reason: 'insufficient_coins',
+        remainingCoins: Math.floor(coins),
+      });
+      io.to(`user:${session.creatorFirebaseUid}`).emit('call:force-end', {
+        callId,
+        reason: 'user_out_of_coins',
+      });
+      return 'stop_needs_settlement';
+    }
+
+    return 'tick_ok';
   }
 
   /**

@@ -29,7 +29,6 @@ import { emitToAdmin } from '../admin/admin.gateway';
 import { getStreamClient } from '../../config/stream';
 import crypto from 'crypto';
 import { recordBillingMetric } from '../../utils/monitoring';
-import { CREATOR_EARNINGS_PER_SECOND } from '../../config/pricing.config';
 import { billingService } from './billing.service';
 import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
@@ -471,16 +470,35 @@ async function processBillingBatch(io: Server): Promise<void> {
     const processingPromises = callIds.map(async (callId: string) => {
       try {
         // Process billing tick
-        const processed = await billingService.processBillingTick(io, callId);
-        
-        if (processed) {
-          // Update next billing time (1 second from now)
-          const nextBillingTime = now + BILLING_TICK_INTERVAL;
+        const tickResult = await billingService.processBillingTick(io, callId);
+
+        if (tickResult === 'tick_ok') {
+          // Align next tick to session.startTime + (elapsed+1)s so N billed seconds span
+          // ~N seconds on the billing clock (not `now + 1s`, which drifts and stretches calls).
+          const sessionRaw = await redis.get(callSessionKey(callId));
+          let nextBillingTime = now + BILLING_TICK_INTERVAL;
+          if (sessionRaw) {
+            try {
+              const session = JSON.parse(sessionRaw as string) as {
+                startTime: number;
+                elapsedSeconds: number;
+              };
+              const startTime = Number(session.startTime) || now;
+              const elapsed = Math.max(0, Math.floor(Number(session.elapsedSeconds) || 0));
+              nextBillingTime = startTime + (elapsed + 1) * BILLING_TICK_INTERVAL;
+            } catch {
+              /* fallback: nextBillingTime already set */
+            }
+          }
           await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
         } else {
-          // Session doesn't exist or settlement needed - remove from active calls
           await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
-          logDebug('Removed call from active billing (settlement needed)', { callId });
+          logDebug('Removed call from active billing', { callId, tickResult });
+          if (tickResult === 'stop_needs_settlement') {
+            await settleCall(io, callId).catch((settleErr) =>
+              logError('settleCall after billing tick stop', settleErr, { callId })
+            );
+          }
         }
       } catch (err) {
         logError('Error processing billing tick in batch', err, { callId });
@@ -568,7 +586,7 @@ const settleLockKey = (callId: string): string => `${SETTLE_LOCK_PREFIX}${callId
  * (socket `call:ended`, socket `disconnect` for user, socket `disconnect`
  * for creator, REST API fallback).
  */
-async function settleCall(io: Server, callId: string): Promise<void> {
+export async function settleCall(io: Server, callId: string): Promise<void> {
   // 🔥 FIX: Remove from active billing immediately (replaces stopBillingLoop)
   await removeCallFromBilling(callId);
 
@@ -654,18 +672,25 @@ async function settleCall(io: Server, callId: string): Promise<void> {
   const earningsMicros = parseInt((finalEarningsRaw as string) || '0', 10) || 0;
   const finalEarnings = earningsMicros / 10000;
 
-  // 🔥 FIX: Use wall-clock duration for exact billing (60s call = exactly 60 coins deducted, 18 earned)
-  // Tick-based session.elapsedSeconds can be ±1 second off due to batch timing
-  const settlementTime = Date.now();
-  const actualDurationSeconds = Math.floor((settlementTime - session.startTime) / 1000);
-  const durationSeconds = Math.max(0, actualDurationSeconds);
-  const totalDeducted = Math.round(durationSeconds * session.pricePerSecond);
-  const totalEarnedCreator = Math.round(durationSeconds * CREATOR_EARNINGS_PER_SECOND);
+  // Tick-authoritative settlement ONLY (must match Redis billing ticks — never wall-clock).
+  // Wall-clock (settlementTime - startTime) can exceed billed seconds when billing starts
+  // after the video connects, causing over-debits (e.g. 81s wall vs 60 billed ticks).
+  const EARNINGS_MICRO_FACTOR = 10000;
+  const billedSeconds = Math.max(0, Math.floor(Number(session.elapsedSeconds) || 0));
+  const durationSeconds = billedSeconds;
+  const totalDeducted = Math.round(billedSeconds * session.pricePerSecond);
+  const totalEarnedCreator = Math.round(earningsMicros / EARNINGS_MICRO_FACTOR);
+
+  const wallClockSeconds = Math.max(
+    0,
+    Math.floor((Date.now() - session.startTime) / 1000)
+  );
 
   logInfo('Settling call - Redis values read', {
     callId,
     elapsedSeconds: session.elapsedSeconds,
-    actualDurationSeconds,
+    billedSeconds,
+    wallClockSeconds,
     durationSeconds,
     finalCoins,
     finalEarnings,
@@ -708,10 +733,8 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     if (!user) {
       throw new Error(`User not found: ${session.userMongoId}`);
     }
-    // finalCoins = balance after tick deductions; totalDeducted = wall-clock exact amount
-    const tickDeducted = Math.round(session.elapsedSeconds * session.pricePerSecond);
-    const effectiveFinalCoins = finalCoins + tickDeducted - totalDeducted;
-    user.coins = Math.max(0, Math.floor(effectiveFinalCoins));
+    // Remaining balance after ticks is authoritative (same basis as totalDeducted).
+    user.coins = Math.max(0, Math.floor(finalCoins));
     await user.save({ session: dbSession });
 
     // 2️⃣  Write debit transaction — idempotent by callId (within transaction)
@@ -747,7 +770,7 @@ async function settleCall(io: Server, callId: string): Promise<void> {
         throw new Error(`Creator user not found: ${creator.userId}`);
       }
 
-      // Use wall-clock exact earnings (60s call = exactly 18 coins at 30% share)
+      // Credits match Redis tick accrual (totalEarnedCreator from earnings micros).
       const creatorCoinsBefore = creatorUser.coins || 0;
       creatorUser.coins = Math.round(creatorCoinsBefore + totalEarnedCreator);
       await creatorUser.save({ session: dbSession });
@@ -916,7 +939,7 @@ async function settleCall(io: Server, callId: string): Promise<void> {
     // 6️⃣  Notify both parties of final settlement
     io.to(`user:${session.userFirebaseUid}`).emit('billing:settled', {
       callId,
-      finalCoins: Math.floor(effectiveFinalCoins),
+      finalCoins: user.coins,
       totalDeducted,
       durationSeconds,
     });
