@@ -13,7 +13,10 @@ import { getIO } from '../../config/socket';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { ensureStreamUser } from '../../config/stream';
-import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
+import {
+  getStreamUpsertPayload,
+  resolveChatPresentationFromDocs,
+} from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
@@ -1398,10 +1401,61 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
       CallHistory.countDocuments({ ownerUserId: user._id }),
     ]);
 
+    const otherUserIds = [...new Set(calls.map((c) => c.otherUserId.toString()))];
+
+    let enrichedCalls = calls;
+    if (otherUserIds.length > 0) {
+      const objectIds = otherUserIds.map((id) => new mongoose.Types.ObjectId(id));
+      const otherUsers = await User.find({ _id: { $in: objectIds } })
+        .select('role username email phone avatar')
+        .lean();
+
+      const creatorUserIds = otherUsers
+        .filter((u) => u.role === 'creator' || u.role === 'admin')
+        .map((u) => u._id);
+      const creators =
+        creatorUserIds.length > 0
+          ? await Creator.find({ userId: { $in: creatorUserIds } })
+              .select('userId name photo')
+              .lean()
+          : [];
+
+      const creatorByUserId = new Map<string, { name?: string; photo?: string }>();
+      for (const c of creators) {
+        creatorByUserId.set(c.userId.toString(), {
+          name: c.name,
+          photo: c.photo,
+        });
+      }
+
+      const presentationByUserId = new Map<
+        string,
+        ReturnType<typeof resolveChatPresentationFromDocs>
+      >();
+      for (const u of otherUsers) {
+        const uid = u._id.toString();
+        const cr =
+          u.role === 'creator' || u.role === 'admin'
+            ? (creatorByUserId.get(uid) ?? null)
+            : null;
+        presentationByUserId.set(uid, resolveChatPresentationFromDocs(u, cr));
+      }
+
+      enrichedCalls = calls.map((c) => {
+        const pres = presentationByUserId.get(c.otherUserId.toString());
+        if (!pres) return c;
+        return {
+          ...c,
+          otherName: pres.name,
+          otherAvatar: pres.image,
+        };
+      });
+    }
+
     res.json({
       success: true,
       data: {
-        calls,
+        calls: enrichedCalls,
         pagination: {
           page,
           limit,
