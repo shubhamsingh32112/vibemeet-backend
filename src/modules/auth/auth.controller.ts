@@ -15,6 +15,7 @@ const DEVICE_FINGERPRINT_MAX = 256;
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
+  let referralApply: { ok: boolean; code?: string } | undefined;
   try {
     logDebug('Login request received', {
       ip: req.ip,
@@ -74,11 +75,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         // Referral: assign unique code and apply referral if provided
         await assignReferralCodeToUser(user);
         const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
-        if (referralCodeRaw && isValidReferralCodeFormat(referralCodeRaw)) {
-          await applyReferralCode(user, referralCodeRaw);
-          // Reload user in case role was promoted to creator
-          await user.save();
+        if (referralCodeRaw) {
+          if (!isValidReferralCodeFormat(referralCodeRaw)) {
+            referralApply = { ok: false, code: 'INVALID_FORMAT' };
+          } else {
+            const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
+            referralApply = ar.ok ? { ok: true } : { ok: false, code: ar.code };
+          }
         }
+        user = (await User.findOne({ firebaseUid }))!;
 
         logInfo('New user created', {
           userId: user._id.toString(),
@@ -98,6 +103,30 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         if (req.auth.phone) user.phone = req.auth.phone;
         await user.save();
         logDebug('User contact info updated', { userId: user._id.toString() });
+      }
+
+      // Referral: existing account — apply login-time code only when not yet linked (same rules as signup)
+      const existingReferralRaw =
+        typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : '';
+      if (existingReferralRaw) {
+        if (user.referredBy) {
+          referralApply = { ok: false, code: 'ALREADY_REFERRED' };
+        } else {
+          if (!user.referralCode) {
+            await assignReferralCodeToUser(user);
+          }
+          let working = await User.findOne({ firebaseUid });
+          if (working) user = working;
+
+          if (!isValidReferralCodeFormat(existingReferralRaw)) {
+            referralApply = { ok: false, code: 'INVALID_FORMAT' };
+          } else {
+            const ar = await applyReferralCode(user, existingReferralRaw, { mode: 'signup' });
+            referralApply = ar.ok ? { ok: true } : { ok: false, code: ar.code };
+            const latest = await User.findOne({ firebaseUid });
+            if (latest) user = latest;
+          }
+        }
       }
     }
 
@@ -160,6 +189,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
+          ...(referralApply !== undefined ? { referralApply } : {}),
         },
       });
     } else {
@@ -189,6 +219,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           },
           creator: null,
           needsOnboarding,
+          ...(referralApply !== undefined ? { referralApply } : {}),
         },
       });
     }

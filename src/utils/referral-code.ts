@@ -1,13 +1,11 @@
 /**
  * Referral Code Generation Utility
  *
- * Format: 6 characters = [First 2 letters of name][4 random numbers]
- * Examples: JO4832, AL9021, MI1234
- * Fallback when name missing: US + 4 random numbers (e.g. US9284)
+ * Legacy format (6 chars): [First 2 letters of name][4 random digits] e.g. JO4832
+ * Current format (8 chars): [First 3 letters of name][5 random digits] e.g. JOE48392
+ * Fallback when name missing: USR + 5 digits
  *
- * Rules:
- * - Uppercase letters only
- * - Globally unique (caller must check uniqueness and retry on collision)
+ * Validation accepts both legacy and current formats during transition.
  */
 
 const DIGITS = '0123456789';
@@ -16,10 +14,9 @@ const DIGITS = '0123456789';
  * Extract first two uppercase letters from a name string.
  * Falls back to 'US' if name is missing or has insufficient letters.
  */
-function getPrefixFromName(name: string | null | undefined): string {
+function getPrefixFromName2(name: string | null | undefined): string {
   if (!name || typeof name !== 'string') return 'US';
 
-  // Remove non-alpha, take first 2 chars, uppercase
   const cleaned = name.replace(/[^a-zA-Z]/g, '').slice(0, 2).toUpperCase();
 
   if (cleaned.length < 2) return 'US';
@@ -27,41 +24,59 @@ function getPrefixFromName(name: string | null | undefined): string {
 }
 
 /**
- * Generate 4 random decimal digits.
+ * Extract first three uppercase letters from a name string.
+ * Falls back to 'USR' if name is missing or has insufficient letters.
  */
-function random4Digits(): string {
+function getPrefixFromName3(name: string | null | undefined): string {
+  if (!name || typeof name !== 'string') return 'USR';
+
+  const cleaned = name.replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase();
+
+  if (cleaned.length === 0) return 'USR';
+  if (cleaned.length === 1) return `${cleaned}XX`.slice(0, 3);
+  if (cleaned.length === 2) return `${cleaned}X`.slice(0, 3);
+  return cleaned;
+}
+
+function randomNDigits(n: number): string {
   let result = '';
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < n; i++) {
     result += DIGITS[Math.floor(Math.random() * DIGITS.length)];
   }
   return result;
 }
 
 /**
- * Generate a referral code from a user's name.
- *
- * @param name - User's display name (username, email local part, or "User")
- * @returns 6-character code: 2 letters + 4 digits (e.g. JO4832, US9284)
+ * @deprecated Legacy 6-character generator — use generateReferralCode for new assignments.
  */
-export function generateReferralCode(name?: string | null): string {
-  const prefix = getPrefixFromName(name);
-  const digits = random4Digits();
-  return `${prefix}${digits}`;
+export function generateReferralCodeLegacy(name?: string | null): string {
+  const prefix = getPrefixFromName2(name);
+  return `${prefix}${randomNDigits(4)}`;
 }
 
-/** Referral code validation: exactly 6 chars, 2 uppercase letters + 4 digits */
-const REFERRAL_CODE_REGEX = /^[A-Z]{2}\d{4}$/;
+/**
+ * Generate a referral code from a user's name (8 characters).
+ */
+export function generateReferralCode(name?: string | null): string {
+  const prefix = getPrefixFromName3(name);
+  return `${prefix}${randomNDigits(5)}`;
+}
+
+/** Legacy: 2 uppercase letters + 4 digits */
+const REFERRAL_CODE_REGEX_V1 = /^[A-Z]{2}\d{4}$/;
+
+/** Current: 3 uppercase letters + 5 digits */
+const REFERRAL_CODE_REGEX_V2 = /^[A-Z]{3}\d{5}$/;
 
 /**
- * Validate referral code format.
- *
- * @param code - Candidate referral code
- * @returns true if format is valid (2 uppercase letters + 4 digits)
+ * Validate referral code format (legacy 6-char or current 8-char).
  */
 export function isValidReferralCodeFormat(code: string | null | undefined): boolean {
   if (!code || typeof code !== 'string') return false;
   const trimmed = code.trim().toUpperCase();
-  return trimmed.length === 6 && REFERRAL_CODE_REGEX.test(trimmed);
+  if (trimmed.length === 6 && REFERRAL_CODE_REGEX_V1.test(trimmed)) return true;
+  if (trimmed.length === 8 && REFERRAL_CODE_REGEX_V2.test(trimmed)) return true;
+  return false;
 }
 
 /**
@@ -72,16 +87,10 @@ export function normalizeReferralCode(code: string): string {
 }
 
 /** Max retries when generating unique referral code */
-const MAX_UNIQUE_RETRIES = 10;
+const MAX_UNIQUE_RETRIES = 32;
 
 /**
  * Generate a unique referral code by checking against the database.
- * Retries on collision (up to MAX_UNIQUE_RETRIES times).
- *
- * @param name - User's display name for prefix
- * @param existsChecker - Async function that returns true if code already exists
- * @returns Unique 6-character referral code
- * @throws Error if unable to generate unique code after retries
  */
 export async function generateUniqueReferralCode(
   name: string | null | undefined,

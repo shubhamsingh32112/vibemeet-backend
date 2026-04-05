@@ -1,11 +1,37 @@
 import { Router } from 'express';
-import { getMe, getReferrals, updateProfile, getAllUsers, searchUsers, promoteToCreator, addCoins, claimWelcomeBonus, getUserTransactions, getCallHistory, getFavoriteCreators, toggleFavoriteCreator, toggleBlockCreator, getBlockedCreatorsCount, deleteAccount } from './user.controller';
+import rateLimit from 'express-rate-limit';
+import {
+  getMe,
+  getReferrals,
+  applyReferralPost,
+  updateProfile,
+  getAllUsers,
+  searchUsers,
+  promoteToCreator,
+  addCoins,
+  claimWelcomeBonus,
+  getUserTransactions,
+  getCallHistory,
+  getFavoriteCreators,
+  toggleFavoriteCreator,
+  toggleBlockCreator,
+  getBlockedCreatorsCount,
+  deleteAccount,
+} from './user.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 
 const router = Router();
 
+const referralApplyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 router.get('/me', verifyFirebaseToken, getMe);
 router.get('/referrals', verifyFirebaseToken, getReferrals);
+router.post('/referral/apply', verifyFirebaseToken, referralApplyLimiter, applyReferralPost);
 router.get('/list', verifyFirebaseToken, getAllUsers);
 router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search users
 router.put('/profile', verifyFirebaseToken, updateProfile);

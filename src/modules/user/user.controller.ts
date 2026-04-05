@@ -19,6 +19,38 @@ import {
 } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
+import {
+  applyReferralCode,
+  assignReferralCodeToUser,
+  type ApplyReferralCodeErrorCode,
+} from './referral.service';
+
+function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
+  return code === 'NOT_FOUND' ? 404 : 400;
+}
+
+function referralErrorMessage(code: ApplyReferralCodeErrorCode): string {
+  switch (code) {
+    case 'INVALID_FORMAT':
+      return 'Invalid referral code format';
+    case 'NOT_FOUND':
+      return 'Referral code not found';
+    case 'SELF':
+      return 'You cannot use your own referral code';
+    case 'AGENT_DISABLED':
+      return 'This referral code is no longer valid';
+    case 'ALREADY_REFERRED':
+      return 'A referral is already linked to your account';
+    case 'WINDOW_EXPIRED':
+      return 'Referral code can no longer be applied (time limit expired)';
+    case 'PURCHASE_ALREADY':
+      return 'Referral codes cannot be applied after your first coin purchase';
+    case 'NOT_ELIGIBLE_ROLE':
+      return 'Referral codes cannot be applied for this account type';
+    default:
+      return 'Unable to apply referral code';
+  }
+}
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -510,6 +542,73 @@ export const getReferrals = async (req: Request, res: Response): Promise<void> =
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+/**
+ * POST /user/referral/apply
+ * One-time referral attach after signup (window + before first coin purchase).
+ */
+export const applyReferralPost = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const raw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : '';
+    if (!raw) {
+      res.status(400).json({
+        success: false,
+        error: 'referralCode is required',
+        errorCode: 'INVALID_FORMAT',
+      });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (!user.referralCode) {
+      await assignReferralCodeToUser(user);
+    }
+
+    const ar = await applyReferralCode(user, raw, { mode: 'late_attach' });
+    if (!ar.ok) {
+      res.status(referralErrorHttpStatus(ar.code)).json({
+        success: false,
+        error: referralErrorMessage(ar.code),
+        errorCode: ar.code,
+      });
+      return;
+    }
+
+    const refreshed = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!refreshed) {
+      res.status(500).json({ success: false, error: 'Internal server error' });
+      return;
+    }
+
+    const appFlags = await getCreatorApplicationFlagsForUser(refreshed._id);
+
+    res.json({
+      success: true,
+      data: {
+        applied: true,
+        role: refreshed.role,
+        creatorApplicationPending: appFlags.creatorApplicationPending,
+        creatorApplicationRejected: appFlags.creatorApplicationRejected,
+        ...(appFlags.creatorApplicationRejectionReason
+          ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+          : {}),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] applyReferralPost error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 

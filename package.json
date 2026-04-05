@@ -14,7 +14,8 @@
     "seed:preset-avatars": "tsx src/scripts/upload-preset-avatars.ts",
     "upload:ringtone": "tsx src/scripts/upload-ringtone.ts",
     "upload:coin-images": "tsx src/scripts/upload-coin-images.ts",
-    "verify:redis": "tsx scripts/verify-redis.ts"
+    "verify:redis": "tsx scripts/verify-redis.ts",
+    "backfill:referral-edges": "tsx src/scripts/backfill-referral-edges.ts"
   },
   "keywords": [],
   "author": "",
