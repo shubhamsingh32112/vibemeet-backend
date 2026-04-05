@@ -35,7 +35,7 @@ export interface IUser extends Document {
   deviceFingerprint?: string;
   /** Fast Login: install ID (per app install). */
   installId?: string;
-  /** Referral: user's own unique 6-character code (e.g. JO4832). */
+  /** Referral: user's own unique code — legacy 6 chars or current 8 chars. */
   referralCode?: string;
   /** Referral: who referred this user (User._id). */
   referredBy?: mongoose.Types.ObjectId;
@@ -162,7 +162,7 @@ const userSchema = new Schema<IUser>(
       trim: true,
       uppercase: true,
       index: true,
-      maxlength: 6,
+      maxlength: 8,
     },
     referredBy: {
       type: Schema.Types.ObjectId,
