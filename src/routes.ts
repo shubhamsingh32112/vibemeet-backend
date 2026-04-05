@@ -8,6 +8,7 @@ import adminRoutes from './modules/admin/admin.routes';
 import billingRoutes from './modules/billing/billing.routes';
 import supportRoutes from './modules/support/support.routes';
 import paymentRoutes from './modules/payment/payment.routes';
+import agentRoutes from './modules/agent/agent.routes';
 
 const router = Router();
 
@@ -17,6 +18,7 @@ router.use('/creator', creatorRoutes);
 router.use('/chat', chatRoutes);
 router.use('/video', videoRoutes);
 router.use('/admin', adminRoutes);
+router.use('/agent', agentRoutes);
 router.use('/billing', billingRoutes);
 router.use('/support', supportRoutes);
 router.use('/payment', paymentRoutes);

@@ -1,12 +1,14 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { checkBonusEligibility } from '../user/identity.service';
 import { assignReferralCodeToUser, applyReferralCode } from '../user/referral.service';
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
 import { logInfo, logError, logDebug } from '../../utils/logger';
+import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
 
 /** Max length for optional deviceFingerprint on POST /auth/login (bonus eligibility). */
 const DEVICE_FINGERPRINT_MAX = 256;
@@ -112,6 +114,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const creator = await Creator.findOne({ userId: user._id }).lean();
 
     const needsOnboarding = (user.categories ?? []).length === 0;
+    const appFlags = await getCreatorApplicationFlagsForUser(user._id);
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -151,6 +154,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           updatedAt: creator.updatedAt,
           needsOnboarding: false, // Creators don't need onboarding
           referralCode: user.referralCode ?? undefined,
+          profileRevision: user.profileRevision ?? 0,
+          creatorApplicationPending: appFlags.creatorApplicationPending,
+          creatorApplicationRejected: appFlags.creatorApplicationRejected,
+          ...(appFlags.creatorApplicationRejectionReason
+            ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+            : {}),
         },
       });
     } else {
@@ -171,6 +180,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             welcomeBonusClaimed: user.welcomeBonusClaimed,
             role: user.role,
             referralCode: user.referralCode ?? undefined,
+            profileRevision: user.profileRevision ?? 0,
+            creatorApplicationPending: appFlags.creatorApplicationPending,
+            creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            ...(appFlags.creatorApplicationRejectionReason
+              ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+              : {}),
           },
           creator: null,
           needsOnboarding,
@@ -297,6 +312,64 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
       email: req.body.email,
       ip: req.ip,
     });
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * Agent dashboard login — email + bcrypt password on User (role agent).
+ */
+export const agentLogin = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const email = String(req.body.email ?? '')
+      .trim()
+      .toLowerCase();
+    const password = String(req.body.password ?? '');
+
+    if (!email || !password) {
+      res.status(400).json({ success: false, error: 'Email and password are required' });
+      return;
+    }
+
+    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
+    const user = await User.findOne({ email, role: 'agent' }).select('+passwordHash');
+
+    if (!user || !user.passwordHash || user.agentDisabled) {
+      logInfo('Agent login failed', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      logInfo('Agent login failed: bad password', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const token = jwt.sign(
+      { userId: user._id.toString(), role: 'agent', email: user.email },
+      jwtSecret,
+      { expiresIn: '7d' },
+    );
+
+    logInfo('Agent login successful', { userId: user._id.toString(), ip: req.ip });
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+          role: user.role,
+          displayName: user.displayName ?? null,
+          referralCode: user.referralCode ?? null,
+        },
+      },
+    });
+  } catch (error) {
+    logError('Agent login error', error, { ip: req.ip });
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

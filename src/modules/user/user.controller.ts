@@ -18,6 +18,7 @@ import {
   resolveChatPresentationFromDocs,
 } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
+import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -365,6 +366,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
     const creator = await Creator.findOne({ userId: user._id });
+    const appFlags = await getCreatorApplicationFlagsForUser(user._id);
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -401,9 +403,15 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           avatar: user.avatar,
           usernameChangeCount: user.usernameChangeCount,
           blockedCreatorCount: (user.blockedCreatorIds || []).length,
+          profileRevision: user.profileRevision ?? 0,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
           referralCode: user.referralCode ?? undefined,
+          creatorApplicationPending: appFlags.creatorApplicationPending,
+          creatorApplicationRejected: appFlags.creatorApplicationRejected,
+          ...(appFlags.creatorApplicationRejectionReason
+            ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+            : {}),
         },
       });
     } else {
@@ -424,9 +432,15 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             welcomeBonusClaimed: user.welcomeBonusClaimed,
             blockedCreatorCount: (user.blockedCreatorIds || []).length,
             role: user.role,
+            profileRevision: user.profileRevision ?? 0,
             createdAt: user.createdAt,
             updatedAt: user.updatedAt,
             referralCode: user.referralCode ?? undefined,
+            creatorApplicationPending: appFlags.creatorApplicationPending,
+            creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            ...(appFlags.creatorApplicationRejectionReason
+              ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+              : {}),
           },
           creator: null,
         },
@@ -1148,10 +1162,10 @@ export const addCoins = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.role === 'creator' || user.role === 'admin') {
+    if (user.role === 'creator' || user.role === 'admin' || user.role === 'agent') {
       res.status(403).json({
         success: false,
-        error: 'Creators and admins cannot add coins through this endpoint',
+        error: 'Creators, admins, and agents cannot add coins through this endpoint',
       });
       return;
     }

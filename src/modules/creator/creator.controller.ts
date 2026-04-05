@@ -8,6 +8,7 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds } from './creator-tasks.config';
 import { getIO } from '../../config/socket';
+import { emitCreatorDataUpdated } from './creator-notify';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { getBatchAvailability } from '../availability/availability.service';
 import {
@@ -23,6 +24,7 @@ import {
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { Withdrawal } from './withdrawal.model';
 import { emitToAdmin } from '../admin/admin.gateway';
+import { assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
 import {
   CREATOR_GALLERY_MAX_IMAGES,
   CREATOR_GALLERY_MIN_IMAGES,
@@ -40,7 +42,7 @@ import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 
-function normalizeGalleryImages(
+export function normalizeGalleryImages(
   galleryImages: Array<{
     id: string;
     url: string;
@@ -101,13 +103,19 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
       currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
     }
     
-    // Only users (not creators) can see creators
-    // Admins can see creators when in "user view" mode
-    // If user is a creator (but not admin), they should see users instead (via /user/list)
+    // Only consumers (role user) may list the public creator catalog.
+    // Creators, agents (dashboard JWT), and admins must not use this aggregate feed.
     if (currentUser && currentUser.role === 'creator') {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Creators cannot view other creators. Use /user/list to view users.',
+      });
+      return;
+    }
+    if (currentUser && currentUser.role === 'agent') {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Use GET /agent/creators for your assigned creators.',
       });
       return;
     }
@@ -391,30 +399,60 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
   }
 };
 
-// Update creator (Admin only) - Only updates creator profile, never touches user identity
+/** Stream + socket + admin cache after creator-linked profile data changed (DB already saved). */
+export async function notifyCreatorProfileChannels(
+  userMongoId: mongoose.Types.ObjectId | string,
+  firebaseUid: string,
+): Promise<void> {
+  const uid = typeof userMongoId === 'string' ? userMongoId : userMongoId.toString();
+  invalidateCreatorDashboard(uid).catch(() => {});
+
+  try {
+    const freshUser = await User.findById(uid);
+    if (freshUser) {
+      const streamPayload = await getStreamUpsertPayload(freshUser);
+      await ensureStreamUser(freshUser.firebaseUid, streamPayload);
+      await invalidateOtherMemberCacheForFirebaseUid(freshUser.firebaseUid);
+    }
+  } catch (syncErr) {
+    console.error('⚠️ [CREATOR] Stream/cache sync after profile update failed:', syncErr);
+  }
+
+  emitCreatorDataUpdated(firebaseUid, { reason: 'profile_updated' });
+  invalidateAdminCaches('overview', 'creators_performance').catch(() => {});
+}
+
+/**
+ * After admin edits creator profile (or linked user / gallery): bump profileRevision,
+ * sync Stream, emit creator:data_updated, invalidate caches.
+ */
+export async function bumpCreatorProfileRevisionForAdmin(
+  userMongoId: mongoose.Types.ObjectId | string,
+  options?: { syncAvatarFromCreatorPhoto?: string },
+): Promise<void> {
+  const id = typeof userMongoId === 'string' ? userMongoId : userMongoId.toString();
+  const user = await User.findById(id);
+  if (!user?.firebaseUid) return;
+
+  if (options?.syncAvatarFromCreatorPhoto !== undefined) {
+    const p = options.syncAvatarFromCreatorPhoto.trim();
+    if (p) user.avatar = p;
+  }
+
+  user.profileRevision = (user.profileRevision ?? 0) + 1;
+  await user.save();
+
+  await notifyCreatorProfileChannels(user._id, user.firebaseUid);
+}
+
+// Update creator (Admin only) — updates Creator; mirrors main photo to User.avatar when photo sent; notifies app
 export const updateCreator = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     console.log(`✏️ [CREATOR] Update creator: ${id}`);
-    
-    if (!req.auth) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-      });
-      return;
-    }
-    
-    // Check if user is admin
-    const adminUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!adminUser || adminUser.role !== 'admin') {
-      res.status(403).json({
-        success: false,
-        error: 'Forbidden: Admin access required',
-      });
-      return;
-    }
-    
+
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, id))) return;
+
     const { name, about, photo, categories, price, age } = req.body;
     
     const creator = await Creator.findById(id);
@@ -426,10 +464,19 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    // Only update creator profile fields - never touch userId or user identity
+    if (!creator.userId) {
+      res.status(400).json({
+        success: false,
+        error: 'Creator has no linked user',
+      });
+      return;
+    }
+    
+    const photoInBody = photo !== undefined && photo !== null;
+    
     if (name) creator.name = name;
     if (about) creator.about = about;
-    if (photo) creator.photo = photo;
+    if (photoInBody) creator.photo = typeof photo === 'string' ? photo.trim() : String(photo);
     
     if (categories !== undefined) {
       if (!Array.isArray(categories) || categories.some((c) => typeof c !== 'string')) {
@@ -454,6 +501,10 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
     }
     
     await creator.save();
+    
+    await bumpCreatorProfileRevisionForAdmin(creator.userId, {
+      syncAvatarFromCreatorPhoto: photoInBody ? creator.photo : undefined,
+    });
     
     console.log(`✅ [CREATOR] Creator updated: ${creator._id}`);
     
@@ -844,6 +895,12 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       }
     } catch (syncErr) {
       console.error('⚠️ [CREATOR] Stream/cache sync after profile update failed:', syncErr);
+    }
+
+    try {
+      emitCreatorDataUpdated(currentUser.firebaseUid, { reason: 'profile_updated' });
+    } catch (emitErr) {
+      console.error('⚠️ [CREATOR] Failed to emit profile_updated:', emitErr);
     }
 
     console.log(`✅ [CREATOR] Creator profile updated: ${creator._id}`);
@@ -2136,6 +2193,10 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       }
     }
 
+    const creatorProfile = await Creator.findOne({ userId: currentUser._id })
+      .select('assignedAgentId')
+      .lean();
+
     // Create withdrawal record — coins NOT deducted yet
     const withdrawal = await Withdrawal.create({
       creatorUserId: currentUser._id,
@@ -2147,6 +2208,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       upi: upi?.trim() || undefined,
       accountNumber: accountNumber?.trim() || undefined,
       ifsc: ifsc?.trim() || undefined,
+      assignedAgentId: creatorProfile?.assignedAgentId ?? undefined,
     });
 
     console.log(`✅ [CREATOR] Withdrawal requested: ${withdrawal._id} for ${amount} coins by user ${currentUser._id}`);
@@ -2227,36 +2289,4 @@ export const getMyWithdrawals = async (req: Request, res: Response): Promise<voi
   }
 };
 
-// ══════════════════════════════════════════════════════════════════════════
-// REAL-TIME SYNC — Emit creator:data_updated via Socket.IO
-// ══════════════════════════════════════════════════════════════════════════
-
-/**
- * Emit `creator:data_updated` to a specific creator's socket room.
- *
- * Called after:
- * - Billing settlement (call ends → earnings/coins changed)
- * - Task reward claim (coins changed, task state changed)
- *
- * The frontend listens for this event and refreshes all creator data.
- */
-export function emitCreatorDataUpdated(
-  creatorFirebaseUid: string,
-  payload: {
-    reason: string;
-    [key: string]: any;
-  }
-): void {
-  try {
-    const io = getIO();
-    io.to(`user:${creatorFirebaseUid}`).emit('creator:data_updated', {
-      ...payload,
-      timestamp: new Date().toISOString(),
-    });
-    console.log(
-      `📡 [CREATOR] Emitted creator:data_updated to ${creatorFirebaseUid} (reason: ${payload.reason})`
-    );
-  } catch (err) {
-    console.error('⚠️ [CREATOR] Failed to emit creator:data_updated:', err);
-  }
-}
+export { emitCreatorDataUpdated } from './creator-notify';

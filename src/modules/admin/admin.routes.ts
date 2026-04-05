@@ -1,5 +1,12 @@
 import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
+import { creatorGalleryUploadLimiter } from '../../middlewares/rate-limit.middleware';
+import {
+  createAgent,
+  listAgents,
+  getAgentDetail,
+  patchAgent,
+} from './admin-agent.controller';
 import {
   getOverview,
   getCreatorsPerformance,
@@ -26,6 +33,11 @@ import {
   getSecurityFlags,
   getFullAuditReport,
   updateWalletPricing,
+  patchCreatorLinkedUser,
+  adminCreatorGalleryUploadUrl,
+  adminCreatorGalleryCommit,
+  adminCreatorGalleryDelete,
+  adminCreatorGalleryReorder,
 } from './admin.controller';
 
 const router = Router();
@@ -46,6 +58,12 @@ router.get('/system/health', getSystemHealth);
 router.get('/realtime-metrics', getRealtimeMetrics);
 router.get('/actions/log', getAdminActionLog);
 
+// ── Agents (super-admin) ────────────────────────────────────────────────
+router.post('/agents', createAgent);
+router.get('/agents', listAgents);
+router.get('/agents/:id', getAgentDetail);
+router.patch('/agents/:id', patchAgent);
+
 // ── Withdrawal Management ────────────────────────────────────────────────
 router.get('/withdrawals', getWithdrawals);
 router.post('/withdrawals/:id/approve', approveWithdrawal);
@@ -60,6 +78,15 @@ router.patch('/support/:id/assign', assignTicket);
 // ── Admin Actions ───────────────────────────────────────────────────────
 router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/force-offline', forceCreatorOffline);
+router.patch('/creators/:id/user', patchCreatorLinkedUser);
+router.post(
+  '/creators/:id/gallery/upload-url',
+  creatorGalleryUploadLimiter,
+  adminCreatorGalleryUploadUrl,
+);
+router.post('/creators/:id/gallery/commit', adminCreatorGalleryCommit);
+router.delete('/creators/:id/gallery/:imageId', adminCreatorGalleryDelete);
+router.patch('/creators/:id/gallery/reorder', adminCreatorGalleryReorder);
 router.post('/calls/:callId/refund', refundCall);
 router.put('/wallet-pricing', updateWalletPricing);
 

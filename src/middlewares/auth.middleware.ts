@@ -42,7 +42,6 @@ export const verifyFirebaseToken = async (
         };
 
         if (decoded.role === 'admin' && decoded.userId) {
-          // Look up the admin user to get their firebaseUid
           const adminUser = await User.findById(decoded.userId);
           if (adminUser && adminUser.role === 'admin') {
             logInfo('Admin JWT verified', {
@@ -57,6 +56,22 @@ export const verifyFirebaseToken = async (
             };
 
             logInfo('Admin authentication successful', { path: req.path });
+            next();
+            return;
+          }
+        }
+
+        if (decoded.role === 'agent' && decoded.userId) {
+          const agentUser = await User.findById(decoded.userId);
+          if (agentUser && agentUser.role === 'agent' && !agentUser.agentDisabled) {
+            logInfo('Agent JWT verified', {
+              agentId: agentUser._id.toString(),
+              path: req.path,
+            });
+            req.auth = {
+              firebaseUid: agentUser.firebaseUid,
+              email: agentUser.email,
+            };
             next();
             return;
           }

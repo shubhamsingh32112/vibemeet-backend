@@ -22,6 +22,8 @@ export interface ICreator extends Document {
   isOnline: boolean; // Online/offline status for creators
   currentCallId?: string; // Current active call ID (locks creator from accepting other calls)
   earningsCoins: number; // Total creator earnings from video calls
+  /** Agent who recruited/manages this creator (set when agent accepts an application). */
+  assignedAgentId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -124,10 +126,18 @@ const creatorSchema = new Schema<ICreator>(
       default: 0,
       min: 0,
     },
+    assignedAgentId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      sparse: true,
+      index: true,
+    },
   },
   {
     timestamps: true,
   }
 );
+
+creatorSchema.index({ assignedAgentId: 1, updatedAt: -1 });
 
 export const Creator = mongoose.model<ICreator>('Creator', creatorSchema);

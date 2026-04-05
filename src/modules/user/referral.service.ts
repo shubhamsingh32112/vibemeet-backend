@@ -8,9 +8,11 @@
  * - Granting 60 coins to referrer when referred user buys coins >= ₹100
  */
 
-import { Types } from 'mongoose';
+import mongoose, { Types } from 'mongoose';
 import { User, IUser } from './user.model';
 import { Creator } from '../creator/creator.model';
+import { CreatorApplication } from '../agent/creator-application.model';
+import { promoteUserToCreatorWithStarterProfile } from '../creator/creator-starter.service';
 import { CoinTransaction } from './coin-transaction.model';
 import { getIO } from '../../config/socket';
 import {
@@ -80,6 +82,12 @@ export async function applyReferralCode(
   // Cannot refer self
   if (referrer._id.equals(newUser._id)) return false;
 
+  // Disabled agent codes behave as invalid (do not set referredBy or pending state)
+  if (referrer.role === 'agent' && referrer.agentDisabled) {
+    logInfo('Referral skipped: agent account disabled', { code, referrerId: referrer._id.toString() });
+    return false;
+  }
+
   // Apply referral
   newUser.referredBy = referrer._id;
   await newUser.save();
@@ -99,15 +107,60 @@ export async function applyReferralCode(
     referralCode: code,
   });
 
-  // Creator promotion: if referrer is a creator, promote new user to creator role
+  // Agent referral: pending application only (stay role user); agentDisabled already filtered above
+  if (referrer.role === 'agent') {
+    const existingPending = await CreatorApplication.findOne({
+      applicantUserId: newUser._id,
+      status: 'pending',
+    })
+      .select('_id')
+      .lean();
+    if (!existingPending) {
+      await CreatorApplication.create({
+        applicantUserId: newUser._id,
+        agentUserId: referrer._id,
+        referralCodeUsed: code,
+        status: 'pending',
+      });
+    }
+    logInfo('Agent referral: creator application pending', {
+      newUserId: newUser._id.toString(),
+      agentUserId: referrer._id.toString(),
+    });
+    return true;
+  }
+
+  // Creator promotion: if referrer has a creator profile, promote + always create Creator doc
   const creatorProfile = await Creator.findOne({ userId: referrer._id });
   if (creatorProfile) {
-    newUser.role = 'creator';
-    await newUser.save();
-    logInfo('Creator referral: promoted new user to creator', {
-      newUserId: newUser._id.toString(),
-      referrerId: referrer._id.toString(),
-    });
+    const existingCreatorForNewUser = await Creator.findOne({ userId: newUser._id });
+    if (existingCreatorForNewUser) {
+      logInfo('Creator referral skipped: applicant already has creator profile', {
+        newUserId: newUser._id.toString(),
+      });
+      return true;
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      newUser.$session(session);
+      await promoteUserToCreatorWithStarterProfile(newUser, { session });
+      await session.commitTransaction();
+      logInfo('Creator referral: promoted with starter Creator document', {
+        newUserId: newUser._id.toString(),
+        referrerId: referrer._id.toString(),
+      });
+    } catch (err) {
+      await session.abortTransaction();
+      logError('Creator referral promotion failed', err as Error, {
+        newUserId: newUser._id.toString(),
+      });
+      throw err;
+    } finally {
+      newUser.$session(null);
+      session.endSession();
+    }
   }
 
   return true;
