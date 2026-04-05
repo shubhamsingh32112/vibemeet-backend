@@ -21,11 +21,8 @@ import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
-import {
-  bumpCreatorProfileRevisionForAdmin,
-  normalizeGalleryImages,
-  notifyCreatorProfileChannels,
-} from '../creator/creator.controller';
+import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
+import { normalizeGalleryImages } from '../creator/creator-gallery-resolve';
 import {
   buildPublicGalleryDownloadUrl,
   createCreatorGallerySignedUpload,

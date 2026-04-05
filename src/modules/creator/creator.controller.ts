@@ -37,60 +37,11 @@ import {
   isAllowedGalleryContentType,
   parseGalleryStoragePath,
 } from './creator-gallery.storage';
-import { logError, logInfo, logWarning } from '../../utils/logger';
+import { logError, logInfo } from '../../utils/logger';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
-
-export function normalizeGalleryImages(
-  galleryImages: Array<{
-    id: string;
-    url: string;
-    storagePath: string;
-    position: number;
-    createdAt: Date;
-  }> = [],
-) {
-  return [...galleryImages]
-    .sort((a, b) => a.position - b.position || +new Date(a.createdAt) - +new Date(b.createdAt))
-    .map((image, idx) => ({
-      id: image.id,
-      url: image.url,
-      storagePath: image.storagePath,
-      position: idx,
-      createdAt: image.createdAt,
-    }));
-}
-
-/** Fix legacy gallery URLs missing Firebase download tokens (403 in mobile clients). */
-async function resolveGalleryImageUrlsForApi(
-  galleryImages: Parameters<typeof normalizeGalleryImages>[0],
-): Promise<{ galleryImages: ReturnType<typeof normalizeGalleryImages>; urlsChanged: boolean }> {
-  const normalized = normalizeGalleryImages(galleryImages);
-  let urlsChanged = false;
-  const resolved = await Promise.all(
-    normalized.map(async (img) => {
-      if (!img.storagePath || img.url.includes('token=')) {
-        return img;
-      }
-      try {
-        const url = await buildPublicGalleryDownloadUrl(img.storagePath);
-        if (url !== img.url) urlsChanged = true;
-        return { ...img, url };
-      } catch (e) {
-        logWarning('Failed to resolve gallery download URL', {
-          storagePath: img.storagePath,
-          error: e instanceof Error ? e.message : String(e),
-        });
-        return img;
-      }
-    }),
-  );
-  return {
-    galleryImages: normalizeGalleryImages(resolved),
-    urlsChanged,
-  };
-}
+import { normalizeGalleryImages, resolveGalleryImageUrlsForApi } from './creator-gallery-resolve';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -542,7 +493,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
   }
 };
 
-// Delete creator (Admin only)
+// Delete creator — admin may delete any; owning agent may delete assigned creators only.
 // Business Rule: Deleting a creator profile ALWAYS downgrades the user role back to 'user'
 // This ensures data consistency - if creator profile is gone, user should not have creator role
 export const deleteCreator = async (req: Request, res: Response): Promise<void> => {
@@ -558,21 +509,31 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    // Check if user is admin
-    const adminUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!adminUser || adminUser.role !== 'admin') {
-      res.status(403).json({
-        success: false,
-        error: 'Forbidden: Admin access required',
-      });
+    const staffUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!staffUser) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
-    
+
     const creator = await Creator.findById(id);
     if (!creator) {
       res.status(404).json({
         success: false,
         error: 'Creator not found',
+      });
+      return;
+    }
+
+    let allowed = false;
+    if (staffUser.role === 'admin') {
+      allowed = true;
+    } else if (staffUser.role === 'agent' && !staffUser.agentDisabled && creator.assignedAgentId?.equals(staffUser._id)) {
+      allowed = true;
+    }
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Admin access or ownership of this creator is required',
       });
       return;
     }
@@ -600,9 +561,12 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
       // Commit transaction
       await session.commitTransaction();
       
-      // Log demotion event (structured for future audit log)
-      console.log(`📝 [AUDIT] ADMIN_DEMOTED_CREATOR`);
-      console.log(`   Admin: ${adminUser._id} (${adminUser.email || adminUser.phone})`);
+      const actorLabel =
+        staffUser.role === 'admin'
+          ? `Admin: ${staffUser._id} (${staffUser.email || staffUser.phone})`
+          : `Agent: ${staffUser._id} (${staffUser.email || staffUser.phone})`;
+      console.log(`📝 [AUDIT] CREATOR_PROFILE_DELETED`);
+      console.log(`   ${actorLabel}`);
       console.log(`   Creator Profile: ${id}`);
       console.log(`   User: ${userId} (downgraded to 'user')`);
       console.log(`   Timestamp: ${new Date().toISOString()}`);

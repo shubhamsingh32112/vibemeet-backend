@@ -7,6 +7,8 @@ import {
   rejectApplication,
   getAgentCreators,
   getAgentCreatorDetail,
+  postAgentCreateCreator,
+  searchUsersForAgent,
   getAgentWithdrawals,
   agentApproveWithdrawal,
   agentRejectWithdrawal,
@@ -20,6 +22,8 @@ router.get('/summary', getAgentDashboardSummary);
 router.get('/pending-applications', getPendingApplications);
 router.post('/applications/:id/accept', acceptApplication);
 router.post('/applications/:id/reject', rejectApplication);
+router.get('/search-users', searchUsersForAgent);
+router.post('/creators', postAgentCreateCreator);
 router.get('/creators', getAgentCreators);
 router.get('/creators/:creatorId', getAgentCreatorDetail);
 router.get('/withdrawals', getAgentWithdrawals);
