@@ -22,7 +22,13 @@ export interface IUser extends Document {
   coins: number;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
   welcomeBonusClaimed: boolean; // Whether user has claimed the 30-coin welcome bonus
-  role: 'user' | 'creator' | 'admin'; // User role
+  role: 'user' | 'creator' | 'admin' | 'agent';
+  /** Bcrypt hash for agent dashboard login (never store plaintext). */
+  passwordHash?: string;
+  /** When true, agent JWT login is blocked (super-admin toggle). */
+  agentDisabled?: boolean;
+  /** Optional label for agent management UI. */
+  displayName?: string;
   /** Fast Login: 'google' | 'fast'. Omitted for existing users (treated as Google). */
   authProvider?: 'google' | 'fast';
   /** Fast Login: device fingerprint for lookup (one account per device). */
@@ -35,6 +41,8 @@ export interface IUser extends Document {
   referredBy?: mongoose.Types.ObjectId;
   /** Referral: users this user referred, with reward status. */
   referrals?: IReferralEntry[];
+  /** Bumped when admin edits profile (creator + linked user); clients show toast when this increases. */
+  profileRevision: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -112,8 +120,23 @@ const userSchema = new Schema<IUser>(
     },
     role: {
       type: String,
-      enum: ['user', 'creator', 'admin'],
+      enum: ['user', 'creator', 'admin', 'agent'],
       default: 'user',
+    },
+    passwordHash: {
+      type: String,
+      select: false,
+      sparse: true,
+    },
+    agentDisabled: {
+      type: Boolean,
+      default: false,
+    },
+    displayName: {
+      type: String,
+      sparse: true,
+      trim: true,
+      maxlength: 120,
     },
     authProvider: {
       type: String,
@@ -164,6 +187,11 @@ const userSchema = new Schema<IUser>(
         },
       },
     ],
+    profileRevision: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,

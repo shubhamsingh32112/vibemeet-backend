@@ -29,6 +29,8 @@ export interface IWithdrawal extends Document {
   upi?: string;
   accountNumber?: string;
   ifsc?: string;
+  /** Copied from Creator.assignedAgentId at request time for indexed agent queues. */
+  assignedAgentId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -89,6 +91,12 @@ const withdrawalSchema = new Schema<IWithdrawal>(
     ifsc: {
       type: String,
     },
+    assignedAgentId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      sparse: true,
+      index: true,
+    },
   },
   {
     timestamps: true,
@@ -96,6 +104,7 @@ const withdrawalSchema = new Schema<IWithdrawal>(
 );
 
 // Compound indexes for common queries
+withdrawalSchema.index({ assignedAgentId: 1, status: 1, createdAt: -1 });
 withdrawalSchema.index({ creatorUserId: 1, status: 1 });
 withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });

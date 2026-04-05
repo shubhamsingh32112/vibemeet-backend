@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { login, logout, adminLogin, fastLoginDeprecated } from './auth.controller';
+import { login, logout, adminLogin, agentLogin, fastLoginDeprecated } from './auth.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { fastLoginLimiter, loginLimiter } from '../../middlewares/rate-limit.middleware';
 
@@ -14,5 +14,8 @@ router.post('/fast-login', fastLoginLimiter, fastLoginDeprecated);
 
 // Admin login — email + password (no Firebase token)
 router.post('/admin-login', adminLogin);
+
+// Agent login — email + password (bcrypt on User.passwordHash)
+router.post('/agent-login', loginLimiter, agentLogin);
 
 export default router;

@@ -21,9 +21,31 @@ import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
-import { emitCreatorDataUpdated } from '../creator/creator.controller';
+import {
+  bumpCreatorProfileRevisionForAdmin,
+  normalizeGalleryImages,
+  notifyCreatorProfileChannels,
+} from '../creator/creator.controller';
+import {
+  buildPublicGalleryDownloadUrl,
+  createCreatorGallerySignedUpload,
+  deleteGalleryStorageObject,
+  isAllowedGalleryContentType,
+  parseGalleryStoragePath,
+} from '../creator/creator-gallery.storage';
+import {
+  CREATOR_GALLERY_ALLOWED_CONTENT_TYPES,
+  CREATOR_GALLERY_MAX_IMAGES,
+  CREATOR_GALLERY_MIN_IMAGES,
+} from '../creator/creator-gallery.constants';
 import { verifyUserBalance, batchVerifyBalances } from '../../utils/balance-integrity';
 import { Withdrawal } from '../creator/withdrawal.model';
+import { assertAdmin, assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
+import {
+  processWithdrawalApproval,
+  processWithdrawalRejection,
+  processWithdrawalMarkPaid,
+} from '../creator/withdrawal-processing.service';
 import { SupportTicket } from '../support/support.model';
 import {
   DEFAULT_WALLET_COIN_PACKAGES,
@@ -45,19 +67,6 @@ const REFUND_MAX_AGE_DAYS = 30;
 async function getAdminUser(req: Request): Promise<any | null> {
   if (!req.auth) return null;
   return User.findOne({ firebaseUid: req.auth.firebaseUid }).lean();
-}
-
-async function assertAdmin(req: Request, res: Response): Promise<boolean> {
-  if (!req.auth) {
-    res.status(401).json({ success: false, error: 'Unauthorized' });
-    return false;
-  }
-  const admin = await getAdminUser(req);
-  if (!admin || admin.role !== 'admin') {
-    res.status(403).json({ success: false, error: 'Admin access required' });
-    return false;
-  }
-  return true;
 }
 
 function daysAgo(days: number): Date {
@@ -457,6 +466,8 @@ async function computeCreatorsPerformance() {
       creatorId: creator._id.toString(),
       userId,
       name: creator.name,
+      username: user?.username ?? null,
+      avatar: user?.avatar ?? null,
       photo: creator.photo,
       categories: creator.categories,
       price: creator.price,
@@ -1582,6 +1593,12 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
     if (statusFilter && ['pending', 'approved', 'rejected', 'paid'].includes(statusFilter)) {
       filter.status = statusFilter;
     }
+    const hasAssignedAgent = String(req.query.hasAssignedAgent || '').toLowerCase();
+    if (hasAssignedAgent === 'true') {
+      filter.assignedAgentId = { $exists: true, $ne: null };
+    } else if (hasAssignedAgent === 'false') {
+      filter.$or = [{ assignedAgentId: null }, { assignedAgentId: { $exists: false } }];
+    }
 
     const [withdrawals, total] = await Promise.all([
       Withdrawal.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
@@ -1614,6 +1631,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           upi: (w as any).upi || null,
           accountNumber: (w as any).accountNumber || null,
           ifsc: (w as any).ifsc || null,
+          assignedAgentId: (w as any).assignedAgentId?.toString() || null,
         };
       })
     );
@@ -1711,140 +1729,22 @@ export const approveWithdrawal = async (req: Request, res: Response): Promise<vo
 
     const { id } = req.params;
     const { notes } = req.body;
-
-    const withdrawal = await Withdrawal.findById(id);
-    if (!withdrawal) {
-      res.status(404).json({ success: false, error: 'Withdrawal not found' });
-      return;
-    }
-
-    if (withdrawal.status !== 'pending') {
-      res.status(400).json({
-        success: false,
-        error: `Cannot approve withdrawal with status '${withdrawal.status}'. Only pending withdrawals can be approved.`,
-      });
-      return;
-    }
-
-    // Resolve the creator user — supports both creatorUserId and creatorFirebaseUid
-    let creatorUser: any = null;
-    if (withdrawal.creatorUserId) {
-      creatorUser = await User.findById(withdrawal.creatorUserId);
-    } else if ((withdrawal as any).creatorFirebaseUid) {
-      creatorUser = await User.findOne({ firebaseUid: (withdrawal as any).creatorFirebaseUid });
-    }
-
-    if (!creatorUser) {
-      res.status(404).json({ success: false, error: 'Creator user not found' });
-      return;
-    }
-
-    // Find the Creator document to update earningsCoins
-    const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
-
-    // Verify balance is sufficient (use User.coins as primary source - actual available balance)
-    // Creator.earningsCoins is a separate tracking field that may be 0 or out of sync
-    const availableBalance = creatorUser.coins;
-    if (availableBalance < withdrawal.amount) {
-      res.status(400).json({
-        success: false,
-        error: `Creator balance (${availableBalance}) is less than withdrawal amount (${withdrawal.amount}). Cannot approve.`,
-      });
-      return;
-    }
-
     const adminUser = await getAdminUser(req);
-    const txId = `withdrawal_${withdrawal._id}_${randomUUID()}`;
-    const oldCoins = creatorUser.coins;
-    const oldEarnings = creatorDoc?.earningsCoins ?? 0;
-
-    // Create CoinTransaction (debit)
-    await new CoinTransaction({
-      transactionId: txId,
-      userId: creatorUser._id,
-      type: 'debit',
-      coins: withdrawal.amount,
-      source: 'withdrawal',
-      description: `Withdrawal approved by ${adminUser?.email || 'admin'}${notes ? ': ' + notes.trim() : ''}`,
-      status: 'completed',
-    }).save();
-
-    // Deduct coins from User balance
-    creatorUser.coins -= withdrawal.amount;
-    await creatorUser.save();
-
-    // Reset Creator.earningsCoins to 0 (total earnings resets on successful withdrawal)
-    if (creatorDoc) {
-      creatorDoc.earningsCoins = Math.max(0, creatorDoc.earningsCoins - withdrawal.amount);
-      await creatorDoc.save();
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
     }
 
-    // Update withdrawal record
-    withdrawal.status = 'approved';
-    withdrawal.processedAt = new Date();
-    withdrawal.adminUserId = adminUser?._id;
-    withdrawal.notes = notes?.trim() || undefined;
-    withdrawal.transactionId = txId;
-    // Backfill creatorUserId if it was missing (creatorB withdrawal)
-    if (!withdrawal.creatorUserId) {
-      withdrawal.creatorUserId = creatorUser._id;
-    }
-    await withdrawal.save();
-
-    // Audit log
-    await logAdminAction(adminUser, 'WITHDRAWAL_APPROVED', 'withdrawal', withdrawal._id.toString(), notes?.trim() || 'Withdrawal approved', {
-      transactionId: txId,
-      creatorUserId: creatorUser._id.toString(),
-      amount: withdrawal.amount,
-      oldBalance: oldCoins,
-      newBalance: creatorUser.coins,
-      oldEarnings,
-      newEarnings: creatorDoc?.earningsCoins ?? 0,
+    const result = await processWithdrawalApproval(id, adminUser, {
+      notes: typeof notes === 'string' ? notes : undefined,
+      isAdmin: true,
     });
-
-    // Balance integrity check (fire-and-forget)
-    verifyUserBalance(creatorUser._id).catch(() => {});
-
-    // Emit coins_updated socket event so creator's app updates instantly
-    try {
-      const io = getIO();
-      io.to(`user:${creatorUser.firebaseUid}`).emit('coins_updated', {
-        userId: creatorUser._id.toString(),
-        coins: creatorUser.coins,
-      });
-      console.log(`📡 [ADMIN] Emitted coins_updated to ${creatorUser.firebaseUid} (${creatorUser.coins} coins)`);
-    } catch (socketErr) {
-      console.error('⚠️ [ADMIN] Failed to emit coins_updated:', socketErr);
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
+      return;
     }
 
-    // Emit creator:data_updated to refresh creator dashboard (earnings, tasks, etc.)
-    try {
-      emitCreatorDataUpdated(creatorUser.firebaseUid, {
-        reason: 'withdrawal_approved',
-        coins: creatorUser.coins,
-        withdrawalAmount: withdrawal.amount,
-        withdrawalId: withdrawal._id.toString(),
-      });
-    } catch (emitErr) {
-      console.error('⚠️ [ADMIN] Failed to emit creator:data_updated:', emitErr);
-    }
-
-    // Invalidate caches
-    await invalidateAdminCaches('overview', 'coins', 'creators_performance');
-
-    console.log(`✅ [ADMIN] Withdrawal ${id} approved. Creator ${creatorUser._id}: coins ${oldCoins} → ${creatorUser.coins}, earnings ${oldEarnings} → ${creatorDoc?.earningsCoins ?? 0}`);
-
-    res.json({
-      success: true,
-      data: {
-        withdrawalId: withdrawal._id.toString(),
-        status: 'approved',
-        amount: withdrawal.amount,
-        transactionId: txId,
-        creatorOldBalance: oldCoins,
-        creatorNewBalance: creatorUser.coins,
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     console.error('❌ [ADMIN] Approve withdrawal error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1862,51 +1762,24 @@ export const rejectWithdrawal = async (req: Request, res: Response): Promise<voi
 
     const { id } = req.params;
     const { notes } = req.body;
+    const adminUser = await getAdminUser(req);
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
 
-    if (!notes || typeof notes !== 'string' || notes.trim().length < 3) {
+    if (!notes || typeof notes !== 'string') {
       res.status(400).json({ success: false, error: 'Notes/reason is required (min 3 characters)' });
       return;
     }
 
-    const withdrawal = await Withdrawal.findById(id);
-    if (!withdrawal) {
-      res.status(404).json({ success: false, error: 'Withdrawal not found' });
+    const result = await processWithdrawalRejection(id, adminUser, { notes, isAdmin: true });
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
       return;
     }
 
-    if (withdrawal.status !== 'pending') {
-      res.status(400).json({
-        success: false,
-        error: `Cannot reject withdrawal with status '${withdrawal.status}'. Only pending withdrawals can be rejected.`,
-      });
-      return;
-    }
-
-    const adminUser = await getAdminUser(req);
-
-    withdrawal.status = 'rejected';
-    withdrawal.adminUserId = adminUser?._id;
-    withdrawal.notes = notes.trim();
-    withdrawal.processedAt = new Date();
-    await withdrawal.save();
-
-    // Audit log
-    await logAdminAction(adminUser, 'WITHDRAWAL_REJECTED', 'withdrawal', withdrawal._id.toString(), notes.trim(), {
-      creatorUserId: withdrawal.creatorUserId?.toString() || (withdrawal as any).creatorFirebaseUid || 'unknown',
-      amount: withdrawal.amount,
-    });
-
-    console.log(`✅ [ADMIN] Withdrawal ${id} rejected. Reason: ${notes.trim()}`);
-
-    res.json({
-      success: true,
-      data: {
-        withdrawalId: withdrawal._id.toString(),
-        status: 'rejected',
-        amount: withdrawal.amount,
-        notes: notes.trim(),
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     console.error('❌ [ADMIN] Reject withdrawal error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1925,66 +1798,22 @@ export const markWithdrawalPaid = async (req: Request, res: Response): Promise<v
 
     const { id } = req.params;
     const { notes } = req.body;
-
-    const withdrawal = await Withdrawal.findById(id);
-    if (!withdrawal) {
-      res.status(404).json({ success: false, error: 'Withdrawal not found' });
-      return;
-    }
-
-    if (withdrawal.status !== 'approved') {
-      res.status(400).json({
-        success: false,
-        error: `Cannot mark as paid. Withdrawal status is '${withdrawal.status}', expected 'approved'.`,
-      });
-      return;
-    }
-
     const adminUser = await getAdminUser(req);
-
-    withdrawal.status = 'paid';
-    withdrawal.processedAt = new Date();
-    if (notes?.trim()) {
-      withdrawal.notes = (withdrawal.notes || '') + (withdrawal.notes ? ' | ' : '') + `Paid: ${notes.trim()}`;
-    }
-    await withdrawal.save();
-
-    // Ensure Creator.earningsCoins is reset to 0 on successful payment
-    let creatorUser: any = null;
-    if (withdrawal.creatorUserId) {
-      creatorUser = await User.findById(withdrawal.creatorUserId).lean();
-    } else if ((withdrawal as any).creatorFirebaseUid) {
-      creatorUser = await User.findOne({ firebaseUid: (withdrawal as any).creatorFirebaseUid }).lean();
-    }
-    if (creatorUser) {
-      const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
-      if (creatorDoc && creatorDoc.earningsCoins > 0) {
-        creatorDoc.earningsCoins = Math.max(0, creatorDoc.earningsCoins - withdrawal.amount);
-        await creatorDoc.save();
-      }
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
     }
 
-    // Audit log
-    await logAdminAction(adminUser, 'WITHDRAWAL_PAID', 'withdrawal', withdrawal._id.toString(), notes?.trim() || 'Marked as paid', {
-      creatorUserId: withdrawal.creatorUserId?.toString() || (withdrawal as any).creatorFirebaseUid || 'unknown',
-      amount: withdrawal.amount,
-      processedAt: withdrawal.processedAt.toISOString(),
+    const result = await processWithdrawalMarkPaid(id, adminUser, {
+      notes: typeof notes === 'string' ? notes : undefined,
+      isAdmin: true,
     });
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
+      return;
+    }
 
-    console.log(`✅ [ADMIN] Withdrawal ${id} marked as paid`);
-
-    // Invalidate caches
-    await invalidateAdminCaches('overview', 'coins', 'creators_performance');
-
-    res.json({
-      success: true,
-      data: {
-        withdrawalId: withdrawal._id.toString(),
-        status: 'paid',
-        amount: withdrawal.amount,
-        processedAt: withdrawal.processedAt.toISOString(),
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     console.error('❌ [ADMIN] Mark withdrawal paid error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -2599,6 +2428,340 @@ export const getFullAuditReport = async (req: Request, res: Response): Promise<v
     });
   } catch (error) {
     console.error('❌ [ADMIN] Full audit report error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ── Creator profile (admin): linked User + gallery for any creator ─────────
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export const patchCreatorLinkedUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator?.userId) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const user = await User.findById(creator.userId);
+    if (!user?.firebaseUid) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const { username, avatar, categories } = req.body ?? {};
+    let changed = false;
+
+    if (username !== undefined) {
+      const u = String(username).trim();
+      if (u.length < 4 || u.length > 10) {
+        res.status(400).json({ success: false, error: 'Username must be between 4 and 10 characters' });
+        return;
+      }
+      if (user.username !== u) {
+        const dup = await User.findOne({
+          _id: { $ne: user._id },
+          username: { $regex: new RegExp(`^${escapeRegex(u)}$`, 'i') },
+        });
+        if (dup) {
+          res.status(409).json({ success: false, error: 'Username already taken' });
+          return;
+        }
+        user.username = u;
+        changed = true;
+      }
+    }
+
+    if (avatar !== undefined) {
+      const a = avatar === null || avatar === '' ? '' : String(avatar).trim();
+      user.avatar = a || undefined;
+      changed = true;
+    }
+
+    if (categories !== undefined) {
+      if (!Array.isArray(categories)) {
+        res.status(400).json({ success: false, error: 'Categories must be an array' });
+        return;
+      }
+      if (categories.length > 4) {
+        res.status(400).json({ success: false, error: 'Maximum 4 categories allowed' });
+        return;
+      }
+      if (categories.some((c: unknown) => typeof c !== 'string')) {
+        res.status(400).json({ success: false, error: 'Categories must be strings' });
+        return;
+      }
+      user.categories = categories as string[];
+      changed = true;
+    }
+
+    if (!changed) {
+      res.json({
+        success: true,
+        data: {
+          user: {
+            id: user._id.toString(),
+            username: user.username,
+            avatar: user.avatar,
+            categories: user.categories,
+            profileRevision: user.profileRevision ?? 0,
+          },
+        },
+      });
+      return;
+    }
+
+    user.profileRevision = (user.profileRevision ?? 0) + 1;
+    await user.save();
+
+    await notifyCreatorProfileChannels(user._id, user.firebaseUid);
+
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id: user._id.toString(),
+          username: user.username,
+          avatar: user.avatar,
+          categories: user.categories,
+          profileRevision: user.profileRevision,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] patchCreatorLinkedUser error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const adminCreatorGalleryUploadUrl = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
+      res.status(409).json({
+        success: false,
+        error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
+      });
+      return;
+    }
+
+    const contentType = req.body?.contentType;
+    if (!isAllowedGalleryContentType(contentType)) {
+      res.status(400).json({
+        success: false,
+        error: `contentType must be one of: ${CREATOR_GALLERY_ALLOWED_CONTENT_TYPES.join(', ')}`,
+      });
+      return;
+    }
+
+    const signedUpload = await createCreatorGallerySignedUpload(creator._id.toString(), contentType);
+    res.status(201).json({ success: true, data: signedUpload });
+  } catch (error) {
+    console.error('❌ [ADMIN] adminCreatorGalleryUploadUrl error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const adminCreatorGalleryCommit = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const { imageId, storagePath } = req.body ?? {};
+    if (
+      typeof imageId !== 'string' ||
+      typeof storagePath !== 'string' ||
+      imageId.trim() === '' ||
+      storagePath.trim() === ''
+    ) {
+      res.status(400).json({ success: false, error: 'imageId and storagePath are required' });
+      return;
+    }
+
+    const parsed = parseGalleryStoragePath(storagePath.trim());
+    if (!parsed || parsed.creatorId !== creator._id.toString() || parsed.imageId !== imageId.trim()) {
+      res.status(422).json({ success: false, error: 'storagePath/imageId mismatch for this creator' });
+      return;
+    }
+
+    let url: string;
+    try {
+      url = await buildPublicGalleryDownloadUrl(storagePath.trim());
+    } catch {
+      res.status(400).json({
+        success: false,
+        error: 'Upload not found in storage. Finish the upload, then try commit again.',
+      });
+      return;
+    }
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    if (!existingImages.some((img) => img.id === imageId.trim())) {
+      if (existingImages.length >= CREATOR_GALLERY_MAX_IMAGES) {
+        res.status(409).json({
+          success: false,
+          error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
+        });
+        return;
+      }
+      existingImages.push({
+        id: imageId.trim(),
+        storagePath: storagePath.trim(),
+        url,
+        createdAt: new Date(),
+        position: existingImages.length,
+      });
+    } else {
+      for (let i = 0; i < existingImages.length; i += 1) {
+        if (existingImages[i].id === imageId.trim()) {
+          existingImages[i] = {
+            ...existingImages[i],
+            storagePath: storagePath.trim(),
+            url,
+          };
+          break;
+        }
+      }
+    }
+
+    creator.galleryImages = normalizeGalleryImages(existingImages);
+    await creator.save();
+
+    await bumpCreatorProfileRevisionForAdmin(creator.userId);
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] adminCreatorGalleryCommit error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const adminCreatorGalleryDelete = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId, imageId } = req.params;
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    if (!imageId?.trim()) {
+      res.status(400).json({ success: false, error: 'imageId is required' });
+      return;
+    }
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator?.userId) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    const target = existingImages.find((img) => img.id === imageId.trim());
+    if (!target) {
+      res.status(404).json({ success: false, error: 'Gallery image not found' });
+      return;
+    }
+
+    if (existingImages.length <= CREATOR_GALLERY_MIN_IMAGES) {
+      res.status(400).json({
+        success: false,
+        error: `At least ${CREATOR_GALLERY_MIN_IMAGES} gallery image is required`,
+      });
+      return;
+    }
+
+    creator.galleryImages = normalizeGalleryImages(
+      existingImages.filter((img) => img.id !== imageId.trim()),
+    );
+    await creator.save();
+
+    await bumpCreatorProfileRevisionForAdmin(creator.userId);
+
+    deleteGalleryStorageObject(target.storagePath).catch((err) => {
+      console.error('Failed to delete gallery storage object', err);
+    });
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] adminCreatorGalleryDelete error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const adminCreatorGalleryReorder = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator?.userId) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const imageIds = req.body?.imageIds;
+    if (!Array.isArray(imageIds) || imageIds.some((id: unknown) => typeof id !== 'string' || id.trim() === '')) {
+      res.status(400).json({ success: false, error: 'imageIds must be a non-empty array of strings' });
+      return;
+    }
+
+    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    if (imageIds.length !== existingImages.length) {
+      res.status(400).json({ success: false, error: 'imageIds length mismatch with existing gallery images' });
+      return;
+    }
+
+    const existingIdSet = new Set(existingImages.map((img) => img.id));
+    for (const id of imageIds) {
+      if (!existingIdSet.has((id as string).trim())) {
+        res.status(422).json({ success: false, error: `Unknown imageId in reorder payload: ${id}` });
+        return;
+      }
+    }
+
+    const imageMap = new Map(existingImages.map((img) => [img.id, img]));
+    creator.galleryImages = (imageIds as string[]).map((id: string, index: number) => ({
+      ...imageMap.get(id.trim())!,
+      position: index,
+    }));
+    await creator.save();
+
+    await bumpCreatorProfileRevisionForAdmin(creator.userId);
+
+    res.json({
+      success: true,
+      data: {
+        galleryImages: normalizeGalleryImages(creator.galleryImages),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] adminCreatorGalleryReorder error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
