@@ -5,17 +5,30 @@ import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { checkBonusEligibility } from '../user/identity.service';
-import { assignReferralCodeToUser, applyReferralCode } from '../user/referral.service';
+import {
+  assignReferralCodeToUser,
+  applyReferralCode,
+  type ApplyReferralCodeErrorCode,
+} from '../user/referral.service';
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
+import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
 
 /** Max length for optional deviceFingerprint on POST /auth/login (bonus eligibility). */
 const DEVICE_FINGERPRINT_MAX = 256;
 
+function referralApplyFailure(code: ApplyReferralCodeErrorCode) {
+  return {
+    ok: false as const,
+    code,
+    message: referralUserFacingMessage(code),
+  };
+}
+
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
-  let referralApply: { ok: boolean; code?: string } | undefined;
+  let referralApply: { ok: true } | ReturnType<typeof referralApplyFailure> | undefined;
   try {
     logDebug('Login request received', {
       ip: req.ip,
@@ -77,10 +90,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
         if (referralCodeRaw) {
           if (!isValidReferralCodeFormat(referralCodeRaw)) {
-            referralApply = { ok: false, code: 'INVALID_FORMAT' };
+            referralApply = referralApplyFailure('INVALID_FORMAT');
           } else {
             const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
-            referralApply = ar.ok ? { ok: true } : { ok: false, code: ar.code };
+            referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
           }
         }
         user = (await User.findOne({ firebaseUid }))!;
@@ -110,7 +123,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : '';
       if (existingReferralRaw) {
         if (user.referredBy) {
-          referralApply = { ok: false, code: 'ALREADY_REFERRED' };
+          referralApply = referralApplyFailure('ALREADY_REFERRED');
         } else {
           if (!user.referralCode) {
             await assignReferralCodeToUser(user);
@@ -119,10 +132,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           if (working) user = working;
 
           if (!isValidReferralCodeFormat(existingReferralRaw)) {
-            referralApply = { ok: false, code: 'INVALID_FORMAT' };
+            referralApply = referralApplyFailure('INVALID_FORMAT');
           } else {
             const ar = await applyReferralCode(user, existingReferralRaw, { mode: 'signup' });
-            referralApply = ar.ok ? { ok: true } : { ok: false, code: ar.code };
+            referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
             const latest = await User.findOne({ firebaseUid });
             if (latest) user = latest;
           }

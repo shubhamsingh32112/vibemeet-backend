@@ -2,9 +2,7 @@ import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import {
   getAgentDashboardSummary,
-  getPendingApplications,
-  acceptApplication,
-  rejectApplication,
+  getAgentReferredUsers,
   getAgentCreators,
   getAgentCreatorDetail,
   postAgentCreateCreator,
@@ -19,9 +17,7 @@ const router = Router();
 router.use(verifyFirebaseToken);
 
 router.get('/summary', getAgentDashboardSummary);
-router.get('/pending-applications', getPendingApplications);
-router.post('/applications/:id/accept', acceptApplication);
-router.post('/applications/:id/reject', rejectApplication);
+router.get('/referred-users', getAgentReferredUsers);
 router.get('/search-users', searchUsersForAgent);
 router.post('/creators', postAgentCreateCreator);
 router.get('/creators', getAgentCreators);

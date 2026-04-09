@@ -25,10 +25,12 @@ const BYPASS_PATHS = [
   '/api/v1/auth/login',
   '/api/v1/auth/fast-login',
   '/api/v1/auth/logout',
+  '/api/v1/referral/preview',
   // Also allow suffix matching when mounted under /api/v1.
   '/auth/login',
   '/auth/fast-login',
   '/auth/logout',
+  '/referral/preview',
 ];
 
 function shouldBypass(req: Request): boolean {

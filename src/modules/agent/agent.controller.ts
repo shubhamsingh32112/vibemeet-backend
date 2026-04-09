@@ -2,12 +2,10 @@ import type { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
-import { CreatorApplication } from './creator-application.model';
+import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assertAgent } from '../../middlewares/staff.middleware';
 import { loadStaffUserByAuth } from '../../middlewares/staff.middleware';
-import { promoteUserToCreatorWithStarterProfile } from '../creator/creator-starter.service';
-import { getIO } from '../../config/socket';
 import {
   processWithdrawalApproval,
   processWithdrawalRejection,
@@ -19,6 +17,9 @@ import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
 import { resolveGalleryImageUrlsForApi } from '../creator/creator-gallery-resolve';
 import { notifyCreatorProfileChannels } from '../creator/creator.controller';
+import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
+import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
+import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 
 function sinceDaysAgo(days: number): Date {
   const d = new Date();
@@ -97,16 +98,17 @@ async function aggregateCallStatsByUser(
   return m;
 }
 
-function emitCreatorApplicationUpdated(applicantFirebaseUid: string, payload: Record<string, unknown>): void {
-  try {
-    const io = getIO();
-    io.to(`user:${applicantFirebaseUid}`).emit('creator_application:updated', {
-      ...payload,
-      timestamp: new Date().toISOString(),
-    });
-  } catch {
-    /* optional */
-  }
+/** Users referred by this agent who do not yet have a Creator profile. */
+async function countReferredUsersAwaitingPromotion(
+  agentId: mongoose.Types.ObjectId
+): Promise<number> {
+  const agg = await User.aggregate<{ n?: number }>([
+    { $match: { referredBy: agentId } },
+    { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+    { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+    { $count: 'n' },
+  ]);
+  return agg[0]?.n ?? 0;
 }
 
 export const getAgentDashboardSummary = async (req: Request, res: Response): Promise<void> => {
@@ -118,8 +120,8 @@ export const getAgentDashboardSummary = async (req: Request, res: Response): Pro
       return;
     }
 
-    const [pendingApps, pendingWd, creatorRows] = await Promise.all([
-      CreatorApplication.countDocuments({ agentUserId: agent._id, status: 'pending' }),
+    const [referredUsersAwaitingPromotion, pendingWd, creatorRows] = await Promise.all([
+      countReferredUsersAwaitingPromotion(agent._id),
       Withdrawal.countDocuments({ assignedAgentId: agent._id, status: 'pending' }),
       Creator.find({ assignedAgentId: agent._id }).select('userId').lean(),
     ]);
@@ -144,7 +146,9 @@ export const getAgentDashboardSummary = async (req: Request, res: Response): Pro
     res.json({
       success: true,
       data: {
-        pendingApplications: pendingApps,
+        referredUsersAwaitingPromotion,
+        /** @deprecated Use referredUsersAwaitingPromotion — same value, kept for older clients */
+        pendingApplications: referredUsersAwaitingPromotion,
         pendingWithdrawals: pendingWd,
         activeCreators: totalCreators,
         totalCreators,
@@ -157,7 +161,8 @@ export const getAgentDashboardSummary = async (req: Request, res: Response): Pro
   }
 };
 
-export const getPendingApplications = async (req: Request, res: Response): Promise<void> => {
+/** Paginated users who signed up with this agent's referral (User.referredBy). */
+export const getAgentReferredUsers = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgent(req, res))) return;
     const agent = await loadStaffUserByAuth(req);
@@ -171,168 +176,295 @@ export const getPendingApplications = async (req: Request, res: Response): Promi
     const skip = (page - 1) * limit;
 
     const [rows, total] = await Promise.all([
-      CreatorApplication.find({ agentUserId: agent._id, status: 'pending' })
+      User.find({ referredBy: agent._id })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .populate('applicantUserId', 'email phone username avatar createdAt')
+        .select('username email phone avatar role createdAt')
         .lean(),
-      CreatorApplication.countDocuments({ agentUserId: agent._id, status: 'pending' }),
+      User.countDocuments({ referredBy: agent._id }),
     ]);
+
+    const userIds = rows.map((u) => u._id);
+    const [edges, creators] = await Promise.all([
+      ReferralEdge.find({ referredUserId: { $in: userIds } })
+        .select('referredUserId referralCodeUsed')
+        .lean(),
+      Creator.find({ userId: { $in: userIds } }).select('_id userId').lean(),
+    ]);
+    const edgeMap = new Map(edges.map((e) => [e.referredUserId.toString(), e.referralCodeUsed]));
+    const creatorByUser = new Map(creators.map((c) => [c.userId.toString(), c._id.toString()]));
+
+    const agentCode = agent.referralCode?.toUpperCase() ?? null;
 
     res.json({
       success: true,
       data: {
-        applications: rows.map((p: any) => ({
-          id: p._id.toString(),
-          referralCodeUsed: p.referralCodeUsed,
-          createdAt: p.createdAt,
-          applicant: p.applicantUserId
-            ? {
-                id: p.applicantUserId._id?.toString(),
-                email: p.applicantUserId.email,
-                phone: p.applicantUserId.phone,
-                username: p.applicantUserId.username,
-                avatar: p.applicantUserId.avatar,
-                createdAt: p.applicantUserId.createdAt,
-              }
-            : null,
-        })),
+        users: rows.map((u) => {
+          const id = u._id.toString();
+          return {
+            id,
+            username: u.username,
+            email: u.email,
+            phone: u.phone,
+            avatar: u.avatar,
+            role: u.role,
+            createdAt: u.createdAt,
+            referralCodeUsed: edgeMap.get(id) ?? agentCode,
+            hasCreator: creatorByUser.has(id),
+            creatorId: creatorByUser.get(id) ?? null,
+          };
+        }),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
       },
     });
   } catch (error) {
-    logError('getPendingApplications', error as Error);
+    logError('getAgentReferredUsers', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
-export const acceptApplication = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgent(req, res))) return;
-    const agent = await loadStaffUserByAuth(req);
-    if (!agent) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
+const DB_PAGINATED_AGENT_CREATOR_SORTS = new Set<string>([
+  'talkMinutesPeriod',
+  'earningsPeriod',
+  'callsPeriod',
+  'allTimeTalkMinutes',
+  'name',
+  'username',
+  'coins',
+  'earningsCoins',
+  'earnings',
+  'updatedAt',
+]);
 
-    const { id } = req.params;
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    try {
-      const appDoc = await CreatorApplication.findById(id).session(session);
-      if (!appDoc || appDoc.status !== 'pending') {
-        await session.abortTransaction();
-        res.status(404).json({ success: false, error: 'Pending application not found' });
-        return;
-      }
-      if (!appDoc.agentUserId.equals(agent._id)) {
-        await session.abortTransaction();
-        res.status(403).json({ success: false, error: 'Forbidden' });
-        return;
-      }
+function normalizeAgentCreatorSortKey(raw: string): string {
+  if (DB_PAGINATED_AGENT_CREATOR_SORTS.has(raw)) return raw;
+  return 'talkMinutesPeriod';
+}
 
-      const applicant = await User.findById(appDoc.applicantUserId).session(session);
-      if (!applicant) {
-        await session.abortTransaction();
-        res.status(404).json({ success: false, error: 'Applicant not found' });
-        return;
-      }
+function buildAgentCreatorSortSpec(sortKey: string, dirAsc: boolean): Record<string, 1 | -1> {
+  const d = dirAsc ? 1 : -1;
+  switch (sortKey) {
+    case 'name':
+      return { nameLower: d, _id: 1 };
+    case 'username':
+      return { usernameLower: d, _id: 1 };
+    case 'coins':
+      return { userCoins: d, _id: 1 };
+    case 'earningsCoins':
+    case 'earnings':
+      return { earningsCoins: d, _id: 1 };
+    case 'updatedAt':
+      return { updatedAt: d, _id: 1 };
+    case 'earningsPeriod':
+      return { periodCoinsEarned: d, _id: 1 };
+    case 'callsPeriod':
+      return { periodCallCount: d, _id: 1 };
+    case 'talkMinutesPeriod':
+      return { periodTalkSeconds: d, _id: 1 };
+    case 'allTimeTalkMinutes':
+      return { allTimeTalkSeconds: d, _id: 1 };
+    default:
+      return { periodTalkSeconds: d, _id: 1 };
+  }
+}
 
-      const existingCreator = await Creator.findOne({ userId: applicant._id }).session(session);
-      if (existingCreator) {
-        await session.abortTransaction();
-        res.status(409).json({ success: false, error: 'Applicant already has a creator profile' });
-        return;
-      }
+type CreatorAggRow = {
+  _id: mongoose.Types.ObjectId;
+  userId: mongoose.Types.ObjectId;
+  name: string;
+  photo: string;
+  categories: string[];
+  price: number;
+  age?: number;
+  earningsCoins: number;
+  updatedAt: Date;
+  u?: {
+    username?: string;
+    email?: string;
+    phone?: string;
+    coins?: number;
+    firebaseUid?: string;
+  };
+  periodTalkSeconds: number;
+  periodCoinsEarned: number;
+  periodCallCount: number;
+  allTimeTalkSeconds: number;
+};
 
-      applicant.$session(session);
-      const created = await promoteUserToCreatorWithStarterProfile(applicant, {
-        assignedAgentId: agent._id,
-        session,
-      });
+function buildCreatorMetricsStages(
+  agentId: mongoose.Types.ObjectId,
+  periodStart: Date | null,
+  periodEnd: Date,
+): mongoose.PipelineStage[] {
+  const userColl = User.collection.collectionName;
+  const callColl = CallHistory.collection.collectionName;
 
-      appDoc.status = 'accepted';
-      appDoc.resolvedAt = new Date();
-      await appDoc.save({ session });
+  const periodExpr: Record<string, unknown> = {
+    $expr: {
+      $and: [
+        { $eq: ['$ownerUserId', '$$uid'] },
+        { $eq: ['$ownerRole', 'creator'] },
+        { $gt: ['$durationSeconds', 0] },
+        ...(periodStart
+          ? [
+              { $gte: ['$createdAt', periodStart] },
+              { $lte: ['$createdAt', periodEnd] },
+            ]
+          : []),
+      ],
+    },
+  };
 
-      await session.commitTransaction();
+  const allTimeExpr: Record<string, unknown> = {
+    $expr: {
+      $and: [
+        { $eq: ['$ownerUserId', '$$uid'] },
+        { $eq: ['$ownerRole', 'creator'] },
+        { $gt: ['$durationSeconds', 0] },
+      ],
+    },
+  };
 
-      logInfo('Agent accepted creator application', {
-        applicationId: id,
-        agentId: agent._id.toString(),
-        creatorId: created._id.toString(),
-      });
-
-      emitCreatorApplicationUpdated(applicant.firebaseUid, {
-        status: 'accepted',
-        creatorId: created._id.toString(),
-      });
-
-      await invalidateAdminCaches('creators_performance', 'overview');
-
-      res.json({
-        success: true,
-        data: {
-          applicationId: appDoc._id.toString(),
-          creatorId: created._id.toString(),
-          userId: applicant._id.toString(),
+  return [
+    { $match: { assignedAgentId: agentId } },
+    {
+      $lookup: {
+        from: userColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$uid'] } } },
+          { $project: { username: 1, email: 1, phone: 1, coins: 1, firebaseUid: 1 } },
+        ],
+        as: 'userArr',
+      },
+    },
+    { $addFields: { u: { $arrayElemAt: ['$userArr', 0] } } },
+    { $project: { userArr: 0 } },
+    {
+      $lookup: {
+        from: callColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: periodExpr },
+          {
+            $group: {
+              _id: null,
+              talkSeconds: { $sum: '$durationSeconds' },
+              periodCoinsEarned: { $sum: '$coinsEarned' },
+              callCount: { $sum: 1 },
+            },
+          },
+        ],
+        as: 'periodAgg',
+      },
+    },
+    {
+      $lookup: {
+        from: callColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: allTimeExpr },
+          { $group: { _id: null, talkSeconds: { $sum: '$durationSeconds' } } },
+        ],
+        as: 'allTimeAgg',
+      },
+    },
+    {
+      $addFields: {
+        periodTalkSeconds: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.talkSeconds', 0] },
+          },
         },
-      });
-    } catch (e) {
-      await session.abortTransaction();
-      throw e;
-    } finally {
-      session.endSession();
-    }
-  } catch (error) {
-    logError('acceptApplication', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
+        periodCoinsEarned: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.periodCoinsEarned', 0] },
+          },
+        },
+        periodCallCount: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.callCount', 0] },
+          },
+        },
+        allTimeTalkSeconds: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$allTimeAgg', 0] } },
+            in: { $ifNull: ['$$row.talkSeconds', 0] },
+          },
+        },
+        nameLower: { $toLower: { $ifNull: ['$name', ''] } },
+        usernameLower: { $toLower: { $ifNull: ['$u.username', ''] } },
+        userCoins: { $ifNull: ['$u.coins', 0] },
+      },
+    },
+    { $project: { periodAgg: 0, allTimeAgg: 0 } },
+  ];
+}
 
-export const rejectApplication = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgent(req, res))) return;
-    const agent = await loadStaffUserByAuth(req);
-    if (!agent) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const { id } = req.params;
-    const reason =
-      typeof req.body?.rejectionReason === 'string' ? req.body.rejectionReason.trim().slice(0, 2000) : '';
-
-    const appDoc = await CreatorApplication.findById(id);
-    if (!appDoc || appDoc.status !== 'pending') {
-      res.status(404).json({ success: false, error: 'Pending application not found' });
-      return;
-    }
-    if (!appDoc.agentUserId.equals(agent._id)) {
-      res.status(403).json({ success: false, error: 'Forbidden' });
-      return;
-    }
-
-    appDoc.status = 'rejected';
-    appDoc.resolvedAt = new Date();
-    appDoc.rejectionReason = reason || undefined;
-    await appDoc.save();
-
-    const applicant = await User.findById(appDoc.applicantUserId).select('firebaseUid').lean();
-    if (applicant) {
-      emitCreatorApplicationUpdated(applicant.firebaseUid, {
-        status: 'rejected',
-        rejectionReason: reason || undefined,
+function buildPendingWithdrawalMap(
+  pendingList: {
+    creatorUserId?: mongoose.Types.ObjectId;
+    _id: mongoose.Types.ObjectId;
+    amount: number;
+    requestedAt: Date;
+  }[],
+): Map<string, { id: string; amount: number; requestedAt: Date }> {
+  const pendingByUserId = new Map<string, { id: string; amount: number; requestedAt: Date }>();
+  for (const w of pendingList) {
+    const uid = w.creatorUserId?.toString();
+    if (uid && !pendingByUserId.has(uid)) {
+      pendingByUserId.set(uid, {
+        id: w._id.toString(),
+        amount: w.amount,
+        requestedAt: w.requestedAt,
       });
     }
-
-    res.json({ success: true, data: { applicationId: appDoc._id.toString(), status: 'rejected' } });
-  } catch (error) {
-    logError('rejectApplication', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
   }
-};
+  return pendingByUserId;
+}
+
+function mapAggDocToAgentCreatorJson(
+  c: CreatorAggRow,
+  availabilityMap: Record<string, string>,
+  pendingByUserId: Map<string, { id: string; amount: number; requestedAt: Date }>,
+) {
+  const uid = c.userId.toString();
+  const u = c.u;
+  const fUid = u?.firebaseUid || '';
+  const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+    | 'online'
+    | 'busy';
+  const pw = pendingByUserId.get(uid);
+  const pts = c.periodTalkSeconds;
+  const ats = c.allTimeTalkSeconds;
+  return {
+    id: c._id.toString(),
+    userId: uid,
+    name: c.name,
+    photo: c.photo,
+    categories: c.categories,
+    price: c.price,
+    age: c.age,
+    earningsCoins: c.earningsCoins,
+    updatedAt: c.updatedAt,
+    username: u?.username,
+    email: u?.email,
+    phone: u?.phone,
+    coins: u?.coins,
+    availability: avail,
+    pendingWithdrawal: pw
+      ? { id: pw.id, amount: pw.amount, requestedAt: pw.requestedAt.toISOString() }
+      : null,
+    periodTalkMinutes: Math.round((pts / 60) * 100) / 100,
+    periodCoinsEarned: c.periodCoinsEarned,
+    periodCallCount: c.periodCallCount,
+    allTimeTalkMinutes: Math.round((ats / 60) * 100) / 100,
+  };
+}
 
 export const getAgentCreators = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -347,16 +479,16 @@ export const getAgentCreators = async (req: Request, res: Response): Promise<voi
     const period = ['today', '7d', '30d', 'all'].includes(periodRaw) ? periodRaw : 'today';
     const { start: periodStart, end: periodEnd } = agentPeriodBounds(period);
 
-    const sortKeyRaw = (req.query.sort as string) || 'talkMinutesPeriod';
-    const sortKey = sortKeyRaw;
+    const sortKeyRaw = ((req.query.sort as string) || 'talkMinutesPeriod').trim();
+    const sortKey =
+      sortKeyRaw === 'online' ? 'online' : normalizeAgentCreatorSortKey(sortKeyRaw);
     const dirAsc = (req.query.dir as string) === 'asc';
 
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
 
-    const creators = await Creator.find({ assignedAgentId: agent._id }).lean();
-    const total = creators.length;
+    const total = await Creator.countDocuments({ assignedAgentId: agent._id });
     if (total === 0) {
       res.json({
         success: true,
@@ -369,157 +501,143 @@ export const getAgentCreators = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const userObjectIds = creators.map((c) => c.userId as mongoose.Types.ObjectId);
-    const users = await User.find({ _id: { $in: userObjectIds } })
-      .select('username email phone coins firebaseUid')
-      .lean();
-    const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+    if (sortKey === 'online') {
+      const minimal = await Creator.find({ assignedAgentId: agent._id }).select('_id userId').lean();
+      const userObjectIds = minimal.map((c) => c.userId as mongoose.Types.ObjectId);
+      const users = await User.find({ _id: { $in: userObjectIds } })
+        .select('_id firebaseUid')
+        .lean();
+      const firebaseByUser = new Map(users.map((u) => [u._id.toString(), u.firebaseUid || '']));
+      const firebaseUids = users.map((u) => u.firebaseUid).filter(Boolean) as string[];
+      const availabilityMap =
+        firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
 
-    const [periodStats, allTimeStats, pendingList] = await Promise.all([
-      aggregateCallStatsByUser(userObjectIds, periodStart, periodEnd),
-      aggregateCallStatsByUser(userObjectIds, null, periodEnd),
-      Withdrawal.find({
-        creatorUserId: { $in: userObjectIds },
-        status: 'pending',
-      })
-        .select('creatorUserId amount requestedAt _id')
-        .lean(),
-    ]);
+      type MRow = {
+        creatorId: mongoose.Types.ObjectId;
+        userId: string;
+        onlineRank: number;
+        tie: string;
+      };
+      const rows: MRow[] = minimal.map((c) => {
+        const uid = c.userId.toString();
+        const f = firebaseByUser.get(uid) || '';
+        const onlineRank = f && availabilityMap[f] === 'online' ? 1 : 0;
+        return { creatorId: c._id, userId: uid, onlineRank, tie: uid };
+      });
+      rows.sort((a, b) => {
+        const v = a.onlineRank - b.onlineRank;
+        if (v !== 0) return dirAsc ? v : -v;
+        return a.tie.localeCompare(b.tie);
+      });
 
-    const pendingByUserId = new Map<string, { id: string; amount: number; requestedAt: Date }>();
-    for (const w of pendingList) {
-      const uid = w.creatorUserId?.toString();
-      if (uid && !pendingByUserId.has(uid)) {
-        pendingByUserId.set(uid, {
-          id: w._id.toString(),
-          amount: w.amount,
-          requestedAt: w.requestedAt,
-        });
-      }
+      const sliced = rows.slice(skip, skip + limit);
+      const pageCreatorIds = sliced.map((r) => r.creatorId);
+      const pageUserIds = sliced.map((r) => new mongoose.Types.ObjectId(r.userId));
+
+      const [creators, fullUsers, periodStats, allTimeStats, pendingList] = await Promise.all([
+        Creator.find({ _id: { $in: pageCreatorIds } }).lean(),
+        User.find({ _id: { $in: pageUserIds } })
+          .select('username email phone coins firebaseUid')
+          .lean(),
+        aggregateCallStatsByUser(pageUserIds, periodStart, periodEnd),
+        aggregateCallStatsByUser(pageUserIds, null, periodEnd),
+        Withdrawal.find({
+          creatorUserId: { $in: pageUserIds },
+          status: 'pending',
+        })
+          .select('creatorUserId amount requestedAt _id')
+          .lean(),
+      ]);
+
+      const order = new Map(pageCreatorIds.map((id, i) => [id.toString(), i]));
+      creators.sort(
+        (a, b) => (order.get(a._id.toString()) ?? 0) - (order.get(b._id.toString()) ?? 0),
+      );
+      const userMap = new Map(fullUsers.map((u) => [u._id.toString(), u]));
+      const pendingByUserId = buildPendingWithdrawalMap(pendingList);
+
+      const pageRows = creators.map((c) => {
+        const uid = c.userId.toString();
+        const u = userMap.get(uid);
+        const fUid = u?.firebaseUid || '';
+        const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+          | 'online'
+          | 'busy';
+        const p = periodStats.get(uid) ?? {
+          talkSeconds: 0,
+          periodCoinsEarned: 0,
+          callCount: 0,
+        };
+        const a = allTimeStats.get(uid) ?? {
+          talkSeconds: 0,
+          periodCoinsEarned: 0,
+          callCount: 0,
+        };
+        const pw = pendingByUserId.get(uid);
+        return {
+          id: c._id.toString(),
+          userId: uid,
+          name: c.name,
+          photo: c.photo,
+          categories: c.categories,
+          price: c.price,
+          age: c.age,
+          earningsCoins: c.earningsCoins,
+          updatedAt: c.updatedAt,
+          username: u?.username,
+          email: u?.email,
+          phone: u?.phone,
+          coins: u?.coins,
+          availability: avail,
+          pendingWithdrawal: pw
+            ? { id: pw.id, amount: pw.amount, requestedAt: pw.requestedAt.toISOString() }
+            : null,
+          periodTalkMinutes: Math.round((p.talkSeconds / 60) * 100) / 100,
+          periodCoinsEarned: p.periodCoinsEarned,
+          periodCallCount: p.callCount,
+          allTimeTalkMinutes: Math.round((a.talkSeconds / 60) * 100) / 100,
+        };
+      });
+
+      res.json({
+        success: true,
+        data: {
+          creators: pageRows,
+          meta: { period },
+          pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+        },
+      });
+      return;
     }
 
-    const firebaseUids = users.map((u) => u.firebaseUid).filter(Boolean) as string[];
+    const pipeline: mongoose.PipelineStage[] = [
+      ...buildCreatorMetricsStages(agent._id, periodStart, periodEnd),
+      { $sort: buildAgentCreatorSortSpec(sortKey, dirAsc) },
+      { $skip: skip },
+      { $limit: limit },
+    ];
+
+    const pageDocs = (await Creator.aggregate(pipeline)) as CreatorAggRow[];
+
+    const pageUserIds = pageDocs.map((d) => d.userId as mongoose.Types.ObjectId);
+    const firebaseUids = pageDocs.map((d) => d.u?.firebaseUid).filter(Boolean) as string[];
     const availabilityMap =
       firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
 
-    type Enriched = {
-      id: string;
-      userId: string;
-      name: string;
-      photo: string;
-      categories: string[];
-      price: number;
-      age?: number;
-      earningsCoins: number;
-      updatedAt: Date;
-      username?: string;
-      email?: string;
-      phone?: string;
-      coins?: number;
-      availability: 'online' | 'busy';
-      pendingWithdrawal: { id: string; amount: number; requestedAt: string } | null;
-      periodTalkMinutes: number;
-      periodCoinsEarned: number;
-      periodCallCount: number;
-      allTimeTalkMinutes: number;
-      _sortOnline: number;
-      _sortName: string;
-      _sortUsername: string;
-      _sortUpdated: number;
-    };
+    const pendingList =
+      pageUserIds.length > 0
+        ? await Withdrawal.find({
+            creatorUserId: { $in: pageUserIds },
+            status: 'pending',
+          })
+            .select('creatorUserId amount requestedAt _id')
+            .lean()
+        : [];
 
-    const rows: Enriched[] = creators.map((c) => {
-      const uid = c.userId.toString();
-      const u = userMap.get(uid);
-      const fUid = u?.firebaseUid || '';
-      const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
-        | 'online'
-        | 'busy';
-      const p = periodStats.get(uid) ?? {
-        talkSeconds: 0,
-        periodCoinsEarned: 0,
-        callCount: 0,
-      };
-      const a = allTimeStats.get(uid) ?? {
-        talkSeconds: 0,
-        periodCoinsEarned: 0,
-        callCount: 0,
-      };
-      const pw = pendingByUserId.get(uid);
-      return {
-        id: c._id.toString(),
-        userId: uid,
-        name: c.name,
-        photo: c.photo,
-        categories: c.categories,
-        price: c.price,
-        age: c.age,
-        earningsCoins: c.earningsCoins,
-        updatedAt: c.updatedAt,
-        username: u?.username,
-        email: u?.email,
-        phone: u?.phone,
-        coins: u?.coins,
-        availability: avail,
-        pendingWithdrawal: pw
-          ? { id: pw.id, amount: pw.amount, requestedAt: pw.requestedAt.toISOString() }
-          : null,
-        periodTalkMinutes: Math.round((p.talkSeconds / 60) * 100) / 100,
-        periodCoinsEarned: p.periodCoinsEarned,
-        periodCallCount: p.callCount,
-        allTimeTalkMinutes: Math.round((a.talkSeconds / 60) * 100) / 100,
-        _sortOnline: avail === 'online' ? 1 : 0,
-        _sortName: (c.name || '').toLowerCase(),
-        _sortUsername: (u?.username || '').toLowerCase(),
-        _sortUpdated: +new Date(c.updatedAt),
-      };
-    });
+    const pendingByUserId = buildPendingWithdrawalMap(pendingList);
 
-    const cmp = (a: Enriched, b: Enriched): number => {
-      let v = 0;
-      switch (sortKey) {
-        case 'name':
-          v = a._sortName.localeCompare(b._sortName);
-          break;
-        case 'username':
-          v = a._sortUsername.localeCompare(b._sortUsername);
-          break;
-        case 'coins':
-          v = (a.coins ?? 0) - (b.coins ?? 0);
-          break;
-        case 'earningsPeriod':
-          v = a.periodCoinsEarned - b.periodCoinsEarned;
-          break;
-        case 'talkMinutesPeriod':
-          v = a.periodTalkMinutes - b.periodTalkMinutes;
-          break;
-        case 'callsPeriod':
-          v = a.periodCallCount - b.periodCallCount;
-          break;
-        case 'updatedAt':
-          v = a._sortUpdated - b._sortUpdated;
-          break;
-        case 'online':
-          v = a._sortOnline - b._sortOnline;
-          break;
-        case 'earnings':
-        case 'earningsCoins':
-          v = a.earningsCoins - b.earningsCoins;
-          break;
-        case 'allTimeTalkMinutes':
-          v = a.allTimeTalkMinutes - b.allTimeTalkMinutes;
-          break;
-        default:
-          v = a.periodTalkMinutes - b.periodTalkMinutes;
-      }
-      if (v !== 0) return dirAsc ? v : -v;
-      return a._sortName.localeCompare(b._sortName);
-    };
-
-    rows.sort(cmp);
-
-    const pageRows = rows.slice(skip, skip + limit).map(
-      ({ _sortOnline, _sortName, _sortUsername, _sortUpdated, ...rest }) => rest,
+    const pageRows = pageDocs.map((doc) =>
+      mapAggDocToAgentCreatorJson(doc, availabilityMap, pendingByUserId),
     );
 
     res.json({
@@ -678,10 +796,12 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       return;
     }
 
-    if (typeof price !== 'number' || price < 0) {
-      res.status(400).json({ success: false, error: 'Price must be a non-negative number' });
+    const priceCheck = validateCreatorPriceForApi(price);
+    if (!priceCheck.ok) {
+      res.status(400).json({ success: false, error: priceCheck.error });
       return;
     }
+    const validatedPrice = priceCheck.price;
 
     if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
       res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
@@ -691,6 +811,11 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
     const targetUser = await User.findById(userId);
     if (!targetUser) {
       res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (!targetUser.referredBy?.equals(agent._id)) {
+      res.status(403).json({ success: false, error: 'User was not referred by this agent' });
       return;
     }
 
@@ -732,7 +857,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
             galleryImages: [],
             userId: targetUser._id,
             categories: Array.isArray(categories) ? categories : [],
-            price,
+            price: validatedPrice,
             age: age !== undefined ? age : undefined,
             assignedAgentId: agent._id,
           },
@@ -787,25 +912,29 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
   }
 };
 
-/** Pick users without a creator profile (for manual add). */
+/** Pick referred users without a creator profile (for manual add). */
 export const searchUsersForAgent = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgent(req, res))) return;
+    const agent = await loadStaffUserByAuth(req);
+    if (!agent) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
 
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const limit = Math.min(30, Math.max(1, parseInt(req.query.limit as string, 10) || 30));
 
-    const creatorUserIds = await Creator.distinct('userId');
-    const excludeIds = creatorUserIds.map((id) => new mongoose.Types.ObjectId(String(id)));
+    const excludeIds = await getCachedCreatorUserObjectIds();
 
     const filter: Record<string, unknown> = {
       _id: { $nin: excludeIds },
       role: { $nin: ['admin', 'agent'] },
+      referredBy: agent._id,
     };
 
     if (q.length > 0) {
-      const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const searchRegex = new RegExp(escaped, 'i');
+      const searchRegex = buildSafeMongoSubstringRegex(q);
       filter.$or = [{ username: searchRegex }, { email: searchRegex }, { phone: searchRegex }];
     }
 

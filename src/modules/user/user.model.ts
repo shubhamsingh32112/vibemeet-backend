@@ -198,6 +198,8 @@ const userSchema = new Schema<IUser>(
   }
 );
 
+// Agent / admin: list users referred by a given agent (User._id)
+userSchema.index({ referredBy: 1 }, { sparse: true });
 // Index for Fast Login lookup (find user by device)
 userSchema.index({ deviceFingerprint: 1 }, { sparse: true });
 // Unique installId: at most one fast user per install (prevents wrong-user return in installId fallback).

@@ -42,6 +42,8 @@ import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 import { normalizeGalleryImages, resolveGalleryImageUrlsForApi } from './creator-gallery-resolve';
+import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -248,13 +250,12 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    if (typeof price !== 'number' || price < 0) {
-      res.status(400).json({
-        success: false,
-        error: 'Price must be a non-negative number',
-      });
+    const priceCheck = validateCreatorPriceForApi(price);
+    if (!priceCheck.ok) {
+      res.status(400).json({ success: false, error: priceCheck.error });
       return;
     }
+    const validatedPrice = priceCheck.price;
     
     if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
       res.status(400).json({
@@ -304,7 +305,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       galleryImages: [],
       userId: targetUser._id,
       categories: Array.isArray(categories) ? categories : [],
-      price,
+      price: validatedPrice,
       age: age !== undefined ? age : undefined,
     });
     
@@ -439,7 +440,14 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       }
       creator.categories = categories;
     }
-    if (price !== undefined) creator.price = price;
+    if (price !== undefined) {
+      const priceCheck = validateCreatorPriceForApi(price);
+      if (!priceCheck.ok) {
+        res.status(400).json({ success: false, error: priceCheck.error });
+        return;
+      }
+      creator.price = priceCheck.price;
+    }
     if (age !== undefined) {
       if (typeof age !== 'number' || age < 18 || age > 100) {
         res.status(400).json({
@@ -1299,8 +1307,7 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
     const totalMinutes = totalSeconds / 60;
     const totalCalls = callRecords.length;
     const avgEarningsPerMinute = totalMinutes > 0 ? totalEarnings / totalMinutes : 0;
-    // Current rate: creator earns 0.30 coins/sec = 18 coins/min
-    const earningsPerMinute = 0.30 * 60; // 18 coins/min
+    const earningsPerMinute = creator.price * CREATOR_SHARE_PERCENTAGE;
 
     // Format call records for response
     const calls = callRecords.slice(0, 50).map((call) => {
@@ -1330,7 +1337,7 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
         avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
         earningsPerMinute,
         currentPrice: creator.price,
-        creatorSharePercentage: 0.30,
+        creatorSharePercentage: CREATOR_SHARE_PERCENTAGE,
         calls,
       },
     });
@@ -1922,7 +1929,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     const totalSeconds = callRecords.reduce((sum, c) => sum + c.durationSeconds, 0);
     const allTimeMinutes = totalSeconds / 60;
     const totalCalls = callRecords.length;
-    const earningsPerMinute = 0.30 * 60; // 18 coins/min (0.30/sec)
+    const earningsPerMinute = creator.price * CREATOR_SHARE_PERCENTAGE;
     const avgEarningsPerMinute = allTimeMinutes > 0 ? totalEarnings / allTimeMinutes : 0;
 
     const recentCalls = callRecords.slice(0, 20).map((call) => {
@@ -1997,7 +2004,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
         earningsPerMinute,
         currentPrice: creator.price,
-        creatorSharePercentage: 0.30,
+        creatorSharePercentage: CREATOR_SHARE_PERCENTAGE,
         calls: recentCalls,
       },
       // Today's earnings (current daily period)

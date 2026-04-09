@@ -4,15 +4,13 @@
  * Handles:
  * - Generating unique referral codes for new users
  * - Applying referral code (signup + one-time late attach)
- * - Creator promotion when referrer is a creator; agent pending applications
+ * - Agent referrals link via User.referredBy (no CreatorApplication); creator-as-referrer is disabled (see applyReferralCode)
  * - Atomic reward when referred user buys coins (≥ min INR)
  */
 
-import mongoose, { Types } from 'mongoose';
+import { Types } from 'mongoose';
 import { User, IUser } from './user.model';
 import { Creator } from '../creator/creator.model';
-import { CreatorApplication } from '../agent/creator-application.model';
-import { promoteUserToCreatorWithStarterProfile } from '../creator/creator-starter.service';
 import { CoinTransaction } from './coin-transaction.model';
 import { ReferralEdge } from './referral-edge.model';
 import { getIO } from '../../config/socket';
@@ -46,6 +44,7 @@ export type ApplyReferralCodeErrorCode =
   | 'SELF'
   | 'AGENT_DISABLED'
   | 'ALREADY_REFERRED'
+  | 'CREATOR_CANNOT_REFER'
   | 'WINDOW_EXPIRED'
   | 'PURCHASE_ALREADY'
   | 'NOT_ELIGIBLE_ROLE';
@@ -161,6 +160,38 @@ export async function assignReferralCodeToUser(user: IUser): Promise<string> {
   return code;
 }
 
+export type PreviewReferralCodeResult =
+  | { ok: true; code: string }
+  | { ok: false; code: ApplyReferralCodeErrorCode };
+
+/**
+ * Validate a referral code for pre-login preview (existence + creator/agent rules).
+ */
+export async function previewReferralCode(
+  referralCodeRaw: string | null | undefined
+): Promise<PreviewReferralCodeResult> {
+  if (!referralCodeRaw || !isValidReferralCodeFormat(referralCodeRaw)) {
+    return { ok: false, code: 'INVALID_FORMAT' };
+  }
+  const code = normalizeReferralCode(referralCodeRaw);
+  const referrer = await User.findOne({ referralCode: code });
+  if (!referrer) {
+    return { ok: false, code: 'NOT_FOUND' };
+  }
+  if (referrer.role === 'agent' && referrer.agentDisabled) {
+    return { ok: false, code: 'AGENT_DISABLED' };
+  }
+  if (referrer.role !== 'agent') {
+    const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
+      .select('_id')
+      .lean();
+    if (referrerCreatorProfile) {
+      return { ok: false, code: 'CREATOR_CANNOT_REFER' };
+    }
+  }
+  return { ok: true, code };
+}
+
 /**
  * Apply referral code (signup on first login, or one-time late attach via API).
  */
@@ -214,6 +245,20 @@ export async function applyReferralCode(
     return { ok: false, code: 'AGENT_DISABLED' };
   }
 
+  // Creators cannot refer (non-agent). Agents may refer even if they have a creator profile.
+  if (referrer.role !== 'agent') {
+    const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
+      .select('_id')
+      .lean();
+    if (referrerCreatorProfile) {
+      logInfo('Referral skipped: creator referrals disabled', {
+        code,
+        referrerId: referrer._id.toString(),
+      });
+      return { ok: false, code: 'CREATOR_CANNOT_REFER' };
+    }
+  }
+
   const claimed = await User.findOneAndUpdate(
     { _id: applicant._id, referredBy: null },
     { $set: { referredBy: referrer._id } },
@@ -260,64 +305,14 @@ export async function applyReferralCode(
   });
 
   if (referrer.role === 'agent') {
-    const existingPending = await CreatorApplication.findOne({
-      applicantUserId: applicant._id,
-      status: 'pending',
-    })
-      .select('_id')
-      .lean();
-    if (!existingPending) {
-      await CreatorApplication.create({
-        applicantUserId: applicant._id,
-        agentUserId: referrer._id,
-        referralCodeUsed: code,
-        status: 'pending',
-      });
-    }
-    logInfo('Agent referral: creator application pending', {
+    logInfo('Agent referral: user linked; promotion via agent or admin dashboard', {
       newUserId: applicant._id.toString(),
       agentUserId: referrer._id.toString(),
     });
     return { ok: true };
   }
 
-  const creatorProfile = await Creator.findOne({ userId: referrer._id });
-  if (creatorProfile) {
-    const existingCreatorForApplicant = await Creator.findOne({ userId: applicant._id });
-    if (existingCreatorForApplicant) {
-      logInfo('Creator referral skipped: applicant already has creator profile', {
-        newUserId: applicant._id.toString(),
-      });
-      return { ok: true };
-    }
-
-    const applicantFresh = await User.findById(applicant._id);
-    if (!applicantFresh) {
-      throw new Error('Applicant missing after referral apply');
-    }
-
-    const pSession = await mongoose.startSession();
-    pSession.startTransaction();
-    try {
-      applicantFresh.$session(pSession);
-      await promoteUserToCreatorWithStarterProfile(applicantFresh, { session: pSession });
-      await pSession.commitTransaction();
-      logInfo('Creator referral: promoted with starter Creator document', {
-        newUserId: applicant._id.toString(),
-        referrerId: referrer._id.toString(),
-      });
-    } catch (promoteErr) {
-      await pSession.abortTransaction();
-      logError('Creator referral promotion failed', promoteErr as Error, {
-        newUserId: applicant._id.toString(),
-      });
-      throw promoteErr;
-    } finally {
-      applicantFresh.$session(null);
-      await pSession.endSession();
-    }
-  }
-
+  // Non-agent creator referrers are rejected before linkage; no invitee promotion path here.
   return { ok: true };
 }
 

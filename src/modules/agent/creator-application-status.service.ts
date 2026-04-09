@@ -1,5 +1,4 @@
 import type { Types } from 'mongoose';
-import { CreatorApplication } from './creator-application.model';
 
 export type CreatorApplicationFlags = {
   creatorApplicationPending: boolean;
@@ -7,39 +6,14 @@ export type CreatorApplicationFlags = {
   creatorApplicationRejectionReason?: string;
 };
 
+/**
+ * Legacy CreatorApplication workflow is retired: agent referrals no longer create pending
+ * applications. Clients still receive these flags for backward compatibility; they are always
+ * false so the app does not block on verification screens.
+ */
 export async function getCreatorApplicationFlagsForUser(
-  userId: Types.ObjectId
+  _userId: Types.ObjectId
 ): Promise<CreatorApplicationFlags> {
-  const pending = await CreatorApplication.findOne({
-    applicantUserId: userId,
-    status: 'pending',
-  })
-    .select('_id')
-    .lean();
-
-  if (pending) {
-    return {
-      creatorApplicationPending: true,
-      creatorApplicationRejected: false,
-    };
-  }
-
-  const rejected = await CreatorApplication.findOne({
-    applicantUserId: userId,
-    status: 'rejected',
-  })
-    .sort({ resolvedAt: -1, updatedAt: -1 })
-    .select('rejectionReason')
-    .lean();
-
-  if (rejected) {
-    return {
-      creatorApplicationPending: false,
-      creatorApplicationRejected: true,
-      creatorApplicationRejectionReason: rejected.rejectionReason || undefined,
-    };
-  }
-
   return {
     creatorApplicationPending: false,
     creatorApplicationRejected: false,

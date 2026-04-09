@@ -33,7 +33,7 @@ import {
   DEFAULT_CREATOR_CALL_DURATION_SECONDS,
   DEFAULT_USER_CALL_DURATION_SECONDS,
   CALL_DURATION_WARNING_SECONDS,
-  CREATOR_EARNINGS_PER_SECOND,
+  CREATOR_SHARE_PERCENTAGE,
 } from '../../config/pricing.config';
 import { recordBillingMetric, monitoring } from '../../utils/monitoring';
 import { logWarning, logInfo, logError } from '../../utils/logger';
@@ -62,6 +62,9 @@ interface CallSession {
   creatorMongoId: string;
   pricePerMinute: number;
   pricePerSecond: number;
+  /** Snapshot at call start; used for ticks (no per-second DB reads). */
+  creatorEarningsPerSecond: number;
+  creatorShareAtCallTime: number;
   startTime: number;
   elapsedSeconds: number;
 }
@@ -103,6 +106,8 @@ export class BillingService {
     const pricing = await pricingService.snapshotForCreator(creator._id.toString());
     const pricePerMinute = pricing.pricePerMinute;
     const pricePerSecond = pricing.pricePerSecond;
+    const creatorEarningsPerSecond = pricing.creatorEarningsPerSecond;
+    const creatorShareAtCallTime = pricing.creatorShareAtCallTime;
 
     // Check user has enough coins for at least 1 second
     if (user.coins < pricePerSecond) {
@@ -123,6 +128,8 @@ export class BillingService {
       creatorMongoId: creator._id.toString(),
       pricePerMinute,
       pricePerSecond,
+      creatorEarningsPerSecond,
+      creatorShareAtCallTime,
       startTime: Date.now(),
       elapsedSeconds: 0,
     };
@@ -182,7 +189,9 @@ export class BillingService {
     io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
       callId,
       earnings: 0,
-      pricePerSecond: CREATOR_EARNINGS_PER_SECOND,
+      pricePerSecond: creatorEarningsPerSecond,
+      creatorEarningsPerSecond,
+      creatorSharePercentage: creatorShareAtCallTime,
       elapsedSeconds: 0,
       serverTimestamp, // Server time when billing started
       callStartTime: session.startTime, // Call start timestamp
@@ -326,11 +335,11 @@ export class BillingService {
     // Apply tick
     coins -= deduction;
     // Use integer micro-coins for creator earnings to avoid floating point drift.
-    // The effective earnings-per-second comes from the PricingService.
-    const pricing = await pricingService.snapshotForCreator(session.creatorMongoId);
-    const earningsIncrementMicros = Math.round(
-      pricing.creatorEarningsPerSecond * EARNINGS_MICRO_FACTOR
-    );
+    // Rates are snapshotted on the session at call start (no Mongo read per tick).
+    const earnPerSec =
+      session.creatorEarningsPerSecond ??
+      (session.pricePerMinute * CREATOR_SHARE_PERCENTAGE) / 60;
+    const earningsIncrementMicros = Math.round(earnPerSec * EARNINGS_MICRO_FACTOR);
     earningsMicros += earningsIncrementMicros;
     session.elapsedSeconds += 1;
 
@@ -409,8 +418,8 @@ export class BillingService {
         elapsedSeconds: session.elapsedSeconds,
         coinsBefore: parseFloat(coinsRaw as string),
         coinsAfter: coins,
-        earningsBefore: earningsMicros / EARNINGS_MICRO_FACTOR,
-        earningsAfter: (earningsMicros + earningsIncrementMicros) / EARNINGS_MICRO_FACTOR,
+        earningsBefore: (earningsMicros - earningsIncrementMicros) / EARNINGS_MICRO_FACTOR,
+        earningsAfter: earningsMicros / EARNINGS_MICRO_FACTOR,
       });
     } catch (redisError) {
       logError('CRITICAL: Redis error during billing tick', redisError, {

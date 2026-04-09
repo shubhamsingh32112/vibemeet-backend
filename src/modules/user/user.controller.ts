@@ -24,32 +24,15 @@ import {
   assignReferralCodeToUser,
   type ApplyReferralCodeErrorCode,
 } from './referral.service';
+import { referralUserFacingMessage } from '../../utils/referral-messages';
+import {
+  ADMIN_USER_SEARCH_QUERY_MAX_LEN,
+  buildSafeMongoSubstringRegex,
+} from '../../utils/mongo-regex';
+import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 
 function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
-}
-
-function referralErrorMessage(code: ApplyReferralCodeErrorCode): string {
-  switch (code) {
-    case 'INVALID_FORMAT':
-      return 'Invalid referral code format';
-    case 'NOT_FOUND':
-      return 'Referral code not found';
-    case 'SELF':
-      return 'You cannot use your own referral code';
-    case 'AGENT_DISABLED':
-      return 'This referral code is no longer valid';
-    case 'ALREADY_REFERRED':
-      return 'A referral is already linked to your account';
-    case 'WINDOW_EXPIRED':
-      return 'Referral code can no longer be applied (time limit expired)';
-    case 'PURCHASE_ALREADY':
-      return 'Referral codes cannot be applied after your first coin purchase';
-    case 'NOT_ELIGIBLE_ROLE':
-      return 'Referral codes cannot be applied for this account type';
-    default:
-      return 'Unable to apply referral code';
-  }
 }
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
@@ -580,7 +563,7 @@ export const applyReferralPost = async (req: Request, res: Response): Promise<vo
     if (!ar.ok) {
       res.status(referralErrorHttpStatus(ar.code)).json({
         success: false,
-        error: referralErrorMessage(ar.code),
+        error: referralUserFacingMessage(ar.code),
         errorCode: ar.code,
       });
       return;
@@ -748,8 +731,16 @@ export const searchUsers = async (req: Request, res: Response): Promise<void> =>
     }
 
     const { query, role } = req.query;
-    const searchQuery = query as string | undefined;
-    const roleFilter = role as string | undefined;
+    const searchQuery = typeof query === 'string' ? query : undefined;
+    const roleFilter = typeof role === 'string' ? role : undefined;
+
+    if (searchQuery && searchQuery.trim().length > ADMIN_USER_SEARCH_QUERY_MAX_LEN) {
+      res.status(400).json({
+        success: false,
+        error: `Search query must be at most ${ADMIN_USER_SEARCH_QUERY_MAX_LEN} characters`,
+      });
+      return;
+    }
 
     // Build search filter
     const filter: any = {};
@@ -770,7 +761,7 @@ export const searchUsers = async (req: Request, res: Response): Promise<void> =>
 
     // Text search (username, email, phone)
     if (searchQuery && searchQuery.trim()) {
-      const searchRegex = new RegExp(searchQuery.trim(), 'i');
+      const searchRegex = buildSafeMongoSubstringRegex(searchQuery.trim());
       // If we already have $or from role filter, merge; otherwise create new
       if (filter.$or) {
         filter.$and = [
@@ -872,13 +863,12 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    if (typeof price !== 'number' || price < 0) {
-      res.status(400).json({
-        success: false,
-        error: 'Price must be a non-negative number',
-      });
+    const priceCheck = validateCreatorPriceForApi(price);
+    if (!priceCheck.ok) {
+      res.status(400).json({ success: false, error: priceCheck.error });
       return;
     }
+    const validatedPrice = priceCheck.price;
 
     // Find target user
     const targetUser = await User.findById(id);
@@ -933,15 +923,29 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       
       await targetUser.save({ session });
 
+      let assignedAgentId: mongoose.Types.ObjectId | undefined;
+      if (targetUser.referredBy) {
+        const refUser = await User.findById(targetUser.referredBy).select('role').session(session).lean();
+        if (refUser?.role === 'agent') {
+          assignedAgentId = targetUser.referredBy as mongoose.Types.ObjectId;
+        }
+      }
+
       // Create creator profile within transaction
-      const creator = await Creator.create([{
-        name,
-        about,
-        photo,
-        userId: targetUser._id,
-        categories: Array.isArray(categories) ? categories : [],
-        price,
-      }], { session });
+      const creator = await Creator.create(
+        [
+          {
+            name,
+            about,
+            photo,
+            userId: targetUser._id,
+            categories: Array.isArray(categories) ? categories : [],
+            price: validatedPrice,
+            ...(assignedAgentId ? { assignedAgentId } : {}),
+          },
+        ],
+        { session }
+      );
 
       // Commit transaction
       await session.commitTransaction();

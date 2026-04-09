@@ -13,10 +13,9 @@
  */
 
 /**
- * Creator earnings per second (as decimal)
- * Default: 0.3 coins/second (18 coins/minute)
- * 
- * Environment variable: CREATOR_EARNINGS_PER_SECOND
+ * @deprecated Video billing no longer uses a flat rate. Creator earn rate is
+ * `(creator.pricePerMinute * CREATOR_SHARE_PERCENTAGE) / 60` per second.
+ * Kept for env compatibility / old docs only.
  */
 export const CREATOR_EARNINGS_PER_SECOND: number = parseFloat(
   process.env.CREATOR_EARNINGS_PER_SECOND || '0.3'
@@ -104,9 +103,7 @@ export const CALL_DURATION_WARNING_SECONDS: number = parseInt(
  * Validate pricing configuration on startup
  */
 export function validatePricingConfig(): void {
-  if (CREATOR_EARNINGS_PER_SECOND < 0 || CREATOR_EARNINGS_PER_SECOND > 100) {
-    throw new Error('CREATOR_EARNINGS_PER_SECOND must be between 0 and 100');
-  }
+  // CREATOR_EARNINGS_PER_SECOND is deprecated; skip strict validation
   
   if (CREATOR_SHARE_PERCENTAGE < 0 || CREATOR_SHARE_PERCENTAGE > 1) {
     throw new Error('CREATOR_SHARE_PERCENTAGE must be between 0 and 1');
@@ -137,7 +134,6 @@ export function validatePricingConfig(): void {
     // Dynamic import to avoid circular dependencies
     import('../utils/logger').then(({ logInfo }) => {
       logInfo('Pricing configuration validated', {
-        creatorEarningsPerSecond: CREATOR_EARNINGS_PER_SECOND,
         creatorSharePercentage: (CREATOR_SHARE_PERCENTAGE * 100).toFixed(1) + '%',
         minCoinsToCall: MIN_COINS_TO_CALL,
         maxCallDurationSeconds: MAX_CALL_DURATION_SECONDS,

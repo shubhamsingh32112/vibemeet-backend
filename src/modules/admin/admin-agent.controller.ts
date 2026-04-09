@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
-import { CreatorApplication } from '../agent/creator-application.model';
+import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assignReferralCodeToUser } from '../user/referral.service';
 import { assertAdmin } from '../../middlewares/staff.middleware';
@@ -89,10 +89,12 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
     ]);
 
     const ids = agents.map((a) => a._id);
-    const [pendingCounts, creatorCounts, pendingWithdrawals] = await Promise.all([
-      CreatorApplication.aggregate([
-        { $match: { agentUserId: { $in: ids }, status: 'pending' } },
-        { $group: { _id: '$agentUserId', c: { $sum: 1 } } },
+    const [awaitingCounts, creatorCounts, pendingWithdrawals] = await Promise.all([
+      User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
+        { $match: { referredBy: { $in: ids } } },
+        { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+        { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+        { $group: { _id: '$referredBy', c: { $sum: 1 } } },
       ]),
       Creator.aggregate([
         { $match: { assignedAgentId: { $in: ids } } },
@@ -109,7 +111,7 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
       ]),
     ]);
 
-    const pendingMap = new Map(pendingCounts.map((p: { _id: mongoose.Types.ObjectId; c: number }) => [p._id.toString(), p.c]));
+    const pendingMap = new Map(awaitingCounts.map((p) => [p._id.toString(), p.c]));
     const creatorMap = new Map(creatorCounts.map((p: { _id: mongoose.Types.ObjectId; c: number }) => [p._id.toString(), p.c]));
     const wdMap = new Map(pendingWithdrawals.map((p: { _id: mongoose.Types.ObjectId; c: number }) => [p._id.toString(), p.c]));
 
@@ -123,6 +125,7 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
           referralCode: a.referralCode ?? null,
           agentDisabled: a.agentDisabled ?? false,
           createdAt: a.createdAt,
+          /** Referred users not yet promoted to creator (legacy field name). */
           pendingApplications: pendingMap.get(a._id.toString()) ?? 0,
           activeCreators: creatorMap.get(a._id.toString()) ?? 0,
           pendingWithdrawals: wdMap.get(a._id.toString()) ?? 0,
@@ -150,12 +153,30 @@ export const getAgentDetail = async (req: Request, res: Response): Promise<void>
     }
 
     const agentOid = new mongoose.Types.ObjectId(id);
-    const [pendingApps, creators, pendingWd] = await Promise.all([
-      CreatorApplication.find({ agentUserId: agentOid, status: 'pending' })
-        .sort({ createdAt: -1 })
-        .limit(200)
-        .populate('applicantUserId', 'email phone username firebaseUid')
-        .lean(),
+
+    const awaitingRaw = await User.aggregate<{
+      _id: mongoose.Types.ObjectId;
+      email?: string;
+      phone?: string;
+      username?: string;
+      firebaseUid?: string;
+      createdAt: Date;
+    }>([
+      { $match: { referredBy: agentOid } },
+      { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+      { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+      { $sort: { createdAt: -1 } },
+      { $limit: 200 },
+      { $project: { email: 1, phone: 1, username: 1, firebaseUid: 1, createdAt: 1 } },
+    ]);
+
+    const awaitingIds = awaitingRaw.map((u) => u._id);
+    const edges = await ReferralEdge.find({ referredUserId: { $in: awaitingIds } })
+      .select('referredUserId referralCodeUsed')
+      .lean();
+    const codeByUser = new Map(edges.map((e) => [e.referredUserId.toString(), e.referralCodeUsed]));
+
+    const [creators, pendingWd] = await Promise.all([
       Creator.find({ assignedAgentId: agentOid })
         .select('name photo userId earningsCoins createdAt')
         .sort({ updatedAt: -1 })
@@ -176,13 +197,22 @@ export const getAgentDetail = async (req: Request, res: Response): Promise<void>
           createdAt: agent.createdAt,
           updatedAt: agent.updatedAt,
         },
-        pendingApplications: pendingApps.map((p: any) => ({
-          id: p._id.toString(),
-          applicantUserId: p.applicantUserId?._id?.toString(),
-          applicant: p.applicantUserId,
-          referralCodeUsed: p.referralCodeUsed,
-          createdAt: p.createdAt,
-        })),
+        pendingApplications: awaitingRaw.map((u) => {
+          const uid = u._id.toString();
+          return {
+            id: uid,
+            applicantUserId: uid,
+            applicant: {
+              _id: u._id,
+              email: u.email,
+              phone: u.phone,
+              username: u.username,
+              firebaseUid: u.firebaseUid,
+            },
+            referralCodeUsed: codeByUser.get(uid) ?? agent.referralCode ?? '',
+            createdAt: u.createdAt,
+          };
+        }),
         creators: creators.map((c) => ({
           id: c._id.toString(),
           userId: c.userId.toString(),

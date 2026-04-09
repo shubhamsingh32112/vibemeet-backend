@@ -17,7 +17,7 @@ export interface ICreator extends Document {
   galleryImages: ICreatorGalleryImage[];
   userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
   categories: string[]; // Array of category names (optional)
-  price: number; // Price per minute in coins (e.g., 60 = 60 coins per minute)
+  price: number; // Coins per minute — must be 60, 90, or 120 (set by admin or assigned agent)
   age?: number; // Creator's age (optional)
   isOnline: boolean; // Online/offline status for creators
   currentCallId?: string; // Current active call ID (locks creator from accepting other calls)

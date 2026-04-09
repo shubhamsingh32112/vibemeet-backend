@@ -55,6 +55,8 @@ interface CallSession {
   creatorMongoId: string;
   pricePerMinute: number;
   pricePerSecond: number;
+  creatorEarningsPerSecond?: number;
+  creatorShareAtCallTime?: number;
   startTime: number; // Date.now() at call start
   elapsedSeconds: number;
 }

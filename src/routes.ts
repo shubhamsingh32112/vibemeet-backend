@@ -9,10 +9,12 @@ import billingRoutes from './modules/billing/billing.routes';
 import supportRoutes from './modules/support/support.routes';
 import paymentRoutes from './modules/payment/payment.routes';
 import agentRoutes from './modules/agent/agent.routes';
+import referralRoutes from './modules/referral/referral.routes';
 
 const router = Router();
 
 router.use('/auth', authRoutes);
+router.use('/referral', referralRoutes);
 router.use('/user', userRoutes);
 router.use('/creator', creatorRoutes);
 router.use('/chat', chatRoutes);

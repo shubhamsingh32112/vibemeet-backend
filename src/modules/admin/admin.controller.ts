@@ -3,6 +3,7 @@ import { Response } from 'express';
 import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
+import { ReferralEdge } from '../user/referral-edge.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { CreatorTaskProgress } from '../creator/creator-task.model';
@@ -44,6 +45,10 @@ import {
   processWithdrawalMarkPaid,
 } from '../creator/withdrawal-processing.service';
 import { SupportTicket } from '../support/support.model';
+import {
+  ADMIN_USER_SEARCH_QUERY_MAX_LEN,
+  buildSafeMongoSubstringRegex,
+} from '../../utils/mongo-regex';
 import {
   DEFAULT_WALLET_COIN_PACKAGES,
   IWalletCoinPack,
@@ -505,22 +510,49 @@ async function computeCreatorsPerformance() {
 // ══════════════════════════════════════════════════════════════════════════
 // GET /admin/users/analytics — User analytics & table (CACHED 60s when no filters)
 // ══════════════════════════════════════════════════════════════════════════
+function firstQueryString(v: unknown): string | undefined {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v) && typeof v[0] === 'string') return v[0];
+  return undefined;
+}
+
 export const getUsersAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const { query, role, sort } = req.query;
-    const searchQuery = query as string | undefined;
-    const roleFilter = role as string | undefined;
-    const sortField = sort as string | undefined;
+    const { query, role, sort, referrerAgentId } = req.query;
+    const searchQuery = firstQueryString(query);
+    const roleFilter = firstQueryString(role);
+    const sortField = firstQueryString(sort);
+
+    if (searchQuery && searchQuery.trim().length > ADMIN_USER_SEARCH_QUERY_MAX_LEN) {
+      res.status(400).json({
+        success: false,
+        error: `Search query must be at most ${ADMIN_USER_SEARCH_QUERY_MAX_LEN} characters`,
+      });
+      return;
+    }
+
+    const rawReferrer = firstQueryString(referrerAgentId);
+    const referrerTrimmed = rawReferrer?.trim() ?? '';
+    if (referrerTrimmed.length > 0 && !mongoose.Types.ObjectId.isValid(referrerTrimmed)) {
+      res.status(400).json({ success: false, error: 'Invalid referrerAgentId' });
+      return;
+    }
+    const referrerAgentOid =
+      referrerTrimmed.length > 0 ? new mongoose.Types.ObjectId(referrerTrimmed) : undefined;
 
     // Only cache the unfiltered default view
-    const hasFilters = (searchQuery && searchQuery.trim()) || (roleFilter && roleFilter !== 'all') || sortField;
+    const hasFilters =
+      (searchQuery && searchQuery.trim()) ||
+      (roleFilter && roleFilter !== 'all') ||
+      sortField ||
+      !!referrerAgentOid;
 
     const data = hasFilters
-      ? await computeUsersAnalytics(searchQuery, roleFilter, sortField)
+      ? await computeUsersAnalytics(searchQuery, roleFilter, sortField, referrerAgentOid)
       : await getCachedOrCompute('users_analytics', () =>
-          computeUsersAnalytics(undefined, undefined, undefined)
+          computeUsersAnalytics(undefined, undefined, undefined, undefined)
         );
 
     res.json({ success: true, data: { users: data } });
@@ -533,22 +565,62 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
 async function computeUsersAnalytics(
   searchQuery?: string,
   roleFilter?: string,
-  sortField?: string
+  sortField?: string,
+  referrerAgentId?: mongoose.Types.ObjectId
 ) {
-  const filter: any = {};
+  const filter: Record<string, unknown> = {};
   if (roleFilter && roleFilter !== 'all') filter.role = roleFilter;
   if (searchQuery && searchQuery.trim()) {
-    const regex = new RegExp(searchQuery.trim(), 'i');
+    const regex = buildSafeMongoSubstringRegex(searchQuery.trim());
     filter.$or = [{ username: regex }, { email: regex }, { phone: regex }];
+  }
+  if (referrerAgentId) {
+    filter.referredBy = referrerAgentId;
   }
 
   const users = await User.find(filter)
-    .select('firebaseUid email phone gender username avatar categories coins welcomeBonusClaimed role usernameChangeCount createdAt')
+    .select(
+      'firebaseUid email phone gender username avatar categories coins welcomeBonusClaimed role usernameChangeCount createdAt referredBy'
+    )
     .sort({ createdAt: -1 })
     .limit(200)
     .lean();
 
   const userIds = users.map((u) => u._id);
+
+  const referrerIds = [
+    ...new Set(
+      users
+        .map((u) => u.referredBy)
+        .filter((id): id is mongoose.Types.ObjectId => !!id)
+        .map((id) => id.toString())
+    ),
+  ].map((id) => new mongoose.Types.ObjectId(id));
+
+  const [referrers, referralEdges] = await Promise.all([
+    referrerIds.length > 0
+      ? User.find({ _id: { $in: referrerIds } })
+          .select('displayName email username role referralCode')
+          .lean()
+      : [],
+    ReferralEdge.find({ referredUserId: { $in: userIds } })
+      .select('referredUserId referralCodeUsed')
+      .lean(),
+  ]);
+
+  const referrerMap = new Map(
+    referrers.map((r) => {
+      const label =
+        (r.displayName && r.displayName.trim()) ||
+        r.email ||
+        r.username ||
+        r._id.toString();
+      return [r._id.toString(), { label, role: r.role, referralCode: r.referralCode }];
+    })
+  );
+  const edgeCodeByUser = new Map(
+    referralEdges.map((e) => [e.referredUserId.toString(), e.referralCodeUsed])
+  );
 
   const [spendingAgg, creditAgg, callAgg, chatAgg, creatorExistence] = await Promise.all([
     CoinTransaction.aggregate([
@@ -583,6 +655,9 @@ async function computeUsersAnalytics(
     const calls = callMap.get(uid) || { callCount: 0, totalMinutes: 0 };
     const chat = chatMap.get(user.firebaseUid) || { chatChannels: 0, totalFreeMessages: 0, totalPaidMessages: 0 };
 
+    const refId = user.referredBy?.toString();
+    const refInfo = refId ? referrerMap.get(refId) : undefined;
+
     return {
       id: uid,
       firebaseUid: user.firebaseUid,
@@ -605,6 +680,10 @@ async function computeUsersAnalytics(
       chatChannels: chat.chatChannels,
       freeMessages: chat.totalFreeMessages,
       paidMessages: chat.totalPaidMessages,
+      referredByUserId: refId ?? null,
+      referralCodeUsed: edgeCodeByUser.get(uid) ?? null,
+      referrerLabel: refInfo?.label ?? null,
+      referrerIsAgent: refInfo?.role === 'agent',
     };
   });
 
