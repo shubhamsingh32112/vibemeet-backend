@@ -20,6 +20,7 @@ import { notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
 import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 
 function sinceDaysAgo(days: number): Date {
   const d = new Date();
@@ -729,6 +730,7 @@ export const getAgentCreatorDetail = async (req: Request, res: Response): Promis
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           earningsCoins: creator.earningsCoins,
           isOnline: creator.isOnline,
           createdAt: creator.createdAt,
@@ -778,7 +780,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       return;
     }
 
-    const { userId, name, about, photo, price, categories, age } = req.body ?? {};
+    const { userId, name, about, photo, price, categories, age, location } = req.body ?? {};
 
     if (!name || !about || !photo || !userId || price === undefined) {
       res.status(400).json({
@@ -805,6 +807,12 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
 
     if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
       res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
+      return;
+    }
+
+    const locCreate = parseCreatorLocationForCreate(location);
+    if (!locCreate.ok) {
+      res.status(400).json({ success: false, error: locCreate.error });
       return;
     }
 
@@ -860,6 +868,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
             price: validatedPrice,
             age: age !== undefined ? age : undefined,
             assignedAgentId: agent._id,
+            ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
           },
         ],
         { session },
@@ -891,6 +900,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
             categories: createdCreator.categories,
             price: createdCreator.price,
             age: createdCreator.age,
+            location: createdCreator.location,
             createdAt: createdCreator.createdAt,
             updatedAt: createdCreator.updatedAt,
           },

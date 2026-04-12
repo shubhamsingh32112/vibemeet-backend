@@ -4,6 +4,10 @@ import { billingLimiter } from '../../middlewares/rate-limit.middleware';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from './billing.gateway';
 import { logError, logDebug } from '../../utils/logger';
+import {
+  assertBillingRestCallEndedAccess,
+  assertBillingRestCallStartedAccess,
+} from './billing-rest-access';
 
 const router = Router();
 
@@ -42,12 +46,28 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
       creatorFirebaseUid,
     });
 
-    const io = getIO();
-    await handleCallStartedHttp(io, firebaseUid, {
+    const access = assertBillingRestCallStartedAccess(
+      firebaseUid,
       callId,
       creatorFirebaseUid,
-      creatorMongoId,
-    });
+      creatorMongoId
+    );
+    if (!access.ok) {
+      res.status(access.status).json({ success: false, error: access.error });
+      return;
+    }
+
+    const io = getIO();
+    await handleCallStartedHttp(
+      io,
+      firebaseUid,
+      {
+        callId,
+        creatorFirebaseUid,
+        creatorMongoId,
+      },
+      { source: 'client_http' }
+    );
 
     res.json({ success: true, message: 'Billing started' });
   } catch (err: any) {
@@ -83,6 +103,12 @@ router.post('/call-ended', verifyFirebaseToken, billingLimiter, async (req: Requ
       firebaseUid,
       callId,
     });
+
+    const endedAccess = await assertBillingRestCallEndedAccess(firebaseUid, callId);
+    if (!endedAccess.ok) {
+      res.status(endedAccess.status).json({ success: false, error: endedAccess.error });
+      return;
+    }
 
     const io = getIO();
     await settleCallHttp(io, callId);

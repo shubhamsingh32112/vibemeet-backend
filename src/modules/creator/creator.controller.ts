@@ -44,6 +44,10 @@ import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-inv
 import { normalizeGalleryImages, resolveGalleryImageUrlsForApi } from './creator-gallery-resolve';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
+import {
+  parseCreatorLocationForCreate,
+  parseCreatorLocationForUpdate,
+} from './creator-location.util';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -115,6 +119,7 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           isOnline: creator.isOnline,
           isFavorite: favoriteSet.has(creator._id.toString()),
           createdAt: creator.createdAt,
@@ -193,6 +198,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           isOnline: creator.isOnline,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
@@ -231,7 +237,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    const { name, about, photo, userId, categories, price, age } = req.body;
+    const { name, about, photo, userId, categories, price, age, location } = req.body;
     
     // Validation
     if (!name || !about || !photo || !userId || price === undefined) {
@@ -262,6 +268,12 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
         success: false,
         error: 'Age must be a number between 18 and 100',
       });
+      return;
+    }
+
+    const locCreate = parseCreatorLocationForCreate(location);
+    if (!locCreate.ok) {
+      res.status(400).json({ success: false, error: locCreate.error });
       return;
     }
     
@@ -307,6 +319,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       categories: Array.isArray(categories) ? categories : [],
       price: validatedPrice,
       age: age !== undefined ? age : undefined,
+      ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
     });
     
     // Update user role to creator (if not already admin)
@@ -330,6 +343,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },
@@ -405,7 +419,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
 
     if (!(await assertAdminOrOwningAgentForCreator(req, res, id))) return;
 
-    const { name, about, photo, categories, price, age } = req.body;
+    const { name, about, photo, categories, price, age, location } = req.body;
     
     const creator = await Creator.findById(id);
     if (!creator) {
@@ -458,6 +472,17 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       }
       creator.age = age;
     }
+
+    const locUpdate = parseCreatorLocationForUpdate(location);
+    if (locUpdate.kind === 'error') {
+      res.status(400).json({ success: false, error: locUpdate.message });
+      return;
+    }
+    if (locUpdate.kind === 'clear') {
+      creator.set('location', undefined);
+    } else if (locUpdate.kind === 'set') {
+      creator.location = locUpdate.value;
+    }
     
     await creator.save();
     
@@ -480,6 +505,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },
@@ -747,8 +773,8 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       return;
     }
     
-    const { name, about, age, categories, photo } = req.body;
-    console.log('📝 [CREATOR] Update request body:', JSON.stringify({ name, about, age, categories, photo: photo ? 'present' : 'missing' }));
+    const { name, about, age, categories, photo, location } = req.body;
+    console.log('📝 [CREATOR] Update request body:', JSON.stringify({ name, about, age, categories, location, photo: photo ? 'present' : 'missing' }));
     let updated = false;
     
     // Update name
@@ -830,6 +856,19 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       creator.categories = categories;
       updated = true;
     }
+
+    const locUp = parseCreatorLocationForUpdate(location);
+    if (locUp.kind === 'error') {
+      res.status(400).json({ success: false, error: locUp.message });
+      return;
+    }
+    if (locUp.kind === 'clear') {
+      creator.set('location', undefined);
+      updated = true;
+    } else if (locUp.kind === 'set') {
+      creator.location = locUp.value;
+      updated = true;
+    }
     
     if (!updated) {
       res.status(400).json({
@@ -890,6 +929,7 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },
@@ -957,6 +997,7 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },
@@ -2025,6 +2066,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         id: creator._id.toString(),
         name: creator.name,
         price: creator.price,
+        location: creator.location,
         isOnline: creator.isOnline,
       },
     };

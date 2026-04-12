@@ -29,6 +29,10 @@ import { Withdrawal } from './withdrawal.model';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
+import {
+  parseCreatorLocationForCreate,
+  parseCreatorLocationForUpdate,
+} from './creator-location.util';
 
 // Get all creators (for users to see - excludes other creators)
 export const getAllCreators = async (req: Request, res: Response): Promise<void> => {
@@ -85,6 +89,7 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
           photo: creator.photo,
           categories: creator.categories,
           price: creator.price,
+          location: creator.location,
           isOnline: creator.isOnline,
           isFavorite: favoriteSet.has(creator._id.toString()),
           createdAt: creator.createdAt,
@@ -127,6 +132,7 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
         photo: creator.photo,
         categories: creator.categories ?? [],
         price: creator.price,
+        location: creator.location ?? null,
         isOnline: creator.isOnline,
         availability: creator.availability === 'online' ? 'online' : 'busy',
         isFavorite: creator.isFavorite,
@@ -177,6 +183,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
         photo: creator.photo,
         categories: creator.categories,
         price: creator.price,
+        location: creator.location,
         isOnline: creator.isOnline,
         createdAt: creator.createdAt,
         updatedAt: creator.updatedAt,
@@ -191,6 +198,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
         photo: creator.photo,
         categories: creator.categories ?? [],
         price: creator.price,
+        location: creator.location ?? null,
         isOnline: creator.isOnline,
         createdAt: creator.createdAt?.toISOString(),
         updatedAt: creator.updatedAt?.toISOString(),
@@ -236,7 +244,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    const { name, about, photo, userId, categories, price } = req.body;
+    const { name, about, photo, userId, categories, price, location } = req.body;
     
     // Validation
     if (!name || !about || !photo || !userId || price === undefined) {
@@ -261,6 +269,12 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     const validatedPrice = priceCheck.price;
+
+    const locCreate = parseCreatorLocationForCreate(location);
+    if (!locCreate.ok) {
+      res.status(400).json({ success: false, error: locCreate.error });
+      return;
+    }
     
     // Verify user exists
     const targetUser = await User.findById(userId);
@@ -302,6 +316,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       userId: targetUser._id,
       categories: Array.isArray(categories) ? categories : [],
       price: validatedPrice,
+      ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
     });
     
     // Update user role to creator (if not already admin)
@@ -323,6 +338,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
           photo: creator.photo,
           categories: creator.categories,
           price: creator.price,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },
@@ -368,7 +384,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    const { name, about, photo, categories, price } = req.body;
+    const { name, about, photo, categories, price, location } = req.body;
     
     const creator = await Creator.findById(id);
     if (!creator) {
@@ -402,6 +418,17 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       }
       creator.price = p.price;
     }
+
+    const locUpdate = parseCreatorLocationForUpdate(location);
+    if (locUpdate.kind === 'error') {
+      res.status(400).json({ success: false, error: locUpdate.message });
+      return;
+    }
+    if (locUpdate.kind === 'clear') {
+      creator.set('location', undefined);
+    } else if (locUpdate.kind === 'set') {
+      creator.location = locUpdate.value;
+    }
     
     await creator.save();
     
@@ -418,6 +445,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
           photo: creator.photo,
           categories: creator.categories,
           price: creator.price,
+          location: creator.location,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },

@@ -30,6 +30,7 @@ import {
   buildSafeMongoSubstringRegex,
 } from '../../utils/mongo-regex';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 
 function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
@@ -403,6 +404,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
               createdAt: image.createdAt,
             })),
           age: creator.age, // Include age field
+          location: creator.location,
           email: user.email, // Use user's email (identity comes from user)
           phone: user.phone, // Use user's phone (identity comes from user)
           categories: creator.categories,
@@ -824,7 +826,7 @@ export const searchUsers = async (req: Request, res: Response): Promise<void> =>
 export const promoteToCreator = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { name, about, photo, categories, price } = req.body;
+    const { name, about, photo, categories, price, location } = req.body;
     
     console.log(`🎭 [USER] Promote user to creator: ${id}`);
     
@@ -869,6 +871,12 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       return;
     }
     const validatedPrice = priceCheck.price;
+
+    const locCreate = parseCreatorLocationForCreate(location);
+    if (!locCreate.ok) {
+      res.status(400).json({ success: false, error: locCreate.error });
+      return;
+    }
 
     // Find target user
     const targetUser = await User.findById(id);
@@ -942,6 +950,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
             categories: Array.isArray(categories) ? categories : [],
             price: validatedPrice,
             ...(assignedAgentId ? { assignedAgentId } : {}),
+            ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
           },
         ],
         { session }
@@ -981,6 +990,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
             photo: createdCreator.photo,
             categories: createdCreator.categories,
             price: createdCreator.price,
+            location: createdCreator.location,
             createdAt: createdCreator.createdAt,
             updatedAt: createdCreator.updatedAt,
           },

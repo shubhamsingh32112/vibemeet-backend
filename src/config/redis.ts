@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { bumpRedisClose, bumpRedisError } from '../utils/driver-metrics';
 import { logInfo, logError, logWarning } from '../utils/logger';
 
 let redis: Redis | null = null;
@@ -69,6 +70,7 @@ export const getRedis = (): Redis => {
     });
     
     redis.on('error', (err) => {
+      bumpRedisError();
       logError('CRITICAL: Redis connection error', err, {
         alert: true,
         impact: 'Billing operations will fail',
@@ -76,6 +78,7 @@ export const getRedis = (): Redis => {
     });
     
     redis.on('close', () => {
+      bumpRedisClose();
       logWarning('Redis connection closed', {
         alert: true,
         impact: 'Billing operations will fail',

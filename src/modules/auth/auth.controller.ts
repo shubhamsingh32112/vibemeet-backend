@@ -182,6 +182,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
+          location: creator.location,
           // User-specific data (coins, role, etc.)
           coins: user.coins,
           welcomeBonusClaimed: user.welcomeBonusClaimed,

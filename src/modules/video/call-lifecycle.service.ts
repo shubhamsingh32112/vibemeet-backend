@@ -1,7 +1,9 @@
+import mongoose from 'mongoose';
 import { Call } from './call.model';
 import { WebhookEvent } from './webhook-event.model';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
+import { pricingService } from './pricing.service';
 import { getStreamClient } from '../../config/stream';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from '../billing/billing.gateway';
@@ -177,6 +179,28 @@ export class CallLifecycleService {
     return payload.call?.id || payload.call_cid?.split(':')[1] || null;
   }
 
+  /** Same pricing source as Redis billing (`BillingService.startBillingSession`). */
+  private async snapshotPricingForCreatorUserId(
+    creatorUserId: mongoose.Types.ObjectId
+  ): Promise<Partial<{ priceAtCallTime: number; creatorShareAtCallTime: number }>> {
+    const creatorDoc = await Creator.findOne({ userId: creatorUserId });
+    if (!creatorDoc) {
+      return {};
+    }
+    try {
+      const p = await pricingService.snapshotForCreator(creatorDoc._id.toString());
+      return {
+        priceAtCallTime: p.pricePerMinute,
+        creatorShareAtCallTime: p.creatorShareAtCallTime,
+      };
+    } catch (err) {
+      logError('Failed to snapshot pricing for Call record', err, {
+        creatorUserId: String(creatorUserId),
+      });
+      return {};
+    }
+  }
+
   /**
    * Handle call.ended event:
    * - Settle billing (Redis-based)
@@ -232,6 +256,7 @@ export class CallLifecycleService {
         return;
       }
 
+      const priceSnap = await this.snapshotPricingForCreatorUserId(creatorUser._id);
       call = await Call.create({
         callId,
         callerUserId: callerUser._id,
@@ -242,6 +267,7 @@ export class CallLifecycleService {
         creatorCoinsEarned: 0,
         isForceEnded: false,
         isSettled: false,
+        ...priceSnap,
       });
     }
 
@@ -337,6 +363,16 @@ export class CallLifecycleService {
       });
     }
 
+    if (call.priceAtCallTime == null || call.creatorShareAtCallTime == null) {
+      const snap = await this.snapshotPricingForCreatorUserId(call.creatorUserId);
+      if (snap.priceAtCallTime != null && call.priceAtCallTime == null) {
+        call.priceAtCallTime = snap.priceAtCallTime;
+      }
+      if (snap.creatorShareAtCallTime != null && call.creatorShareAtCallTime == null) {
+        call.creatorShareAtCallTime = snap.creatorShareAtCallTime;
+      }
+    }
+
     call.billedSeconds = 0;
     call.userCoinsSpent = 0;
     call.creatorCoinsEarned = 0;
@@ -401,11 +437,16 @@ export class CallLifecycleService {
 
     try {
       const io = getIO();
-      await handleCallStartedHttp(io, callerUser.firebaseUid, {
-        callId,
-        creatorFirebaseUid: creatorUser.firebaseUid,
-        creatorMongoId: creator._id.toString(),
-      });
+      await handleCallStartedHttp(
+        io,
+        callerUser.firebaseUid,
+        {
+          callId,
+          creatorFirebaseUid: creatorUser.firebaseUid,
+          creatorMongoId: creator._id.toString(),
+        },
+        { source: 'webhook_session_started' }
+      );
       logInfo('Redis billing started for call', { callId });
     } catch (error) {
       logError('Failed to start Redis billing for call', error, { callId });
@@ -479,7 +520,7 @@ export class CallLifecycleService {
     await updateCreatorAvailabilityAfterCall(call.creatorUserId.toString());
     await call.save();
 
-    // Note: Chat activity message is posted by settleCall() in billing.gateway.ts
+    // Note: Chat activity message is posted by settleCall() in billing-settlement.service.ts
     // to avoid duplicates. No need to post here.
   }
 
@@ -710,6 +751,7 @@ export class CallLifecycleService {
 
     // Create call record
     try {
+      const priceSnap = await this.snapshotPricingForCreatorUserId(creatorUser._id);
       await Call.create({
         callId,
         callerUserId: callerUser._id,
@@ -720,11 +762,10 @@ export class CallLifecycleService {
         creatorCoinsEarned: 0,
         isForceEnded: false,
         isSettled: false,
+        ...priceSnap,
       });
       logInfo('Call record created from webhook', { callId });
       
-      // 🔥 FIX: Mark creator busy immediately when call record is created
-      // The post-save hook will also mark busy, but this ensures it happens even if hook fails
       if (creatorUser.firebaseUid) {
         await this.markCreatorBusy(creatorUser.firebaseUid);
         logInfo('Creator marked busy after call record creation', {

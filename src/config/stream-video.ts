@@ -84,20 +84,11 @@ export const generateServerSideToken = (): string => {
 };
 
 /**
- * Generate call ID matching frontend format
- * 
- * 🔥 FIX 2: Updated to match frontend format: userId_creatorId_timestamp
- * 
- * IMPORTANT: Frontend is the primary source of call IDs (creates calls via Stream SDK).
- * This function is only used in legacy REST endpoint (initiateCall).
- * 
- * Frontend format: userId_creatorId_timestamp (e.g., "abc123_def456_1703001234")
- * - Includes timestamp for uniqueness per call attempt
- * - Total length: ~63 chars (well under Stream's 64-char limit)
- * 
+ * Generate call ID matching the Flutter app: userId_creatorId_timestamp (Stream SDK getOrCreate).
+ * Kept for docs/tests; server no longer creates calls over REST.
+ *
  * @param userId - User's Firebase UID
  * @param creatorId - Creator's MongoDB ObjectId (as string)
- * @returns Call ID in format: userId_creatorId_timestamp
  */
 export const generateCallId = (userId: string, creatorId: string): string => {
   // 🔥 FIX 2: Match frontend format: userId_creatorId_timestamp

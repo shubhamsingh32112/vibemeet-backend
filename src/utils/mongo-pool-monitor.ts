@@ -25,7 +25,7 @@ export interface MongoPoolStats {
 class MongoPoolMonitor {
   private checkedOut = 0;
   private checkOutFailedTotal = 0;
-  private maxPoolSize = 1500; // default, updated from connectionPoolCreated
+  private maxPoolSize = 50; // default until connectionPoolCreated / setMaxPoolSize
   private lastCheckOutFailedAt: number | undefined;
   private initialized = false;
 

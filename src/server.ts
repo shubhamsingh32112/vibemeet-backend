@@ -1,7 +1,9 @@
-import express from 'express';
+import express, { type Request } from 'express';
 import compression from 'compression';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+import Redis from 'ioredis';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -18,7 +20,7 @@ import { startReconciliationJob, stopReconciliationJob } from './modules/billing
 import { verifyStartupRecovery } from './modules/billing/billing-recovery';
 import { setupAdminGateway } from './modules/admin/admin.gateway';
 import routes from './routes';
-import { clearAllCreatorBusyStates, cleanupStaleCreatorLocks } from './modules/video/video.webhook';
+import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
 import { startCallReconciliationJob, stopCallReconciliationJob } from './modules/video/call-reconciliation';
 import { isRazorpayConfigured } from './config/razorpay';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
@@ -28,6 +30,8 @@ import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { logRateLimitConfig } from './utils/rate-limit.service';
 import { requestQueueMiddleware, getRequestQueueStats } from './middlewares/request-queue.middleware';
 import { mongoPoolMonitor } from './utils/mongo-pool-monitor';
+import { getDriverMetrics } from './utils/driver-metrics';
+import { monitoring, recordAPIMetric } from './utils/monitoring';
 import mongoose from 'mongoose';
 
 const app = express();
@@ -52,16 +56,34 @@ app.use(helmet({
   crossOriginOpenerPolicy: false, // Allow popups for OAuth
 }));
 
-// CORS configuration - allow all origins for development
-// CRITICAL: Must allow mobile devices to connect
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*', // Allow all origins for local dev
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-  exposedHeaders: ['Content-Length', 'Content-Type'],
-  maxAge: 86400, // 24 hours
-}));
+function buildCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
+  const raw = process.env.CORS_ORIGIN;
+  if (!raw || raw === '*') {
+    if (process.env.NODE_ENV === 'production') {
+      logWarning('CORS_ORIGIN is * or unset in production — set explicit origins for web clients', {});
+    }
+    return '*';
+  }
+  const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    return '*';
+  }
+  if (parts.length === 1) {
+    return parts[0];
+  }
+  return parts;
+}
+
+app.use(
+  cors({
+    origin: buildCorsOrigin(),
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+    exposedHeaders: ['Content-Length', 'Content-Type'],
+    maxAge: 86400,
+  })
+);
 
 // Rate limiting
 // FIX 3: More lenient limit for status endpoint (polling every 3s = 20/min)
@@ -90,9 +112,36 @@ app.use('/api/', statusLimiter);
 // Compression - gzip responses for scalability (reduces bandwidth)
 app.use(compression());
 
-// Body parsing middleware - increase limit for base64 images
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+/** Stream Video webhooks must use the raw request bytes for HMAC (see webhook-signature.middleware). */
+function isStreamVideoWebhookPost(req: Request): boolean {
+  if (req.method !== 'POST') return false;
+  const pathOnly = req.originalUrl.split('?')[0];
+  return pathOnly === '/api/v1/video/webhook';
+}
+
+const jsonParser = express.json({ limit: '50mb' });
+const urlEncodedParser = express.urlencoded({ extended: true, limit: '50mb' });
+
+app.use((req, res, next) => {
+  if (isStreamVideoWebhookPost(req)) {
+    return express.raw({ type: '*/*', limit: '2mb' })(req, res, next);
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  if (isStreamVideoWebhookPost(req)) {
+    return next();
+  }
+  jsonParser(req, res, next);
+});
+
+app.use((req, res, next) => {
+  if (isStreamVideoWebhookPost(req)) {
+    return next();
+  }
+  urlEncodedParser(req, res, next);
+});
 
 // Request logging middleware
 app.use((req, _res, next) => {
@@ -107,11 +156,26 @@ app.use((req, _res, next) => {
 // Request queuing & backpressure (applies to /api routes)
 app.use('/api/', requestQueueMiddleware);
 
+// Basic API latency + status (for dashboards / alerting)
+app.use('/api/', (_req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    recordAPIMetric('latency_ms', ms);
+    if (res.statusCode >= 500) {
+      recordAPIMetric('http_5xx', 1);
+    }
+  });
+  next();
+});
+
 // Metrics endpoint (on-demand, no polling)
 app.get('/metrics', (_req, res) => {
   try {
     const mongoStats = mongoPoolMonitor.getStats();
     const queueStats = getRequestQueueStats();
+    const driver = getDriverMetrics();
+    const apiSummary = monitoring.getMetricsSummary().byName['api.latency_ms'];
     res.status(200).json({
       mongo: {
         activeConnections: mongoStats.checkedOut,
@@ -119,11 +183,25 @@ app.get('/metrics', (_req, res) => {
         poolUtilization: Math.round(mongoStats.utilization * 100) / 100,
         checkOutFailedTotal: mongoStats.checkOutFailedTotal,
         lastCheckOutFailedAt: mongoStats.lastCheckOutFailedAt,
+        driverConnectionErrors: driver.mongo.connectionErrors,
+      },
+      redis: {
+        driverErrors: driver.redis.errors,
+        driverCloses: driver.redis.closes,
       },
       requestQueue: {
         active: queueStats.active,
         waiting: queueStats.waiting,
         rejected: queueStats.rejected,
+      },
+      api: {
+        latencyMs: apiSummary
+          ? {
+              samples: apiSummary.count,
+              avgMs: Math.round((apiSummary.sum / apiSummary.count) * 100) / 100,
+            }
+          : null,
+        http5xxSamples: monitoring.getMetricsSummary().byName['api.http_5xx']?.count ?? 0,
       },
       timestamp: new Date().toISOString(),
     });
@@ -300,17 +378,50 @@ const startServer = async () => {
     // Configure Stream Chat push notifications (FCM)
     await configureStreamPush();
     
-    // Create HTTP server and attach Socket.IO
+    // Create HTTP server and attach Socket.IO (same CORS policy as Express)
     const httpServer = createServer(app);
+    const socketCorsOrigin = buildCorsOrigin();
     const io = new SocketIOServer(httpServer, {
       cors: {
-        origin: process.env.CORS_ORIGIN || '*',
+        origin: socketCorsOrigin,
         methods: ['GET', 'POST'],
       },
       pingTimeout: 60000,
       pingInterval: 25000,
       transports: ['websocket', 'polling'],
     });
+
+    // Multi-node Socket.IO: same Redis pub/sub for all replicas (opt-out via env)
+    if (isRedisConfigured() && process.env.SOCKET_IO_REDIS_ADAPTER !== 'false') {
+      try {
+        const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
+        let pubClient: Redis | null = null;
+        if (redisUrl) {
+          pubClient = new Redis(redisUrl, {
+            maxRetriesPerRequest: 20,
+            enableReadyCheck: true,
+          });
+        } else if (process.env.REDISHOST) {
+          pubClient = new Redis({
+            host: process.env.REDISHOST,
+            port: parseInt(process.env.REDISPORT || '6379', 10),
+            password: process.env.REDIS_PASSWORD || process.env.REDISPASSWORD,
+            username: process.env.REDISUSER,
+            maxRetriesPerRequest: 20,
+            enableReadyCheck: true,
+          });
+        }
+        if (pubClient) {
+          const subClient = pubClient.duplicate();
+          io.adapter(createAdapter(pubClient, subClient));
+          logInfo('Socket.IO Redis adapter enabled (multi-node broadcasts)');
+        }
+      } catch (adapterErr) {
+        logWarning('Socket.IO Redis adapter failed — using in-memory adapter only', {
+          error: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
+        });
+      }
+    }
 
     // Store IO instance globally (so controllers can broadcast)
     setIO(io);
@@ -447,18 +558,19 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
-// Process cleanup handlers - clear stuck busy states on crash/redeploy
+// Process cleanup: do not mass-clear Stream Chat busy flags (deploys would desync presence).
+// Stale locks are handled by cleanupStaleCreatorLocks + call reconciliation jobs.
 process.on('uncaughtException', async (error) => {
   logError('Uncaught exception - cleaning up and exiting', error);
-  await clearAllCreatorBusyStates();
+  await cleanupBillingIntervals().catch(() => {});
+  stopReconciliationJob();
+  stopCallReconciliationJob();
   process.exit(1);
 });
 
 process.on('SIGTERM', async () => {
   logInfo('SIGTERM received — cleaning up', { signal: 'SIGTERM' });
-  await clearAllCreatorBusyStates();
-  cleanupBillingIntervals();
-  // 🔥 FIX 5: Stop reconciliation job
+  await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
   process.exit(0);
@@ -466,9 +578,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   logInfo('SIGINT received — cleaning up', { signal: 'SIGINT' });
-  await clearAllCreatorBusyStates();
-  cleanupBillingIntervals();
-  // 🔥 FIX 5: Stop reconciliation job
+  await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
   process.exit(0);

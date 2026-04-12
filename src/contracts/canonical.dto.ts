@@ -19,6 +19,7 @@ export const creatorSummarySchema = z.object({
   about: z.string().nullable().optional(),
   photo: z.string().nullable().optional(),
   categories: z.array(z.string()).optional(),
+  location: z.string().nullable().optional(),
   price: z.number().nullable().optional(),
   isOnline: z.boolean().nullable().optional(),
   availability: z.string().optional(),

@@ -1,16 +1,27 @@
 import { Creator } from '../creator/creator.model';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
+import {
+  COIN_MICROS,
+  pricePerMinuteToCreatorMicrosPerSecond,
+  pricePerMinuteToUserMicrosPerSecond,
+} from '../billing/billing.constants';
 
 export interface PricingSnapshot {
   pricePerMinute: number;
+  /** @deprecated use pricePerSecondMicros; kept for API/clients */
   pricePerSecond: number;
-  /** Coins accrued per second for the creator (share of tier price per minute). */
+  /** @deprecated use creatorEarningsPerSecondMicros */
   creatorEarningsPerSecond: number;
   creatorShareAtCallTime: number;
+  /** Integer: user coins charged per second in micro-coins */
+  pricePerSecondMicros: number;
+  /** Integer: creator earnings per second in micro-coins */
+  creatorEarningsPerSecondMicros: number;
 }
 
 /**
  * User pays pricePerMinute/60 per second; creator earns (pricePerMinute * share) / 60 per second.
+ * Per-second rates are exposed as integer micro-coins (COIN_MICROS per 1 coin).
  */
 export class PricingService {
   async snapshotForCreator(creatorMongoId: string): Promise<PricingSnapshot> {
@@ -20,17 +31,21 @@ export class PricingService {
     }
 
     const pricePerMinute = creator.price;
-    const pricePerSecond = pricePerMinute / 60;
-    const creatorEarningsPerSecond = (pricePerMinute * CREATOR_SHARE_PERCENTAGE) / 60;
+    const pricePerSecondMicros = pricePerMinuteToUserMicrosPerSecond(pricePerMinute);
+    const creatorEarningsPerSecondMicros = pricePerMinuteToCreatorMicrosPerSecond(
+      pricePerMinute,
+      CREATOR_SHARE_PERCENTAGE
+    );
 
     return {
       pricePerMinute,
-      pricePerSecond,
-      creatorEarningsPerSecond,
+      pricePerSecond: pricePerSecondMicros / COIN_MICROS,
+      creatorEarningsPerSecond: creatorEarningsPerSecondMicros / COIN_MICROS,
+      pricePerSecondMicros,
+      creatorEarningsPerSecondMicros,
       creatorShareAtCallTime: CREATOR_SHARE_PERCENTAGE,
     };
   }
 }
 
 export const pricingService = new PricingService();
-

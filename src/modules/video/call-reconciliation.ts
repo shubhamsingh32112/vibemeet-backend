@@ -1,5 +1,6 @@
 import { Server } from 'socket.io';
 import axios from 'axios';
+import mongoose from 'mongoose';
 import { Call } from './call.model';
 import { User } from '../user/user.model';
 import { generateServerSideToken } from '../../config/stream-video';
@@ -7,12 +8,48 @@ import { transitionCallStatus } from './call-state.service';
 import { setAvailability, getAvailability } from '../availability/availability.service';
 import { emitCreatorStatus } from '../availability/availability.socket';
 import { logInfo, logError } from '../../utils/logger';
+import { recordCallMetric } from '../../utils/monitoring';
 
 let reconciliationTimer: NodeJS.Timeout | null = null;
 
 const RECONCILIATION_INTERVAL_MS =
   parseInt(process.env.CALL_RECONCILIATION_INTERVAL_MS || '300000', 10) || // default 5 minutes
   300000;
+
+const RECON_BATCH_SIZE = 100;
+/** Max time per tick to avoid blocking event loop on huge backlogs */
+const RECON_MAX_MS_PER_TICK = 45_000;
+
+/** Limit scanning of ancient unsettled rows (ms). Active ringing/accepted always included. */
+const RECON_UNSETTLED_LOOKBACK_MS =
+  parseInt(process.env.CALL_RECON_UNSETTLED_LOOKBACK_MS || String(7 * 24 * 60 * 60 * 1000), 10) ||
+  7 * 24 * 60 * 60 * 1000;
+
+function activeCallFilterAfter(
+  lastId: mongoose.Types.ObjectId | null
+): mongoose.FilterQuery<typeof Call> {
+  const recentCutoff = new Date(Date.now() - RECON_UNSETTLED_LOOKBACK_MS);
+  const unsettledRecent = {
+    isSettled: { $ne: true },
+    updatedAt: { $gte: recentCutoff },
+  };
+  const base: mongoose.FilterQuery<typeof Call> = {
+    $or: [{ status: { $in: ['ringing', 'accepted'] } }, unsettledRecent],
+  };
+  if (!lastId) {
+    return base;
+  }
+  return { $and: [base, { _id: { $gt: lastId } }] };
+}
+
+async function fetchActiveCallBatch(
+  lastId: mongoose.Types.ObjectId | null
+): Promise<Array<InstanceType<typeof Call>>> {
+  return Call.find(activeCallFilterAfter(lastId))
+    .sort({ _id: 1 })
+    .limit(RECON_BATCH_SIZE)
+    .exec();
+}
 
 /**
  * Simple call state reconciliation job.
@@ -66,44 +103,47 @@ export function stopCallReconciliationJob(): void {
  */
 async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
   try {
-    const activeCalls = await Call.find({
-      $or: [
-        { status: { $in: ['ringing', 'accepted'] } },
-        { isSettled: { $ne: true } },
-      ],
-    })
-      .limit(200)
-      .exec();
+    const passStarted = Date.now();
+    let lastId: mongoose.Types.ObjectId | null = null;
+    let scanned = 0;
 
-    if (!activeCalls.length) {
-      return; // No active calls
-    }
+    while (Date.now() - passStarted < RECON_MAX_MS_PER_TICK) {
+      const activeCalls = await fetchActiveCallBatch(lastId);
+      if (!activeCalls.length) {
+        break;
+      }
 
-    // Mark each creator busy if they have an active call
-    for (const call of activeCalls) {
-      try {
-        const creatorUser = await User.findById(call.creatorUserId);
-        if (creatorUser?.firebaseUid) {
-          // Check current status
-          const currentStatus = await getAvailability(creatorUser.firebaseUid);
-          
-          if (currentStatus !== 'busy') {
-            // Creator should be busy but isn't - fix it
-            await setAvailability(creatorUser.firebaseUid, 'busy');
-            emitCreatorStatus(creatorUser.firebaseUid, 'busy');
-            logInfo('Reconciliation: Fixed creator busy status', {
-              callId: call.callId,
-              creatorFirebaseUid: creatorUser.firebaseUid,
-              previousStatus: currentStatus,
-            });
+      for (const call of activeCalls) {
+        try {
+          const creatorUser = await User.findById(call.creatorUserId);
+          if (creatorUser?.firebaseUid) {
+            const currentStatus = await getAvailability(creatorUser.firebaseUid);
+
+            if (currentStatus !== 'busy') {
+              await setAvailability(creatorUser.firebaseUid, 'busy');
+              emitCreatorStatus(creatorUser.firebaseUid, 'busy');
+              logInfo('Reconciliation: Fixed creator busy status', {
+                callId: call.callId,
+                creatorFirebaseUid: creatorUser.firebaseUid,
+                previousStatus: currentStatus,
+              });
+            }
           }
+        } catch (err) {
+          logError('Error ensuring creator busy status in reconciliation', err, {
+            callId: call.callId,
+          });
         }
-      } catch (err) {
-        logError('Error ensuring creator busy status in reconciliation', err, {
-          callId: call.callId,
-        });
+      }
+
+      scanned += activeCalls.length;
+      lastId = activeCalls[activeCalls.length - 1]._id as mongoose.Types.ObjectId;
+      if (activeCalls.length < RECON_BATCH_SIZE) {
+        break;
       }
     }
+
+    recordCallMetric('call_reconciliation.busy_scan', scanned, {});
   } catch (err) {
     logError('Error in ensureCreatorsWithActiveCallsAreBusy', err);
   }
@@ -111,26 +151,7 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
 
 async function reconcileActiveCalls(): Promise<void> {
   try {
-    // 🔥 FIX: First ensure creators with active calls are marked busy
     await ensureCreatorsWithActiveCallsAreBusy();
-
-    const activeCalls = await Call.find({
-      $or: [
-        { status: { $in: ['ringing', 'accepted'] } },
-        { isSettled: { $ne: true } },
-      ],
-    })
-      .limit(200)
-      .exec();
-
-    if (!activeCalls.length) {
-      logInfo('Call reconciliation: no active calls to check', {});
-      return;
-    }
-
-    logInfo('Call reconciliation: checking active calls', {
-      count: activeCalls.length,
-    });
 
     const apiKey = process.env.STREAM_API_KEY;
     const baseUrl = 'https://video.stream-io-api.com';
@@ -144,8 +165,27 @@ async function reconcileActiveCalls(): Promise<void> {
     }
 
     const serverToken = generateServerSideToken();
+    const passStarted = Date.now();
+    let lastId: mongoose.Types.ObjectId | null = null;
+    let totalChecked = 0;
 
-    for (const call of activeCalls) {
+    while (Date.now() - passStarted < RECON_MAX_MS_PER_TICK) {
+      const activeCalls = await fetchActiveCallBatch(lastId);
+
+      if (!activeCalls.length) {
+        if (totalChecked === 0) {
+          logInfo('Call reconciliation: no active calls to check', {});
+        }
+        break;
+      }
+
+      if (totalChecked === 0) {
+        logInfo('Call reconciliation: checking active calls (paginated)', {
+          firstBatchSize: activeCalls.length,
+        });
+      }
+
+      for (const call of activeCalls) {
       const callId = call.callId;
       try {
         // Query Stream Video for call state
@@ -215,7 +255,16 @@ async function reconcileActiveCalls(): Promise<void> {
           logError('Error reconciling call with Stream', err, { callId });
         }
       }
+      }
+
+      totalChecked += activeCalls.length;
+      lastId = activeCalls[activeCalls.length - 1]._id as mongoose.Types.ObjectId;
+      if (activeCalls.length < RECON_BATCH_SIZE) {
+        break;
+      }
     }
+
+    recordCallMetric('call_reconciliation.stream_checked', totalChecked, {});
   } catch (err) {
     logError('Call reconciliation job failed', err);
   }

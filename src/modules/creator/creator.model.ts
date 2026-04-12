@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema } from 'mongoose';
 import { CREATOR_GALLERY_MAX_IMAGES } from './creator-gallery.constants';
+import { CREATOR_LOCATION_MAX_LEN } from './creator-location.util';
 
 export interface ICreatorGalleryImage {
   id: string;
@@ -19,6 +20,8 @@ export interface ICreator extends Document {
   categories: string[]; // Array of category names (optional)
   price: number; // Coins per minute — must be 60, 90, or 120 (set by admin or assigned agent)
   age?: number; // Creator's age (optional)
+  /** Display location (e.g. city or region). */
+  location?: string;
   isOnline: boolean; // Online/offline status for creators
   currentCallId?: string; // Current active call ID (locks creator from accepting other calls)
   earningsCoins: number; // Total creator earnings from video calls
@@ -110,6 +113,12 @@ const creatorSchema = new Schema<ICreator>(
       sparse: true,
       min: 18,
       max: 100,
+    },
+    location: {
+      type: String,
+      trim: true,
+      maxlength: CREATOR_LOCATION_MAX_LEN,
+      sparse: true,
     },
     isOnline: {
       type: Boolean,

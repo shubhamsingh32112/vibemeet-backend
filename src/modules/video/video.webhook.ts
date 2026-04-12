@@ -1,12 +1,39 @@
 import type { Request, Response } from 'express';
 import { callLifecycleService } from './call-lifecycle.service';
+import type { StreamVideoWebhookPayload } from './call-lifecycle.service';
 import { logError, logInfo } from '../../utils/logger';
+import { recordCallMetric } from '../../utils/monitoring';
 import { Call } from './call.model';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { getStreamClient } from '../../config/stream';
-import { CoinTransaction } from '../user/coin-transaction.model';
 
+function parseStreamVideoWebhookPayload(req: Request): StreamVideoWebhookPayload {
+  if (Buffer.isBuffer(req.body)) {
+    const raw = req.body as Buffer;
+    const s = raw.toString('utf8');
+    if (!s?.trim()) {
+      return {} as StreamVideoWebhookPayload;
+    }
+    return JSON.parse(s) as StreamVideoWebhookPayload;
+  }
+  return (req.body || {}) as StreamVideoWebhookPayload;
+}
+
+function webhookLogContext(payload: StreamVideoWebhookPayload): Record<string, string | undefined> {
+  const callId = payload.call?.id ?? payload.call_cid?.split(':')[1];
+  const eventIdParts = [
+    payload.type || 'unknown',
+    payload.call_cid || payload.call?.id || 'no-call',
+    payload.session_id || payload.session?.id || 'no-session',
+    payload.created_at || '',
+  ];
+  return {
+    webhookType: payload.type,
+    callId: callId || undefined,
+    eventId: eventIdParts.join(':'),
+  };
+}
 
 /**
  * Stream Video webhook HTTP controller.
@@ -18,28 +45,36 @@ import { CoinTransaction } from '../user/coin-transaction.model';
  * - Delegate persistence, idempotency and business logic to CallLifecycleService
  */
 export const handleStreamVideoWebhook = async (req: Request, res: Response): Promise<void> => {
+  let payload: StreamVideoWebhookPayload;
   try {
-    const payload = req.body;
+    payload = parseStreamVideoWebhookPayload(req);
+  } catch (e) {
+    logError('Invalid Stream Video webhook JSON', e, { path: req.path });
+    res.status(400).json({ success: false, error: 'Invalid JSON body' });
+    return;
+  }
 
+  try {
     logInfo('Received Stream Video webhook', { type: payload?.type });
 
     res.status(200).json({ success: true });
 
+    const webhookType = String(payload?.type ?? 'unknown');
+
     // Process asynchronously so HTTP latency stays low for Stream.
     setImmediate(async () => {
       try {
-        const shouldProcess = await callLifecycleService.persistAndApplyIdempotency(
-          payload
-        );
+        const shouldProcess = await callLifecycleService.persistAndApplyIdempotency(payload);
         if (!shouldProcess) {
+          recordCallMetric('webhook_async_duplicate', 1, { type: webhookType });
           return;
         }
 
         await callLifecycleService.routeEvent(payload);
+        recordCallMetric('webhook_async_success', 1, { type: webhookType });
       } catch (error) {
-        logError('Error processing webhook asynchronously', error, {
-          webhookType: payload?.type,
-        });
+        recordCallMetric('webhook_async_error', 1, { type: webhookType });
+        logError('Error processing webhook asynchronously', error, webhookLogContext(payload));
       }
     });
   } catch (error) {
@@ -48,121 +83,8 @@ export const handleStreamVideoWebhook = async (req: Request, res: Response): Pro
   }
 };
 
-// Note: Event-specific handlers like call.ringing, call.accepted, call.session_started,
-// and call.session_ended are now handled in CallLifecycleService (see call-lifecycle.service.ts).
-// This file focuses on the HTTP controller and shared helpers (cleanup, legacy billing).
-
-/**
- * Process call billing (LEGACY - replaced by per-second billing)
- * 
- * ⚠️ DEPRECATED: This function is no longer used for active calls.
- * Per-second billing happens in processPerSecondBilling().
- * 
- * This function is kept for backwards compatibility with call.ended events
- * that might not have gone through session_ended.
- */
-export async function processCallBilling(call: any): Promise<void> {
-  // Skip if already settled
-  if (call.isSettled) {
-    console.log(`ℹ️  [BILLING] Call ${call.callId} already settled, skipping`);
-    return;
-  }
-  
-  // Get caller
-  const caller = await User.findById(call.callerUserId);
-  if (!caller) {
-    console.error(`❌ [BILLING] Caller not found: ${call.callerUserId}`);
-    return;
-  }
-  
-  // Get creator
-  const creator = await Creator.findOne({ userId: call.creatorUserId });
-  if (!creator) {
-    console.error(`❌ [BILLING] Creator not found: ${call.creatorUserId}`);
-    return;
-  }
-  
-  // PHASE 0: Per-second billing
-  // billedSeconds is the authoritative duration (already calculated from startedAt/endedAt)
-  const billedSeconds = call.durationSeconds || 0;
-  
-  if (billedSeconds <= 0) {
-    console.log(`ℹ️  [BILLING] Call ${call.callId}: No duration to bill`);
-    call.isSettled = true;
-    call.billedSeconds = 0;
-    call.userCoinsSpent = 0;
-    call.creatorCoinsEarned = 0;
-    await call.save();
-    return;
-  }
-  
-  // User pays: 1 coin per second
-  const userCoinsSpent = billedSeconds; // 1 coin per second
-  
-  // Creator earns: 0.3 coins per second
-  const creatorCoinsEarned = Math.floor(billedSeconds * 0.3); // Integer coins
-  
-  // Don't deduct more than user has
-  const actualDeduction = Math.min(userCoinsSpent, caller.coins);
-  
-  // Check if call was force-ended due to insufficient coins
-  const isForceEnded = actualDeduction < userCoinsSpent;
-  
-  if (actualDeduction <= 0) {
-    console.log(`ℹ️  [BILLING] Call ${call.callId}: No coins to deduct (user has ${caller.coins} coins)`);
-    call.isSettled = true;
-    call.billedSeconds = billedSeconds;
-    call.userCoinsSpent = 0;
-    call.creatorCoinsEarned = 0;
-    call.isForceEnded = true;
-    await call.save();
-    return;
-  }
-  
-  // Create transaction record BEFORE updating balance (audit trail)
-  // Generate unique transaction ID for idempotency
-  const transactionId = `call_${call.callId}_${Date.now()}`;
-  const transaction = new CoinTransaction({
-    transactionId,
-    userId: caller._id,
-    type: 'debit',
-    coins: actualDeduction,
-    source: 'video_call',
-    description: `Video call with creator (${billedSeconds} seconds @ 1 coin/sec)`,
-    callId: call.callId,
-    status: 'completed',
-  });
-  await transaction.save();
-  
-  // Update caller balance
-  const oldCoins = caller.coins;
-  caller.coins = Math.max(0, caller.coins - actualDeduction);
-  await caller.save();
-  
-  // Update creator earnings
-  creator.earningsCoins = (creator.earningsCoins || 0) + creatorCoinsEarned;
-  await creator.save();
-  
-  // Update call record
-  call.billedSeconds = billedSeconds;
-  call.userCoinsSpent = actualDeduction;
-  call.creatorCoinsEarned = creatorCoinsEarned;
-  call.isForceEnded = isForceEnded;
-  call.userPaidCoins = actualDeduction; // Legacy field
-  call.isSettled = true;
-  await call.save();
-  
-  console.log(`✅ [BILLING] Call ${call.callId} settled`);
-  console.log(`   Duration: ${billedSeconds} seconds`);
-  console.log(`   User spent: ${actualDeduction} coins (balance: ${oldCoins} → ${caller.coins})`);
-  console.log(`   Creator earned: ${creatorCoinsEarned} coins (total: ${creator.earningsCoins})`);
-  if (isForceEnded) {
-    console.log(`   ⚠️  Call was force-ended due to insufficient coins`);
-  }
-  
-  // TODO: Emit coins_updated socket event if socket.io is available
-  // This should be done via the socket service
-}
+// Event-specific handlers: call.ringing, call.accepted, call.session_started, call.session_ended
+// are in CallLifecycleService. This file: HTTP handler + cleanup helpers.
 
 /**
  * 🔥 FIX 6: Cleanup stale creator locks on server startup
@@ -200,14 +122,8 @@ export async function cleanupStaleCreatorLocks(): Promise<void> {
 }
 
 /**
- * FIX 4: Clear all creator busy states (process cleanup)
- * 
- * Called on:
- * - Process crash (uncaughtException)
- * - Graceful shutdown (SIGTERM, SIGINT)
- * - Server redeploy
- * 
- * Prevents creators from being stuck in busy: true state.
+ * Clears Stream Chat `busy` for all creator users (expensive). Not used on graceful shutdown.
+ * Kept for manual/emergency scripts if Stream Chat presence drifts from Redis.
  */
 export async function clearAllCreatorBusyStates(): Promise<void> {
   try {
