@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { User } from '../user/user.model';
 import { SupportTicket } from './support.model';
 import { emitToAdmin } from '../admin/admin.gateway';
+import { invalidateAdminCaches } from '../../config/redis';
 import { Creator } from '../creator/creator.model';
 import { CallHistory } from '../billing/call-history.model';
 
@@ -175,6 +176,8 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       reportedCreatorFirebaseUid: ticket.reportedCreatorFirebaseUid || null,
       reportedCreatorName: ticket.reportedCreatorName || null,
     });
+
+    invalidateAdminCaches('overview').catch(() => {});
 
     res.status(201).json({
       success: true,

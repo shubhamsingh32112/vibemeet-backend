@@ -4,6 +4,7 @@ import { creatorGalleryUploadLimiter } from '../../middlewares/rate-limit.middle
 import {
   createAgent,
   listAgents,
+  listAgentsBrief,
   getAgentDetail,
   patchAgent,
 } from './admin-agent.controller';
@@ -60,6 +61,7 @@ router.get('/actions/log', getAdminActionLog);
 
 // ── Agents (super-admin) ────────────────────────────────────────────────
 router.post('/agents', createAgent);
+router.get('/agents/brief', listAgentsBrief);
 router.get('/agents', listAgents);
 router.get('/agents/:id', getAgentDetail);
 router.patch('/agents/:id', patchAgent);

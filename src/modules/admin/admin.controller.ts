@@ -20,6 +20,7 @@ import {
 } from '../../config/redis';
 import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
+import { emitToAdmin } from './admin.gateway';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
@@ -928,12 +929,7 @@ export const updateWalletPricing = async (req: Request, res: Response): Promise<
     );
 
     try {
-      const io = getIO();
-      io.emit('wallet_pricing_updated', {
-        updatedAt: config.updatedAt.toISOString(),
-        updatedByAdminId: adminUser?._id?.toString() || null,
-      });
-      io.of('/admin').emit('wallet_pricing_updated', {
+      emitToAdmin('wallet_pricing_updated', {
         updatedAt: config.updatedAt.toISOString(),
         updatedByAdminId: adminUser?._id?.toString() || null,
       });
@@ -2086,6 +2082,13 @@ export const updateTicketStatus = async (req: Request, res: Response): Promise<v
 
     console.log(`✅ [ADMIN] Ticket ${id} status: ${oldStatus} → ${status}`);
 
+    invalidateAdminCaches('overview').catch(() => {});
+    emitToAdmin('support:ticket_updated', {
+      ticketId: ticket._id.toString(),
+      oldStatus,
+      newStatus: status,
+    });
+
     res.json({
       success: true,
       data: {
@@ -2140,6 +2143,13 @@ export const assignTicket = async (req: Request, res: Response): Promise<void> =
     });
 
     console.log(`✅ [ADMIN] Ticket ${id} assigned to ${adminId || 'nobody'}`);
+
+    invalidateAdminCaches('overview').catch(() => {});
+    emitToAdmin('support:ticket_updated', {
+      ticketId: ticket._id.toString(),
+      kind: 'assign',
+      assignedAdminId: ticket.assignedAdminId?.toString() || null,
+    });
 
     res.json({
       success: true,

@@ -169,9 +169,17 @@ app.use('/api/', (_req, res, next) => {
   next();
 });
 
-// Metrics endpoint (on-demand, no polling)
-app.get('/metrics', (_req, res) => {
+// Metrics endpoint — set METRICS_TOKEN and send header X-Metrics-Token to access
+app.get('/metrics', (req, res) => {
   try {
+    const metricsToken = (process.env.METRICS_TOKEN || '').trim();
+    if (metricsToken) {
+      const sent = req.headers['x-metrics-token'];
+      if (sent !== metricsToken) {
+        res.status(403).json({ success: false, error: 'Forbidden' });
+        return;
+      }
+    }
     const mongoStats = mongoPoolMonitor.getStats();
     const queueStats = getRequestQueueStats();
     const driver = getDriverMetrics();
@@ -328,10 +336,27 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 // Initialize services and start server
+function assertProductionSecurity(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  const jwt = (process.env.JWT_SECRET || '').trim();
+  if (!jwt || jwt === 'admin-secret-change-me') {
+    throw new Error(
+      'NODE_ENV=production requires JWT_SECRET to be set to a secure non-default value',
+    );
+  }
+  const email = (process.env.ADMIN_EMAIL || '').trim();
+  const pw = (process.env.ADMIN_PASSWORD || '').trim();
+  if (!email || !pw) {
+    throw new Error('NODE_ENV=production requires ADMIN_EMAIL and ADMIN_PASSWORD to be set');
+  }
+}
+
 const startServer = async () => {
   try {
     // Initialize Firebase Admin
     initializeFirebase();
+
+    assertProductionSecurity();
     
     // 🔥 FIX 12: Validate pricing configuration on startup
     validatePricingConfig();

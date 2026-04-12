@@ -13,7 +13,7 @@ router.post('/logout', verifyFirebaseToken, logout);
 router.post('/fast-login', fastLoginLimiter, fastLoginDeprecated);
 
 // Admin login — email + password (no Firebase token)
-router.post('/admin-login', adminLogin);
+router.post('/admin-login', loginLimiter, adminLogin);
 
 // Agent login — email + password (bcrypt on User.passwordHash)
 router.post('/agent-login', loginLimiter, agentLogin);

@@ -1550,6 +1550,8 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       amount,
     });
 
+    invalidateAdminCaches('overview', 'creators_performance').catch(() => {});
+
     res.status(201).json({
       success: true,
       data: {

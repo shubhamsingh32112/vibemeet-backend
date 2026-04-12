@@ -9,6 +9,7 @@ import {
 } from '../../config/redis';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getIO } from '../../config/socket';
+import { emitToAdmin } from '../admin/admin.gateway';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { AdminActionLog } from '../admin/admin-action-log.model';
 
@@ -180,6 +181,10 @@ export async function processWithdrawalApproval(
   }
 
   await invalidateAdminCaches('overview', 'coins', 'creators_performance');
+  emitToAdmin('withdrawal:updated', {
+    withdrawalId: withdrawal._id.toString(),
+    status: 'approved',
+  });
 
   return {
     ok: true,
@@ -234,6 +239,12 @@ export async function processWithdrawalRejection(
     creatorUserId: withdrawal.creatorUserId?.toString() || (withdrawal as { creatorFirebaseUid?: string }).creatorFirebaseUid || 'unknown',
     amount: withdrawal.amount,
     actorRole: actingUser.role,
+  });
+
+  await invalidateAdminCaches('overview', 'coins', 'creators_performance');
+  emitToAdmin('withdrawal:updated', {
+    withdrawalId: withdrawal._id.toString(),
+    status: 'rejected',
   });
 
   return {
@@ -303,6 +314,10 @@ export async function processWithdrawalMarkPaid(
   });
 
   await invalidateAdminCaches('overview', 'coins', 'creators_performance');
+  emitToAdmin('withdrawal:updated', {
+    withdrawalId: withdrawal._id.toString(),
+    status: 'paid',
+  });
 
   return {
     ok: true,

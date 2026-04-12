@@ -8,6 +8,7 @@ import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assignReferralCodeToUser } from '../user/referral.service';
 import { assertAdmin } from '../../middlewares/staff.middleware';
+import { invalidateAdminCaches } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 
 const BCRYPT_ROUNDS = 12;
@@ -53,6 +54,8 @@ export const createAgent = async (req: Request, res: Response): Promise<void> =>
     await assignReferralCodeToUser(agent);
 
     logInfo('Admin created agent', { agentId: agent._id.toString(), email });
+
+    invalidateAdminCaches('overview', 'users_analytics').catch(() => {});
 
     res.status(201).json({
       success: true,
@@ -135,6 +138,32 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
     });
   } catch (error) {
     logError('listAgents error', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Minimal agent list for filters (e.g. user analytics referrer dropdown) — no aggregates. */
+export const listAgentsBrief = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const agents = await User.find({ role: 'agent' })
+      .sort({ email: 1 })
+      .select('_id email displayName')
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        agents: agents.map((a) => ({
+          id: a._id.toString(),
+          email: a.email,
+          displayName: a.displayName ?? null,
+        })),
+      },
+    });
+  } catch (error) {
+    logError('listAgentsBrief error', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -273,6 +302,8 @@ export const patchAgent = async (req: Request, res: Response): Promise<void> => 
     }
 
     await agent.save();
+
+    invalidateAdminCaches('overview', 'users_analytics', 'creators_performance').catch(() => {});
 
     res.json({
       success: true,
