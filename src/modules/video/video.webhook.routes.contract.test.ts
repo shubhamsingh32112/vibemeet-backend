@@ -3,11 +3,8 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('video routes must not import legacy webhook billing', () => {
   const p = join(__dirname, 'video.routes.ts');

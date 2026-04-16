@@ -163,11 +163,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           user.age = existingDefaults.age;
           profileBackfilled = true;
         }
-        if (!user.username || user.username.trim().isEmpty) {
+        if (!user.username || user.username.trim().length === 0) {
           user.username = existingDefaults.username;
           profileBackfilled = true;
         }
-        if (!user.avatar || user.avatar.trim().isEmpty) {
+        if (!user.avatar || user.avatar.trim().length === 0) {
           user.avatar = existingDefaults.avatar;
           profileBackfilled = true;
         }

@@ -7,13 +7,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   CREATOR_PROMOTION_BONUS_REVERSAL_COINS,
   creatorPromotionBonusReversalTransactionId,
 } from './creator-starter.service';
-
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('creator promotion bonus reversal amount is fixed to 30', () => {
   assert.equal(CREATOR_PROMOTION_BONUS_REVERSAL_COINS, 30);
