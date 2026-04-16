@@ -1,10 +1,36 @@
 import type { ClientSession } from 'mongoose';
 import type { IUser } from '../user/user.model';
 import { Creator, type ICreator } from './creator.model';
+import { CoinTransaction } from '../user/coin-transaction.model';
 
 export const STARTER_CREATOR_ABOUT =
   'Complete your creator profile in the app to start connecting with fans.';
 export const DEFAULT_CREATOR_STARTER_PRICE = 60;
+export const CREATOR_PROMOTION_BONUS_REVERSAL_COINS = 30;
+
+export function creatorPromotionBonusReversalTransactionId(userId: string): string {
+  return `creator_promotion_bonus_reversal_${userId}`;
+}
+
+export async function ensureCreatorPromotionBonusReversalEntry(
+  user: IUser,
+  session?: ClientSession
+): Promise<void> {
+  await CoinTransaction.updateOne(
+    { transactionId: creatorPromotionBonusReversalTransactionId(user._id.toString()) },
+    {
+      $setOnInsert: {
+        userId: user._id,
+        type: 'debit',
+        coins: CREATOR_PROMOTION_BONUS_REVERSAL_COINS,
+        source: 'admin',
+        description: 'Welcome bonus reversal on creator promotion (-30 coins)',
+        status: 'completed',
+      },
+    },
+    { upsert: true, session }
+  );
+}
 
 export function starterCreatorDisplayName(user: IUser): string {
   const raw =
@@ -40,6 +66,7 @@ export async function promoteUserToCreatorWithStarterProfile(
   user.coins = 0;
   user.role = 'creator';
   await user.save({ session });
+  await ensureCreatorPromotionBonusReversalEntry(user, session);
 
   if (previousCoins > 0) {
     // eslint-disable-next-line no-console

@@ -11,11 +11,13 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
-import { isRedisConfigured } from './config/redis';
+import { isRedisConfigured, getRedis, metricsKey } from './config/redis';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
 import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
+import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
+import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
 import { startReconciliationJob, stopReconciliationJob } from './modules/billing/billing-reconciliation';
 import { verifyStartupRecovery } from './modules/billing/billing-recovery';
 import { setupAdminGateway } from './modules/admin/admin.gateway';
@@ -31,11 +33,14 @@ import { logRateLimitConfig } from './utils/rate-limit.service';
 import { requestQueueMiddleware, getRequestQueueStats } from './middlewares/request-queue.middleware';
 import { mongoPoolMonitor } from './utils/mongo-pool-monitor';
 import { getDriverMetrics } from './utils/driver-metrics';
-import { monitoring, recordAPIMetric } from './utils/monitoring';
+import { monitoring, recordAPIMetric, recordSystemMetric } from './utils/monitoring';
+import { setLatestEventLoopLagMs } from './utils/runtime-signals';
 import mongoose from 'mongoose';
+import { performance } from 'perf_hooks';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+let eventLoopProbe: NodeJS.Timeout | null = null;
 
 // One hop (Railway, Heroku, Fly, nginx ingress, etc.) sets X-Forwarded-For.
 // Required so express-rate-limit can read client IPs without throwing
@@ -170,7 +175,7 @@ app.use('/api/', (_req, res, next) => {
 });
 
 // Metrics endpoint — set METRICS_TOKEN and send header X-Metrics-Token to access
-app.get('/metrics', (req, res) => {
+app.get('/metrics', async (req, res) => {
   try {
     const metricsToken = (process.env.METRICS_TOKEN || '').trim();
     if (metricsToken) {
@@ -183,7 +188,139 @@ app.get('/metrics', (req, res) => {
     const mongoStats = mongoPoolMonitor.getStats();
     const queueStats = getRequestQueueStats();
     const driver = getDriverMetrics();
-    const apiSummary = monitoring.getMetricsSummary().byName['api.latency_ms'];
+    const metricsSummary = monitoring.getMetricsSummary();
+    const byName = metricsSummary.byName;
+    const apiSummary = byName['api.latency_ms'];
+    const forceTerminateRequested = byName['billing.force_terminate_requested']?.sum ?? 0;
+    const forceTerminateFailed = byName['billing.force_terminate_stream_failed']?.sum ?? 0;
+    const forceTerminateFailureRate =
+      forceTerminateRequested > 0 ? forceTerminateFailed / forceTerminateRequested : 0;
+    const bullLagAvgMs = byName['billing.bullmq_queue_lag_ms']?.avg ?? 0;
+    const eventLoopLag = byName['system.event_loop_lag_ms'];
+    const tickDrift = byName['billing.tick_drift_ms'];
+    const settlementTotal = byName['billing.settlement_total_ms'];
+    const backpressureStage = byName['billing.backpressure_stage'];
+    const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
+    const reconRunMsAvg = byName['billing.reconciliation_run_ms']?.avg ?? 0;
+    const reconItemsAvg = byName['billing.reconciliation_items_processed']?.avg ?? 0;
+    const now = Date.now();
+    const rollingWindowMs = 5 * 60 * 1000;
+    const fromTs = now - rollingWindowMs;
+    const rollingSampleLimit = 2000;
+    const metricsAlerts: string[] = [];
+
+    let rollingForceTerminateRequested = 0;
+    let rollingForceTerminateFailed = 0;
+    let rollingForceTerminateFailureRate = 0;
+    let rollingBullLagAvgMs = 0;
+    let rollingReconRunAvgMs = 0;
+    let rollingRedisOpsPerSec = 0;
+    let rollingRedisPipelineSuccess = 0;
+    let rollingRedisPipelineFailure = 0;
+    let rollingRedisPipelineFailureRate = 0;
+
+    if (isRedisConfigured()) {
+      const redis = getRedis();
+      const [requested5m, failed5m] = await Promise.all([
+        redis.zcount(metricsKey('billing.force_terminate_requested'), fromTs, now),
+        redis.zcount(metricsKey('billing.force_terminate_stream_failed'), fromTs, now),
+      ]);
+      rollingForceTerminateRequested = Number(requested5m || 0);
+      rollingForceTerminateFailed = Number(failed5m || 0);
+      rollingForceTerminateFailureRate =
+        rollingForceTerminateRequested > 0
+          ? rollingForceTerminateFailed / rollingForceTerminateRequested
+          : 0;
+
+      const [lagSampleRaw, reconSampleRaw, redisOpsRaw, pipelineSuccess5m, pipelineFailure5m] = await Promise.all([
+        redis.zrevrangebyscore(
+          metricsKey('billing.bullmq_queue_lag_ms'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('billing.reconciliation_run_ms'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('billing.redis_ops'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zcount(metricsKey('billing.redis_pipeline_success'), fromTs, now),
+        redis.zcount(metricsKey('billing.redis_pipeline_failure'), fromTs, now),
+      ]);
+
+      const parseMetricSampleStats = (raw: string[]): { avg: number; sum: number; count: number } => {
+        if (!raw || raw.length === 0) return { avg: 0, sum: 0, count: 0 };
+        let sum = 0;
+        let count = 0;
+        for (const item of raw) {
+          try {
+            const parsed = JSON.parse(item) as { value?: number };
+            const v = Number(parsed.value);
+            if (Number.isFinite(v)) {
+              sum += v;
+              count += 1;
+            }
+          } catch {
+            // ignore malformed sample
+          }
+        }
+        return {
+          avg: count > 0 ? sum / count : 0,
+          sum,
+          count,
+        };
+      };
+
+      const lagStats = parseMetricSampleStats(lagSampleRaw);
+      const reconStats = parseMetricSampleStats(reconSampleRaw);
+      const redisOpsStats = parseMetricSampleStats(redisOpsRaw);
+      rollingBullLagAvgMs = lagStats.avg;
+      rollingReconRunAvgMs = reconStats.avg;
+      rollingRedisOpsPerSec = redisOpsStats.sum / (rollingWindowMs / 1000);
+      rollingRedisPipelineSuccess = Number(pipelineSuccess5m || 0);
+      rollingRedisPipelineFailure = Number(pipelineFailure5m || 0);
+      const totalPipelines = rollingRedisPipelineSuccess + rollingRedisPipelineFailure;
+      rollingRedisPipelineFailureRate =
+        totalPipelines > 0 ? rollingRedisPipelineFailure / totalPipelines : 0;
+    }
+
+    if (rollingForceTerminateRequested > 0 && rollingForceTerminateFailureRate > 0.02) {
+      metricsAlerts.push('billing_force_termination_failure_rate_high_5m');
+    }
+    if (rollingBullLagAvgMs > 5000) {
+      metricsAlerts.push('bullmq_queue_lag_high_5m');
+    }
+    if ((eventLoopLag?.p95 ?? 0) > 50) {
+      metricsAlerts.push('event_loop_lag_p95_high');
+    }
+    if ((tickDrift?.p95 ?? 0) > 100 || (tickDrift?.p99 ?? 0) > 300) {
+      metricsAlerts.push('billing_tick_drift_high');
+    }
+    if ((settlementTotal?.p95 ?? 0) > 5000) {
+      metricsAlerts.push('billing_settlement_p95_high');
+    }
+    if ((creatorStatusPropagation?.p95 ?? 0) > 500) {
+      metricsAlerts.push('creator_status_propagation_high');
+    }
+    if (rollingRedisPipelineFailureRate > 0.02) {
+      metricsAlerts.push('billing_redis_pipeline_failure_rate_high_5m');
+    }
+    if (rollingReconRunAvgMs > 0 && rollingReconRunAvgMs > 0.8 * 5 * 60 * 1000) {
+      metricsAlerts.push('billing_reconciliation_runtime_high_5m');
+    }
     res.status(200).json({
       mongo: {
         activeConnections: mongoStats.checkedOut,
@@ -209,7 +346,91 @@ app.get('/metrics', (req, res) => {
               avgMs: Math.round((apiSummary.sum / apiSummary.count) * 100) / 100,
             }
           : null,
-        http5xxSamples: monitoring.getMetricsSummary().byName['api.http_5xx']?.count ?? 0,
+        http5xxSamples: byName['api.http_5xx']?.count ?? 0,
+      },
+      billing: {
+        backpressure: {
+          currentStage: Math.round(backpressureStage?.max ?? 0),
+        },
+        tickDriftMs: tickDrift
+          ? {
+              samples: tickDrift.count,
+              avgMs: Math.round(tickDrift.avg * 100) / 100,
+              p95Ms: Math.round(tickDrift.p95 * 100) / 100,
+              p99Ms: Math.round(tickDrift.p99 * 100) / 100,
+              maxMs: Math.round(tickDrift.max * 100) / 100,
+            }
+          : null,
+        settlementTotalMs: settlementTotal
+          ? {
+              samples: settlementTotal.count,
+              avgMs: Math.round(settlementTotal.avg * 100) / 100,
+              p95Ms: Math.round(settlementTotal.p95 * 100) / 100,
+              p99Ms: Math.round(settlementTotal.p99 * 100) / 100,
+              maxMs: Math.round(settlementTotal.max * 100) / 100,
+            }
+          : null,
+        forceTermination: {
+          requested: forceTerminateRequested,
+          streamFailures: forceTerminateFailed,
+          failureRate: Math.round(forceTerminateFailureRate * 10000) / 10000,
+          rolling5m: {
+            requested: rollingForceTerminateRequested,
+            streamFailures: rollingForceTerminateFailed,
+            failureRate:
+              Math.round(rollingForceTerminateFailureRate * 10000) / 10000,
+          },
+        },
+        bullmq: {
+          queueLagAvgMs: Math.round(bullLagAvgMs * 100) / 100,
+          queueLagSamples: byName['billing.bullmq_queue_lag_ms']?.count ?? 0,
+          rolling5m: {
+            queueLagAvgMs: Math.round(rollingBullLagAvgMs * 100) / 100,
+            sampleLimit: rollingSampleLimit,
+          },
+        },
+        redis: {
+          opsPerSecRolling5m: Math.round(rollingRedisOpsPerSec * 100) / 100,
+          pipelineRolling5m: {
+            success: rollingRedisPipelineSuccess,
+            failure: rollingRedisPipelineFailure,
+            failureRate: Math.round(rollingRedisPipelineFailureRate * 10000) / 10000,
+          },
+        },
+        reconciliation: {
+          runAvgMs: Math.round(reconRunMsAvg * 100) / 100,
+          runSamples: byName['billing.reconciliation_run_ms']?.count ?? 0,
+          itemsAvg: Math.round(reconItemsAvg * 100) / 100,
+          rolling5m: {
+            runAvgMs: Math.round(rollingReconRunAvgMs * 100) / 100,
+            sampleLimit: rollingSampleLimit,
+          },
+        },
+      },
+      runtime: {
+        eventLoopLagMs: eventLoopLag
+          ? {
+              samples: eventLoopLag.count,
+              avgMs: Math.round(eventLoopLag.avg * 100) / 100,
+              p95Ms: Math.round(eventLoopLag.p95 * 100) / 100,
+              p99Ms: Math.round(eventLoopLag.p99 * 100) / 100,
+              maxMs: Math.round(eventLoopLag.max * 100) / 100,
+            }
+          : null,
+      },
+      presence: {
+        creatorStatusPropagationMs: creatorStatusPropagation
+          ? {
+              samples: creatorStatusPropagation.count,
+              avgMs: Math.round(creatorStatusPropagation.avg * 100) / 100,
+              p95Ms: Math.round(creatorStatusPropagation.p95 * 100) / 100,
+              p99Ms: Math.round(creatorStatusPropagation.p99 * 100) / 100,
+              maxMs: Math.round(creatorStatusPropagation.max * 100) / 100,
+            }
+          : null,
+      },
+      alerts: {
+        active: metricsAlerts,
       },
       timestamp: new Date().toISOString(),
     });
@@ -360,6 +581,22 @@ const startServer = async () => {
     
     // 🔥 FIX 12: Validate pricing configuration on startup
     validatePricingConfig();
+    if (!eventLoopProbe) {
+      eventLoopProbe = setInterval(() => {
+        const startedAt = performance.now();
+        setImmediate(() => {
+          const lagMs = Math.max(0, performance.now() - startedAt);
+          setLatestEventLoopLagMs(lagMs);
+          recordSystemMetric('event_loop_lag_ms', lagMs);
+        });
+      }, 1000);
+    }
+
+    if (process.env.NODE_ENV === 'production' && !isBullmqBillingEnabled()) {
+      logWarning('Production is running without BILLING_DRIVER=bullmq; scale may be limited', {
+        billingDriver: process.env.BILLING_DRIVER || 'zset',
+      });
+    }
     
     // 🔥 FIX 40: Log rate limiting configuration on startup
     logRateLimitConfig();
@@ -460,6 +697,7 @@ const startServer = async () => {
     
     // 🔥 FIX: Start global billing batch processor (replaces per-call polling)
     startGlobalBillingProcessor(io);
+    startTerminationRetryWorker();
     // 🔥 FIX 5: Start reconciliation job for error recovery
     startReconciliationJob(io);
     logInfo('Global billing batch processor started');
@@ -590,6 +828,10 @@ process.on('uncaughtException', async (error) => {
   await cleanupBillingIntervals().catch(() => {});
   stopReconciliationJob();
   stopCallReconciliationJob();
+  if (eventLoopProbe) {
+    clearInterval(eventLoopProbe);
+    eventLoopProbe = null;
+  }
   process.exit(1);
 });
 
@@ -598,6 +840,10 @@ process.on('SIGTERM', async () => {
   await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
+  if (eventLoopProbe) {
+    clearInterval(eventLoopProbe);
+    eventLoopProbe = null;
+  }
   process.exit(0);
 });
 
@@ -606,6 +852,10 @@ process.on('SIGINT', async () => {
   await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
+  if (eventLoopProbe) {
+    clearInterval(eventLoopProbe);
+    eventLoopProbe = null;
+  }
   process.exit(0);
 });
 

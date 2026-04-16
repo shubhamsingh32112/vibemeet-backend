@@ -6,15 +6,149 @@
  */
 
 import { Server } from 'socket.io';
-import { getRedis, DLQ_BILLING_PREFIX, RECONCILIATION_LAST_RUN_KEY, RECONCILIATION_INTERVAL_MS, ACTIVE_BILLING_CALLS_KEY, callSessionKey } from '../../config/redis';
+import { randomUUID } from 'crypto';
+import {
+  getRedis,
+  DLQ_BILLING_PREFIX,
+  BILLING_DLQ_SSCAN_CURSOR_KEY,
+  RECONCILIATION_LAST_RUN_KEY,
+  RECONCILIATION_INTERVAL_MS,
+  ACTIVE_BILLING_CALLS_KEY,
+  callSessionKey,
+  BILLING_RECONCILIATION_LOCK_KEY,
+  RECONCILIATION_LOCK_TTL_MS,
+  CALL_SESSION_PREFIX,
+} from '../../config/redis';
 import { billingService } from './billing.service';
 import { settleCall } from './billing-settlement.service';
-import { isBullmqBillingEnabled } from './billing.queue';
+import {
+  isBullmqBillingEnabled,
+  scheduleNextBillingCycleAfterTickOk,
+  needsBillingCycleReschedule,
+  scheduleBillingJob,
+} from './billing.queue';
+import { processTerminationRedisRetries } from './billing-termination-redis-retry';
 import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
 import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;
+const RELEASE_LOCK_LUA = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`;
+
+function readNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const n = parseInt(raw || '', 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+const DLQ_BATCH_SIZE = readNumber(process.env.BILLING_RECON_DLQ_BATCH_SIZE, 200, 20, 1000);
+const DLQ_PARALLELISM = readNumber(process.env.BILLING_RECON_DLQ_PARALLELISM, 8, 1, 50);
+const DLQ_BATCH_PAUSE_MS = readNumber(process.env.BILLING_RECON_DLQ_BATCH_PAUSE_MS, 120, 0, 1000);
+const DLQ_SCAN_COUNT = readNumber(process.env.BILLING_RECON_DLQ_SCAN_COUNT, 200, 20, 1000);
+const DLQ_SCAN_MAX_MS = readNumber(process.env.BILLING_RECON_DLQ_SCAN_MAX_MS, 200, 50, 3000);
+const STALE_BATCH_SIZE = readNumber(process.env.BILLING_RECON_STALE_BATCH_SIZE, 40, 10, 200);
+const STALE_PARALLELISM = readNumber(process.env.BILLING_RECON_STALE_PARALLELISM, 5, 1, 20);
+const RUN_BUDGET_MS = readNumber(process.env.BILLING_RECON_MAX_RUN_MS, 45_000, 10_000, 180_000);
+const BULLMQ_STALE_BATCH_SIZE = readNumber(process.env.BILLING_BULLMQ_STALE_BATCH_SIZE, 40, 10, 200);
+const BULLMQ_STALE_SCAN_COUNT = readNumber(process.env.BILLING_BULLMQ_STALE_SCAN_COUNT, 200, 50, 1000);
+const BULLMQ_STALE_MAX_KEYS = readNumber(process.env.BILLING_BULLMQ_STALE_MAX_KEYS, 600, 100, 5000);
+const BULLMQ_STALE_PARALLELISM = readNumber(process.env.BILLING_BULLMQ_STALE_PARALLELISM, 5, 1, 20);
+
+function isBullmqStaleWatchdogEnabled(): boolean {
+  return process.env.BILLING_BULLMQ_STALE_WATCHDOG_ENABLED !== 'false';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function releaseLock(lockKey: string, token: string): Promise<void> {
+  const redis = getRedis();
+  try {
+    await redis.eval(RELEASE_LOCK_LUA, 1, lockKey, token);
+  } catch {
+    // ignore lock release failures
+  }
+}
+
+async function withBillingReconciliationLock(task: () => Promise<void>): Promise<void> {
+  const redis = getRedis();
+  const token = randomUUID();
+  const lockResult = await redis.set(
+    BILLING_RECONCILIATION_LOCK_KEY,
+    token,
+    'PX',
+    RECONCILIATION_LOCK_TTL_MS,
+    'NX'
+  );
+  if (lockResult !== 'OK') {
+    recordBillingMetric('reconciliation_skipped_lock_busy', 1, {});
+    return;
+  }
+
+  const heartbeat = setInterval(() => {
+    redis
+      .set(BILLING_RECONCILIATION_LOCK_KEY, token, 'PX', RECONCILIATION_LOCK_TTL_MS, 'XX')
+      .catch(() => {});
+  }, Math.max(1000, Math.floor(RECONCILIATION_LOCK_TTL_MS / 3)));
+
+  try {
+    await task();
+  } finally {
+    clearInterval(heartbeat);
+    await releaseLock(BILLING_RECONCILIATION_LOCK_KEY, token);
+  }
+}
+
+async function processInParallel<T>(
+  items: T[],
+  parallelism: number,
+  handler: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  for (let i = 0; i < items.length; i += parallelism) {
+    const chunk = items.slice(i, i + parallelism);
+    await Promise.allSettled(chunk.map((item) => handler(item)));
+  }
+}
+
+async function getDlqBatch(
+  redis: ReturnType<typeof getRedis>,
+  dlqSetKey: string,
+  maxItems: number
+): Promise<string[]> {
+  const items: string[] = [];
+  let cursor = (await redis.get(BILLING_DLQ_SSCAN_CURSOR_KEY)) || '0';
+  const startedAt = Date.now();
+
+  do {
+    const [nextCursor, members] = await redis.sscan(dlqSetKey, cursor, 'COUNT', DLQ_SCAN_COUNT);
+    if (nextCursor === '0') {
+      recordBillingMetric('dlq_sscan_cursor_full_pass', 1, {});
+    }
+    cursor = nextCursor;
+    await redis.set(BILLING_DLQ_SSCAN_CURSOR_KEY, cursor).catch(() => {});
+    for (const member of members) {
+      items.push(member);
+      if (items.length >= maxItems) {
+        return items;
+      }
+    }
+    if (Date.now() - startedAt > DLQ_SCAN_MAX_MS) {
+      recordBillingMetric('dlq_scan_runtime_capped', 1, {
+        maxMs: String(DLQ_SCAN_MAX_MS),
+      });
+      break;
+    }
+  } while (cursor !== '0');
+
+  return items;
+}
 
 /**
  * Start the reconciliation job
@@ -31,11 +165,15 @@ export function startReconciliationJob(io: Server): void {
   });
 
   const run = (): void => {
-    processDLQ(io).catch((err) => {
+    withBillingReconciliationLock(async () => {
+      const startedAt = Date.now();
+      await processDLQ(io, startedAt);
+      await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
+      await runBullmqBillingWatchdog(startedAt);
+      await runStaleBillingWatchdog(io, startedAt);
+      recordBillingMetric('reconciliation_run_ms', Date.now() - startedAt, {});
+    }).catch((err) => {
       logError('Error in reconciliation run', err);
-    });
-    runStaleBillingWatchdog(io).catch((err) => {
-      logError('Error in stale billing watchdog', err);
     });
   };
 
@@ -44,8 +182,73 @@ export function startReconciliationJob(io: Server): void {
   reconciliationInterval = setInterval(run, RECONCILIATION_INTERVAL_MS);
 }
 
+/**
+ * BullMQ: re-enqueue lost delayed jobs (no ZSET mirror). Bounded SCAN of session keys.
+ */
+async function runBullmqBillingWatchdog(startedAt: number): Promise<void> {
+  if (!isBullmqBillingEnabled() || !isBullmqStaleWatchdogEnabled()) {
+    return;
+  }
+  const redis = getRedis();
+  const seen = new Set<string>();
+  let cursor = '0';
+
+  do {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) {
+      logWarning('Stopping BullMQ stale watchdog scan early due to runtime budget', {
+        elapsedMs: Date.now() - startedAt,
+        budgetMs: RUN_BUDGET_MS,
+      });
+      break;
+    }
+    const scanResult = await redis.scan(
+      cursor,
+      'MATCH',
+      `${CALL_SESSION_PREFIX}*`,
+      'COUNT',
+      BULLMQ_STALE_SCAN_COUNT
+    );
+    cursor = scanResult[0];
+    const keys = scanResult[1] || [];
+    for (const key of keys) {
+      const callId = key.replace(CALL_SESSION_PREFIX, '');
+      if (callId) seen.add(callId);
+      if (seen.size >= BULLMQ_STALE_MAX_KEYS) break;
+    }
+  } while (cursor !== '0' && seen.size < BULLMQ_STALE_MAX_KEYS);
+
+  const allIds = Array.from(seen);
+  recordBillingMetric('billing_bullmq_watchdog_scanned', allIds.length, {});
+  const callIds = allIds.slice(0, BULLMQ_STALE_BATCH_SIZE);
+  if (callIds.length === 0) return;
+
+  let rescheduled = 0;
+  await processInParallel(callIds, BULLMQ_STALE_PARALLELISM, async (callId) => {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) {
+      return;
+    }
+    try {
+      const sessionRaw = await redis.get(callSessionKey(callId));
+      if (!sessionRaw) return;
+      const needs = await needsBillingCycleReschedule(callId);
+      if (!needs) return;
+      await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
+      rescheduled++;
+      recordBillingMetric('billing_bullmq_stale_rescheduled', 1, { callId });
+    } catch (e) {
+      logError('BullMQ stale watchdog reschedule failed', e, { callId });
+    }
+  });
+  if (rescheduled > 0) {
+    logWarning('BullMQ stale watchdog rescheduled missing cycle jobs', {
+      rescheduled,
+      batchSize: callIds.length,
+    });
+  }
+}
+
 /** ZSET-only: recover calls whose next-process score is far in the past (stuck scheduler). */
-async function runStaleBillingWatchdog(io: Server): Promise<void> {
+async function runStaleBillingWatchdog(io: Server, startedAt: number): Promise<void> {
   if (isBullmqBillingEnabled()) {
     return;
   }
@@ -53,15 +256,37 @@ async function runStaleBillingWatchdog(io: Server): Promise<void> {
   const STALE_AFTER_MS = 120_000;
   const now = Date.now();
   const maxScore = now - STALE_AFTER_MS;
-  const stale = await redis.zrangebyscore(ACTIVE_BILLING_CALLS_KEY, 0, maxScore, 'LIMIT', 0, 40);
+  const stale = await redis.zrangebyscore(
+    ACTIVE_BILLING_CALLS_KEY,
+    0,
+    maxScore,
+    'LIMIT',
+    0,
+    STALE_BATCH_SIZE
+  );
   const callIds: string[] = Array.isArray(stale) ? stale : [];
   if (callIds.length === 0) return;
 
   logWarning('Stale billing schedules detected', { count: callIds.length });
 
-  for (const callId of callIds) {
+  await processInParallel(callIds, STALE_PARALLELISM, async (callId) => {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) {
+      return;
+    }
     try {
       const r = await billingService.processBillingTick(io, callId);
+      if (r === 'tick_ok') {
+        const sessionRaw = await redis.get(callSessionKey(callId));
+        if (sessionRaw) {
+          try {
+            const sess = JSON.parse(sessionRaw as string) as { lastProcessedAt?: number };
+            const lp = Number(sess.lastProcessedAt) || Date.now();
+            await redis.zadd(ACTIVE_BILLING_CALLS_KEY, lp + BILLING_PROCESS_INTERVAL_MS, callId);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       if (r === 'stop_needs_settlement') {
         await settleCall(io, callId).catch((e) => logError('Watchdog settleCall failed', e, { callId }));
       }
@@ -69,7 +294,7 @@ async function runStaleBillingWatchdog(io: Server): Promise<void> {
     } catch (e) {
       logError('Watchdog billing cycle failed', e, { callId });
     }
-  }
+  });
 }
 
 /**
@@ -86,14 +311,12 @@ export function stopReconciliationJob(): void {
 /**
  * Process dead letter queue items
  */
-async function processDLQ(io: Server): Promise<void> {
+async function processDLQ(io: Server, startedAt: number): Promise<void> {
   const redis = getRedis();
   const startTime = Date.now();
 
   // 🔥 FIX (Critique #7): Process DLQ in bounded batches to avoid O(n) scans
   // even if the set grows very large over time.
-  const MAX_DLQ_BATCH = 200;
-
   try {
     // Update last run timestamp
     await redis.set(RECONCILIATION_LAST_RUN_KEY, startTime.toString());
@@ -102,35 +325,48 @@ async function processDLQ(io: Server): Promise<void> {
     // Note: Railway Redis supports KEYS but it's expensive, so we use a set for efficient retrieval
     const dlqSetKey = `${DLQ_BILLING_PREFIX}set`;
 
-    // Get a bounded batch of DLQ items from the set
-    const allItems = await redis.smembers(dlqSetKey);
+    const dlqFetchStartedAt = Date.now();
+    const dlqItems = await getDlqBatch(redis, dlqSetKey, DLQ_BATCH_SIZE);
+    const dlqFetchMs = Date.now() - dlqFetchStartedAt;
+    recordBillingMetric('dlq_batch_fetch_ms', dlqFetchMs, {});
+    recordBillingMetric('dlq_batch_fetched_items', dlqItems.length, {});
 
-    if (!allItems || allItems.length === 0) {
+    if (!dlqItems || dlqItems.length === 0) {
       logInfo('No items in DLQ to process', {});
       return;
     }
 
-    const dlqItems = allItems.slice(0, MAX_DLQ_BATCH);
-
     logInfo('Processing DLQ items', {
       count: dlqItems.length,
-      total: allItems.length,
-      maxBatch: MAX_DLQ_BATCH,
+      scanCountHint: DLQ_SCAN_COUNT,
+      maxBatch: DLQ_BATCH_SIZE,
+      fetchMs: dlqFetchMs,
     });
 
     let processed = 0;
     let retried = 0;
     let failed = 0;
 
-    // Process each DLQ item
-    for (const dlqKey of dlqItems) {
+    for (let i = 0; i < dlqItems.length; i += DLQ_PARALLELISM) {
+      if (Date.now() - startedAt > RUN_BUDGET_MS) {
+        logWarning('Stopping DLQ reconciliation early due to runtime budget', {
+          elapsedMs: Date.now() - startedAt,
+          budgetMs: RUN_BUDGET_MS,
+        });
+        break;
+      }
+
+      const batch = dlqItems.slice(i, i + DLQ_PARALLELISM);
+      await Promise.allSettled(
+        batch.map(async (dlqKey) => {
       try {
         // Get error details
         const errorDetailsRaw = await redis.get(dlqKey);
         if (!errorDetailsRaw) {
           // Item expired or already processed, remove from set
           await redis.srem(dlqSetKey, dlqKey);
-          continue;
+          processed++;
+          return;
         }
 
         const errorDetails = JSON.parse(errorDetailsRaw);
@@ -153,13 +389,20 @@ async function processDLQ(io: Server): Promise<void> {
           processed++;
           logInfo('Removed ended call from DLQ', { callId });
           recordBillingMetric('dlq_ended_call_removed', 1, { callId });
-          continue;
+          return;
         }
         
         const tickResult = await billingService.processBillingTick(io, callId);
 
         if (tickResult === 'tick_ok') {
-          if (!isBullmqBillingEnabled()) {
+          if (isBullmqBillingEnabled()) {
+            const sessionStillThere = await redis.get(callSessionKey(callId));
+            if (sessionStillThere) {
+              await scheduleNextBillingCycleAfterTickOk(callId, 0).catch((e) =>
+                logError('DLQ: schedule next BullMQ cycle failed', e, { callId })
+              );
+            }
+          } else {
             const sessionRaw = await redis.get(callSessionKey(callId));
             if (sessionRaw) {
               try {
@@ -180,6 +423,7 @@ async function processDLQ(io: Server): Promise<void> {
             redis.srem(dlqSetKey, dlqKey),
           ]);
           retried++;
+          processed++;
           logInfo('Successfully retried billing tick from DLQ', { callId });
         } else if (tickResult === 'stop_needs_settlement') {
           await settleCall(io, callId).catch((e) =>
@@ -207,14 +451,18 @@ async function processDLQ(io: Server): Promise<void> {
             recordBillingMetric('dlq_ended_call_removed', 1, { callId });
           } else {
             failed++;
+            processed++;
             logWarning('Billing tick still failing after retry', { callId });
           }
         }
-
-        processed++;
       } catch (itemError) {
         logError('Error processing DLQ item', itemError, { dlqKey });
         failed++;
+      }
+        })
+      );
+      if (DLQ_BATCH_PAUSE_MS > 0 && i + DLQ_PARALLELISM < dlqItems.length) {
+        await sleep(DLQ_BATCH_PAUSE_MS);
       }
     }
 
@@ -230,6 +478,10 @@ async function processDLQ(io: Server): Promise<void> {
       processed: processed.toString(),
       retried: retried.toString(),
       failed: failed.toString(),
+    });
+    recordBillingMetric('reconciliation_items_processed', processed, {
+      retried: String(retried),
+      failed: String(failed),
     });
   } catch (error) {
     logError('Error in reconciliation job', error);

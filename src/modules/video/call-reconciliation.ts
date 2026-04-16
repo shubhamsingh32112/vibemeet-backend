@@ -1,12 +1,18 @@
 import { Server } from 'socket.io';
 import axios from 'axios';
 import mongoose from 'mongoose';
+import { randomUUID } from 'crypto';
 import { Call } from './call.model';
 import { User } from '../user/user.model';
 import { generateServerSideToken } from '../../config/stream-video';
 import { transitionCallStatus } from './call-state.service';
 import { setAvailability, getAvailability } from '../availability/availability.service';
 import { emitCreatorStatus } from '../availability/availability.socket';
+import {
+  getRedis,
+  CALL_RECONCILIATION_LOCK_KEY,
+  RECONCILIATION_LOCK_TTL_MS,
+} from '../../config/redis';
 import { logInfo, logError } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 
@@ -19,6 +25,16 @@ const RECONCILIATION_INTERVAL_MS =
 const RECON_BATCH_SIZE = 100;
 /** Max time per tick to avoid blocking event loop on huge backlogs */
 const RECON_MAX_MS_PER_TICK = 45_000;
+const RECON_PARALLELISM =
+  Math.min(20, Math.max(1, parseInt(process.env.CALL_RECONCILIATION_PARALLELISM || '6', 10))) || 6;
+const RECON_BATCH_PAUSE_MS =
+  Math.min(1000, Math.max(0, parseInt(process.env.CALL_RECONCILIATION_BATCH_PAUSE_MS || '100', 10))) || 100;
+const RELEASE_LOCK_LUA = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`;
 
 /** Limit scanning of ancient unsettled rows (ms). Active ringing/accepted always included. */
 const RECON_UNSETTLED_LOOKBACK_MS =
@@ -78,12 +94,12 @@ export function startCallReconciliationJob(_io: Server): void {
   });
 
   // Fire once on startup
-  reconcileActiveCalls().catch((err) => {
+  reconcileActiveCallsWithLock().catch((err) => {
     logError('Initial call reconciliation failed', err);
   });
 
   reconciliationTimer = setInterval(() => {
-    reconcileActiveCalls().catch((err) => {
+    reconcileActiveCallsWithLock().catch((err) => {
       logError('Scheduled call reconciliation failed', err);
     });
   }, RECONCILIATION_INTERVAL_MS);
@@ -138,6 +154,9 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
 
       scanned += activeCalls.length;
       lastId = activeCalls[activeCalls.length - 1]._id as mongoose.Types.ObjectId;
+      if (RECON_BATCH_PAUSE_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, RECON_BATCH_PAUSE_MS));
+      }
       if (activeCalls.length < RECON_BATCH_SIZE) {
         break;
       }
@@ -149,8 +168,47 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
   }
 }
 
+async function releaseLock(lockKey: string, token: string): Promise<void> {
+  const redis = getRedis();
+  try {
+    await redis.eval(RELEASE_LOCK_LUA, 1, lockKey, token);
+  } catch {
+    // ignore release failure
+  }
+}
+
+async function reconcileActiveCallsWithLock(): Promise<void> {
+  const redis = getRedis();
+  const token = randomUUID();
+  const lockResult = await redis.set(
+    CALL_RECONCILIATION_LOCK_KEY,
+    token,
+    'PX',
+    RECONCILIATION_LOCK_TTL_MS,
+    'NX'
+  );
+  if (lockResult !== 'OK') {
+    recordCallMetric('call_reconciliation.skipped_lock_busy', 1, {});
+    return;
+  }
+
+  const heartbeat = setInterval(() => {
+    redis
+      .set(CALL_RECONCILIATION_LOCK_KEY, token, 'PX', RECONCILIATION_LOCK_TTL_MS, 'XX')
+      .catch(() => {});
+  }, Math.max(1000, Math.floor(RECONCILIATION_LOCK_TTL_MS / 3)));
+
+  try {
+    await reconcileActiveCalls();
+  } finally {
+    clearInterval(heartbeat);
+    await releaseLock(CALL_RECONCILIATION_LOCK_KEY, token);
+  }
+}
+
 async function reconcileActiveCalls(): Promise<void> {
   try {
+    const runStartedAt = Date.now();
     await ensureCreatorsWithActiveCallsAreBusy();
 
     const apiKey = process.env.STREAM_API_KEY;
@@ -185,9 +243,12 @@ async function reconcileActiveCalls(): Promise<void> {
         });
       }
 
-      for (const call of activeCalls) {
-      const callId = call.callId;
-      try {
+      for (let i = 0; i < activeCalls.length; i += RECON_PARALLELISM) {
+        const batch = activeCalls.slice(i, i + RECON_PARALLELISM);
+        await Promise.allSettled(
+          batch.map(async (call) => {
+            const callId = call.callId;
+            try {
         // Query Stream Video for call state
         const url = `${baseUrl}/video/calls/default/${encodeURIComponent(
           callId
@@ -208,7 +269,7 @@ async function reconcileActiveCalls(): Promise<void> {
 
         if (!ended) {
           // Stream still thinks call is active; nothing to do
-          continue;
+          return;
         }
 
         // If Stream says ended but our Call is still not ended/settled, close it
@@ -254,7 +315,11 @@ async function reconcileActiveCalls(): Promise<void> {
         } else {
           logError('Error reconciling call with Stream', err, { callId });
         }
-      }
+      }})
+        );
+        if (RECON_BATCH_PAUSE_MS > 0 && i + RECON_PARALLELISM < activeCalls.length) {
+          await new Promise((resolve) => setTimeout(resolve, RECON_BATCH_PAUSE_MS));
+        }
       }
 
       totalChecked += activeCalls.length;
@@ -265,6 +330,9 @@ async function reconcileActiveCalls(): Promise<void> {
     }
 
     recordCallMetric('call_reconciliation.stream_checked', totalChecked, {});
+    recordCallMetric('call_reconciliation.run_ms', Date.now() - runStartedAt, {
+      checked: String(totalChecked),
+    });
   } catch (err) {
     logError('Call reconciliation job failed', err);
   }

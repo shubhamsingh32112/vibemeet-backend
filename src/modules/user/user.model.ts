@@ -13,6 +13,7 @@ export interface IUser extends Document {
   email?: string;
   phone?: string;
   gender?: 'male' | 'female' | 'other';
+  age?: number;
   username?: string;
   avatar?: string; // e.g., 'a1.png' or 'fa1.png'
   categories?: string[]; // Array of category names
@@ -80,6 +81,12 @@ const userSchema = new Schema<IUser>(
       type: String,
       enum: ['male', 'female', 'other'],
       sparse: true,
+    },
+    age: {
+      type: Number,
+      sparse: true,
+      min: 13,
+      max: 120,
     },
     username: {
       type: String,

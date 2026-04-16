@@ -17,6 +17,42 @@ import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-
 
 /** Max length for optional deviceFingerprint on POST /auth/login (bonus eligibility). */
 const DEVICE_FINGERPRINT_MAX = 256;
+const DEFAULT_NEW_USER_AGE = 26;
+const DEFAULT_NEW_USER_GENDER = 'male' as const;
+const DEFAULT_NEW_USER_AVATAR_URL =
+  'https://firebasestorage.googleapis.com/v0/b/matchvibe-d55f9.firebasestorage.app/o/avatars%2Fpresets%2Fmale%2Fa2.png?alt=media&token=aeb7e524-83f2-492a-a80d-a107374a4fe9';
+const DEFAULT_USER_CATEGORY_POOL = [
+  'Trauma',
+  'Health',
+  'Breakup',
+  'Low confidence',
+  'Loneliness',
+  'Stress',
+  'Work',
+  'Family',
+  'Relationship',
+];
+
+function buildRandomUsername(): string {
+  const suffix = Math.random().toString(36).slice(2, 9);
+  return `u${suffix}`.slice(0, 10);
+}
+
+function pickRandomCategories(): string[] {
+  const shuffled = [...DEFAULT_USER_CATEGORY_POOL].sort(() => Math.random() - 0.5);
+  const count = Math.floor(Math.random() * 3) + 1;
+  return shuffled.slice(0, count);
+}
+
+function buildDefaultFirstLoginProfile() {
+  return {
+    gender: DEFAULT_NEW_USER_GENDER,
+    age: DEFAULT_NEW_USER_AGE,
+    username: buildRandomUsername(),
+    avatar: DEFAULT_NEW_USER_AVATAR_URL,
+    categories: pickRandomCategories(),
+  };
+}
 
 function referralApplyFailure(code: ApplyReferralCodeErrorCode) {
   return {
@@ -53,6 +89,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       // ✅ Create user ONLY here (never in middleware)
       if (!user) {
         logInfo('Creating new user (first login)', { firebaseUid });
+        const firstLoginProfile = buildDefaultFirstLoginProfile();
 
         // Identity-based welcome bonus eligibility — pass ALL identities we know
         // (user may have signed in with Google before, then Fast Login; check all to prevent bypass)
@@ -79,7 +116,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           phone: req.auth.phone,
           email: req.auth.email,
           role: 'user', // Default to 'user' - creators are promoted later via admin or referral
-          categories: [], // onboarding pending
+          gender: firstLoginProfile.gender,
+          age: firstLoginProfile.age,
+          username: firstLoginProfile.username,
+          avatar: firstLoginProfile.avatar,
+          categories: firstLoginProfile.categories,
           coins: 0, // ✅ New users start with 0 coins - 30 coins are added when they accept the welcome bonus popup
           freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
           welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Set to true if phone number previously claimed bonus
@@ -103,19 +144,56 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           firebaseUid,
           initialCoins: 0,
           freeTextUsed: 0,
+          gender: firstLoginProfile.gender,
+          age: firstLoginProfile.age,
+          username: firstLoginProfile.username,
+          categories: firstLoginProfile.categories,
           welcomeBonusClaimed: welcomeBonusClaimed,
         });
     } else {
+      // Keep older users smooth: backfill profile defaults if onboarding fields are missing.
+      const existingDefaults = buildDefaultFirstLoginProfile();
+      let profileBackfilled = false;
+      if (user.role === 'user') {
+        if (!user.gender) {
+          user.gender = existingDefaults.gender;
+          profileBackfilled = true;
+        }
+        if (!Number.isInteger(user.age)) {
+          user.age = existingDefaults.age;
+          profileBackfilled = true;
+        }
+        if (!user.username || user.username.trim().isEmpty) {
+          user.username = existingDefaults.username;
+          profileBackfilled = true;
+        }
+        if (!user.avatar || user.avatar.trim().isEmpty) {
+          user.avatar = existingDefaults.avatar;
+          profileBackfilled = true;
+        }
+        if (!Array.isArray(user.categories) || user.categories.length === 0) {
+          user.categories = existingDefaults.categories;
+          profileBackfilled = true;
+        }
+      }
+
       // Keep user contact info in sync (DB writes are OK here)
-      const needsUpdate =
+      const needsContactUpdate =
         (req.auth.email && user.email !== req.auth.email) ||
         (req.auth.phone && user.phone !== req.auth.phone);
 
-      if (needsUpdate) {
+      if (needsContactUpdate || profileBackfilled) {
         if (req.auth.email) user.email = req.auth.email;
         if (req.auth.phone) user.phone = req.auth.phone;
         await user.save();
-        logDebug('User contact info updated', { userId: user._id.toString() });
+        if (profileBackfilled) {
+          logInfo('Backfilled existing user onboarding defaults', {
+            userId: user._id.toString(),
+            firebaseUid,
+          });
+        } else {
+          logDebug('User contact info updated', { userId: user._id.toString() });
+        }
       }
 
       // Referral: existing account — apply login-time code only when not yet linked (same rules as signup)
@@ -128,7 +206,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           if (!user.referralCode) {
             await assignReferralCodeToUser(user);
           }
-          let working = await User.findOne({ firebaseUid });
+          const working = await User.findOne({ firebaseUid });
           if (working) user = working;
 
           if (!isValidReferralCodeFormat(existingReferralRaw)) {
@@ -216,6 +294,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             email: user.email,
             phone: user.phone,
             gender: user.gender,
+            age: user.age,
             username: user.username,
             avatar: user.avatar,
             categories: user.categories,

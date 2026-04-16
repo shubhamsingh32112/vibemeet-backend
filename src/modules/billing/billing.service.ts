@@ -20,6 +20,7 @@ import {
   DEFAULT_CREATOR_CALL_DURATION_SECONDS,
   DEFAULT_USER_CALL_DURATION_SECONDS,
   CALL_DURATION_WARNING_SECONDS,
+  MIN_COINS_TO_CALL,
 } from '../../config/pricing.config';
 import { recordBillingMetric, monitoring } from '../../utils/monitoring';
 import { logWarning, logInfo, logError } from '../../utils/logger';
@@ -39,10 +40,20 @@ import {
   microsToWholeCoinsFloor,
   getBillingCheckpointIntervalMs,
   getBillingCheckpointMinDeltaMicros,
+  getBillingEmitIntervalMs,
+  getBillingRedisBackpressureMs,
 } from './billing.constants';
 import { upsertBillingCheckpoint } from './billing-checkpoint.service';
+import { forceTerminateCall } from './billing-termination.service';
+import {
+  getEmitIntervalForStage,
+  isNewCallAdmissionBlocked,
+  updateBackpressureStage,
+} from './billing-backpressure';
 
 const CALL_SESSION_TTL = 7200;
+const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
+const FINAL_FLUSH_MARKER_TTL_SECONDS = 24 * 60 * 60;
 
 /** Legacy creator earnings used 1e4 micro-units; convert to COIN_MICROS scale. */
 const LEGACY_EARNINGS_MICRO_FACTOR = 10_000;
@@ -68,6 +79,77 @@ async function releaseBillingCycleLock(
     await redis.eval(RELEASE_BILLING_CYCLE_LOCK_LUA, 1, lockKey, token);
   } catch {
     /* ignore */
+  }
+}
+
+/** One active billed call per user/creator slot — blocks double session balance snapshots. */
+async function tryReserveActiveCallSlots(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<'ok' | 'conflict'> {
+  const userKey = activeCallByUserKey(userFirebaseUid);
+  const creatorKey = activeCallByUserKey(creatorFirebaseUid);
+
+  const u = await redis.set(userKey, callId, 'EX', ACTIVE_CALL_BY_USER_TTL, 'NX');
+  if (u === null) {
+    const existing = await redis.get(userKey);
+    if (existing === callId) return 'ok';
+    return 'conflict';
+  }
+  const c = await redis.set(creatorKey, callId, 'EX', ACTIVE_CALL_BY_USER_TTL, 'NX');
+  if (c === null) {
+    const existing = await redis.get(creatorKey);
+    if (existing === callId) return 'ok';
+    await redis.del(userKey).catch(() => {});
+    return 'conflict';
+  }
+  return 'ok';
+}
+
+async function releaseActiveCallSlotsIfOurs(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<void> {
+  const userKey = activeCallByUserKey(userFirebaseUid);
+  const creatorKey = activeCallByUserKey(creatorFirebaseUid);
+  const [u, c] = await Promise.all([redis.get(userKey), redis.get(creatorKey)]);
+  if (u === callId) await redis.del(userKey).catch(() => {});
+  if (c === callId) await redis.del(creatorKey).catch(() => {});
+}
+
+async function refreshActiveCallSlotsTtl(
+  redis: ReturnType<typeof getRedis>,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<void> {
+  await Promise.all([
+    redis.expire(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL),
+    redis.expire(activeCallByUserKey(creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL),
+  ]);
+}
+
+/** Max flush iterations before settlement (covers worst-case wall lag vs MAX_BILLING_DELTA_MS). */
+export const MAX_SETTLEMENT_FLUSH_ITERATIONS = 50;
+
+export function finalFlushMarkerKey(callId: string): string {
+  return `${FINAL_FLUSH_MARKER_PREFIX}${callId}`;
+}
+
+export async function getBillingWallLagMs(callId: string): Promise<number | null> {
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) return null;
+  try {
+    const parsed = JSON.parse(sessionRaw) as { lastProcessedAt?: number };
+    const lp = Number(parsed.lastProcessedAt);
+    if (!Number.isFinite(lp)) return null;
+    return Math.max(0, Date.now() - lp);
+  } catch {
+    return null;
   }
 }
 
@@ -101,6 +183,10 @@ export interface CallSession {
   /** Totals at last successful checkpoint upsert (micros); for adaptive checkpoint gating */
   lastCheckpointDeductedMicros?: number;
   lastCheckpointEarnedMicros?: number;
+  /** Last server emit timestamp for throttling high-frequency billing:update fanout. */
+  lastEmitAtMs?: number;
+  /** Expected next tick time for drift telemetry. */
+  expectedNextTickAtMs?: number;
   /** @deprecated migrated from v1 */
   pricePerSecond?: number;
   creatorEarningsPerSecond?: number;
@@ -209,6 +295,15 @@ export class BillingService {
     const { callId, creatorFirebaseUid, creatorMongoId } = data;
     const source: BillingSessionStartSource = opts?.source ?? 'unknown';
     const callIdPrefix = callId.length > 16 ? callId.slice(0, 16) : callId;
+    if (isNewCallAdmissionBlocked()) {
+      recordBillingMetric('new_call_admission_rejected', 1, { source, callIdPrefix });
+      io.to(`user:${userFirebaseUid}`).emit('billing:error', {
+        callId,
+        error: 'SYSTEM_BUSY_TRY_AGAIN',
+        message: 'System is under heavy load. Please try starting the call again shortly.',
+      });
+      return;
+    }
 
     const existingSession = await redis.get(callSessionKey(callId));
     if (existingSession) {
@@ -223,6 +318,30 @@ export class BillingService {
       return;
     }
 
+    const slotReserve = await tryReserveActiveCallSlots(
+      redis,
+      callId,
+      userFirebaseUid,
+      creatorFirebaseUid
+    );
+    if (slotReserve === 'conflict') {
+      logWarning('Active call slot conflict — rejecting billing session start', {
+        callId,
+        userFirebaseUid,
+        callIdPrefix,
+      });
+      recordBillingMetric('session_start_active_slot_conflict', 1, { source, callIdPrefix });
+      io.to(`user:${userFirebaseUid}`).emit('billing:error', {
+        callId,
+        error: 'ACTIVE_CALL_CONFLICT',
+        message: 'Another call is already active for this account.',
+      });
+      return;
+    }
+
+    let slotsToReleaseOnFailure = true;
+
+    try {
     const user = await User.findOne({ firebaseUid: userFirebaseUid });
     if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
 
@@ -237,11 +356,25 @@ export class BillingService {
     const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
 
     const balanceMicros = coinsWholeToMicros(user.coins);
-    if (balanceMicros < pricePerSecondMicros) {
-      io.to(`user:${userFirebaseUid}`).emit('call:force-end', {
+    const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
+    if (balanceMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      slotsToReleaseOnFailure = false;
+      void forceTerminateCall(io, {
         callId,
-        reason: 'insufficient_coins',
-        remainingCoins: user.coins,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: balanceMicros < minEntryMicros ? 'min_coins_not_met' : 'insufficient_coins',
+        creatorReason: 'user_out_of_coins',
+        userPayload: {
+          remainingCoins: user.coins,
+          minCoinsRequired: MIN_COINS_TO_CALL,
+        },
+      }).catch((err) => {
+        logError('Failed to trigger force termination at call start', err, {
+          callId,
+          userFirebaseUid,
+        });
       });
       return;
     }
@@ -278,14 +411,18 @@ export class BillingService {
       elapsedSeconds: 0,
       effectiveDurationLimitSeconds,
       lastCheckpointAtMs: 0,
+      expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
     };
 
     try {
-      await Promise.all([
-        redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
-        redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros)),
-        redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0'),
-      ]);
+      recordBillingMetric('redis_ops', 3, { callId, path: 'session_seed' });
+      await redis
+        .multi()
+        .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
+        .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+        .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
+        .exec();
+      recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
       logInfo('Billing session started - Redis keys seeded', {
         callId,
@@ -293,6 +430,7 @@ export class BillingService {
         billingStartSource: source,
       });
     } catch (redisError) {
+      recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'session_seed' });
       logError('CRITICAL: Failed to start billing session in Redis', redisError, {
         callId,
         userFirebaseUid,
@@ -305,6 +443,8 @@ export class BillingService {
       });
       throw redisError;
     }
+
+    slotsToReleaseOnFailure = false;
 
     const maxSeconds =
       pricePerSecondMicros > 0
@@ -345,10 +485,7 @@ export class BillingService {
     });
 
     try {
-      await Promise.all([
-        redis.setex(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL, callId),
-        redis.setex(activeCallByUserKey(creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL, callId),
-      ]);
+      await refreshActiveCallSlotsTtl(redis, userFirebaseUid, creatorFirebaseUid);
       const { isBullmqBillingEnabled, scheduleBillingJob } = await import('./billing.queue');
       if (isBullmqBillingEnabled()) {
         await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
@@ -363,6 +500,12 @@ export class BillingService {
         callId,
         alert: true,
       });
+    }
+    } catch (err) {
+      if (slotsToReleaseOnFailure) {
+        await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      }
+      throw err;
     }
   }
 
@@ -384,10 +527,78 @@ export class BillingService {
     }
   }
 
+  /**
+   * Drain capped billing deltas before Mongo settlement so lastProcessedAt / totalDeductedMicros
+   * match wall time (see MAX_BILLING_DELTA_MS partial-tick behavior).
+   */
+  async flushBillingToQuiescence(
+    io: Server,
+    callId: string
+  ): Promise<{ iterations: number; residualLagMs: number }> {
+    let iterations = 0;
+    let residualLagMs = 0;
+
+    while (iterations < MAX_SETTLEMENT_FLUSH_ITERATIONS) {
+      const lagBefore = await getBillingWallLagMs(callId);
+      if (lagBefore === null) {
+        residualLagMs = 0;
+        break;
+      }
+      if (lagBefore < MIN_BILLING_DELTA_MS) {
+        residualLagMs = lagBefore;
+        break;
+      }
+
+      const prevLag = lagBefore;
+      iterations += 1;
+      const result = await this.processBillingTick(io, callId);
+
+      const lagAfter = (await getBillingWallLagMs(callId)) ?? 0;
+      residualLagMs = lagAfter;
+
+      if (result === 'stop_no_session' || result === 'stop_needs_settlement') {
+        break;
+      }
+      if (lagAfter < MIN_BILLING_DELTA_MS) {
+        break;
+      }
+      if (result === 'tick_ok' && lagAfter >= MIN_BILLING_DELTA_MS && Math.abs(lagAfter - prevLag) < 2) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      }
+    }
+
+    recordBillingMetric('billing_settlement_flush_iterations', iterations, { callId });
+    recordBillingMetric('billing_settlement_residual_lag_ms', residualLagMs, { callId });
+    await getRedis()
+      .setex(
+        finalFlushMarkerKey(callId),
+        FINAL_FLUSH_MARKER_TTL_SECONDS,
+        JSON.stringify({
+          callId,
+          iterations,
+          residualLagMs,
+          flushedAt: Date.now(),
+        })
+      )
+      .catch(() => {});
+    recordBillingMetric('billing_settlement_final_flush_marker_written', 1, { callId });
+
+    if (iterations >= MAX_SETTLEMENT_FLUSH_ITERATIONS) {
+      logWarning('Settlement billing flush hit iteration cap', {
+        callId,
+        iterations,
+        residualLagMs,
+      });
+    }
+
+    return { iterations, residualLagMs };
+  }
+
   private async _processBillingCycleInternal(
     io: Server,
     callId: string
   ): Promise<BillingTickResult> {
+    const cycleStartedAt = Date.now();
     const redis = getRedis();
     const lockKey = billingCycleLockKey(callId);
     const lockToken = randomUUID();
@@ -396,8 +607,12 @@ export class BillingService {
       return 'tick_ok';
     }
 
-    const heartbeat = setInterval(() => {
-      redis.set(lockKey, lockToken, 'PX', BILLING_CYCLE_LOCK_TTL_MS, 'XX').catch(() => {});
+    // Most ticks complete well before heartbeat interval. Start the interval lazily to avoid per-tick timer churn.
+    let heartbeat: NodeJS.Timeout | null = null;
+    const heartbeatStarter = setTimeout(() => {
+      heartbeat = setInterval(() => {
+        redis.set(lockKey, lockToken, 'PX', BILLING_CYCLE_LOCK_TTL_MS, 'XX').catch(() => {});
+      }, BILLING_CYCLE_LOCK_HEARTBEAT_MS);
     }, BILLING_CYCLE_LOCK_HEARTBEAT_MS);
 
     try {
@@ -429,13 +644,21 @@ export class BillingService {
       let earningsMicros = earn0;
 
       if (parsed.schemaVersion === undefined || Number(parsed.schemaVersion) < BILLING_SESSION_SCHEMA_VERSION) {
-        await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
-        await redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros));
-        await redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros));
+        recordBillingMetric('redis_ops', 5, { callId, path: 'session_migration' });
+        await redis
+          .multi()
+          .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
+          .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+          .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros))
+          .exec();
+        await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
+        recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_migration' });
       }
 
       const pricePerSecondMicros = session.pricePerSecondMicros;
       const creatorEarningsPerSecondMicros = session.creatorEarningsPerSecondMicros;
+      const previousDeductedMicros = session.totalDeductedMicros;
+      const previousEarnedMicros = session.totalEarnedMicros;
 
       if (pricePerSecondMicros <= 0) {
         logWarning('Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });
@@ -443,9 +666,18 @@ export class BillingService {
       }
 
       const now = Date.now();
-      let deltaMs = now - session.lastProcessedAt;
-      if (deltaMs < 0) deltaMs = 0;
-      deltaMs = Math.min(deltaMs, MAX_BILLING_DELTA_MS);
+      if (session.expectedNextTickAtMs && Number.isFinite(session.expectedNextTickAtMs)) {
+        const tickDriftMs = Math.max(0, now - session.expectedNextTickAtMs);
+        recordBillingMetric('tick_drift_ms', tickDriftMs, { callId });
+        updateBackpressureStage({ tickDriftMs });
+      }
+      let rawWallLagMs = now - session.lastProcessedAt;
+      if (rawWallLagMs < 0) rawWallLagMs = 0;
+      recordBillingMetric('billing_wall_lag_ms', rawWallLagMs, { callId });
+      if (rawWallLagMs > MAX_BILLING_DELTA_MS) {
+        recordBillingMetric('billing_delta_capped', 1, { callId });
+      }
+      const deltaMs = Math.min(rawWallLagMs, MAX_BILLING_DELTA_MS);
 
       if (deltaMs < MIN_BILLING_DELTA_MS) {
         return 'tick_ok';
@@ -457,14 +689,17 @@ export class BillingService {
       if (actualDeduct <= 0) {
         if (balanceMicros < pricePerSecondMicros) {
           emitSoon(() => {
-            io.to(`user:${session.userFirebaseUid}`).emit('call:force-end', {
+            void forceTerminateCall(io, {
               callId,
+              userFirebaseUid: session.userFirebaseUid,
+              creatorFirebaseUid: session.creatorFirebaseUid,
               reason: 'insufficient_coins',
-              remainingCoins: microsToWholeCoinsFloor(balanceMicros),
-            });
-            io.to(`user:${session.creatorFirebaseUid}`).emit('call:force-end', {
-              callId,
-              reason: 'user_out_of_coins',
+              creatorReason: 'user_out_of_coins',
+              userPayload: {
+                remainingCoins: microsToWholeCoinsFloor(balanceMicros),
+              },
+            }).catch((err) => {
+              logError('Failed force termination for insufficient balance', err, { callId });
             });
           });
           return 'stop_needs_settlement';
@@ -480,12 +715,20 @@ export class BillingService {
       session.lastProcessedAt += timeCoveredMs;
       session.totalDeductedMicros += actualDeduct;
       session.totalEarnedMicros += earnMicros;
+      if (
+        session.totalDeductedMicros < previousDeductedMicros ||
+        session.totalEarnedMicros < previousEarnedMicros
+      ) {
+        recordBillingMetric('billing_invariant_monotonicity_violation', 1, { callId });
+        throw new Error('Billing totals violated monotonicity invariant');
+      }
       session.version += 1;
 
       session.elapsedSeconds =
         pricePerSecondMicros > 0
           ? Math.floor(session.totalDeductedMicros / pricePerSecondMicros)
           : 0;
+      session.expectedNextTickAtMs = session.lastProcessedAt + BILLING_PROCESS_INTERVAL_MS;
 
       const effectiveLimit = session.effectiveDurationLimitSeconds;
       const secondsUntilLimit = effectiveLimit - session.elapsedSeconds;
@@ -517,17 +760,21 @@ export class BillingService {
           'warning'
         );
         emitSoon(() => {
-          io.to(`user:${session.userFirebaseUid}`).emit('call:force-end', {
+          void forceTerminateCall(io, {
             callId,
+            userFirebaseUid: session.userFirebaseUid,
+            creatorFirebaseUid: session.creatorFirebaseUid,
             reason: 'duration_limit_reached',
-            elapsedSeconds: session.elapsedSeconds,
-            limitSeconds: effectiveLimit,
-          });
-          io.to(`user:${session.creatorFirebaseUid}`).emit('call:force-end', {
-            callId,
-            reason: 'duration_limit_reached',
-            elapsedSeconds: session.elapsedSeconds,
-            limitSeconds: effectiveLimit,
+            userPayload: {
+              elapsedSeconds: session.elapsedSeconds,
+              limitSeconds: effectiveLimit,
+            },
+            creatorPayload: {
+              elapsedSeconds: session.elapsedSeconds,
+              limitSeconds: effectiveLimit,
+            },
+          }).catch((err) => {
+            logError('Failed force termination for duration limit', err, { callId });
           });
         });
         return 'stop_needs_settlement';
@@ -562,13 +809,19 @@ export class BillingService {
         }
       }
 
+      const redisWriteStartedAt = Date.now();
       try {
-        await Promise.all([
-          redis.setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros)),
-          redis.setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros)),
-          redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session)),
-        ]);
+        recordBillingMetric('redis_ops', 5, { callId, path: 'tick_persist' });
+        await redis
+          .multi()
+          .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+          .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros))
+          .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
+          .exec();
+        await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
+        recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'tick_persist' });
       } catch (redisError) {
+        recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'tick_persist' });
         logError('CRITICAL: Redis error during billing cycle', redisError, { callId, alert: true });
         emitSoon(() => {
           io.to(`user:${session.userFirebaseUid}`).emit('billing:error', {
@@ -579,6 +832,9 @@ export class BillingService {
         });
         throw redisError;
       }
+      const redisWriteMs = Date.now() - redisWriteStartedAt;
+      recordBillingMetric('redis_write_ms', redisWriteMs, { callId });
+      const activeStage = updateBackpressureStage({ redisWriteMs });
 
       const remainingSeconds =
         pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
@@ -589,40 +845,65 @@ export class BillingService {
       recordBillingMetric('tick_processed', 1, { callId });
       recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });
 
-      emitSoon(() => {
-        io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
-          callId,
-          coins: microsToWholeCoinsFloor(balanceMicros),
-          coinsExact: balanceMicros / COIN_MICROS,
-          elapsedSeconds: session.elapsedSeconds,
-          remainingSeconds,
-          durationLimit: effectiveLimit,
-          serverTimestamp,
-          callStartTime: session.startTime,
-          pricePerSecondMicros,
-        });
+      const emitIntervalMs = getEmitIntervalForStage(getBillingEmitIntervalMs());
+      const backpressureMs = getBillingRedisBackpressureMs();
+      const nowMs = Date.now();
+      const timeSinceLastEmit = nowMs - (session.lastEmitAtMs || 0);
+      const isEmitDue = session.lastEmitAtMs === undefined || timeSinceLastEmit >= emitIntervalMs;
+      const isLowBalance = balanceMicros < pricePerSecondMicros * 3;
+      const shouldEmitUpdate =
+        (isEmitDue || isLowBalance) && redisWriteMs <= backpressureMs && activeStage < 3;
 
-        io.to(`user:${session.creatorFirebaseUid}`).emit('billing:update', {
-          callId,
-          earnings: roundedEarningsDisplay,
-          elapsedSeconds: session.elapsedSeconds,
-          durationLimit: effectiveLimit,
-          serverTimestamp,
-          callStartTime: session.startTime,
-          pricePerSecondMicros: creatorEarningsPerSecondMicros,
+      if (shouldEmitUpdate) {
+        session.lastEmitAtMs = nowMs;
+        recordBillingMetric('redis_ops', 1, { callId, path: 'emit_state_persist' });
+        await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+        await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
+        recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'emit_state_persist' });
+        emitSoon(() => {
+          io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
+            callId,
+            coins: microsToWholeCoinsFloor(balanceMicros),
+            coinsExact: balanceMicros / COIN_MICROS,
+            elapsedSeconds: session.elapsedSeconds,
+            remainingSeconds,
+            durationLimit: effectiveLimit,
+            serverTimestamp,
+            callStartTime: session.startTime,
+            pricePerSecondMicros,
+          });
+
+          io.to(`user:${session.creatorFirebaseUid}`).emit('billing:update', {
+            callId,
+            earnings: roundedEarningsDisplay,
+            elapsedSeconds: session.elapsedSeconds,
+            durationLimit: effectiveLimit,
+            serverTimestamp,
+            callStartTime: session.startTime,
+            pricePerSecondMicros: creatorEarningsPerSecondMicros,
+          });
         });
-      });
+        recordBillingMetric('emit_update_sent', 1, { callId });
+      } else {
+        recordBillingMetric('emit_update_suppressed', 1, {
+          callId,
+          reason: activeStage >= 3 ? 'stage3_severe' : redisWriteMs > backpressureMs ? 'redis_backpressure' : 'throttled',
+        });
+      }
 
       if (balanceMicros < pricePerSecondMicros) {
         emitSoon(() => {
-          io.to(`user:${session.userFirebaseUid}`).emit('call:force-end', {
+          void forceTerminateCall(io, {
             callId,
+            userFirebaseUid: session.userFirebaseUid,
+            creatorFirebaseUid: session.creatorFirebaseUid,
             reason: 'insufficient_coins',
-            remainingCoins: microsToWholeCoinsFloor(balanceMicros),
-          });
-          io.to(`user:${session.creatorFirebaseUid}`).emit('call:force-end', {
-            callId,
-            reason: 'user_out_of_coins',
+            creatorReason: 'user_out_of_coins',
+            userPayload: {
+              remainingCoins: microsToWholeCoinsFloor(balanceMicros),
+            },
+          }).catch((err) => {
+            logError('Failed force termination for post-tick low balance', err, { callId });
           });
         });
         return 'stop_needs_settlement';
@@ -630,7 +911,9 @@ export class BillingService {
 
       return 'tick_ok';
     } finally {
-      clearInterval(heartbeat);
+      clearTimeout(heartbeatStarter);
+      if (heartbeat) clearInterval(heartbeat);
+      recordBillingMetric('tick_duration_ms', Date.now() - cycleStartedAt, { callId });
       await releaseBillingCycleLock(redis, lockKey, lockToken);
     }
   }

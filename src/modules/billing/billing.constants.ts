@@ -62,6 +62,96 @@ export const BILLING_CYCLE_LOCK_TTL_MS = readBillingCycleLockTtlMs();
 
 export const BILLING_SESSION_SCHEMA_VERSION = 2;
 
+const DEFAULT_BILLING_EMIT_INTERVAL_MS = 1000;
+const MIN_BILLING_EMIT_INTERVAL_MS = 250;
+const MAX_BILLING_EMIT_INTERVAL_MS = 5000;
+
+/**
+ * Minimum interval between `billing:update` emits per call.
+ * Billing math still runs at `BILLING_PROCESS_INTERVAL_MS`; this only controls fanout.
+ */
+export function getBillingEmitIntervalMs(): number {
+  const raw = process.env.BILLING_EMIT_INTERVAL_MS;
+  if (raw === undefined || raw === '') return DEFAULT_BILLING_EMIT_INTERVAL_MS;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return DEFAULT_BILLING_EMIT_INTERVAL_MS;
+  return Math.min(MAX_BILLING_EMIT_INTERVAL_MS, Math.max(MIN_BILLING_EMIT_INTERVAL_MS, n));
+}
+
+const DEFAULT_BILLING_REDIS_BACKPRESSURE_MS = 250;
+const MIN_BILLING_REDIS_BACKPRESSURE_MS = 50;
+const MAX_BILLING_REDIS_BACKPRESSURE_MS = 5000;
+
+/**
+ * If Redis write latency for a tick exceeds this threshold, suppress non-critical emits for that tick.
+ */
+export function getBillingRedisBackpressureMs(): number {
+  const raw = process.env.BILLING_REDIS_BACKPRESSURE_MS;
+  if (raw === undefined || raw === '') return DEFAULT_BILLING_REDIS_BACKPRESSURE_MS;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return DEFAULT_BILLING_REDIS_BACKPRESSURE_MS;
+  return Math.min(
+    MAX_BILLING_REDIS_BACKPRESSURE_MS,
+    Math.max(MIN_BILLING_REDIS_BACKPRESSURE_MS, n)
+  );
+}
+
+function readEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+export function getBackpressureMildEventLoopLagMs(): number {
+  return readEnvInt('BILLING_BP_MILD_EVENT_LOOP_LAG_MS', 50, 10, 10_000);
+}
+export function getBackpressureSustainedEventLoopLagMs(): number {
+  return readEnvInt('BILLING_BP_SUSTAINED_EVENT_LOOP_LAG_MS', 100, 20, 20_000);
+}
+export function getBackpressureSevereEventLoopLagMs(): number {
+  return readEnvInt('BILLING_BP_SEVERE_EVENT_LOOP_LAG_MS', 200, 50, 60_000);
+}
+
+export function getBackpressureMildRedisWriteMs(): number {
+  return readEnvInt('BILLING_BP_MILD_REDIS_WRITE_MS', 250, 50, 20_000);
+}
+export function getBackpressureSustainedRedisWriteMs(): number {
+  return readEnvInt('BILLING_BP_SUSTAINED_REDIS_WRITE_MS', 400, 100, 30_000);
+}
+export function getBackpressureSevereRedisWriteMs(): number {
+  return readEnvInt('BILLING_BP_SEVERE_REDIS_WRITE_MS', 750, 200, 60_000);
+}
+
+export function getBackpressureMildQueueLagMs(): number {
+  return readEnvInt('BILLING_BP_MILD_QUEUE_LAG_MS', 1500, 100, 120_000);
+}
+export function getBackpressureSustainedQueueLagMs(): number {
+  return readEnvInt('BILLING_BP_SUSTAINED_QUEUE_LAG_MS', 4000, 200, 180_000);
+}
+export function getBackpressureSevereQueueLagMs(): number {
+  return readEnvInt('BILLING_BP_SEVERE_QUEUE_LAG_MS', 10_000, 500, 300_000);
+}
+
+export function getBackpressureMildTickDriftMs(): number {
+  return readEnvInt('BILLING_BP_MILD_TICK_DRIFT_MS', 100, 20, 20_000);
+}
+export function getBackpressureSustainedTickDriftMs(): number {
+  return readEnvInt('BILLING_BP_SUSTAINED_TICK_DRIFT_MS', 300, 50, 30_000);
+}
+export function getBackpressureSevereTickDriftMs(): number {
+  return readEnvInt('BILLING_BP_SEVERE_TICK_DRIFT_MS', 1200, 100, 120_000);
+}
+
+export function getBackpressureSustainedSampleWindow(): number {
+  return readEnvInt('BILLING_BP_SUSTAINED_SAMPLE_WINDOW', 8, 2, 200);
+}
+
+export function getBackpressureStage2EmitIntervalMs(): number {
+  return readEnvInt('BILLING_BP_STAGE2_EMIT_INTERVAL_MS', 2000, 500, 30_000);
+}
+
 /** Minimum checkpoint interval clamp (ms). */
 const MIN_BILLING_CHECKPOINT_INTERVAL_MS = 10_000;
 

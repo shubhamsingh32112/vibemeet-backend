@@ -2,7 +2,6 @@ import { Server } from 'socket.io';
 import {
   getRedis,
   callSessionKey,
-  ACTIVE_BILLING_CALLS_KEY,
   pendingCallEndKey,
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
@@ -10,6 +9,8 @@ import { billingService, type BillingSessionStartSource } from './billing.servic
 import { settleCall } from './billing-settlement.service';
 import { logInfo, logDebug } from '../../utils/logger';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
+import { closeTerminationRetryQueue } from './billing-termination.queue';
+import { isCallActive } from './billing-active-call.service';
 import { setupBillingGateway } from './billing-socket.gateway';
 import {
   startGlobalBillingProcessor,
@@ -71,11 +72,30 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
   logInfo('settleCallHttp', { callId });
 
   const redis = getRedis();
-  const sessionExists = await redis.get(callSessionKey(callId));
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  let userFirebaseUid: string | undefined;
+  let creatorFirebaseUid: string | undefined;
+  if (sessionRaw) {
+    try {
+      const session = JSON.parse(sessionRaw) as {
+        userFirebaseUid?: string;
+        creatorFirebaseUid?: string;
+      };
+      userFirebaseUid = session.userFirebaseUid;
+      creatorFirebaseUid = session.creatorFirebaseUid;
+    } catch {
+      // Ignore parse failures; helper still checks call session existence.
+    }
+  }
 
-  const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
+  const active = await isCallActive(redis, {
+    callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
+  });
 
-  if (!sessionExists && !isInActiveBilling) {
+  if (!active) {
     await redis.setex(pendingCallEndKey(callId), PENDING_CALL_END_TTL, '1');
     logInfo('Deferring call:ended (HTTP, session not ready)', { callId });
     return;
@@ -86,6 +106,7 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
 
 export async function cleanupBillingIntervals(): Promise<void> {
   stopGlobalBillingProcessor();
+  await closeTerminationRetryQueue().catch(() => {});
   if (isBullmqBillingEnabled()) {
     await closeBillingBullMq().catch(() => {});
   }

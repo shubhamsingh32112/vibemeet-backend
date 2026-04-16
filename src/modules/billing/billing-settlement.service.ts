@@ -36,6 +36,7 @@ import {
   microsToUserDebitWholeCoins,
   microsToCreatorCreditWholeCoins,
 } from './billing.constants';
+import { billingService, finalFlushMarkerKey } from './billing.service';
 
 interface CallSession {
   schemaVersion?: number;
@@ -115,13 +116,27 @@ async function deleteBillingSessionRedisKeys(
 }
 
 export async function settleCall(io: Server, callId: string): Promise<void> {
-  await removeCallFromBilling(callId);
-
   const redis = getRedis();
+  const settleStartedAt = Date.now();
 
   const settledKey = settledCallKey(callId);
-  const alreadySettled = await redis.get(settledKey);
-  if (alreadySettled) {
+  if (await redis.get(settledKey)) {
+    logWarning('Call already settled (Redis) — skipping', { callId });
+    return;
+  }
+
+  await billingService.flushBillingToQuiescence(io, callId);
+  const flushMarkerRaw = await redis.get(finalFlushMarkerKey(callId));
+  if (!flushMarkerRaw) {
+    recordBillingMetric('settlement_final_flush_marker_missing', 1, { callId });
+    logWarning('Settlement proceeding without final flush marker', { callId });
+  } else {
+    recordBillingMetric('settlement_final_flush_marker_present', 1, { callId });
+  }
+
+  await removeCallFromBilling(callId);
+
+  if (await redis.get(settledKey)) {
     logWarning('Call already settled (Redis) — skipping', { callId });
     return;
   }
@@ -225,6 +240,18 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
   let totalDeducted = microsToUserDebitWholeCoins(session.totalDeductedMicros ?? 0);
   let totalEarnedCreator = microsToCreatorCreditWholeCoins(earningsMicros);
+  const sessionEarnedMicros = Number(session.totalEarnedMicros ?? 0);
+  const settlementMicrosDiff = Math.abs(sessionEarnedMicros - earningsMicros);
+  recordBillingMetric('settlement_redis_session_earned_diff_micros', settlementMicrosDiff, { callId });
+  if (settlementMicrosDiff > COIN_MICROS) {
+    recordBillingMetric('settlement_redis_session_earned_diff_alert', 1, { callId });
+    logWarning('Settlement earned discrepancy above threshold', {
+      callId,
+      sessionEarnedMicros,
+      redisEarnedMicros: earningsMicros,
+      diffMicros: settlementMicrosDiff,
+    });
+  }
 
   if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION && session.pricePerSecond) {
     const legacyDeductMicros = Math.round(billedSeconds * session.pricePerSecond * COIN_MICROS);
@@ -279,7 +306,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       );
     }
 
-    let creatorUser: (mongoose.Document<unknown, {}, IUser> & IUser) | null = null;
+    let creatorUser: (mongoose.Document<unknown, object, IUser> & IUser) | null = null;
     if (totalEarnedCreator > 0) {
       const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
       if (!creator) {
@@ -370,7 +397,9 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       );
     }
 
+    const txnStartedAt = Date.now();
     await dbSession.commitTransaction();
+    recordBillingMetric('settlement_transaction_ms', Date.now() - txnStartedAt, { callId });
     logInfo('Settlement transaction committed', { callId });
 
     try {
@@ -401,6 +430,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       });
     }
 
+    const postCommitStartedAt = Date.now();
     try {
       const streamClient = getStreamClient();
       const channelId = generateUserCreatorChannelId(
@@ -434,17 +464,6 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       logError('Failed to post call activity in chat', chatErr, { callId });
     }
 
-    try {
-      const creatorDoc2 = await Creator.findById(session.creatorMongoId);
-      if (creatorDoc2) {
-        await invalidateCreatorTasks(creatorDoc2.userId.toString());
-        await invalidateCreatorDashboard(creatorDoc2.userId.toString());
-      }
-      await invalidateAdminCaches('overview', 'coins', 'creators_performance');
-    } catch (cacheErr) {
-      logError('Failed to invalidate caches', cacheErr, { callId });
-    }
-
     io.to(`user:${session.userFirebaseUid}`).emit('billing:settled', {
       callId,
       finalCoins: user.coins,
@@ -458,23 +477,31 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       durationSeconds,
     });
 
-    try {
-      const creatorDoc3 = await Creator.findById(session.creatorMongoId);
-      if (creatorDoc3) {
-        emitCreatorDataUpdated(session.creatorFirebaseUid, {
-          reason: 'call_settled',
-          callId,
-          totalEarned: totalEarnedCreator,
-          durationSeconds,
-        });
-      }
-    } catch (emitErr) {
-      logError('Failed to emit creator data update', emitErr, { callId });
+    const sideEffects: Promise<unknown>[] = [
+      invalidateAdminCaches('overview', 'coins', 'creators_performance'),
+      verifyUserBalance(session.userMongoId),
+    ];
+    if (creatorOwnerUserId) {
+      sideEffects.push(invalidateCreatorTasks(creatorOwnerUserId.toString()));
+      sideEffects.push(invalidateCreatorDashboard(creatorOwnerUserId.toString()));
+      sideEffects.push(verifyUserBalance(creatorOwnerUserId.toString()));
+      sideEffects.push(
+        Promise.resolve().then(() =>
+          emitCreatorDataUpdated(session.creatorFirebaseUid, {
+            reason: 'call_settled',
+            callId,
+            totalEarned: totalEarnedCreator,
+            durationSeconds,
+          })
+        )
+      );
     }
-
-    verifyUserBalance(session.userMongoId).catch(() => {});
-    const creatorDoc4 = await Creator.findById(session.creatorMongoId);
-    if (creatorDoc4) verifyUserBalance(creatorDoc4.userId).catch(() => {});
+    const sideEffectResults = await Promise.allSettled(sideEffects);
+    const sideEffectFailures = sideEffectResults.filter((r) => r.status === 'rejected').length;
+    if (sideEffectFailures > 0) {
+      logWarning('Some post-settlement side effects failed', { callId, sideEffectFailures });
+    }
+    recordBillingMetric('settlement_post_commit_ms', Date.now() - postCommitStartedAt, { callId });
 
     emitToAdmin('billing:settled', {
       callId,
@@ -486,6 +513,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     });
 
     logInfo('Settlement complete', { callId });
+    recordBillingMetric('settlement_total_ms', Date.now() - settleStartedAt, { callId });
   } catch (err) {
     try {
       await dbSession.abortTransaction();

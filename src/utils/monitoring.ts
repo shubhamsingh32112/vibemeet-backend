@@ -18,7 +18,7 @@ interface Metric {
 interface ErrorLog {
   message: string;
   stack?: string;
-  context?: Record<string, any>;
+  context?: Record<string, unknown>;
   timestamp: number;
   severity: 'error' | 'warning' | 'info';
 }
@@ -60,7 +60,7 @@ class MonitoringService {
   recordError(
     message: string,
     error?: Error | unknown,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
     severity: 'error' | 'warning' | 'info' = 'error'
   ): void {
     const errorLog: ErrorLog = {
@@ -102,7 +102,10 @@ class MonitoringService {
    */
   getMetricsSummary(): {
     total: number;
-    byName: Record<string, { count: number; sum: number; avg: number }>;
+    byName: Record<
+      string,
+      { count: number; sum: number; avg: number; max: number; p95: number; p99: number }
+    >;
   } {
     const byName: Record<string, { count: number; sum: number; values: number[] }> = {};
 
@@ -115,12 +118,26 @@ class MonitoringService {
       byName[metric.name].values.push(metric.value);
     }
 
-    const summary: Record<string, { count: number; sum: number; avg: number }> = {};
+    const percentile = (sorted: number[], p: number): number => {
+      if (sorted.length === 0) return 0;
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+      return sorted[idx];
+    };
+
+    const summary: Record<
+      string,
+      { count: number; sum: number; avg: number; max: number; p95: number; p99: number }
+    > = {};
     for (const [name, data] of Object.entries(byName)) {
+      const sorted = [...data.values].sort((a, b) => a - b);
+      const max = sorted.length > 0 ? sorted[sorted.length - 1] : 0;
       summary[name] = {
         count: data.count,
         sum: data.sum,
         avg: data.sum / data.count,
+        max,
+        p95: percentile(sorted, 95),
+        p99: percentile(sorted, 99),
       };
     }
 
@@ -273,4 +290,15 @@ export function recordCallMetric(metric: string, value: number, tags?: Record<st
  */
 export function recordAPIMetric(metric: string, value: number, tags?: Record<string, string>): void {
   monitoring.recordMetric(`api.${metric}`, value, tags);
+}
+
+/**
+ * Helper function to record system/runtime metrics.
+ */
+export function recordSystemMetric(
+  metric: string,
+  value: number,
+  tags?: Record<string, string>
+): void {
+  monitoring.recordMetric(`system.${metric}`, value, tags);
 }

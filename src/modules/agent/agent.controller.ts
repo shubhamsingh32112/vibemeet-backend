@@ -21,6 +21,7 @@ import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
 import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
+import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
 
 function sinceDaysAgo(days: number): Date {
   const d = new Date();
@@ -848,6 +849,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
         targetUser.role = 'creator';
       }
       await targetUser.save({ session });
+      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
 
       if (previousCoins > 0) {
         logInfo('Agent manual creator: cleared coins', {

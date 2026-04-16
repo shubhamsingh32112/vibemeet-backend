@@ -31,6 +31,7 @@ import {
 } from '../../utils/mongo-regex';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
+import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
 
 function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
@@ -441,6 +442,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             email: user.email,
             phone: user.phone,
             gender: user.gender,
+            age: user.age,
             username: user.username,
             avatar: user.avatar,
             categories: user.categories,
@@ -930,6 +932,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       }
       
       await targetUser.save({ session });
+      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
 
       let assignedAgentId: mongoose.Types.ObjectId | undefined;
       if (targetUser.referredBy) {
@@ -1030,7 +1033,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const { gender, username, avatar, categories } = req.body;
+    const { gender, age, username, avatar, categories } = req.body;
 
     const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
 
@@ -1055,6 +1058,29 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
     if (gender) {
       user.gender = gender as 'male' | 'female' | 'other';
       updated = true;
+    }
+
+    // Update age
+    if (age !== undefined) {
+      if (age === null) {
+        if (user.age !== undefined) {
+          user.age = undefined;
+          updated = true;
+        }
+      } else {
+        const parsedAge = typeof age === 'string' ? parseInt(age, 10) : age;
+        if (!Number.isInteger(parsedAge) || parsedAge < 13 || parsedAge > 120) {
+          res.status(400).json({
+            success: false,
+            error: 'Age must be an integer between 13 and 120',
+          });
+          return;
+        }
+        if (user.age !== parsedAge) {
+          user.age = parsedAge;
+          updated = true;
+        }
+      }
     }
 
     // Update username
@@ -1122,6 +1148,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
           email: user.email,
           phone: user.phone,
           gender: user.gender,
+          age: user.age,
           username: user.username,
           avatar: user.avatar,
           categories: user.categories,

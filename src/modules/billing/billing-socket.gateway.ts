@@ -4,7 +4,6 @@ import {
   callSessionKey,
   callUserCoinsKey,
   callCreatorEarningsKey,
-  ACTIVE_BILLING_CALLS_KEY,
   activeCallByUserKey,
   pendingCallEndKey,
   PENDING_CALL_END_TTL,
@@ -12,6 +11,8 @@ import {
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService } from './billing.service';
 import { settleCall } from './billing-settlement.service';
+import { isBullmqBillingEnabled } from './billing.queue';
+import { isCallActive } from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
@@ -132,11 +133,13 @@ export function setupBillingGateway(io: Server): void {
         logInfo('call:ended received', { callId: data.callId, firebaseUid });
 
         const redis = getRedis();
-        const sessionExists = await redis.get(callSessionKey(data.callId));
+        const active = await isCallActive(redis, {
+          callId: data.callId,
+          userFirebaseUid: firebaseUid,
+          includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
+        });
 
-        const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, data.callId);
-
-        if (!sessionExists && !isInActiveBilling) {
+        if (!active) {
           await redis.setex(pendingCallEndKey(data.callId), PENDING_CALL_END_TTL, '1');
           logInfo('Deferring call:ended (session not ready)', { callId: data.callId });
           return;
@@ -163,8 +166,12 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const isInActiveBilling = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
-        if (!isInActiveBilling) {
+        const active = await isCallActive(redis, {
+          callId,
+          userFirebaseUid: firebaseUid,
+          includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
+        });
+        if (!active) {
           await redis.del(activeCallByUserKey(firebaseUid));
           socket.emit('billing:recover-state:response', {
             success: true,
@@ -252,16 +259,10 @@ export function setupBillingGateway(io: Server): void {
 
     socket.on('disconnect', async (reason) => {
       logInfo('Socket disconnected', { firebaseUid, reason });
-      const redis = getRedis();
-      const callId = await redis.get(activeCallByUserKey(firebaseUid));
-      if (callId) {
-        logInfo('Auto-settling call due to disconnect', { callId, firebaseUid });
-        try {
-          await settleCall(io, callId);
-        } catch (err) {
-          logError('Auto-settle failed', err, { callId, firebaseUid });
-        }
-      }
+      // Do NOT settle active calls on transient socket disconnects.
+      // Calls continue over Stream/WebRTC even if Socket.IO drops briefly; settling
+      // here truncates billed duration and causes timer/UI desync on clients.
+      // Settlement is handled by explicit `call:ended` and Stream webhooks.
     });
   });
 }

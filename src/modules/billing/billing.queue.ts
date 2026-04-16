@@ -11,15 +11,105 @@ import { billingService } from './billing.service';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { getRedis, callSessionKey } from '../../config/redis';
+import { isBullmqBillingEnabled } from './billing-driver';
+import { isCallInBillingRolloutCohort } from './billing-rollout';
+import { updateBackpressureStage } from './billing-backpressure';
+
+export { isBullmqBillingEnabled };
 
 const QUEUE_NAME = 'billing-cycle';
 
 let sharedConnection: Redis | null = null;
 let billingQueue: Queue | null = null;
 let billingWorker: Worker | null = null;
+let lastQueueStatsAt = 0;
 
-export function isBullmqBillingEnabled(): boolean {
-  return process.env.BILLING_DRIVER === 'bullmq';
+function readBullmqConcurrency(): number {
+  const raw = parseInt(process.env.BILLING_BULLMQ_CONCURRENCY || '50', 10);
+  if (!Number.isFinite(raw)) {
+    return 50;
+  }
+  return Math.min(200, Math.max(1, raw));
+}
+
+function readBackpressureLagThresholdMs(): number {
+  const raw = parseInt(process.env.BILLING_BACKPRESSURE_LAG_MS || '5000', 10);
+  if (!Number.isFinite(raw) || raw < 0) {
+    return 5000;
+  }
+  return Math.min(120_000, raw);
+}
+
+function readBackpressureDelayFactor(): number {
+  const raw = parseFloat(process.env.BILLING_BACKPRESSURE_DELAY_FACTOR || '1.5');
+  if (!Number.isFinite(raw) || raw < 1) {
+    return 1.5;
+  }
+  return Math.min(5, raw);
+}
+
+function readBackpressureDelayCapMs(): number {
+  const raw = parseInt(process.env.BILLING_BACKPRESSURE_DELAY_CAP_MS || '30000', 10);
+  if (!Number.isFinite(raw)) {
+    return 30000;
+  }
+  return Math.min(120_000, Math.max(BILLING_PROCESS_INTERVAL_MS, raw));
+}
+
+async function computeNextCycleDelayMs(
+  queueLagMs: number,
+  callId: string,
+  baseMs: number
+): Promise<number> {
+  if (queueLagMs <= readBackpressureLagThresholdMs()) {
+    return baseMs;
+  }
+  const inCohort = await isCallInBillingRolloutCohort(callId);
+  if (!inCohort) {
+    recordBillingMetric('billing_backpressure_skipped_out_of_cohort', 1, { callId });
+    return baseMs;
+  }
+  const factor = readBackpressureDelayFactor();
+  const cap = readBackpressureDelayCapMs();
+  const bumped = Math.min(Math.floor(baseMs * factor), cap);
+  recordBillingMetric('billing_backpressure_applied', 1, { callId });
+  return bumped;
+}
+
+/**
+ * Chain the next delayed billing job after a successful tick (worker, DLQ, stale recovery).
+ * Use queueLagMsApprox=0 when lag is unknown (reconciliation paths).
+ */
+export async function scheduleNextBillingCycleAfterTickOk(
+  callId: string,
+  queueLagMsApprox: number
+): Promise<void> {
+  const delay = await computeNextCycleDelayMs(
+    queueLagMsApprox,
+    callId,
+    BILLING_PROCESS_INTERVAL_MS
+  );
+  await scheduleBillingJob(callId, delay);
+}
+
+export function billingCycleJobId(callId: string): string {
+  return `billing-cycle:${callId}`;
+}
+
+/**
+ * True when no healthy delayed/waiting/active cycle job exists for this call (e.g. lost after crash).
+ */
+export async function needsBillingCycleReschedule(callId: string): Promise<boolean> {
+  const q = getQueue();
+  const job = await q.getJob(billingCycleJobId(callId));
+  if (!job) {
+    return true;
+  }
+  const state = await job.getState();
+  if (state === 'delayed' || state === 'waiting' || state === 'active') {
+    return false;
+  }
+  return true;
 }
 
 function createRedisConnection(): Redis {
@@ -61,21 +151,65 @@ function getQueue(): Queue {
 
 /**
  * Schedule the next billing cycle for a call (chain of delayed jobs).
+ * Relies on per-call `billing:cycle_lock:` + idempotent ticks in `processBillingTick` (MAX_BILLING_DELTA_MS).
+ * Default: single `add` with stable jobId (no get/remove race). Set `BILLING_CYCLE_EMERGENCY_REMOVE_DEDUPE=true`
+ * to restore the previous remove-before-add behavior if needed.
  */
 export async function scheduleBillingJob(
   callId: string,
   delayMs: number = BILLING_PROCESS_INTERVAL_MS
 ): Promise<void> {
   const q = getQueue();
-  await q.add(
-    'cycle',
-    { callId },
-    {
-      delay: delayMs,
-      removeOnComplete: 500,
-      removeOnFail: 200,
+  const jobId = billingCycleJobId(callId);
+  recordBillingMetric('bullmq_cycle_enqueue_attempted', 1, { callId });
+
+  if (process.env.BILLING_CYCLE_EMERGENCY_REMOVE_DEDUPE === 'true') {
+    const existing = await q.getJob(jobId);
+    if (existing) {
+      const state = await existing.getState();
+      if (state === 'active') {
+        recordBillingMetric('bullmq_cycle_enqueue_deduped', 1, { callId, state });
+        return;
+      }
+      if (state === 'waiting' || state === 'delayed') {
+        await existing.remove().catch(() => {});
+        recordBillingMetric('bullmq_cycle_enqueue_deduped', 1, { callId, state });
+      }
     }
-  );
+  }
+
+  try {
+    await q.add(
+      'cycle',
+      { callId },
+      {
+        jobId,
+        delay: delayMs,
+        removeOnComplete: 500,
+        removeOnFail: 200,
+      }
+    );
+  } catch (err) {
+    recordBillingMetric('bullmq_cycle_enqueue_failed', 1, { callId });
+    logError('BullMQ cycle add failed', err, { callId, jobId });
+    throw err;
+  }
+
+  const now = Date.now();
+  if (now - lastQueueStatsAt >= 5000) {
+    lastQueueStatsAt = now;
+    try {
+      const counts = await q.getJobCounts('active', 'waiting', 'delayed');
+      const activeCount = Number(counts.active || 0);
+      const waitingCount = Number(counts.waiting || 0);
+      const delayedCount = Number(counts.delayed || 0);
+      recordBillingMetric('bullmq_cycle_jobs_active', activeCount, {});
+      recordBillingMetric('bullmq_cycle_jobs_waiting', waitingCount, {});
+      recordBillingMetric('bullmq_cycle_jobs_delayed', delayedCount, {});
+    } catch (error) {
+      logError('Failed to collect BullMQ queue counts', error, {});
+    }
+  }
 }
 
 export function startBillingBullWorker(): Worker {
@@ -91,6 +225,9 @@ export function startBillingBullWorker(): Worker {
     async (job) => {
       const { callId } = job.data as { callId: string };
       const io = getIO();
+      const queueLagMs = Math.max(0, Date.now() - (job.timestamp + (job.opts.delay || 0)));
+      recordBillingMetric('bullmq_queue_lag_ms', queueLagMs, { callId });
+      updateBackpressureStage({ queueLagMs });
       let result: Awaited<ReturnType<typeof billingService.processBillingTick>>;
       try {
         result = await billingService.processBillingTick(io, callId);
@@ -100,7 +237,9 @@ export function startBillingBullWorker(): Worker {
           const redis = getRedis();
           const exists = await redis.exists(callSessionKey(callId));
           if (exists === 1) {
-            await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS * 2);
+            const base = BILLING_PROCESS_INTERVAL_MS * 2;
+            const delay = await computeNextCycleDelayMs(queueLagMs, callId, base);
+            await scheduleBillingJob(callId, delay);
           }
         } catch (rescheduleErr) {
           logError('BullMQ reschedule after throw failed', rescheduleErr, { callId });
@@ -110,7 +249,7 @@ export function startBillingBullWorker(): Worker {
       }
 
       if (result === 'tick_ok') {
-        await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS).catch((e) =>
+        await scheduleNextBillingCycleAfterTickOk(callId, queueLagMs).catch((e) =>
           logError('BullMQ schedule next failed', e, { callId })
         );
       } else if (result === 'stop_needs_settlement') {
@@ -121,7 +260,7 @@ export function startBillingBullWorker(): Worker {
     },
     {
       connection: getSharedConnection().duplicate(),
-      concurrency: Number(process.env.BILLING_BULLMQ_CONCURRENCY || 50),
+      concurrency: readBullmqConcurrency(),
     }
   );
 

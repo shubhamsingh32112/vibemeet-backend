@@ -9,9 +9,9 @@ import {
   isRedisConfigured,
   getRedis,
   activeCallByUserKey,
-  callSessionKey,
-  ACTIVE_BILLING_CALLS_KEY,
 } from '../../config/redis';
+import { isBullmqBillingEnabled } from '../billing/billing.queue';
+import { isCallActive } from '../billing/billing-active-call.service';
 
 const router = Router();
 
@@ -53,12 +53,12 @@ router.get('/calls/active', verifyFirebaseToken, async (req: Request, res: Respo
       return;
     }
 
-    const [sessionRaw, inBilling] = await Promise.all([
-      redis.get(callSessionKey(callId)),
-      redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId),
-    ]);
-
-    if (!sessionRaw && (inBilling == null || inBilling === undefined)) {
+    const active = await isCallActive(redis, {
+      callId,
+      userFirebaseUid: firebaseUid,
+      includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
+    });
+    if (!active) {
       await redis.del(activeCallByUserKey(firebaseUid)).catch(() => {});
       res.json({
         success: true,

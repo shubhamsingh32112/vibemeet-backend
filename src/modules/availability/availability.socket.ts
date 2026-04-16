@@ -42,6 +42,7 @@ import {
   UserAvailability,
 } from './user-availability.service';
 import { getIO as getGlobalIO } from '../../config/socket';
+import { logWarning } from '../../utils/logger';
 
 // Store Socket.IO server instance for external access
 let ioInstance: Server | null = null;
@@ -52,6 +53,7 @@ const socketUserMap = new Map<string, { firebaseUid: string; isCreator: boolean;
 
 // Heartbeat interval (in ms) - must be less than TTL (120s)
 const HEARTBEAT_INTERVAL = 60000; // 60 seconds
+const LEGACY_AVAILABILITY_SOCKET_ENABLED = process.env.ENABLE_LEGACY_AVAILABILITY_SOCKET === 'true';
 
 /**
  * Get the Socket.IO server instance
@@ -84,7 +86,8 @@ export function emitCreatorStatus(creatorId: string, status: CreatorAvailability
     return;
   }
 
-  io.emit('creator:status', { creatorId, status });
+  io.to('consumers').emit('creator:status', { creatorId, status });
+  io.to('creators').emit('creator:status', { creatorId, status });
   console.log(`📤 [SOCKET] Emitted creator:status - ${creatorId}: ${status}`);
 }
 
@@ -166,6 +169,14 @@ async function isRegularUser(firebaseUid: string): Promise<boolean> {
  * Register Socket.IO handlers for availability
  */
 export function registerAvailabilitySocket(io: Server): void {
+  if (!LEGACY_AVAILABILITY_SOCKET_ENABLED) {
+    ioInstance = io;
+    logWarning(
+      'registerAvailabilitySocket is disabled; availability.gateway.ts is authoritative. Set ENABLE_LEGACY_AVAILABILITY_SOCKET=true only for emergency rollback.',
+      {}
+    );
+    return;
+  }
   ioInstance = io;
   
   console.log('🔌 [SOCKET] Registering availability socket handlers');

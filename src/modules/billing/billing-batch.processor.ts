@@ -13,6 +13,7 @@ import {
   startBillingBullWorker,
 } from './billing.queue';
 import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
+import { updateBackpressureStage } from './billing-backpressure';
 
 let globalBillingProcessor: NodeJS.Timeout | null = null;
 const BILLING_BATCH_SIZE = 50;
@@ -49,6 +50,11 @@ export async function processBillingBatch(io: Server): Promise<void> {
     );
 
     const callIds: string[] = Array.isArray(callsDue) ? callsDue : [];
+    const queueLagMsApprox = callIds.length > 0 ? Math.max(0, now - Number(await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callIds[0]) || now)) : 0;
+    if (queueLagMsApprox > 0) {
+      recordBillingMetric('zset_queue_lag_ms', queueLagMsApprox, {});
+      updateBackpressureStage({ queueLagMs: queueLagMsApprox });
+    }
 
     if (callIds.length === 0) {
       return;

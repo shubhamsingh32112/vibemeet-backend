@@ -38,6 +38,7 @@ import {
   parseGalleryStoragePath,
 } from './creator-gallery.storage';
 import { logError, logInfo } from '../../utils/logger';
+import { ensureCreatorPromotionBonusReversalEntry } from './creator-starter.service';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
@@ -81,37 +82,35 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
     // Availability (online/busy) is managed via Redis + Socket.IO in real-time.
     // The REST endpoint always returns every creator; the frontend shows
     // online/busy tags based on the Socket.IO availability provider.
-    const creators = await Creator.find({}).sort({ createdAt: -1 });
+    const creators = await Creator.find({}).sort({ createdAt: -1 }).lean();
     
     console.log(`✅ [CREATOR] Found ${creators.length} creator(s) (all creators returned, availability via Redis)`);
 
     // Favorites are a "user-only" feature
     const favoriteSet =
       currentUser && currentUser.role === 'user'
-        ? new Set((currentUser.favoriteCreatorIds || []).map((id: any) => id.toString()))
+        ? new Set((currentUser.favoriteCreatorIds || []).map((id) => id.toString()))
         : new Set<string>();
     
-    // Map creators with their associated user IDs and Firebase UIDs (pure read - no side effects)
-    // Need to get Firebase UIDs for Stream Video calls (Stream uses Firebase UIDs as user IDs)
+    // Build a userId -> firebaseUid map in one query (avoids N+1 creator-user lookups).
+    const userIds = creators
+      .map((creator) => creator.userId)
+      .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+    const linkedUsers = userIds.length
+      ? await User.find({ _id: { $in: userIds } }).select('_id firebaseUid').lean()
+      : [];
+    const firebaseUidByUserId = new Map(
+      linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const)
+    );
+
+    // Resolve gallery URLs for response only (no write-on-read in hot feed endpoint).
     const creatorsWithUserIds = await Promise.all(
       creators.map(async (creator) => {
-        let creatorFirebaseUid: string | null = null;
-        if (creator.userId) {
-          const creatorUser = await User.findById(creator.userId);
-          creatorFirebaseUid = creatorUser?.firebaseUid || null;
-        }
-
-        const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(
-          creator.galleryImages,
-        );
-        if (urlsChanged) {
-          await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
-        }
-
+        const { galleryImages } = await resolveGalleryImageUrlsForApi(creator.galleryImages);
         return {
           id: creator._id.toString(),
           userId: creator.userId ? creator.userId.toString() : null, // MongoDB User ID
-          firebaseUid: creatorFirebaseUid, // Firebase UID for Stream Video calls
+          firebaseUid: creator.userId ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null) : null,
           name: creator.name,
           about: creator.about,
           photo: creator.photo,
@@ -309,23 +308,41 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    // Create creator profile
-    const creator = await Creator.create({
-      name,
-      about,
-      photo,
-      galleryImages: [],
-      userId: targetUser._id,
-      categories: Array.isArray(categories) ? categories : [],
-      price: validatedPrice,
-      age: age !== undefined ? age : undefined,
-      ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
-    });
-    
-    // Update user role to creator (if not already admin)
-    if (targetUser.role !== 'creator' && targetUser.role !== 'admin') {
-      targetUser.role = 'creator';
-      await targetUser.save();
+    const session = await mongoose.startSession();
+    let creator;
+    try {
+      session.startTransaction();
+
+      targetUser.welcomeBonusClaimed = true;
+      targetUser.coins = 0;
+      if (targetUser.role !== 'creator' && targetUser.role !== 'admin') {
+        targetUser.role = 'creator';
+      }
+      await targetUser.save({ session });
+      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+
+      const created = await Creator.create(
+        [{
+          name,
+          about,
+          photo,
+          galleryImages: [],
+          userId: targetUser._id,
+          categories: Array.isArray(categories) ? categories : [],
+          price: validatedPrice,
+          age: age !== undefined ? age : undefined,
+          ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
+        }],
+        { session }
+      );
+      creator = created[0];
+
+      await session.commitTransaction();
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
     }
     
     console.log(`✅ [CREATOR] Creator created: ${creator._id} for user: ${targetUser._id}`);

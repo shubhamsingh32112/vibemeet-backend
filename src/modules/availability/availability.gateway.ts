@@ -1,10 +1,10 @@
 import { Server, Socket } from 'socket.io';
-import { getRedis, availabilityKey } from '../../config/redis';
+import { getRedis, availabilityKey, activeCallByUserKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { User } from '../user/user.model';
-import { Creator } from '../creator/creator.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
+import { recordCallMetric } from '../../utils/monitoring';
 import {
   setUserAvailability,
   refreshUserAvailability,
@@ -36,6 +36,8 @@ const userHeartbeatIntervals = new Map<string, NodeJS.Timeout>();
 // Track active socket IDs per user/creator to verify connection status in heartbeat
 const activeSocketsByUser = new Map<string, Set<string>>();
 const activeSocketsByCreator = new Map<string, Set<string>>();
+const lastCreatorHeartbeatAtMs = new Map<string, number>();
+const lastUserHeartbeatAtMs = new Map<string, number>();
 
 /**
  * 🔥 SCALABILITY: Periodic cleanup of stale socket tracking entries
@@ -133,6 +135,16 @@ function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefin
   return [];
 }
 
+async function hasActiveCallForUid(firebaseUid: string): Promise<boolean> {
+  try {
+    const redis = getRedis();
+    const activeCall = await redis.get(activeCallByUserKey(firebaseUid));
+    return Boolean(activeCall && activeCall.length > 0);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Set up Socket.IO gateway for creator availability.
  *
@@ -150,6 +162,11 @@ export function setupAvailabilityGateway(io: Server): void {
   setInterval(() => {
     cleanupStaleSocketTracking(io);
   }, 10 * 60 * 1000); // 10 minutes
+
+  // Strict TTL safety sweep: force fallback state if heartbeats go stale.
+  setInterval(() => {
+    void sweepStaleHeartbeats(io);
+  }, 30 * 1000);
   
   // ── Auth middleware ─────────────────────────────────────────────────────
   io.use(async (socket, next) => {
@@ -193,7 +210,7 @@ export function setupAvailabilityGateway(io: Server): void {
 
     // Handle creator connection
     if (firebaseUid && isCreator) {
-      // 🔥 SCALABILITY: Join creators room for targeted broadcasting
+      // 🔥 SCALABILITY: Join creators room for targeted creator-side broadcasts
       socket.join('creators');
       
       const currentCount = creatorSocketCounts.get(firebaseUid) ?? 0;
@@ -205,20 +222,18 @@ export function setupAvailabilityGateway(io: Server): void {
       }
       activeSocketsByCreator.get(firebaseUid)!.add(socket.id);
       
-      // 🔥 FIX: Check if creator is on an active call before setting online
-      // If they have an active call, keep them busy (don't overwrite with online)
-      const user = await User.findOne({ firebaseUid });
-      const creator = user ? await Creator.findOne({ userId: user._id }) : null;
-      const hasActiveCall = creator?.currentCallId != null;
+      // Avoid Mongo reads on hot presence path; active call slot is tracked in Redis by billing lifecycle.
+      const hasActiveCall = await hasActiveCallForUid(firebaseUid);
       
       // 🔥 FIX: Automatically set creator online when first device connects
       // Product requirement: creators are automatically online when app opens
       // BUT: Don't overwrite busy status if creator is on an active call
       if (currentCount === 0) {
+        lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
         if (hasActiveCall) {
           // Creator is on a call - keep them busy
           await setCreatorAvailability(io, firebaseUid, 'busy');
-          logInfo('Creator has active call, kept as busy on connect', { firebaseUid, callId: creator.currentCallId });
+          logInfo('Creator has active call, kept as busy on connect', { firebaseUid });
         } else {
           await setCreatorAvailability(io, firebaseUid, 'online');
           logInfo('Creator automatically set to online on connect', { firebaseUid });
@@ -259,16 +274,14 @@ export function setupAvailabilityGateway(io: Server): void {
               return;
             }
             
-            // 🔥 FIX: Check if creator is on an active call before refreshing
-            // If they have an active call, keep them busy (don't refresh to online)
-            const user = await User.findOne({ firebaseUid });
-            const creator = user ? await Creator.findOne({ userId: user._id }) : null;
-            const hasActiveCall = creator?.currentCallId != null;
+            // Avoid Mongo lookups in heartbeat; read active call slot from Redis.
+            const hasActiveCall = await hasActiveCallForUid(firebaseUid);
+            lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
             
             if (hasActiveCall) {
               // Creator is on a call - ensure they stay busy
               await setCreatorAvailability(io, firebaseUid, 'busy');
-              logDebug('Heartbeat: Creator on active call, kept as busy', { firebaseUid, callId: creator.currentCallId });
+              logDebug('Heartbeat: Creator on active call, kept as busy', { firebaseUid });
             } else {
               const redis = getRedis();
               const status = await redis.get(availabilityKey(firebaseUid));
@@ -289,6 +302,7 @@ export function setupAvailabilityGateway(io: Server): void {
 
     // Handle regular user connection
     if (firebaseUid && isUser) {
+      socket.join('consumers');
       const currentCount = userSocketCounts.get(firebaseUid) ?? 0;
       userSocketCounts.set(firebaseUid, currentCount + 1);
       
@@ -301,6 +315,7 @@ export function setupAvailabilityGateway(io: Server): void {
       // 🔥 NEW: Automatically set user online when first device connects
       // Product requirement: users are automatically online when app opens
       if (currentCount === 0) {
+        lastUserHeartbeatAtMs.set(firebaseUid, Date.now());
         await setUserAvailability(firebaseUid, 'online');
         
         // 🔥 SCALABILITY: Broadcast only to creators (not all clients)
@@ -346,6 +361,7 @@ export function setupAvailabilityGateway(io: Server): void {
             }
             
             await refreshUserAvailability(firebaseUid);
+            lastUserHeartbeatAtMs.set(firebaseUid, Date.now());
             logDebug('User heartbeat refreshed TTL', { firebaseUid });
           } catch (err) {
             logError('User heartbeat failed', err, { firebaseUid });
@@ -412,17 +428,16 @@ export function setupAvailabilityGateway(io: Server): void {
         return;
       }
       
-      // 🔥 FIX: Check if creator is on an active call before setting online
-      // If they have an active call, keep them busy (don't overwrite with online)
-      const user = await User.findOne({ firebaseUid: uid });
-      const creatorDoc = user ? await Creator.findOne({ userId: user._id }) : null;
-      const hasActiveCall = creatorDoc?.currentCallId != null;
+      // Avoid Mongo reads on presence event; Redis call slot is authoritative for active-call busy state.
+      const hasActiveCall = await hasActiveCallForUid(uid);
       
       if (hasActiveCall) {
         // Creator is on a call - keep them busy
+        lastCreatorHeartbeatAtMs.set(uid, Date.now());
         await setCreatorAvailability(io, uid, 'busy');
-        logInfo('Creator has active call, kept as busy (creator:online event)', { firebaseUid: uid, callId: creatorDoc.currentCallId });
+        logInfo('Creator has active call, kept as busy (creator:online event)', { firebaseUid: uid });
       } else {
+        lastCreatorHeartbeatAtMs.set(uid, Date.now());
         await setCreatorAvailability(io, uid, 'online');
         logInfo('Creator set to online', { firebaseUid: uid });
       }
@@ -436,6 +451,7 @@ export function setupAvailabilityGateway(io: Server): void {
         return;
       }
       await setCreatorAvailability(io, uid, 'busy');
+      lastCreatorHeartbeatAtMs.set(uid, Date.now());
       logInfo('Creator set to offline', { firebaseUid: uid });
     });
 
@@ -448,6 +464,7 @@ export function setupAvailabilityGateway(io: Server): void {
         return;
       }
       await setUserAvailability(uid, 'online');
+      lastUserHeartbeatAtMs.set(uid, Date.now());
       // 🔥 SCALABILITY: Broadcast only to creators
       io.to('creators').emit('user:status', { firebaseUid: uid, status: 'online' });
       logInfo('User set to online', { firebaseUid: uid });
@@ -462,6 +479,7 @@ export function setupAvailabilityGateway(io: Server): void {
         return;
       }
       await setUserAvailability(uid, 'offline');
+      lastUserHeartbeatAtMs.set(uid, Date.now());
       // 🔥 SCALABILITY: Broadcast only to creators
       io.to('creators').emit('user:status', { firebaseUid: uid, status: 'offline' });
       logInfo('User set to offline', { firebaseUid: uid });
@@ -510,6 +528,7 @@ export function setupAvailabilityGateway(io: Server): void {
           // 🔥 AUTOMATIC OFFLINE: Mark creator as offline when all devices disconnect
           // Product requirement: creators are automatically offline when app closes
           creatorSocketCounts.delete(uid);
+          lastCreatorHeartbeatAtMs.delete(uid);
           
           // Stop heartbeat immediately (CRITICAL: must happen before status update)
           const heartbeatInterval = creatorHeartbeatIntervals.get(uid);
@@ -528,10 +547,12 @@ export function setupAvailabilityGateway(io: Server): void {
           } catch (err) {
             logError('Failed to set creator offline on disconnect', err, { firebaseUid: uid });
             // Even if Redis fails, try to broadcast the status change
-            io.emit('creator:status', {
+            const payload = {
               creatorId: uid,
               status: 'busy',
-            });
+            };
+            io.to('consumers').emit('creator:status', payload);
+            io.to('creators').emit('creator:status', payload);
           }
         } else {
           // Still have other devices connected - just decrement count
@@ -561,6 +582,7 @@ export function setupAvailabilityGateway(io: Server): void {
           // 🔥 AUTOMATIC OFFLINE: Mark user as offline when all devices disconnect
           // Product requirement: users are automatically offline when app closes
           userSocketCounts.delete(uid);
+          lastUserHeartbeatAtMs.delete(uid);
           
           // Stop heartbeat immediately (CRITICAL: must happen before status update)
           const heartbeatInterval = userHeartbeatIntervals.get(uid);
@@ -614,26 +636,39 @@ export async function setCreatorAvailability(
   creatorFirebaseUid: string,
   status: 'online' | 'busy'
 ): Promise<void> {
+  const startedAt = Date.now();
   const redis = getRedis();
+  const key = availabilityKey(creatorFirebaseUid);
+  const existing = await redis.get(key);
+  const currentStatus = existing === 'online' ? 'online' : 'busy';
 
-  if (status === 'online') {
-    await redis.setex(availabilityKey(creatorFirebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
-  } else {
-    // Delete key — absence = busy (the universal default)
-    await redis.del(availabilityKey(creatorFirebaseUid));
+  if (currentStatus === status) {
+    recordCallMetric('presence.creator_status_noop', 1, { status });
+    return;
   }
 
-  // Broadcast to ALL connected clients instantly
-  // 🔥 CRITICAL: This ensures all users see status changes in real-time
-  io.emit('creator:status', {
+  if (status === 'online') {
+    await redis.setex(key, AVAILABILITY_TTL_SECONDS, 'online');
+  } else {
+    // Delete key — absence = busy (the universal default)
+    await redis.del(key);
+  }
+
+  // Fanout to user-facing consumers and creators without a global broadcast.
+  const payload = {
     creatorId: creatorFirebaseUid,
     status,
-  });
-  
-  logDebug('Broadcast creator status to all clients', {
+  };
+  io.to('consumers').emit('creator:status', payload);
+  io.to('creators').emit('creator:status', payload);
+  recordCallMetric('presence.creator_status_emit', 1, { status });
+  recordCallMetric('presence.creator_status_propagation_ms', Date.now() - startedAt, { status });
+
+  logDebug('Broadcast creator status to presence rooms', {
     creatorFirebaseUid,
     status,
-    connectedClients: io.sockets.sockets.size,
+    consumersRoomSize: io.sockets.adapter.rooms.get('consumers')?.size ?? 0,
+    creatorsRoomSize: io.sockets.adapter.rooms.get('creators')?.size ?? 0,
   });
 
   // Emit to admin dashboard
@@ -646,4 +681,46 @@ export async function setCreatorAvailability(
     creatorFirebaseUid,
     status,
   });
+}
+
+async function sweepStaleHeartbeats(io: Server): Promise<void> {
+  const staleAfterMs = AVAILABILITY_TTL_SECONDS * 1000;
+  const now = Date.now();
+
+  for (const [uid, lastAt] of lastCreatorHeartbeatAtMs.entries()) {
+    if (now - lastAt <= staleAfterMs) continue;
+    const sockets = activeSocketsByCreator.get(uid);
+    const hasConnectedSocket =
+      !!sockets &&
+      Array.from(sockets).some((socketId) => {
+        const s = io.sockets.sockets.get(socketId);
+        return Boolean(s && s.connected);
+      });
+    if (hasConnectedSocket) continue;
+    await setCreatorAvailability(io, uid, 'busy');
+    lastCreatorHeartbeatAtMs.delete(uid);
+    activeSocketsByCreator.delete(uid);
+    creatorSocketCounts.delete(uid);
+    recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'creator', status: 'busy' });
+    logWarning('Applied creator TTL fallback to busy', { firebaseUid: uid });
+  }
+
+  for (const [uid, lastAt] of lastUserHeartbeatAtMs.entries()) {
+    if (now - lastAt <= staleAfterMs) continue;
+    const sockets = activeSocketsByUser.get(uid);
+    const hasConnectedSocket =
+      !!sockets &&
+      Array.from(sockets).some((socketId) => {
+        const s = io.sockets.sockets.get(socketId);
+        return Boolean(s && s.connected);
+      });
+    if (hasConnectedSocket) continue;
+    await setUserAvailability(uid, 'offline');
+    io.to('creators').emit('user:status', { firebaseUid: uid, status: 'offline' });
+    lastUserHeartbeatAtMs.delete(uid);
+    activeSocketsByUser.delete(uid);
+    userSocketCounts.delete(uid);
+    recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'user', status: 'offline' });
+    logWarning('Applied user TTL fallback to offline', { firebaseUid: uid });
+  }
 }

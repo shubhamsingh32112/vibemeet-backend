@@ -169,9 +169,18 @@ export const webhookIdKey = (eventId: string): string =>
   `${WEBHOOK_IDEMPOTENCY_PREFIX}${eventId}`;
 export const WEBHOOK_IDEMPOTENCY_TTL = 60 * 60; // 1 hour
 
+// DLQ SSCAN cursor (fairness across large dead-letter sets)
+export const BILLING_DLQ_SSCAN_CURSOR_KEY = 'billing:dlq:sscan_cursor';
+
 // Reconciliation job tracking
 export const RECONCILIATION_LAST_RUN_KEY = 'reconciliation:last_run';
 export const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+export const BILLING_RECONCILIATION_LOCK_KEY = 'lock:reconciliation:billing';
+export const CALL_RECONCILIATION_LOCK_KEY = 'lock:reconciliation:call';
+export const RECONCILIATION_LOCK_TTL_MS = Math.min(
+  120_000,
+  Math.max(10_000, parseInt(process.env.RECONCILIATION_LOCK_TTL_MS || '90000', 10) || 90_000)
+);
 
 // 🔥 FIX 6: Monitoring persistence to Redis
 export const METRICS_PREFIX = 'metrics:';
