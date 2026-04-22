@@ -29,7 +29,7 @@ export const verifyFirebaseToken = async (
     }
 
     const token = authHeader.split('Bearer ')[1];
-    logDebug('Token received', { path: req.path, tokenLength: token.length });
+    logDebug('Auth token received', { path: req.path });
 
     // --- Try Admin JWT first (short tokens, ~236 chars) ---
     const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
@@ -88,8 +88,6 @@ export const verifyFirebaseToken = async (
     const decodedToken = await admin.auth().verifyIdToken(token);
     logInfo('Firebase token verified', {
       firebaseUid: decodedToken.uid,
-      email: decodedToken.email || 'N/A',
-      phone: decodedToken.phone_number || 'N/A',
       path: req.path,
     });
 

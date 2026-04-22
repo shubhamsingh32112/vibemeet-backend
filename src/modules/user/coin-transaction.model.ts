@@ -23,6 +23,8 @@ export interface ICoinTransaction extends Document {
   description?: string; // Human-readable description
   callId?: string; // If transaction is from a video call
   paymentGatewayTransactionId?: string; // External payment gateway transaction ID (if applicable)
+  paymentGatewayOrderId?: string; // External payment gateway order ID (if applicable)
+  paymentGatewayProvider?: 'razorpay'; // Provider responsible for this transaction
   status: 'completed' | 'pending' | 'failed'; // Transaction status
   createdAt: Date;
   updatedAt: Date;
@@ -71,6 +73,17 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
       sparse: true,
       index: true,
     },
+    paymentGatewayOrderId: {
+      type: String,
+      sparse: true,
+      index: true,
+    },
+    paymentGatewayProvider: {
+      type: String,
+      enum: ['razorpay'],
+      sparse: true,
+      index: true,
+    },
     status: {
       type: String,
       enum: ['completed', 'pending', 'failed'],
@@ -84,5 +97,7 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
 
 // Compound index for efficient lookups
 coinTransactionSchema.index({ userId: 1, createdAt: -1 });
+coinTransactionSchema.index({ source: 1, paymentGatewayOrderId: 1 });
+coinTransactionSchema.index({ source: 1, paymentGatewayTransactionId: 1 });
 
 export const CoinTransaction = mongoose.model<ICoinTransaction>('CoinTransaction', coinTransactionSchema);

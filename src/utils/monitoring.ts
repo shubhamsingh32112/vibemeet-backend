@@ -293,6 +293,17 @@ export function recordAPIMetric(metric: string, value: number, tags?: Record<str
 }
 
 /**
+ * Helper function to record payment metrics.
+ */
+export function recordPaymentMetric(
+  metric: string,
+  value: number,
+  tags?: Record<string, string>
+): void {
+  monitoring.recordMetric(`payment.${metric}`, value, tags);
+}
+
+/**
  * Helper function to record system/runtime metrics.
  */
 export function recordSystemMetric(

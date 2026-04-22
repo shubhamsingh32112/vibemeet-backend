@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import dns from 'dns';
 import { mongoPoolMonitor } from '../utils/mongo-pool-monitor';
 import { bumpMongoConnectionError } from '../utils/driver-metrics';
 import { logInfo, logError } from '../utils/logger';
@@ -41,6 +42,18 @@ export const connectDatabase = async (): Promise<void> => {
     retryWrites: true,
     retryReads: true,
   };
+
+  const rawDnsServers = process.env.LOAD_TEST_DNS_SERVERS?.trim();
+  if (rawDnsServers) {
+    const servers = rawDnsServers
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (servers.length > 0) {
+      dns.setServers(servers);
+      logInfo('Mongo SRV DNS override enabled', { servers });
+    }
+  }
 
   try {
     await mongoose.connect(mongoUri, connectionOptions);

@@ -24,6 +24,10 @@ import { setupAdminGateway } from './modules/admin/admin.gateway';
 import routes from './routes';
 import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
 import { startCallReconciliationJob, stopCallReconciliationJob } from './modules/video/call-reconciliation';
+import {
+  startPaymentWebhookRetryWorker,
+  stopPaymentWebhookRetryWorker,
+} from './modules/payment/payment-webhook-retry.service';
 import { isRazorpayConfigured } from './config/razorpay';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
@@ -117,32 +121,36 @@ app.use('/api/', statusLimiter);
 // Compression - gzip responses for scalability (reduces bandwidth)
 app.use(compression());
 
-/** Stream Video webhooks must use the raw request bytes for HMAC (see webhook-signature.middleware). */
-function isStreamVideoWebhookPost(req: Request): boolean {
+/** Signed webhook endpoints must use raw request bytes for HMAC verification. */
+function isSignedWebhookPost(req: Request): boolean {
   if (req.method !== 'POST') return false;
   const pathOnly = req.originalUrl.split('?')[0];
-  return pathOnly === '/api/v1/video/webhook';
+  return (
+    pathOnly === '/api/v1/video/webhook' ||
+    pathOnly === '/api/v1/chat/webhook' ||
+    pathOnly === '/api/v1/payment/webhook'
+  );
 }
 
 const jsonParser = express.json({ limit: '50mb' });
 const urlEncodedParser = express.urlencoded({ extended: true, limit: '50mb' });
 
 app.use((req, res, next) => {
-  if (isStreamVideoWebhookPost(req)) {
+  if (isSignedWebhookPost(req)) {
     return express.raw({ type: '*/*', limit: '2mb' })(req, res, next);
   }
   next();
 });
 
 app.use((req, res, next) => {
-  if (isStreamVideoWebhookPost(req)) {
+  if (isSignedWebhookPost(req)) {
     return next();
   }
   jsonParser(req, res, next);
 });
 
 app.use((req, res, next) => {
-  if (isStreamVideoWebhookPost(req)) {
+  if (isSignedWebhookPost(req)) {
     return next();
   }
   urlEncodedParser(req, res, next);
@@ -153,7 +161,6 @@ app.use((req, _res, next) => {
   logRequest(req.method, req.path, req.ip || 'unknown-ip', {
     fullUrl: `${req.protocol}://${req.get('host') ?? 'unknown-host'}${req.originalUrl}`,
     hasAuth: !!req.headers.authorization,
-    authHeaderPrefix: req.headers.authorization ? req.headers.authorization.substring(0, 20) : undefined,
   });
   next();
 });
@@ -201,6 +208,16 @@ app.get('/metrics', async (req, res) => {
     const settlementTotal = byName['billing.settlement_total_ms'];
     const backpressureStage = byName['billing.backpressure_stage'];
     const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
+    const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
+    const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
+    const paymentWebhookProcessed = byName['payment.webhook.processed'];
+    const paymentWebhookProcessFailed = byName['payment.webhook.process_failed'];
+    const paymentFinalizeCompleted = byName['payment.finalize.completed'];
+    const paymentFinalizeAlreadyCompleted = byName['payment.finalize.already_completed'];
+    const paymentFinalizeFailed = byName['payment.finalize.failed'];
+    const paymentWebVerifySuccess = byName['payment.web.verify_success'];
+    const paymentWebVerifyFailed = byName['payment.web.verify_failed'];
+    const paymentWebVerifyDuration = byName['payment.web.verify_duration_ms'];
     const reconRunMsAvg = byName['billing.reconciliation_run_ms']?.avg ?? 0;
     const reconItemsAvg = byName['billing.reconciliation_items_processed']?.avg ?? 0;
     const now = Date.now();
@@ -405,6 +422,36 @@ app.get('/metrics', async (req, res) => {
             runAvgMs: Math.round(rollingReconRunAvgMs * 100) / 100,
             sampleLimit: rollingSampleLimit,
           },
+        },
+      },
+      payment: {
+        webhook: {
+          verify: {
+            successSamples: paymentWebhookVerifySuccess?.count ?? 0,
+            failedSamples: paymentWebhookVerifyFail?.count ?? 0,
+          },
+          processing: {
+            processedSamples: paymentWebhookProcessed?.count ?? 0,
+            failedSamples: paymentWebhookProcessFailed?.count ?? 0,
+          },
+        },
+        finalize: {
+          completedSamples: paymentFinalizeCompleted?.count ?? 0,
+          alreadyCompletedSamples: paymentFinalizeAlreadyCompleted?.count ?? 0,
+          failedSamples: paymentFinalizeFailed?.count ?? 0,
+        },
+        webVerify: {
+          successSamples: paymentWebVerifySuccess?.count ?? 0,
+          failedSamples: paymentWebVerifyFailed?.count ?? 0,
+          durationMs: paymentWebVerifyDuration
+            ? {
+                samples: paymentWebVerifyDuration.count,
+                avgMs: Math.round(paymentWebVerifyDuration.avg * 100) / 100,
+                p95Ms: Math.round(paymentWebVerifyDuration.p95 * 100) / 100,
+                p99Ms: Math.round(paymentWebVerifyDuration.p99 * 100) / 100,
+                maxMs: Math.round(paymentWebVerifyDuration.max * 100) / 100,
+              }
+            : null,
         },
       },
       runtime: {
@@ -709,6 +756,7 @@ const startServer = async () => {
 
     // 🔥 NEW: Start periodic call reconciliation against Stream
     startCallReconciliationJob(io);
+    startPaymentWebhookRetryWorker();
 
     setupAdminGateway(io);
     logInfo('Socket.IO admin gateway ready');
@@ -828,6 +876,7 @@ process.on('uncaughtException', async (error) => {
   await cleanupBillingIntervals().catch(() => {});
   stopReconciliationJob();
   stopCallReconciliationJob();
+  stopPaymentWebhookRetryWorker();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -840,6 +889,7 @@ process.on('SIGTERM', async () => {
   await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
+  stopPaymentWebhookRetryWorker();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -852,6 +902,7 @@ process.on('SIGINT', async () => {
   await cleanupBillingIntervals();
   stopReconciliationJob();
   stopCallReconciliationJob();
+  stopPaymentWebhookRetryWorker();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;

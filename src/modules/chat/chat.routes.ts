@@ -9,7 +9,8 @@ import {
 } from './chat.controller';
 import { handleStreamWebhook } from './chat.webhook';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
-import { chatLimiter } from '../../middlewares/rate-limit.middleware';
+import { chatLimiter, webhookLimiter } from '../../middlewares/rate-limit.middleware';
+import { verifyStreamChatWebhookSignature } from '../../middlewares/webhook-signature.middleware';
 
 const router = Router();
 
@@ -42,6 +43,6 @@ router.get(
 );
 
 // Stream webhook endpoint (no auth required - Stream calls this directly)
-router.post('/webhook', handleStreamWebhook);
+router.post('/webhook', webhookLimiter, verifyStreamChatWebhookSignature, handleStreamWebhook);
 
 export default router;

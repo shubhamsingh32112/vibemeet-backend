@@ -3,11 +3,14 @@ import {
   createOrder,
   createWebOrder,
   getWalletPackages,
+  handleRazorpayWebhook,
   initiateWebCheckout,
   verifyPayment,
   verifyWebPayment,
 } from './payment.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
+import { webhookLimiter } from '../../middlewares/rate-limit.middleware';
+import { verifyRazorpayWebhookSignature } from '../../middlewares/webhook-signature.middleware';
 
 const router = Router();
 
@@ -28,5 +31,8 @@ router.post('/web/create-order', createWebOrder);
 
 // POST /payment/web/verify — Website verifies payment and returns app deep-link
 router.post('/web/verify', verifyWebPayment);
+
+// POST /payment/webhook — Razorpay webhook (signature protected + rate limited)
+router.post('/webhook', webhookLimiter, verifyRazorpayWebhookSignature, handleRazorpayWebhook);
 
 export default router;

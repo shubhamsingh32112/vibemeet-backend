@@ -196,7 +196,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         }
       }
 
-      // Referral: existing account — apply login-time code only when not yet linked (same rules as signup)
+      // Referral: existing account attach must respect late-attach constraints.
       const existingReferralRaw =
         typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : '';
       if (existingReferralRaw) {
@@ -212,7 +212,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           if (!isValidReferralCodeFormat(existingReferralRaw)) {
             referralApply = referralApplyFailure('INVALID_FORMAT');
           } else {
-            const ar = await applyReferralCode(user, existingReferralRaw, { mode: 'signup' });
+            const ar = await applyReferralCode(user, existingReferralRaw, { mode: 'late_attach' });
             referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
             const latest = await User.findOne({ firebaseUid });
             if (latest) user = latest;

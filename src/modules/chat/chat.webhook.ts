@@ -42,6 +42,14 @@ interface StreamWebhookPayload {
   };
 }
 
+const parseWebhookPayload = (body: unknown): StreamWebhookPayload => {
+  if (Buffer.isBuffer(body)) {
+    const raw = body.toString('utf8');
+    return raw.trim() ? (JSON.parse(raw) as StreamWebhookPayload) : ({} as StreamWebhookPayload);
+  }
+  return (body || {}) as StreamWebhookPayload;
+};
+
 /**
  * Validate attachments — only creators can send images / videos.
  * Voice messages are allowed for everyone.
@@ -71,7 +79,7 @@ export const handleStreamWebhook = async (
   res: Response
 ): Promise<void> => {
   try {
-    const payload = req.body as StreamWebhookPayload;
+    const payload = parseWebhookPayload(req.body);
 
     console.log(`📥 [WEBHOOK] Received: ${payload.type}`);
 

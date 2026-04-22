@@ -9,12 +9,13 @@
     "start": "node dist/server.js",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit",
-    "test": "tsx --test src/modules/billing/billing.queue.contract.test.ts src/modules/billing/billing.flush.contract.test.ts src/modules/video/video.webhook.routes.contract.test.ts src/modules/creator/creator-promotion-ledger.contract.test.ts",
+    "test": "tsx --test src/modules/billing/billing.queue.contract.test.ts src/modules/billing/billing.flush.contract.test.ts src/modules/billing/billing.idempotency.contract.test.ts src/modules/video/video.webhook.routes.contract.test.ts src/modules/creator/creator-promotion-ledger.contract.test.ts src/modules/payment/payment.webhook.contract.test.ts src/middlewares/webhook-signature.contract.test.ts",
     "seed:admin": "tsx src/scripts/seed-admin.ts",
     "migrate:identity-ledger": "tsx src/scripts/backfill-identity-ledger.ts",
     "seed:preset-avatars": "tsx src/scripts/upload-preset-avatars.ts",
     "upload:ringtone": "tsx src/scripts/upload-ringtone.ts",
     "upload:coin-images": "tsx src/scripts/upload-coin-images.ts",
+    "guard:flutter-payment-boundary": "node scripts/check-flutter-payment-boundary.cjs",
     "verify:redis": "tsx scripts/verify-redis.ts",
     "backfill:referral-edges": "tsx src/scripts/backfill-referral-edges.ts"
   },
@@ -59,6 +60,7 @@
     "@typescript-eslint/eslint-plugin": "^6.15.0",
     "@typescript-eslint/parser": "^6.15.0",
     "eslint": "^8.56.0",
+    "socket.io-client": "^4.8.3",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   }

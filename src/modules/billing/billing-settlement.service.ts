@@ -32,11 +32,12 @@ import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
 import {
   COIN_MICROS,
   BILLING_SESSION_SCHEMA_VERSION,
-  microsToWholeCoinsFloor,
   microsToUserDebitWholeCoins,
   microsToCreatorCreditWholeCoins,
 } from './billing.constants';
 import { billingService, finalFlushMarkerKey } from './billing.service';
+import { getBillingCheckpoint } from './billing-checkpoint.service';
+import { featureFlags } from '../../config/feature-flags';
 
 interface CallSession {
   schemaVersion?: number;
@@ -57,6 +58,45 @@ interface CallSession {
   totalEarnedMicros?: number;
   elapsedSeconds: number;
   effectiveDurationLimitSeconds?: number;
+}
+
+function buildSettlementSessionFromCheckpoint(checkpoint: Record<string, unknown>, callId: string): CallSession | null {
+  const userMongoId = String(checkpoint.userMongoId || '');
+  const creatorMongoId = String(checkpoint.creatorMongoId || '');
+  const userFirebaseUid = String(checkpoint.userFirebaseUid || '');
+  const creatorFirebaseUid = String(checkpoint.creatorFirebaseUid || '');
+  if (!userMongoId || !creatorMongoId || !userFirebaseUid || !creatorFirebaseUid) return null;
+
+  const pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
+  const startTimeMs = Number(checkpoint.startTimeMs) || Date.now();
+  const lastProcessedAtMs = Number(checkpoint.lastProcessedAtMs) || startTimeMs;
+  const totalDeductedMicros = Math.max(0, Number(checkpoint.totalDeductedMicros) || 0);
+  const totalEarnedMicros = Math.max(0, Number(checkpoint.totalEarnedMicros) || 0);
+  const elapsedSeconds =
+    pricePerSecondMicros > 0 ? Math.floor(totalDeductedMicros / pricePerSecondMicros) : 0;
+  const pricePerMinute =
+    pricePerSecondMicros > 0 ? Math.round((pricePerSecondMicros * 60) / COIN_MICROS) : 0;
+
+  return {
+    schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+    callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    userMongoId,
+    creatorMongoId,
+    pricePerMinute,
+    pricePerSecondMicros,
+    creatorEarningsPerSecondMicros: Math.max(
+      0,
+      Number(checkpoint.creatorEarningsPerSecondMicros) || 0
+    ),
+    startTime: startTimeMs,
+    lastProcessedAt: lastProcessedAtMs,
+    totalDeductedMicros,
+    totalEarnedMicros,
+    elapsedSeconds,
+    effectiveDurationLimitSeconds: Number(checkpoint.effectiveDurationLimitSeconds) || undefined,
+  };
 }
 
 function generateUserCreatorChannelId(uid1: string, uid2: string): string {
@@ -98,6 +138,14 @@ async function removeCallFromBilling(callId: string): Promise<void> {
 
 const SETTLE_LOCK_PREFIX = 'settle:lock:';
 const settleLockKey = (callId: string): string => `${SETTLE_LOCK_PREFIX}${callId}`;
+const SETTLE_LOCK_TTL_SECONDS = 120;
+const SETTLE_LOCK_HEARTBEAT_MS = 30_000;
+const RELEASE_IF_MATCH_LUA = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`;
 
 /** Remove live billing keys only after Mongo commit (or idempotent cleanup). */
 async function deleteBillingSessionRedisKeys(
@@ -106,12 +154,14 @@ async function deleteBillingSessionRedisKeys(
   userFirebaseUid: string,
   creatorFirebaseUid: string
 ): Promise<void> {
+  const userSlotKey = activeCallByUserKey(userFirebaseUid);
+  const creatorSlotKey = activeCallByUserKey(creatorFirebaseUid);
   await Promise.all([
     redis.del(callSessionKey(callId)),
     redis.del(callUserCoinsKey(callId)),
     redis.del(callCreatorEarningsKey(callId)),
-    redis.del(activeCallByUserKey(userFirebaseUid)),
-    redis.del(activeCallByUserKey(creatorFirebaseUid)),
+    redis.eval(RELEASE_IF_MATCH_LUA, 1, userSlotKey, callId),
+    redis.eval(RELEASE_IF_MATCH_LUA, 1, creatorSlotKey, callId),
   ]);
 }
 
@@ -134,19 +184,24 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     recordBillingMetric('settlement_final_flush_marker_present', 1, { callId });
   }
 
-  await removeCallFromBilling(callId);
-
   if (await redis.get(settledKey)) {
     logWarning('Call already settled (Redis) — skipping', { callId });
     return;
   }
 
-  const lockResult = await redis.set(settleLockKey(callId), '1', 'EX', 60, 'NX');
+  const lockToken = crypto.randomUUID();
+  const settleLockRedisKey = settleLockKey(callId);
+  const lockResult = await redis.set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'NX');
   const lockAcquired = lockResult === 'OK';
   if (!lockAcquired) {
     logWarning('Settlement already in progress / completed — skipping', { callId });
     return;
   }
+  const lockHeartbeat = setInterval(() => {
+    redis
+      .set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'XX')
+      .catch(() => {});
+  }, SETTLE_LOCK_HEARTBEAT_MS);
 
   logInfo('Settling call - reading from Redis', {
     callId,
@@ -157,6 +212,8 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     },
   });
 
+  await removeCallFromBilling(callId);
+
   let sessionRaw: string | null;
   try {
     sessionRaw = await redis.get(callSessionKey(callId));
@@ -165,8 +222,20 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       callId,
       alert: true,
     });
-    await redis.del(settleLockKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
     return;
+  }
+
+  if (!sessionRaw) {
+    if (featureFlags.billingDeltaCursorV3Enabled) {
+      const checkpoint = await getBillingCheckpoint(callId);
+      const checkpointSession = checkpoint
+        ? buildSettlementSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId)
+        : null;
+      if (checkpointSession) {
+        sessionRaw = JSON.stringify(checkpointSession);
+      }
+    }
   }
 
   if (!sessionRaw) {
@@ -180,7 +249,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
         impact: 'Settlement skipped - no billing data available',
       });
     }
-    await redis.del(settleLockKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
     return;
   }
 
@@ -200,7 +269,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       session.creatorFirebaseUid
     );
     await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
-    await redis.del(settleLockKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
     return;
   }
 
@@ -217,8 +286,20 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       callId,
       alert: true,
     });
-    await redis.del(settleLockKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
     return;
+  }
+
+  if (featureFlags.billingDeltaCursorV3Enabled && (finalCoinsRaw === null || finalEarningsRaw === null)) {
+    const checkpoint = await getBillingCheckpoint(callId);
+    if (checkpoint) {
+      if (finalCoinsRaw === null) {
+        finalCoinsRaw = String(Number((checkpoint as any).remainingUserBalanceMicros || 0));
+      }
+      if (finalEarningsRaw === null) {
+        finalEarningsRaw = String(Number((checkpoint as any).totalEarnedMicros || 0));
+      }
+    }
   }
 
   const coinsStr = String(finalCoinsRaw ?? '0');
@@ -286,8 +367,39 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     if (!user) {
       throw new Error(`User not found: ${session.userMongoId}`);
     }
-    user.coins = Math.max(0, microsToWholeCoinsFloor(balanceMicros));
-    await user.save({ session: dbSession });
+
+    const targetUserDebit = Math.max(0, totalDeducted);
+    const existingUserDebitTxn = await CoinTransaction.findOne({
+      callId,
+      userId: session.userMongoId,
+      type: 'debit',
+    }).session(dbSession);
+    const alreadyDebited = Math.max(0, existingUserDebitTxn?.coins || 0);
+    const userDebitDelta = Math.max(0, targetUserDebit - alreadyDebited);
+
+    let updatedUserCoins = user.coins || 0;
+    if (userDebitDelta > 0) {
+      const updatedUser = await User.findByIdAndUpdate(
+        user._id,
+        [
+          {
+            $set: {
+              coins: {
+                $max: [0, { $subtract: ['$coins', userDebitDelta] }],
+              },
+            },
+          },
+        ],
+        {
+          new: true,
+          session: dbSession,
+        }
+      );
+      if (!updatedUser) {
+        throw new Error(`User not found during debit update: ${session.userMongoId}`);
+      }
+      updatedUserCoins = updatedUser.coins || 0;
+    }
 
     if (totalDeducted > 0) {
       await CoinTransaction.findOneAndUpdate(
@@ -318,9 +430,28 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
         throw new Error(`Creator user not found: ${creator.userId}`);
       }
 
-      const creatorCoinsBefore = creatorUser.coins || 0;
-      creatorUser.coins = Math.round(creatorCoinsBefore + totalEarnedCreator);
-      await creatorUser.save({ session: dbSession });
+      const existingCreatorCreditTxn = await CoinTransaction.findOne({
+        callId,
+        userId: creator.userId,
+        type: 'credit',
+      }).session(dbSession);
+      const alreadyCredited = Math.max(0, existingCreatorCreditTxn?.coins || 0);
+      const targetCreatorCredit = Math.max(0, totalEarnedCreator);
+      const creatorCreditDelta = Math.max(0, targetCreatorCredit - alreadyCredited);
+
+      let creatorCoinsBefore = creatorUser.coins || 0;
+      if (creatorCreditDelta > 0) {
+        const updatedCreatorUser = await User.findByIdAndUpdate(
+          creatorUser._id,
+          { $inc: { coins: creatorCreditDelta } },
+          { new: true, session: dbSession }
+        );
+        if (!updatedCreatorUser) {
+          throw new Error(`Creator user not found during credit update: ${creator.userId}`);
+        }
+        creatorCoinsBefore = Math.max(0, (updatedCreatorUser.coins || 0) - creatorCreditDelta);
+        creatorUser = updatedCreatorUser;
+      }
 
       logInfo('Settling call - Creator coins updated', {
         callId,
@@ -420,7 +551,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
     io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
       userId: user._id.toString(),
-      coins: user.coins,
+      coins: updatedUserCoins,
     });
 
     if (creatorUser) {
@@ -466,7 +597,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
     io.to(`user:${session.userFirebaseUid}`).emit('billing:settled', {
       callId,
-      finalCoins: user.coins,
+      finalCoins: updatedUserCoins,
       totalDeducted,
       durationSeconds,
     });
@@ -524,7 +655,8 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     }
     throw err;
   } finally {
+    clearInterval(lockHeartbeat);
     await dbSession.endSession();
-    await redis.del(settleLockKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
   }
 }

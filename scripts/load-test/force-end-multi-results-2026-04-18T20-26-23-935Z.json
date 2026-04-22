@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "multiN": 2,
+    "baseURL": "http://127.0.0.1:3000",
+    "seedFanCoins": 600,
+    "creatorPrice": 60,
+    "generatedAt": "2026-04-18T20:26:23.936Z",
+    "expectedWallSecondsApprox": 600,
+    "naturalExhaustionOnly": true,
+    "postsCallEnded": false,
+    "autoEndSignal": "call:force-end with reason insufficient_coins"
+  },
+  "aggregateDurationSeconds": null,
+  "results": [
+    {
+      "index": 0,
+      "callId": "E8uEv9lNjhZKxNrdbqw7SpegWxr1_69e3e84daa1dc9907bd2b40f_1776543977930",
+      "ok": false,
+      "error": "Request failed with status code 500",
+      "expectedSec": 600
+    },
+    {
+      "index": 1,
+      "callId": "CjcPfk4amrUksUjCBdoJ8Krlu0G3_69e3e84faa1dc9907bd2b41a_1776543978049",
+      "ok": false,
+      "error": "Request failed with status code 500",
+      "expectedSec": 600
+    }
+  ]
+}

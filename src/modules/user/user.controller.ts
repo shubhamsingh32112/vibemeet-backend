@@ -73,6 +73,125 @@ export const getFavoriteCreators = async (req: Request, res: Response): Promise<
   }
 };
 
+export const getFavoriteCreatorProfiles = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (user.role !== 'user') {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Only users can view favorite creators',
+      });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const favoriteIds = (user.favoriteCreatorIds || []).map((id) => id.toString());
+    const total = favoriteIds.length;
+
+    if (total === 0) {
+      res.json({
+        success: true,
+        data: {
+          creators: [],
+          pagination: {
+            page,
+            limit,
+            total: 0,
+            totalPages: 0,
+          },
+        },
+      });
+      return;
+    }
+
+    const start = (page - 1) * limit;
+    const pagedIds = favoriteIds.slice(start, start + limit);
+    const validObjectIds = pagedIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    const creators = validObjectIds.length
+      ? await Creator.find({ _id: { $in: validObjectIds } }).lean()
+      : [];
+    const creatorById = new Map(creators.map((creator) => [creator._id.toString(), creator] as const));
+    const orderedCreators = pagedIds
+      .map((id) => creatorById.get(id))
+      .filter((creator): creator is NonNullable<typeof creator> => Boolean(creator));
+
+    const userIds = orderedCreators
+      .map((creator) => creator.userId)
+      .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+    const linkedUsers = userIds.length
+      ? await User.find({ _id: { $in: userIds } }).select('_id firebaseUid').lean()
+      : [];
+    const firebaseUidByUserId = new Map(
+      linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const)
+    );
+
+    const firebaseUids = orderedCreators
+      .map((creator) =>
+        creator.userId ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null) : null
+      )
+      .filter((uid): uid is string => Boolean(uid));
+
+    const { getBatchAvailability } = await import('../availability/availability.service');
+    const availabilityMap =
+      firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
+
+    res.json({
+      success: true,
+      data: {
+        creators: orderedCreators.map((creator) => {
+          const firebaseUid = creator.userId
+            ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
+            : null;
+          return {
+            id: creator._id.toString(),
+            userId: creator.userId ? creator.userId.toString() : '',
+            firebaseUid,
+            name: creator.name,
+            about: creator.about,
+            photo: creator.photo,
+            galleryImages: creator.galleryImages || [],
+            categories: creator.categories,
+            price: creator.price,
+            age: creator.age,
+            location: creator.location,
+            isOnline: creator.isOnline,
+            availability: firebaseUid ? (availabilityMap[firebaseUid] ?? 'busy') : 'busy',
+            isFavorite: true,
+            createdAt: creator.createdAt,
+            updatedAt: creator.updatedAt,
+          };
+        }),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get favorite creator profiles error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 export const toggleFavoriteCreator = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.auth) {

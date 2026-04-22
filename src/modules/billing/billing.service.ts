@@ -43,13 +43,19 @@ import {
   getBillingEmitIntervalMs,
   getBillingRedisBackpressureMs,
 } from './billing.constants';
-import { upsertBillingCheckpoint } from './billing-checkpoint.service';
+import {
+  advanceBillingCheckpointCursor,
+  getBillingCheckpoint,
+  upsertBillingCheckpoint,
+  upsertBillingCheckpointSnapshot,
+} from './billing-checkpoint.service';
 import { forceTerminateCall } from './billing-termination.service';
 import {
   getEmitIntervalForStage,
   isNewCallAdmissionBlocked,
   updateBackpressureStage,
 } from './billing-backpressure';
+import { featureFlags } from '../../config/feature-flags';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
@@ -61,6 +67,11 @@ const LEGACY_EARNINGS_MICRO_FACTOR = 10_000;
 const BILLING_CYCLE_LOCK_PREFIX = 'billing:cycle_lock:';
 function billingCycleLockKey(callId: string): string {
   return `${BILLING_CYCLE_LOCK_PREFIX}${callId}`;
+}
+const BILLING_SESSION_START_LOCK_PREFIX = 'billing:start_lock:';
+const BILLING_SESSION_START_LOCK_TTL_SECONDS = 30;
+function billingSessionStartLockKey(callId: string): string {
+  return `${BILLING_SESSION_START_LOCK_PREFIX}${callId}`;
 }
 
 const RELEASE_BILLING_CYCLE_LOCK_LUA = `
@@ -91,21 +102,28 @@ async function tryReserveActiveCallSlots(
 ): Promise<'ok' | 'conflict'> {
   const userKey = activeCallByUserKey(userFirebaseUid);
   const creatorKey = activeCallByUserKey(creatorFirebaseUid);
-
-  const u = await redis.set(userKey, callId, 'EX', ACTIVE_CALL_BY_USER_TTL, 'NX');
-  if (u === null) {
-    const existing = await redis.get(userKey);
-    if (existing === callId) return 'ok';
-    return 'conflict';
-  }
-  const c = await redis.set(creatorKey, callId, 'EX', ACTIVE_CALL_BY_USER_TTL, 'NX');
-  if (c === null) {
-    const existing = await redis.get(creatorKey);
-    if (existing === callId) return 'ok';
-    await redis.del(userKey).catch(() => {});
-    return 'conflict';
-  }
-  return 'ok';
+  const reserveLua = `
+local userExisting = redis.call("GET", KEYS[1])
+if userExisting and userExisting ~= ARGV[1] then
+  return "conflict"
+end
+local creatorExisting = redis.call("GET", KEYS[2])
+if creatorExisting and creatorExisting ~= ARGV[1] then
+  return "conflict"
+end
+redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+redis.call("SET", KEYS[2], ARGV[1], "EX", ARGV[2])
+return "ok"
+`;
+  const result = await redis.eval(
+    reserveLua,
+    2,
+    userKey,
+    creatorKey,
+    callId,
+    String(ACTIVE_CALL_BY_USER_TTL)
+  );
+  return result === 'ok' ? 'ok' : 'conflict';
 }
 
 async function releaseActiveCallSlotsIfOurs(
@@ -272,6 +290,64 @@ function migrateSession(
   return { session, balanceMicros, earningsMicros };
 }
 
+function buildSessionFromCheckpoint(
+  checkpoint: Record<string, unknown>,
+  callId: string
+): { session: CallSession; balanceMicros: number; earningsMicros: number } | null {
+  const userMongoId = String(checkpoint.userMongoId || '');
+  const creatorMongoId = String(checkpoint.creatorMongoId || '');
+  const userFirebaseUid = String(checkpoint.userFirebaseUid || '');
+  const creatorFirebaseUid = String(checkpoint.creatorFirebaseUid || '');
+  if (!userMongoId || !creatorMongoId || !userFirebaseUid || !creatorFirebaseUid) {
+    return null;
+  }
+  const startTimeMs = Number(checkpoint.startTimeMs) || Date.now();
+  const lastProcessedAtMs = Number(checkpoint.lastProcessedAtMs) || startTimeMs;
+  const pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
+  const creatorEarningsPerSecondMicros = Math.max(
+    0,
+    Number(checkpoint.creatorEarningsPerSecondMicros) || 0
+  );
+  const totalDeductedMicros = Math.max(0, Number(checkpoint.totalDeductedMicros) || 0);
+  const totalEarnedMicros = Math.max(0, Number(checkpoint.totalEarnedMicros) || 0);
+  const remainingUserBalanceMicros = Math.max(
+    0,
+    Number(checkpoint.remainingUserBalanceMicros) || 0
+  );
+
+  const elapsedSeconds =
+    pricePerSecondMicros > 0 ? Math.floor(totalDeductedMicros / pricePerSecondMicros) : 0;
+  const pricePerMinute =
+    pricePerSecondMicros > 0 ? Math.round((pricePerSecondMicros * 60) / COIN_MICROS) : 0;
+
+  const session: CallSession = {
+    schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+    callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    userMongoId,
+    creatorMongoId,
+    pricePerMinute,
+    pricePerSecondMicros,
+    creatorEarningsPerSecondMicros,
+    creatorShareAtCallTime: 0,
+    startTime: startTimeMs,
+    lastProcessedAt: lastProcessedAtMs,
+    version: Math.max(1, Number(checkpoint.version) || 1),
+    totalDeductedMicros,
+    totalEarnedMicros,
+    elapsedSeconds,
+    effectiveDurationLimitSeconds: MAX_CALL_DURATION_SECONDS,
+    expectedNextTickAtMs: lastProcessedAtMs + BILLING_PROCESS_INTERVAL_MS,
+  };
+
+  return {
+    session,
+    balanceMicros: remainingUserBalanceMicros,
+    earningsMicros: totalEarnedMicros,
+  };
+}
+
 /** Who invoked `startBillingSession` (for metrics and debugging multi-writer races). */
 export type BillingSessionStartSource =
   | 'client_socket'
@@ -295,6 +371,28 @@ export class BillingService {
     const { callId, creatorFirebaseUid, creatorMongoId } = data;
     const source: BillingSessionStartSource = opts?.source ?? 'unknown';
     const callIdPrefix = callId.length > 16 ? callId.slice(0, 16) : callId;
+    const startLockToken = randomUUID();
+    const startLockKey = billingSessionStartLockKey(callId);
+    const startLock = await redis.set(
+      startLockKey,
+      startLockToken,
+      'EX',
+      BILLING_SESSION_START_LOCK_TTL_SECONDS,
+      'NX'
+    );
+    if (startLock !== 'OK') {
+      logInfo('Billing session start lock busy (idempotent duplicate)', {
+        callId,
+        attemptedSource: source,
+      });
+      recordBillingMetric('session_start_duplicate', 1, {
+        source,
+        callIdPrefix,
+        reason: 'start_lock_busy',
+      });
+      return;
+    }
+    try {
     if (isNewCallAdmissionBlocked()) {
       recordBillingMetric('new_call_admission_rejected', 1, { source, callIdPrefix });
       io.to(`user:${userFirebaseUid}`).emit('billing:error', {
@@ -424,6 +522,24 @@ export class BillingService {
         .exec();
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
+      if (featureFlags.billingDeltaCursorV3Enabled) {
+        await upsertBillingCheckpointSnapshot({
+          callId,
+          userMongoId: session.userMongoId,
+          creatorMongoId: session.creatorMongoId,
+          userFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+          startTimeMs: session.startTime,
+          lastProcessedAtMs: session.lastProcessedAt,
+          remainingUserBalanceMicros: balanceMicros,
+          pricePerSecondMicros: session.pricePerSecondMicros,
+          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+          totalDeductedMicros: session.totalDeductedMicros,
+          totalEarnedMicros: session.totalEarnedMicros,
+          status: 'active',
+        });
+      }
+
       logInfo('Billing session started - Redis keys seeded', {
         callId,
         initialBalanceMicros: balanceMicros,
@@ -506,6 +622,9 @@ export class BillingService {
         await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
       }
       throw err;
+    }
+    } finally {
+      await releaseBillingCycleLock(redis, startLockKey, startLockToken);
     }
   }
 
@@ -624,26 +743,67 @@ export class BillingService {
         throw redisError;
       }
 
+      let session: CallSession;
+      let balanceMicros = 0;
+      let earningsMicros = 0;
+      let parsed: Record<string, unknown> = {};
+      let coinsRaw: string | null = null;
+      let earningsRaw: string | null = null;
+
       if (!sessionRaw) {
-        logWarning('Session not found in Redis', { callId });
-        return 'stop_no_session';
+        if (!featureFlags.billingDeltaCursorV3Enabled) {
+          logWarning('Session not found in Redis', { callId });
+          return 'stop_no_session';
+        }
+        const checkpoint = await getBillingCheckpoint(callId);
+        if (!checkpoint) {
+          logWarning('Session/checkpoint not found for billing tick', { callId });
+          return 'stop_no_session';
+        }
+        const reconstructed = buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId);
+        if (!reconstructed) {
+          logWarning('Failed to reconstruct session from checkpoint', { callId });
+          return 'stop_no_session';
+        }
+        session = reconstructed.session;
+        balanceMicros = reconstructed.balanceMicros;
+        earningsMicros = reconstructed.earningsMicros;
+      } else {
+        parsed = JSON.parse(sessionRaw) as Record<string, unknown>;
+        [coinsRaw, earningsRaw] = await Promise.all([
+          redis.get(callUserCoinsKey(callId)),
+          redis.get(callCreatorEarningsKey(callId)),
+        ]);
+
+        const migrated = migrateSession(parsed, coinsRaw as string | null, earningsRaw as string | null);
+        session = migrated.session;
+        balanceMicros = migrated.balanceMicros;
+        earningsMicros = migrated.earningsMicros;
+
+        if (
+          featureFlags.billingDeltaCursorV3Enabled &&
+          (coinsRaw === null || earningsRaw === null)
+        ) {
+          const checkpoint = await getBillingCheckpoint(callId);
+          const reconstructed = checkpoint
+            ? buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId)
+            : null;
+          if (reconstructed) {
+            balanceMicros = reconstructed.balanceMicros;
+            earningsMicros = reconstructed.earningsMicros;
+            session.lastProcessedAt = reconstructed.session.lastProcessedAt;
+            session.totalDeductedMicros = reconstructed.session.totalDeductedMicros;
+            session.totalEarnedMicros = reconstructed.session.totalEarnedMicros;
+            session.version = Math.max(session.version, reconstructed.session.version);
+          }
+        }
       }
 
-      const parsed = JSON.parse(sessionRaw) as Record<string, unknown>;
-      const [coinsRaw, earningsRaw] = await Promise.all([
-        redis.get(callUserCoinsKey(callId)),
-        redis.get(callCreatorEarningsKey(callId)),
-      ]);
-
-      const { session, balanceMicros: bal0, earningsMicros: earn0 } = migrateSession(
-        parsed,
-        coinsRaw as string | null,
-        earningsRaw as string | null
-      );
-      let balanceMicros = bal0;
-      let earningsMicros = earn0;
-
-      if (parsed.schemaVersion === undefined || Number(parsed.schemaVersion) < BILLING_SESSION_SCHEMA_VERSION) {
+      if (
+        sessionRaw &&
+        (parsed.schemaVersion === undefined ||
+          Number(parsed.schemaVersion) < BILLING_SESSION_SCHEMA_VERSION)
+      ) {
         recordBillingMetric('redis_ops', 5, { callId, path: 'session_migration' });
         await redis
           .multi()
@@ -782,30 +942,49 @@ export class BillingService {
 
       const cpInterval = getBillingCheckpointIntervalMs();
       const minDeltaMicros = getBillingCheckpointMinDeltaMicros();
-      const checkpointDue =
-        cpInterval > 0 && Date.now() - (session.lastCheckpointAtMs || 0) >= cpInterval;
-      if (checkpointDue) {
-        const prevDed = session.lastCheckpointDeductedMicros;
-        const prevEarn = session.lastCheckpointEarnedMicros;
-        const noPriorCheckpoint = prevDed === undefined && prevEarn === undefined;
-        const deltaDeduct = Math.abs(session.totalDeductedMicros - (prevDed ?? 0));
-        const deltaEarn = Math.abs(session.totalEarnedMicros - (prevEarn ?? 0));
-        const deltaOk =
-          minDeltaMicros <= 0 ||
-          noPriorCheckpoint ||
-          deltaDeduct >= minDeltaMicros ||
-          deltaEarn >= minDeltaMicros;
-        if (deltaOk) {
-          session.lastCheckpointAtMs = Date.now();
-          await upsertBillingCheckpoint({
-            callId,
-            userMongoId: session.userMongoId,
-            creatorMongoId: session.creatorMongoId,
-            totalDeductedMicros: session.totalDeductedMicros,
-            totalEarnedMicros: session.totalEarnedMicros,
-          });
-          session.lastCheckpointDeductedMicros = session.totalDeductedMicros;
-          session.lastCheckpointEarnedMicros = session.totalEarnedMicros;
+      if (featureFlags.billingDeltaCursorV3Enabled) {
+        await advanceBillingCheckpointCursor({
+          callId,
+          userMongoId: session.userMongoId,
+          creatorMongoId: session.creatorMongoId,
+          userFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+          startTimeMs: session.startTime,
+          lastProcessedAtMs: session.lastProcessedAt,
+          remainingUserBalanceMicros: balanceMicros,
+          pricePerSecondMicros: session.pricePerSecondMicros,
+          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+          totalDeductedMicros: session.totalDeductedMicros,
+          totalEarnedMicros: session.totalEarnedMicros,
+          expectedVersion: session.version - 1,
+          status: 'active',
+        });
+      } else {
+        const checkpointDue =
+          cpInterval > 0 && Date.now() - (session.lastCheckpointAtMs || 0) >= cpInterval;
+        if (checkpointDue) {
+          const prevDed = session.lastCheckpointDeductedMicros;
+          const prevEarn = session.lastCheckpointEarnedMicros;
+          const noPriorCheckpoint = prevDed === undefined && prevEarn === undefined;
+          const deltaDeduct = Math.abs(session.totalDeductedMicros - (prevDed ?? 0));
+          const deltaEarn = Math.abs(session.totalEarnedMicros - (prevEarn ?? 0));
+          const deltaOk =
+            minDeltaMicros <= 0 ||
+            noPriorCheckpoint ||
+            deltaDeduct >= minDeltaMicros ||
+            deltaEarn >= minDeltaMicros;
+          if (deltaOk) {
+            session.lastCheckpointAtMs = Date.now();
+            await upsertBillingCheckpoint({
+              callId,
+              userMongoId: session.userMongoId,
+              creatorMongoId: session.creatorMongoId,
+              totalDeductedMicros: session.totalDeductedMicros,
+              totalEarnedMicros: session.totalEarnedMicros,
+            });
+            session.lastCheckpointDeductedMicros = session.totalDeductedMicros;
+            session.lastCheckpointEarnedMicros = session.totalEarnedMicros;
+          }
         }
       }
 

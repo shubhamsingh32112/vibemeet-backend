@@ -12,8 +12,8 @@ import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { getRedis, callSessionKey } from '../../config/redis';
 import { isBullmqBillingEnabled } from './billing-driver';
-import { isCallInBillingRolloutCohort } from './billing-rollout';
 import { updateBackpressureStage } from './billing-backpressure';
+import { featureFlags } from '../../config/feature-flags';
 
 export { isBullmqBillingEnabled };
 
@@ -25,17 +25,21 @@ let billingWorker: Worker | null = null;
 let lastQueueStatsAt = 0;
 
 function readBullmqConcurrency(): number {
-  const raw = parseInt(process.env.BILLING_BULLMQ_CONCURRENCY || '50', 10);
+  const fallback = parseInt(
+    process.env.BILLING_BATCH_SIZE || process.env.BILLING_DEFAULT_BULLMQ_CONCURRENCY || '130',
+    10
+  );
+  const raw = parseInt(process.env.BILLING_BULLMQ_CONCURRENCY || String(fallback), 10);
   if (!Number.isFinite(raw)) {
-    return 50;
+    return 130;
   }
   return Math.min(200, Math.max(1, raw));
 }
 
 function readBackpressureLagThresholdMs(): number {
-  const raw = parseInt(process.env.BILLING_BACKPRESSURE_LAG_MS || '5000', 10);
+  const raw = parseInt(process.env.BILLING_BACKPRESSURE_LAG_MS || '1500', 10);
   if (!Number.isFinite(raw) || raw < 0) {
-    return 5000;
+    return 1500;
   }
   return Math.min(120_000, raw);
 }
@@ -61,18 +65,27 @@ async function computeNextCycleDelayMs(
   callId: string,
   baseMs: number
 ): Promise<number> {
-  if (queueLagMs <= readBackpressureLagThresholdMs()) {
+  if (!featureFlags.billingAdaptiveLagPolicyEnabled) {
     return baseMs;
   }
-  const inCohort = await isCallInBillingRolloutCohort(callId);
-  if (!inCohort) {
-    recordBillingMetric('billing_backpressure_skipped_out_of_cohort', 1, { callId });
+  const thresholdMs = readBackpressureLagThresholdMs();
+  if (queueLagMs <= thresholdMs) {
     return baseMs;
   }
+
   const factor = readBackpressureDelayFactor();
   const cap = readBackpressureDelayCapMs();
-  const bumped = Math.min(Math.floor(baseMs * factor), cap);
+  const lagBoostSteps = Math.min(4, Math.floor(queueLagMs / thresholdMs));
+  const adaptiveFactor = factor + lagBoostSteps * 0.2;
+  const bumped = Math.min(Math.floor(baseMs * adaptiveFactor), cap);
   recordBillingMetric('billing_backpressure_applied', 1, { callId });
+  if (bumped > baseMs) {
+    recordBillingMetric('billing_cycle_delay_adaptive_ms', bumped, {
+      callId,
+      queueLagMs: String(queueLagMs),
+      thresholdMs: String(thresholdMs),
+    });
+  }
   return bumped;
 }
 
@@ -263,6 +276,12 @@ export function startBillingBullWorker(): Worker {
       concurrency: readBullmqConcurrency(),
     }
   );
+
+  logInfo('BullMQ billing worker config', {
+    queue: QUEUE_NAME,
+    concurrency: readBullmqConcurrency(),
+    adaptiveLagPolicyEnabled: featureFlags.billingAdaptiveLagPolicyEnabled,
+  });
 
   billingWorker.on('failed', (job, err) => {
     logError('BullMQ billing job failed', err, { jobId: job?.id, callId: job?.data?.callId });

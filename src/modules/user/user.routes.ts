@@ -13,6 +13,7 @@ import {
   getUserTransactions,
   getCallHistory,
   getFavoriteCreators,
+  getFavoriteCreatorProfiles,
   toggleFavoriteCreator,
   toggleBlockCreator,
   getBlockedCreatorsCount,
@@ -40,6 +41,7 @@ router.post('/welcome-bonus', verifyFirebaseToken, claimWelcomeBonus); // Claim 
 router.get('/transactions', verifyFirebaseToken, getUserTransactions); // Get user transaction history
 router.get('/call-history', verifyFirebaseToken, getCallHistory); // Get call history (users + creators)
 router.get('/favorites', verifyFirebaseToken, getFavoriteCreators); // Get favorite creators (user only)
+router.get('/favorites/creators', verifyFirebaseToken, getFavoriteCreatorProfiles); // Get favorite creator profiles (paginated, user only)
 router.post('/favorites/:creatorId', verifyFirebaseToken, toggleFavoriteCreator); // Toggle favorite (user only)
 router.post('/block-creator', verifyFirebaseToken, toggleBlockCreator); // Toggle block creator (user only) - accepts creatorId in params or userId in body
 router.get('/blocked-creators/count', verifyFirebaseToken, getBlockedCreatorsCount); // Get blocked creators count (user account settings)

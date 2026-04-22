@@ -78,13 +78,25 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
       return;
     }
     
-    // Return ALL creators regardless of online status.
-    // Availability (online/busy) is managed via Redis + Socket.IO in real-time.
-    // The REST endpoint always returns every creator; the frontend shows
-    // online/busy tags based on the Socket.IO availability provider.
-    const creators = await Creator.find({}).sort({ createdAt: -1 }).lean();
+    const hasPaginationQuery =
+      req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(
+      500,
+      Math.max(1, parseInt(req.query.limit as string) || 100),
+    );
+    const skip = (page - 1) * limit;
+
+    // Return ALL creators by default (backward-compatible).
+    // If page/limit is passed, return paginated data for frontend scale paths.
+    const baseQuery = Creator.find({}).sort({ createdAt: -1 });
+    const query = hasPaginationQuery ? baseQuery.skip(skip).limit(limit) : baseQuery;
+    const creators = await query.lean();
+    const total = hasPaginationQuery ? await Creator.countDocuments({}) : creators.length;
     
-    console.log(`✅ [CREATOR] Found ${creators.length} creator(s) (all creators returned, availability via Redis)`);
+    console.log(
+      `✅ [CREATOR] Found ${creators.length} creator(s) (page=${page}, limit=${limit}, total=${total})`,
+    );
 
     // Favorites are a "user-only" feature
     const favoriteSet =
@@ -152,6 +164,16 @@ export const getAllCreators = async (req: Request, res: Response): Promise<void>
       success: true,
       data: {
         creators: creatorsWithAvailability,
+        ...(hasPaginationQuery
+          ? {
+              pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit),
+              },
+            }
+          : {}),
       },
     });
   } catch (error) {
@@ -1353,22 +1375,43 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Query actual earnings from CallHistory where this creator was the owner
-    const callRecords = await CallHistory.find({
-      ownerUserId: currentUser._id,
-      ownerRole: 'creator',
-      durationSeconds: { $gt: 0 },
-    }).sort({ createdAt: -1 });
+    // Aggregate all-time summary directly in MongoDB to avoid loading full history into memory.
+    const summaryAgg = await CallHistory.aggregate([
+      {
+        $match: {
+          ownerUserId: currentUser._id,
+          ownerRole: 'creator',
+          durationSeconds: { $gt: 0 },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalEarnings: { $sum: '$coinsEarned' },
+          totalSeconds: { $sum: '$durationSeconds' },
+          totalCalls: { $sum: 1 },
+        },
+      },
+    ]);
 
-    const totalEarnings = callRecords.reduce((sum, call) => sum + (call.coinsEarned || 0), 0);
-    const totalSeconds = callRecords.reduce((sum, call) => sum + call.durationSeconds, 0);
+    const summary = summaryAgg[0] || { totalEarnings: 0, totalSeconds: 0, totalCalls: 0 };
+    const totalEarnings = summary.totalEarnings || 0;
+    const totalSeconds = summary.totalSeconds || 0;
     const totalMinutes = totalSeconds / 60;
-    const totalCalls = callRecords.length;
+    const totalCalls = summary.totalCalls || 0;
     const avgEarningsPerMinute = totalMinutes > 0 ? totalEarnings / totalMinutes : 0;
     const earningsPerMinute = creator.price * CREATOR_SHARE_PERCENTAGE;
 
-    // Format call records for response
-    const calls = callRecords.slice(0, 50).map((call) => {
+    const recentCallRecords = await CallHistory.find({
+      ownerUserId: currentUser._id,
+      ownerRole: 'creator',
+      durationSeconds: { $gt: 0 },
+    })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    const calls = recentCallRecords.map((call) => {
       const mins = call.durationSeconds / 60;
       const formatted = call.durationSeconds >= 60
         ? `${Math.floor(call.durationSeconds / 60)}m ${call.durationSeconds % 60}s`
@@ -1976,21 +2019,42 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     // ── Daily period bounds (for task progress) ───────────────────────
     const { periodStart, periodEnd, resetsAt } = getDailyPeriodBounds();
 
-    // 1. Earnings from call history (all-time for earnings summary)
-    const callRecords = await CallHistory.find({
-      ownerUserId: currentUser._id,
-      ownerRole: 'creator',
-      durationSeconds: { $gt: 0 },
-    }).sort({ createdAt: -1 });
-
-    const totalEarnings = callRecords.reduce((sum, c) => sum + (c.coinsEarned || 0), 0);
-    const totalSeconds = callRecords.reduce((sum, c) => sum + c.durationSeconds, 0);
+    // 1. Earnings summary (all-time) from aggregation instead of full-history in-memory reduction.
+    const allTimeSummaryAgg = await CallHistory.aggregate([
+      {
+        $match: {
+          ownerUserId: currentUser._id,
+          ownerRole: 'creator',
+          durationSeconds: { $gt: 0 },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalEarnings: { $sum: '$coinsEarned' },
+          totalSeconds: { $sum: '$durationSeconds' },
+          totalCalls: { $sum: 1 },
+        },
+      },
+    ]);
+    const allTimeSummary = allTimeSummaryAgg[0] || { totalEarnings: 0, totalSeconds: 0, totalCalls: 0 };
+    const totalEarnings = allTimeSummary.totalEarnings || 0;
+    const totalSeconds = allTimeSummary.totalSeconds || 0;
     const allTimeMinutes = totalSeconds / 60;
-    const totalCalls = callRecords.length;
+    const totalCalls = allTimeSummary.totalCalls || 0;
     const earningsPerMinute = creator.price * CREATOR_SHARE_PERCENTAGE;
     const avgEarningsPerMinute = allTimeMinutes > 0 ? totalEarnings / allTimeMinutes : 0;
 
-    const recentCalls = callRecords.slice(0, 20).map((call) => {
+    const recentCallRecords = await CallHistory.find({
+      ownerUserId: currentUser._id,
+      ownerRole: 'creator',
+      durationSeconds: { $gt: 0 },
+    })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    const recentCalls = recentCallRecords.map((call) => {
       const formatted = call.durationSeconds >= 60
         ? `${Math.floor(call.durationSeconds / 60)}m ${call.durationSeconds % 60}s`
         : `${call.durationSeconds}s`;

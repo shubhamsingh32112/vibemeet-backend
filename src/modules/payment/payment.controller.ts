@@ -3,6 +3,8 @@ import { Response } from 'express';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { getRazorpayInstance } from '../../config/razorpay';
+import { featureFlags } from '../../config/feature-flags';
+import { logError, logInfo, logWarning } from '../../utils/logger';
 import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { verifyUserBalance } from '../../utils/balance-integrity';
@@ -14,14 +16,26 @@ import {
   hasCompletedCoinPurchase,
 } from './wallet-pricing.model';
 import { processReferralRewardOnPurchase } from '../user/referral.service';
+import { finalizePaymentAtomically } from './payment-finalization.service';
+import { PaymentWebhookEvent } from './payment-webhook-event.model';
+import { recordPaymentMetric } from '../../utils/monitoring';
 
 const CHECKOUT_SESSION_TTL_SECONDS = 15 * 60;
 const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
 const APP_RETURN_DEEP_LINK = process.env.APP_RETURN_DEEP_LINK || 'zztherapy://wallet';
+const PAYMENT_WEBHOOK_MAX_RETRIES = Math.max(
+  1,
+  parseInt(process.env.PAYMENT_WEBHOOK_MAX_RETRIES || '6', 10) || 6
+);
+const PAYMENT_WEBHOOK_RETRY_BASE_MS = Math.max(
+  500,
+  parseInt(process.env.PAYMENT_WEBHOOK_RETRY_BASE_MS || '2000', 10) || 2000
+);
 
 interface CheckoutSessionPayload {
   firebaseUid: string;
   userId: string;
+  packageId: string;
   coins: number;
   priceInr: number;
   pricingTier: PricingTier;
@@ -32,16 +46,19 @@ interface CheckoutSessionPayload {
 const getCheckoutSessionSecret = (): string =>
   (process.env.CHECKOUT_SESSION_SECRET || process.env.JWT_SECRET || 'checkout-session-secret-change-me').trim();
 
-const getActiveCoinPackForTier = async (
-  coins: number,
+const normalizePackageId = (coins: number): string => `pack_${coins}`;
+
+const getActiveCoinPackByPackageIdForTier = async (
+  packageId: string,
   tier: PricingTier
-): Promise<{ coins: number; priceInr: number } | null> => {
+): Promise<{ packageId: string; coins: number; priceInr: number } | null> => {
   const config = await getOrCreateWalletPricingConfig();
   const pack = config.packages
     .filter((p) => p.isActive)
-    .find((p) => p.coins === coins);
+    .find((p) => normalizePackageId(p.coins) === packageId);
   if (!pack) return null;
   return {
+    packageId,
     coins: pack.coins,
     priceInr: getEffectivePackPrice(pack, tier),
   };
@@ -64,6 +81,29 @@ const buildAppOpenUrl = (params: Record<string, string>): string => {
   return `${base}?${query.toString()}`;
 };
 
+const buildPaymentStatusDeepLink = (
+  status: 'success' | 'failed',
+  values: {
+    sessionId?: string;
+    walletDelta?: number;
+    message?: string;
+    reason?: string;
+  } = {}
+): string => {
+  const params: Record<string, string> = {
+    status,
+    payment: status, // temporary backward compatibility for older app builds
+  };
+  if (values.sessionId) params.sessionId = values.sessionId;
+  if (typeof values.walletDelta === 'number') {
+    params.walletDelta = String(values.walletDelta);
+    params.coinsAdded = String(values.walletDelta); // temporary backward compatibility
+  }
+  if (values.message) params.message = values.message;
+  if (values.reason) params.reason = values.reason;
+  return buildAppOpenUrl(params);
+};
+
 const signCheckoutSession = (payload: CheckoutSessionPayload): string =>
   jwt.sign(payload, getCheckoutSessionSecret(), { expiresIn: CHECKOUT_SESSION_TTL_SECONDS });
 
@@ -77,6 +117,72 @@ const verifyCheckoutSession = (checkoutToken: string): CheckoutSessionPayload | 
   }
 };
 
+const verifyClientSignature = (
+  razorpay_order_id: string,
+  razorpay_payment_id: string,
+  razorpay_signature: string
+): boolean => {
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  if (!keySecret) {
+    throw new Error('PAYMENT_VERIFICATION_UNAVAILABLE');
+  }
+  const generatedSignature = crypto
+    .createHmac('sha256', keySecret)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .digest('hex');
+  try {
+    const expected = Buffer.from(generatedSignature, 'hex');
+    const received = Buffer.from(String(razorpay_signature), 'hex');
+    if (expected.length !== received.length) return false;
+    return crypto.timingSafeEqual(expected, received);
+  } catch {
+    return false;
+  }
+};
+
+interface ProviderPaymentVerificationResult {
+  payment: any;
+  order: any | null;
+}
+
+const verifyProviderPaymentCaptured = async (
+  razorpay_order_id: string,
+  razorpay_payment_id: string
+): Promise<ProviderPaymentVerificationResult> => {
+  if (featureFlags.mockPaymentProvider) {
+    return {
+      payment: {
+        id: razorpay_payment_id,
+        order_id: razorpay_order_id,
+        status: 'captured',
+      },
+      order: null,
+    };
+  }
+
+  const razorpay = getRazorpayInstance();
+  const payment = await razorpay.payments.fetch(razorpay_payment_id);
+  if (!payment || payment.order_id !== razorpay_order_id) {
+    throw new Error('PAYMENT_ORDER_MISMATCH');
+  }
+  if (payment.status !== 'captured') {
+    throw new Error(`PAYMENT_NOT_CAPTURED:${payment.status || 'unknown'}`);
+  }
+  const order = await razorpay.orders.fetch(razorpay_order_id);
+  return { payment, order };
+};
+
+const buildPendingTransactionId = (orderId: string): string => `pay_${orderId}`;
+
+const getOrderTransactionSelectors = (orderId: string): Array<Record<string, string>> => [
+  { transactionId: buildPendingTransactionId(orderId) },
+  { transactionId: `razorpay_${orderId}` }, // backward compatibility with historical rows
+  { paymentGatewayOrderId: orderId },
+];
+
+const findPendingTransactionByOrderId = async (orderId: string) =>
+  CoinTransaction.findOne({ $or: getOrderTransactionSelectors(orderId) });
+
 const createPendingCoinTransaction = async (
   userId: string,
   orderId: string,
@@ -84,13 +190,15 @@ const createPendingCoinTransaction = async (
   priceInr: number
 ) => {
   const transaction = new CoinTransaction({
-    transactionId: `razorpay_${orderId}`,
+    transactionId: buildPendingTransactionId(orderId),
     userId,
     type: 'credit',
     coins,
     source: 'payment_gateway',
     description: `Purchase ${coins} coins for ₹${priceInr}`,
     paymentGatewayTransactionId: orderId,
+    paymentGatewayOrderId: orderId,
+    paymentGatewayProvider: 'razorpay',
     status: 'pending',
   });
   await transaction.save();
@@ -106,98 +214,12 @@ const createPendingCoinTransaction = async (
  * needs to open the checkout.
  */
 export const createOrder = async (req: Request, res: Response): Promise<void> => {
-  try {
-    console.log('💳 [PAYMENT] Create order request');
-
-    if (!req.auth) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const { coins } = req.body;
-
-    if (!coins || typeof coins !== 'number' || coins <= 0) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid coins amount',
-      });
-      return;
-    }
-
-    // Only allow regular users to purchase coins
-    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!user) {
-      res.status(404).json({ success: false, error: 'User not found' });
-      return;
-    }
-
-    if (user.role !== 'user') {
-      res.status(403).json({
-        success: false,
-        error: 'Only regular users can purchase coins',
-      });
-      return;
-    }
-
-    const pricingTier = await resolveUserPricingTier(user._id.toString());
-    const pack = await getActiveCoinPackForTier(coins, pricingTier);
-    if (!pack) {
-      const validCoins = await getValidCoinsList();
-      res.status(400).json({
-        success: false,
-        error: `Invalid coin package. Valid packages: ${validCoins.join(', ')}`,
-      });
-      return;
-    }
-
-    // Create Razorpay order
-    // Amount is in paise (smallest currency subunit): ₹75 = 7500 paise
-    const razorpay = getRazorpayInstance();
-    const amountInPaise = pack.priceInr * 100;
-
-    const order = await razorpay.orders.create({
-      amount: amountInPaise,
-      currency: 'INR',
-      receipt: `c_${pack.coins}_${Date.now()}`,
-      notes: {
-        userId: user._id.toString(),
-        coins: pack.coins.toString(),
-        priceInr: pack.priceInr.toString(),
-      },
-    });
-
-    console.log(`✅ [PAYMENT] Order created: ${order.id} for ${pack.coins} coins (₹${pack.priceInr})`);
-    console.log(`   User: ${user._id}`);
-
-    // Create a pending transaction record so we can track it
-    const transaction = new CoinTransaction({
-      transactionId: `razorpay_${order.id}`,
-      userId: user._id,
-      type: 'credit',
-      coins: pack.coins,
-      source: 'payment_gateway',
-      description: `Purchase ${pack.coins} coins for ₹${pack.priceInr}`,
-      paymentGatewayTransactionId: order.id,
-      status: 'pending',
-    });
-    await transaction.save();
-
-    console.log(`📝 [PAYMENT] Pending transaction created: ${transaction.transactionId}`);
-
-    res.json({
-      success: true,
-      data: {
-        orderId: order.id,
-        amount: amountInPaise,
-        currency: 'INR',
-        coins: pack.coins,
-        keyId: process.env.RAZORPAY_KEY_ID, // Public key for frontend checkout
-      },
-    });
-  } catch (error) {
-    console.error('❌ [PAYMENT] Create order error:', error);
-    res.status(500).json({ success: false, error: 'Failed to create order' });
-  }
+  void req;
+  res.status(410).json({
+    success: false,
+    error: 'Deprecated endpoint. Use /payment/web/initiate from mobile clients.',
+    errorCode: 'PAYMENT_APP_DIRECT_FLOW_DISABLED',
+  });
 };
 
 /**
@@ -213,9 +235,9 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const { coins } = req.body;
-    if (!coins || typeof coins !== 'number' || coins <= 0) {
-      res.status(400).json({ success: false, error: 'Invalid coins amount' });
+    const { packageId, coins } = req.body as { packageId?: string; coins?: number };
+    if ((!packageId || typeof packageId !== 'string') && (!coins || typeof coins !== 'number')) {
+      res.status(400).json({ success: false, error: 'Missing packageId' });
       return;
     }
 
@@ -234,12 +256,14 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
     }
 
     const pricingTier = await resolveUserPricingTier(user._id.toString());
-    const pack = await getActiveCoinPackForTier(coins, pricingTier);
+    const resolvedPackageId =
+      packageId && packageId.trim().length > 0 ? packageId.trim() : normalizePackageId(coins!);
+    const pack = await getActiveCoinPackByPackageIdForTier(resolvedPackageId, pricingTier);
     if (!pack) {
       const validCoins = await getValidCoinsList();
       res.status(400).json({
         success: false,
-        error: `Invalid coin package. Valid packages: ${validCoins.join(', ')}`,
+        error: `Invalid packageId. Valid package coins: ${validCoins.join(', ')}`,
       });
       return;
     }
@@ -247,6 +271,7 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
     const checkoutToken = signCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
+      packageId: pack.packageId,
       coins: pack.coins,
       priceInr: pack.priceInr,
       pricingTier,
@@ -258,6 +283,8 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       success: true,
       data: {
         checkoutUrl,
+        sessionId: checkoutToken,
+        packageId: pack.packageId,
         coins: pack.coins,
         priceInr: pack.priceInr,
         amount: pack.priceInr * 100,
@@ -265,7 +292,8 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       },
     });
   } catch (error) {
-    console.error('❌ [PAYMENT] initiateWebCheckout error:', error);
+    const message = error instanceof Error ? error.message : 'unknown';
+    console.error(`❌ [PAYMENT] initiateWebCheckout error: ${message}`);
     res.status(500).json({ success: false, error: 'Failed to initiate checkout' });
   }
 };
@@ -300,32 +328,34 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const validCoins = await getValidCoinsList();
-    if (!validCoins.includes(session.coins)) {
+    const pricingTier = await resolveUserPricingTier(user._id.toString());
+    const activePack = await getActiveCoinPackByPackageIdForTier(session.packageId, pricingTier);
+    if (!activePack) {
       res.status(400).json({ success: false, error: 'Invalid checkout session package' });
       return;
     }
 
     const razorpay = getRazorpayInstance();
-    const amountInPaise = session.priceInr * 100;
+    const amountInPaise = activePack.priceInr * 100;
 
     const order = await razorpay.orders.create({
       amount: amountInPaise,
       currency: 'INR',
-      receipt: `web_c_${session.coins}_${Date.now()}`,
+      receipt: `web_c_${activePack.coins}_${Date.now()}`,
       notes: {
         userId: user._id.toString(),
         firebaseUid: user.firebaseUid,
-        coins: session.coins.toString(),
-        priceInr: session.priceInr.toString(),
+        packageId: session.packageId,
+        coins: activePack.coins.toString(),
+        priceInr: activePack.priceInr.toString(),
         pricingTier: session.pricingTier,
       },
     });
 
-    await createPendingCoinTransaction(user._id.toString(), order.id, session.coins, session.priceInr);
+    await createPendingCoinTransaction(user._id.toString(), order.id, activePack.coins, activePack.priceInr);
 
     if (!process.env.RAZORPAY_KEY_ID) {
-      res.status(500).json({ success: false, error: 'RAZORPAY_KEY_ID is not configured' });
+      res.status(500).json({ success: false, error: 'Payment checkout is currently unavailable' });
       return;
     }
 
@@ -335,12 +365,13 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
         orderId: order.id,
         amount: amountInPaise,
         currency: 'INR',
-        coins: session.coins,
+        coins: activePack.coins,
         keyId: process.env.RAZORPAY_KEY_ID,
       },
     });
   } catch (error) {
-    console.error('❌ [PAYMENT] createWebOrder error:', error);
+    const message = error instanceof Error ? error.message : 'unknown';
+    console.error(`❌ [PAYMENT] createWebOrder error: ${message}`);
     res.status(500).json({ success: false, error: 'Failed to create checkout order' });
   }
 };
@@ -351,6 +382,7 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
  * Website endpoint: verifies payment, credits coins, and returns app deep link.
  */
 export const verifyWebPayment = async (req: Request, res: Response): Promise<void> => {
+  const startedAt = Date.now();
   try {
     const {
       checkoutToken,
@@ -360,11 +392,13 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
     } = req.body;
 
     if (!checkoutToken || typeof checkoutToken !== 'string') {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'missing_checkout_token' });
       res.status(400).json({ success: false, error: 'Missing checkoutToken' });
       return;
     }
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'missing_required_fields' });
       res.status(400).json({
         success: false,
         error: 'Missing required fields: razorpay_order_id, razorpay_payment_id, razorpay_signature',
@@ -374,11 +408,12 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'invalid_or_expired_session' });
       res.status(401).json({
         success: false,
         error: 'Invalid or expired checkout token',
         data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'session_expired' }),
+          appOpenUrl: buildPaymentStatusDeepLink('failed', { reason: 'session_expired' }),
         },
       });
       return;
@@ -386,147 +421,236 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
 
     const user = await User.findOne({ firebaseUid: session.firebaseUid });
     if (!user || user._id.toString() !== session.userId || user.role !== 'user') {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'invalid_session_user' });
       res.status(403).json({
         success: false,
         error: 'Checkout session is not valid for this user',
         data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'invalid_session_user' }),
+          appOpenUrl: buildPaymentStatusDeepLink('failed', { reason: 'invalid_session_user' }),
         },
       });
       return;
     }
 
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keySecret) {
+    let signatureOk = false;
+    try {
+      signatureOk = verifyClientSignature(razorpay_order_id, razorpay_payment_id, razorpay_signature);
+    } catch {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'signature_verifier_unavailable' });
       res.status(500).json({ success: false, error: 'Payment verification unavailable' });
       return;
     }
 
-    const generatedSignature = crypto
-      .createHmac('sha256', keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest('hex');
-
-    if (generatedSignature !== razorpay_signature) {
+    if (!signatureOk) {
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'signature_mismatch' });
       await CoinTransaction.findOneAndUpdate(
-        { transactionId: `razorpay_${razorpay_order_id}` },
+        { $or: getOrderTransactionSelectors(razorpay_order_id) },
         { status: 'failed' }
       );
       res.status(400).json({
         success: false,
         error: 'Payment verification failed: Invalid signature',
         data: {
-          appOpenUrl: buildAppOpenUrl({
-            payment: 'failed',
-            orderId: razorpay_order_id,
+          appOpenUrl: buildPaymentStatusDeepLink('failed', {
+            sessionId: checkoutToken,
+            reason: 'signature_mismatch',
+          }),
+        },
+      });
+      return;
+    }
+    let providerOrder: any | null = null;
+    try {
+      const providerCheck = await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
+      providerOrder = providerCheck.order;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'PAYMENT_PROVIDER_ERROR';
+      recordPaymentMetric('web.verify_failed', 1, { reason: 'provider_verification_failed' });
+      const reason = message.startsWith('PAYMENT_NOT_CAPTURED')
+        ? 'payment_not_captured'
+        : message === 'PAYMENT_ORDER_MISMATCH'
+          ? 'order_payment_mismatch'
+          : 'provider_verification_failed';
+      res.status(400).json({
+        success: false,
+        error: 'Payment provider verification failed',
+        data: {
+          appOpenUrl: buildPaymentStatusDeepLink('failed', { sessionId: checkoutToken, reason }),
+        },
+      });
+      return;
+    }
+
+    if (providerOrder) {
+      const notes = providerOrder.notes || {};
+      if (notes.userId && String(notes.userId) !== user._id.toString()) {
+        res.status(403).json({
+          success: false,
+          error: 'Payment user mismatch',
+          data: {
+            appOpenUrl: buildPaymentStatusDeepLink('failed', {
+              sessionId: checkoutToken,
+              reason: 'provider_user_mismatch',
+            }),
+          },
+        });
+        return;
+      }
+    }
+
+    const transaction = await findPendingTransactionByOrderId(razorpay_order_id);
+    if (!transaction) {
+      res.status(404).json({
+        success: false,
+        error: 'Transaction not found',
+        data: {
+          appOpenUrl: buildPaymentStatusDeepLink('failed', {
+            sessionId: checkoutToken,
+            reason: 'txn_not_found',
+          }),
+        },
+      });
+      return;
+    }
+    if (transaction.userId.toString() !== user._id.toString()) {
+      res.status(403).json({
+        success: false,
+        error: 'Transaction does not belong to this user',
+        data: {
+          appOpenUrl: buildPaymentStatusDeepLink('failed', {
+            sessionId: checkoutToken,
+            reason: 'txn_user_mismatch',
           }),
         },
       });
       return;
     }
 
-    // Best-practice S2S verification:
-    // Ensure payment belongs to this order and is captured before crediting coins.
-    const razorpay = getRazorpayInstance();
-    const razorpayPayment = await razorpay.payments.fetch(razorpay_payment_id);
-    if (!razorpayPayment || razorpayPayment.order_id !== razorpay_order_id) {
+    if (providerOrder?.notes?.coins && Number(providerOrder.notes.coins) !== transaction.coins) {
       res.status(400).json({
         success: false,
-        error: 'Payment order mismatch',
+        error: 'Provider coin pack mismatch',
         data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'order_payment_mismatch' }),
+          appOpenUrl: buildPaymentStatusDeepLink('failed', {
+            sessionId: checkoutToken,
+            reason: 'provider_coin_mismatch',
+          }),
         },
       });
       return;
     }
 
-    if (razorpayPayment.status !== 'captured') {
-      res.status(400).json({
+    let finalizeResult;
+    try {
+      finalizeResult = await finalizePaymentAtomically({
+        orderId: razorpay_order_id,
+        paymentId: razorpay_payment_id,
+        expectedUserId: user._id.toString(),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'UNKNOWN_FINALIZE_ERROR';
+      const statusCode =
+        message === 'TRANSACTION_NOT_FOUND'
+          ? 404
+          : message === 'TRANSACTION_USER_MISMATCH'
+            ? 403
+            : 500;
+      const reason =
+        message === 'TRANSACTION_NOT_FOUND'
+          ? 'txn_not_found'
+          : message === 'TRANSACTION_USER_MISMATCH'
+            ? 'txn_user_mismatch'
+            : 'finalize_error';
+      res.status(statusCode).json({
         success: false,
-        error: `Payment is not captured. Current status: ${razorpayPayment.status}`,
+        error: 'Failed to finalize payment',
         data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'payment_not_captured' }),
+          appOpenUrl: buildPaymentStatusDeepLink('failed', {
+            sessionId: checkoutToken,
+            reason,
+          }),
         },
       });
       return;
     }
 
-    const transaction = await CoinTransaction.findOne({
-      transactionId: `razorpay_${razorpay_order_id}`,
-    });
+    verifyUserBalance(user._id).catch(() => {});
 
-    if (!transaction) {
-      res.status(404).json({
-        success: false,
-        error: 'Transaction not found',
-        data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'txn_not_found' }),
-        },
-      });
-      return;
-    }
-
-    if (transaction.userId.toString() !== user._id.toString()) {
-      res.status(403).json({
-        success: false,
-        error: 'Transaction does not belong to this user',
-        data: {
-          appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'txn_user_mismatch' }),
-        },
-      });
-      return;
-    }
-
-    let coinsAdded = 0;
-    if (transaction.status !== 'completed') {
-      coinsAdded = transaction.coins;
-      transaction.status = 'completed';
-      transaction.paymentGatewayTransactionId = razorpay_payment_id;
-      await transaction.save();
-
-      user.coins = (user.coins || 0) + coinsAdded;
-      await user.save();
-
-      verifyUserBalance(user._id).catch(() => {});
-
+    if (finalizeResult.status === 'completed') {
       try {
         const io = getIO();
         io.to(`user:${user.firebaseUid}`).emit('coins_updated', {
           userId: user._id.toString(),
-          coins: user.coins,
+          coins: finalizeResult.updatedUserCoins,
         });
       } catch (socketErr) {
-        console.error('⚠️ [PAYMENT] Failed to emit coins_updated:', socketErr);
+        const message = socketErr instanceof Error ? socketErr.message : 'unknown';
+        logWarning('Failed to emit payment coins_updated', {
+          message,
+          orderId: razorpay_order_id,
+          paymentId: razorpay_payment_id,
+          userFirebaseUid: user.firebaseUid,
+        });
       }
-
-      // Referral reward: grant 60 coins to referrer if purchase >= ₹100
-      const priceInr = session.priceInr ?? 0;
-      processReferralRewardOnPurchase(user._id, priceInr).catch((err) =>
-        console.error('⚠️ [PAYMENT] Referral reward error (non-fatal):', err)
-      );
     }
+
+    const referralPriceInr = providerOrder?.notes?.priceInr
+      ? parseInt(String(providerOrder.notes.priceInr), 10)
+      : session.priceInr ?? 0;
+    if (finalizeResult.status === 'completed') {
+      processReferralRewardOnPurchase(user._id, referralPriceInr).catch((err) => {
+        const message = err instanceof Error ? err.message : 'unknown';
+        logWarning('Referral reward processing failed (non-fatal)', {
+          message,
+          userId: user._id.toString(),
+          orderId: razorpay_order_id,
+        });
+      });
+    }
+
+    recordPaymentMetric('web.verify_success', 1, {
+      finalizeStatus: finalizeResult.status,
+    });
+    recordPaymentMetric('web.verify_duration_ms', Date.now() - startedAt, {
+      status: 'success',
+    });
+    logInfo('Web payment verification completed', {
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      userId: user._id.toString(),
+      finalizeStatus: finalizeResult.status,
+    });
 
     res.json({
       success: true,
       data: {
-        message: 'Payment verified successfully',
-        coins: user.coins,
-        coinsAdded,
-        transactionId: transaction.transactionId,
-        appOpenUrl: buildAppOpenUrl({
-          payment: 'success',
-          coinsAdded: coinsAdded.toString(),
-          orderId: razorpay_order_id,
+        message:
+          finalizeResult.status === 'already_completed'
+            ? 'Payment already verified'
+            : 'Payment verified successfully',
+        coins: finalizeResult.updatedUserCoins,
+        walletDelta: finalizeResult.coinsAdded,
+        coinsAdded: finalizeResult.coinsAdded,
+        sessionId: checkoutToken,
+        transactionRef: finalizeResult.transaction._id.toString(),
+        appOpenUrl: buildPaymentStatusDeepLink('success', {
+          sessionId: checkoutToken,
+          walletDelta: finalizeResult.coinsAdded,
         }),
       },
     });
   } catch (error) {
-    console.error('❌ [PAYMENT] verifyWebPayment error:', error);
+    const message = error instanceof Error ? error.message : 'unknown';
+    recordPaymentMetric('web.verify_failed', 1, { reason: 'internal_error' });
+    recordPaymentMetric('web.verify_duration_ms', Date.now() - startedAt, {
+      status: 'failed',
+    });
+    logError('verifyWebPayment error', error, { message });
     res.status(500).json({
       success: false,
       error: 'Payment verification failed',
       data: {
-        appOpenUrl: buildAppOpenUrl({ payment: 'failed', reason: 'internal_error' }),
+        appOpenUrl: buildPaymentStatusDeepLink('failed', { reason: 'internal_error' }),
       },
     });
   }
@@ -535,159 +659,282 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
 /**
  * POST /payment/verify
  *
- * Verifies the Razorpay payment signature and credits coins to the user.
- * Body: {
- *   razorpay_order_id: string,
- *   razorpay_payment_id: string,
- *   razorpay_signature: string,
- * }
+ * App/API endpoint: verifies signature + provider capture + credits coins atomically.
  */
 export const verifyPayment = async (req: Request, res: Response): Promise<void> => {
-  try {
-    console.log('🔐 [PAYMENT] Verify payment request');
+  void req;
+  res.status(410).json({
+    success: false,
+    error: 'Deprecated endpoint. Use /payment/web/initiate from mobile clients.',
+    errorCode: 'PAYMENT_APP_DIRECT_FLOW_DISABLED',
+  });
+};
 
-    if (!req.auth) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
+interface RazorpayWebhookPayload {
+  event?: string;
+  payload?: {
+    payment?: { entity?: any };
+    order?: { entity?: any };
+  };
+  created_at?: number;
+}
 
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+interface PaymentWebhookProcessResult {
+  outcome: 'processed' | 'ignored' | 'already_processed' | 'failed' | 'retryable_failed';
+  reason?: string;
+}
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      res.status(400).json({
-        success: false,
-        error: 'Missing required fields: razorpay_order_id, razorpay_payment_id, razorpay_signature',
-      });
-      return;
-    }
+function getWebhookRawBody(req: Request): Buffer {
+  return Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(req.body === undefined || req.body === null ? '' : JSON.stringify(req.body), 'utf8');
+}
 
-    // Find the user
-    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!user) {
-      res.status(404).json({ success: false, error: 'User not found' });
-      return;
-    }
+const parseRazorpayWebhookPayload = (body: unknown): RazorpayWebhookPayload => {
+  if (Buffer.isBuffer(body)) {
+    const raw = body.toString('utf8');
+    return raw.trim() ? (JSON.parse(raw) as RazorpayWebhookPayload) : {};
+  }
+  return (body || {}) as RazorpayWebhookPayload;
+};
 
-    // ── Step 1: Verify the payment signature ──
-    // generated_signature = hmac_sha256(order_id + "|" + razorpay_payment_id, secret)
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keySecret) {
-      console.error('❌ [PAYMENT] RAZORPAY_KEY_SECRET not configured');
-      res.status(500).json({ success: false, error: 'Payment verification unavailable' });
-      return;
-    }
+const buildWebhookAuditPayload = (payload: RazorpayWebhookPayload): Record<string, unknown> => ({
+  event: payload.event || null,
+  created_at: payload.created_at || null,
+  paymentId: payload.payload?.payment?.entity?.id || null,
+  orderId:
+    payload.payload?.payment?.entity?.order_id || payload.payload?.order?.entity?.id || null,
+});
 
-    const generatedSignature = crypto
-      .createHmac('sha256', keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest('hex');
+const isRetriableWebhookFailure = (message: string): boolean => {
+  if (!message) return true;
+  if (message.startsWith('PAYMENT_ORDER_MISMATCH')) return false;
+  if (message.startsWith('TRANSACTION_USER_MISMATCH')) return false;
+  if (message.startsWith('TRANSACTION_NOT_FOUND')) return false;
+  return true;
+};
 
-    if (generatedSignature !== razorpay_signature) {
-      console.error(`❌ [PAYMENT] Signature mismatch for order ${razorpay_order_id}`);
-      console.error(`   Expected: ${generatedSignature}`);
-      console.error(`   Received: ${razorpay_signature}`);
+const computeNextRetryAt = (attemptCount: number): Date => {
+  const exponent = Math.max(0, attemptCount - 1);
+  const delay = Math.min(60_000, PAYMENT_WEBHOOK_RETRY_BASE_MS * 2 ** exponent);
+  return new Date(Date.now() + delay);
+};
 
-      // Mark the pending transaction as failed
-      await CoinTransaction.findOneAndUpdate(
-        { transactionId: `razorpay_${razorpay_order_id}` },
-        { status: 'failed' }
-      );
+const buildDeterministicWebhookEventId = (
+  req: Request,
+  eventType: string,
+  paymentId: string,
+  orderId: string
+): string => {
+  const providerEventId = req.headers['x-razorpay-event-id'];
+  if (typeof providerEventId === 'string' && providerEventId.trim().length > 0) {
+    return `rzp:${providerEventId.trim()}`;
+  }
+  const fingerprint = crypto.createHash('sha256').update(getWebhookRawBody(req)).digest('hex');
+  const entityRef = paymentId || orderId || 'unknown';
+  return `rzp:${eventType}:${entityRef}:${fingerprint}`;
+};
 
-      res.status(400).json({
-        success: false,
-        error: 'Payment verification failed: Invalid signature',
-      });
-      return;
-    }
-
-    console.log(`✅ [PAYMENT] Signature verified for order ${razorpay_order_id}`);
-
-    // ── Step 2: Find and update the pending transaction ──
-    const transaction = await CoinTransaction.findOne({
-      transactionId: `razorpay_${razorpay_order_id}`,
-    });
-
-    if (!transaction) {
-      console.error(`❌ [PAYMENT] Transaction not found for order ${razorpay_order_id}`);
-      res.status(404).json({ success: false, error: 'Transaction not found' });
-      return;
-    }
-
-    // Check if already completed (idempotency)
-    if (transaction.status === 'completed') {
-      console.log(`⚠️  [PAYMENT] Transaction already completed: ${transaction.transactionId}`);
-      res.json({
-        success: true,
-        data: {
-          message: 'Payment already verified',
-          coins: user.coins,
-          coinsAdded: transaction.coins,
-        },
-      });
-      return;
-    }
-
-    // Verify the transaction belongs to this user
-    if (transaction.userId.toString() !== user._id.toString()) {
-      console.error(`❌ [PAYMENT] Transaction user mismatch: expected ${user._id}, got ${transaction.userId}`);
-      res.status(403).json({ success: false, error: 'Transaction does not belong to this user' });
-      return;
-    }
-
-    // ── Step 3: Credit coins and mark transaction as completed ──
-    const coinsToAdd = transaction.coins;
-    const oldBalance = user.coins;
-
-    // Update transaction status and add payment ID
-    transaction.status = 'completed';
-    transaction.paymentGatewayTransactionId = razorpay_payment_id;
-    await transaction.save();
-
-    // Credit coins to user
-    user.coins = (user.coins || 0) + coinsToAdd;
-    await user.save();
-
-    console.log(`✅ [PAYMENT] Coins credited: ${oldBalance} → ${user.coins} (+${coinsToAdd})`);
-
-    // Referral reward: grant 60 coins to referrer if purchase >= ₹100
-    const razorpay = getRazorpayInstance();
-    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
-    const priceInr = razorpayOrder?.notes?.priceInr
-      ? parseInt(String(razorpayOrder.notes.priceInr), 10)
-      : 0;
-    processReferralRewardOnPurchase(user._id, priceInr).catch((err) =>
-      console.error('⚠️ [PAYMENT] Referral reward error (non-fatal):', err)
-    );
-    console.log(`   Payment ID: ${razorpay_payment_id}`);
-    console.log(`   Order ID: ${razorpay_order_id}`);
-
-    // Balance integrity check (fire-and-forget)
-    verifyUserBalance(user._id).catch(() => {});
-
-    // Emit coins_updated socket event
-    try {
-      const io = getIO();
-      io.to(`user:${user.firebaseUid}`).emit('coins_updated', {
-        userId: user._id.toString(),
-        coins: user.coins,
-      });
-      console.log(`📡 [PAYMENT] Emitted coins_updated to ${user.firebaseUid} (${user.coins} coins)`);
-    } catch (socketErr) {
-      console.error('⚠️ [PAYMENT] Failed to emit coins_updated:', socketErr);
-    }
-
-    res.json({
-      success: true,
-      data: {
-        message: 'Payment verified successfully',
-        coins: user.coins,
-        coinsAdded: coinsToAdd,
-        transactionId: transaction.transactionId,
+async function processStoredRazorpayWebhookEvent(
+  eventDocId: string
+): Promise<PaymentWebhookProcessResult> {
+  const now = new Date();
+  const claimed = await PaymentWebhookEvent.findOneAndUpdate(
+    {
+      _id: eventDocId,
+      status: { $in: ['received', 'failed'] },
+      $or: [{ nextRetryAt: { $exists: false } }, { nextRetryAt: null }, { nextRetryAt: { $lte: now } }],
+    },
+    {
+      $set: {
+        status: 'processing',
+        lastAttemptAt: now,
       },
+      $inc: { attemptCount: 1 },
+    },
+    { new: true }
+  );
+
+  if (!claimed) {
+    const existing = await PaymentWebhookEvent.findById(eventDocId).lean();
+    if (existing?.status === 'processed') {
+      return { outcome: 'already_processed' };
+    }
+    return { outcome: 'ignored', reason: 'not_eligible_for_processing' };
+  }
+
+  const eventType = claimed.eventType || 'unknown';
+  const paymentId = claimed.paymentId || '';
+  const orderId = claimed.orderId || '';
+
+  if (!paymentId || !orderId) {
+    await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
+      status: 'failed',
+      failureReason: 'missing_payment_or_order_id',
+      nextRetryAt: null,
     });
+    recordPaymentMetric('webhook.process_failed', 1, { reason: 'missing_ids', eventType });
+    return { outcome: 'failed', reason: 'missing_payment_or_order_id' };
+  }
+
+  if (!['payment.captured', 'order.paid'].includes(eventType)) {
+    await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
+      status: 'processed',
+      processedAt: new Date(),
+      failureReason: undefined,
+      nextRetryAt: null,
+    });
+    recordPaymentMetric('webhook.ignored', 1, { eventType });
+    return { outcome: 'ignored' };
+  }
+
+  const processStartedAt = Date.now();
+  try {
+    await verifyProviderPaymentCaptured(orderId, paymentId);
+    const finalizeResult = await finalizePaymentAtomically({ orderId, paymentId });
+    await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
+      status: 'processed',
+      processedAt: new Date(),
+      failureReason: undefined,
+      nextRetryAt: null,
+    });
+
+    recordPaymentMetric('webhook.processed', 1, {
+      eventType,
+      finalizeStatus: finalizeResult.status,
+    });
+    recordPaymentMetric('webhook.process_latency_ms', Date.now() - processStartedAt, {
+      eventType,
+    });
+    return { outcome: 'processed' };
   } catch (error) {
-    console.error('❌ [PAYMENT] Verify payment error:', error);
-    res.status(500).json({ success: false, error: 'Payment verification failed' });
+    const failureReason = error instanceof Error ? error.message : 'webhook_processing_error';
+    const retriable =
+      claimed.attemptCount < PAYMENT_WEBHOOK_MAX_RETRIES && isRetriableWebhookFailure(failureReason);
+    await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
+      status: 'failed',
+      failureReason,
+      nextRetryAt: retriable ? computeNextRetryAt(claimed.attemptCount) : null,
+    });
+
+    recordPaymentMetric('webhook.process_failed', 1, {
+      eventType,
+      reason: failureReason,
+      retriable: retriable ? 'true' : 'false',
+    });
+
+    if (retriable) {
+      return { outcome: 'retryable_failed', reason: failureReason };
+    }
+    return { outcome: 'failed', reason: failureReason };
+  }
+}
+
+export async function retryFailedPaymentWebhooks(limit: number = 20): Promise<number> {
+  const now = new Date();
+  const candidates = await PaymentWebhookEvent.find({
+    status: { $in: ['received', 'failed'] },
+    $or: [{ nextRetryAt: { $exists: false } }, { nextRetryAt: null }, { nextRetryAt: { $lte: now } }],
+  })
+    .sort({ createdAt: 1 })
+    .limit(Math.max(1, limit))
+    .lean();
+
+  let processed = 0;
+  for (const event of candidates) {
+    const result = await processStoredRazorpayWebhookEvent(event._id.toString());
+    if (result.outcome === 'processed' || result.outcome === 'ignored' || result.outcome === 'already_processed') {
+      processed += 1;
+    }
+  }
+  if (candidates.length > 0) {
+    recordPaymentMetric('webhook.retry_scan_size', candidates.length);
+    recordPaymentMetric('webhook.retry_processed', processed);
+  }
+  return processed;
+}
+
+export const handleRazorpayWebhook = async (req: Request, res: Response): Promise<void> => {
+  let payload: RazorpayWebhookPayload = {};
+  try {
+    payload = parseRazorpayWebhookPayload(req.body);
+  } catch {
+    res.status(400).json({ success: false, error: 'Invalid JSON body' });
+    return;
+  }
+
+  try {
+    const eventType = String(payload.event || 'unknown');
+    const paymentEntity = payload.payload?.payment?.entity;
+    const orderEntity = payload.payload?.order?.entity;
+    const paymentId = String(paymentEntity?.id || '');
+    const orderId = String(paymentEntity?.order_id || orderEntity?.id || '');
+    const eventId = buildDeterministicWebhookEventId(req, eventType, paymentId, orderId);
+
+    let eventDoc;
+    try {
+      eventDoc = await PaymentWebhookEvent.create({
+        eventId,
+        eventType,
+        paymentId: paymentId || undefined,
+        orderId: orderId || undefined,
+        status: 'received',
+        attemptCount: 0,
+        rawPayload: buildWebhookAuditPayload(payload),
+      });
+    } catch (error: any) {
+      if (error?.code === 11000) {
+        recordPaymentMetric('webhook.duplicate', 1, { eventType });
+        res.status(200).json({ success: true, duplicate: true });
+        return;
+      }
+      throw error;
+    }
+
+    recordPaymentMetric('webhook.received', 1, { eventType });
+    logInfo('Razorpay webhook received', {
+      eventId,
+      eventType,
+      orderId,
+      paymentId,
+    });
+
+    const processResult = await processStoredRazorpayWebhookEvent(eventDoc._id.toString());
+    if (processResult.outcome === 'retryable_failed') {
+      logWarning('Razorpay webhook processing failed with retry scheduled', {
+        eventId,
+        eventType,
+        reason: processResult.reason,
+      });
+      res.status(500).json({
+        success: false,
+        error: 'Webhook processing failed; retry scheduled',
+      });
+      return;
+    }
+
+    if (processResult.outcome === 'failed') {
+      logWarning('Razorpay webhook processing failed permanently', {
+        eventId,
+        eventType,
+        reason: processResult.reason,
+      });
+      res.status(200).json({
+        success: true,
+        processed: false,
+        reason: processResult.reason,
+      });
+      return;
+    }
+
+    res.status(200).json({ success: true, processed: true, outcome: processResult.outcome });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown';
+    logError('Razorpay webhook handler error', error, {
+      message,
+    });
+    recordPaymentMetric('webhook.handler_error', 1);
+    res.status(500).json({ success: false, error: 'Failed to process webhook' });
   }
 };
 
@@ -728,6 +975,7 @@ export const getWalletPackages = async (req: Request, res: Response): Promise<vo
         return a.coins - b.coins;
       })
       .map((p) => ({
+        packageId: normalizePackageId(p.coins),
         coins: p.coins,
         priceInr: getEffectivePackPrice(p, pricingTier),
         oldPriceInr: p.oldPriceInr,
@@ -745,7 +993,8 @@ export const getWalletPackages = async (req: Request, res: Response): Promise<vo
       },
     });
   } catch (error) {
-    console.error('❌ [PAYMENT] getWalletPackages error:', error);
+    const message = error instanceof Error ? error.message : 'unknown';
+    console.error(`❌ [PAYMENT] getWalletPackages error: ${message}`);
     res.status(500).json({ success: false, error: 'Failed to fetch wallet packages' });
   }
 };

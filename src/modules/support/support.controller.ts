@@ -2,6 +2,7 @@ import type { Request } from 'express';
 import { Response } from 'express';
 import { User } from '../user/user.model';
 import { SupportTicket } from './support.model';
+import { SupportDailyCounter } from './support-daily-counter.model';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { invalidateAdminCaches } from '../../config/redis';
 import { Creator } from '../creator/creator.model';
@@ -11,6 +12,51 @@ type CreatorResolution = {
   creatorUserId?: any;
   creatorFirebaseUid?: string;
   creatorName?: string;
+};
+
+const MAX_DAILY_TICKETS = 5;
+
+const getUtcDayKey = (d: Date): string => d.toISOString().slice(0, 10);
+
+const reserveDailySupportTicketSlot = async (userId: string): Promise<boolean> => {
+  const dayKey = getUtcDayKey(new Date());
+
+  const existing = await SupportDailyCounter.findOneAndUpdate(
+    { userId, dayKey, count: { $lt: MAX_DAILY_TICKETS } },
+    { $inc: { count: 1 } },
+    { new: true }
+  ).lean();
+
+  if (existing) return true;
+
+  try {
+    await SupportDailyCounter.create({
+      userId,
+      dayKey,
+      count: 1,
+    });
+    return true;
+  } catch (error: any) {
+    if (error?.code !== 11000) {
+      throw error;
+    }
+  }
+
+  const retried = await SupportDailyCounter.findOneAndUpdate(
+    { userId, dayKey, count: { $lt: MAX_DAILY_TICKETS } },
+    { $inc: { count: 1 } },
+    { new: true }
+  ).lean();
+
+  return Boolean(retried);
+};
+
+const releaseDailySupportTicketSlot = async (userId: string): Promise<void> => {
+  const dayKey = getUtcDayKey(new Date());
+  await SupportDailyCounter.updateOne(
+    { userId, dayKey, count: { $gt: 0 } },
+    { $inc: { count: -1 } }
+  );
 };
 
 const resolveReportedCreator = async (params: {
@@ -118,17 +164,11 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
     // Auto-detect role (map admin → user for support purposes)
     const ticketRole: 'user' | 'creator' = currentUser.role === 'creator' ? 'creator' : 'user';
 
-    // Phase 9: Support ticket rate limit — 5 per day
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const ticketsToday = await SupportTicket.countDocuments({
-      userId: currentUser._id,
-      createdAt: { $gte: oneDayAgo },
-    });
-
-    if (ticketsToday >= 5) {
+    const ticketSlotReserved = await reserveDailySupportTicketSlot(currentUser._id.toString());
+    if (!ticketSlotReserved) {
       res.status(429).json({
         success: false,
-        error: 'You can submit a maximum of 5 support tickets per day. Please try again later.',
+        error: `You can submit a maximum of ${MAX_DAILY_TICKETS} support tickets per day. Please try again later.`,
       });
       return;
     }
@@ -146,20 +186,26 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       creatorFirebaseUid: typeof creatorFirebaseUid === 'string' ? creatorFirebaseUid : undefined,
     });
 
-    const ticket = await SupportTicket.create({
-      userId: currentUser._id,
-      role: ticketRole,
-      category: category.trim(),
-      subject: subject.trim(),
-      message: message.trim(),
-      priority: ticketPriority,
-      source: ticketSource,
-      relatedCallId: callId,
-      reportedCreatorUserId: resolvedCreator.creatorUserId,
-      reportedCreatorFirebaseUid: resolvedCreator.creatorFirebaseUid,
-      reportedCreatorName: resolvedCreator.creatorName,
-      status: 'open',
-    });
+    let ticket;
+    try {
+      ticket = await SupportTicket.create({
+        userId: currentUser._id,
+        role: ticketRole,
+        category: category.trim(),
+        subject: subject.trim(),
+        message: message.trim(),
+        priority: ticketPriority,
+        source: ticketSource,
+        relatedCallId: callId,
+        reportedCreatorUserId: resolvedCreator.creatorUserId,
+        reportedCreatorFirebaseUid: resolvedCreator.creatorFirebaseUid,
+        reportedCreatorName: resolvedCreator.creatorName,
+        status: 'open',
+      });
+    } catch (error) {
+      await releaseDailySupportTicketSlot(currentUser._id.toString()).catch(() => {});
+      throw error;
+    }
 
     console.log(`✅ [SUPPORT] Ticket created: ${ticket._id} by ${ticketRole} ${currentUser._id}`);
 

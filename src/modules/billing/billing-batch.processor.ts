@@ -14,9 +14,43 @@ import {
 } from './billing.queue';
 import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
 import { updateBackpressureStage } from './billing-backpressure';
+import { getLatestEventLoopLagMs } from '../../utils/runtime-signals';
+import { featureFlags } from '../../config/feature-flags';
 
 let globalBillingProcessor: NodeJS.Timeout | null = null;
-const BILLING_BATCH_SIZE = 50;
+
+function readIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = parseInt(process.env[name] || '', 10);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, raw));
+}
+
+const BILLING_BATCH_SIZE = readIntEnv('BILLING_BATCH_SIZE', 130, 50, 300);
+const BILLING_LAG_ADAPTIVE_THRESHOLD_MS = readIntEnv(
+  'BILLING_LAG_ADAPTIVE_THRESHOLD_MS',
+  1500,
+  100,
+  120_000
+);
+const BILLING_LAG_ADAPTIVE_BOOST_MULTIPLIER = readIntEnv(
+  'BILLING_LAG_ADAPTIVE_BOOST_MULTIPLIER',
+  2,
+  1,
+  5
+);
+const BILLING_LAG_ADAPTIVE_MAX_BATCH = readIntEnv('BILLING_LAG_ADAPTIVE_MAX_BATCH', 260, 50, 500);
+const BILLING_LAG_SKIP_THRESHOLD_MS = readIntEnv(
+  'BILLING_LAG_SKIP_THRESHOLD_MS',
+  8000,
+  500,
+  240_000
+);
+const BILLING_EVENT_LOOP_SKIP_THRESHOLD_MS = readIntEnv(
+  'BILLING_EVENT_LOOP_SKIP_THRESHOLD_MS',
+  120,
+  20,
+  5000
+);
 
 /**
  * Single global billing processor that processes all active calls in batches.
@@ -40,21 +74,62 @@ export async function processBillingBatch(io: Server): Promise<void> {
   const now = Date.now();
 
   try {
+    const firstDue = await redis.zrangebyscore(
+      ACTIVE_BILLING_CALLS_KEY,
+      0,
+      now,
+      'LIMIT',
+      0,
+      1
+    );
+    const firstDueCallId = Array.isArray(firstDue) && firstDue.length > 0 ? String(firstDue[0]) : null;
+    const firstDueScore = firstDueCallId
+      ? Number(await redis.zscore(ACTIVE_BILLING_CALLS_KEY, firstDueCallId) || now)
+      : now;
+    const queueLagMsApprox = firstDueCallId ? Math.max(0, now - firstDueScore) : 0;
+
+    if (queueLagMsApprox > 0) {
+      recordBillingMetric('zset_queue_lag_ms', queueLagMsApprox, {});
+      updateBackpressureStage({ queueLagMs: queueLagMsApprox });
+    }
+
+    const eventLoopLagMs = getLatestEventLoopLagMs();
+    const shouldSkipThisCycle =
+      featureFlags.billingAdaptiveLagPolicyEnabled &&
+      queueLagMsApprox >= BILLING_LAG_SKIP_THRESHOLD_MS &&
+      eventLoopLagMs >= BILLING_EVENT_LOOP_SKIP_THRESHOLD_MS;
+    if (shouldSkipThisCycle) {
+      recordBillingMetric('zset_cycle_skipped_lag_guard', 1, {
+        queueLagMs: String(queueLagMsApprox),
+        eventLoopLagMs: String(Math.round(eventLoopLagMs)),
+      });
+      return;
+    }
+
+    const effectiveBatchSize =
+      featureFlags.billingAdaptiveLagPolicyEnabled && queueLagMsApprox > BILLING_LAG_ADAPTIVE_THRESHOLD_MS
+        ? Math.min(
+            BILLING_LAG_ADAPTIVE_MAX_BATCH,
+            Math.max(BILLING_BATCH_SIZE, Math.floor(BILLING_BATCH_SIZE * BILLING_LAG_ADAPTIVE_BOOST_MULTIPLIER))
+          )
+        : BILLING_BATCH_SIZE;
+    if (effectiveBatchSize > BILLING_BATCH_SIZE) {
+      recordBillingMetric('zset_adaptive_batch_boost_applied', 1, {
+        batchSize: String(effectiveBatchSize),
+        queueLagMs: String(queueLagMsApprox),
+      });
+    }
+
     const callsDue = await redis.zrangebyscore(
       ACTIVE_BILLING_CALLS_KEY,
       0,
       now,
       'LIMIT',
       0,
-      BILLING_BATCH_SIZE
+      effectiveBatchSize
     );
 
     const callIds: string[] = Array.isArray(callsDue) ? callsDue : [];
-    const queueLagMsApprox = callIds.length > 0 ? Math.max(0, now - Number(await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callIds[0]) || now)) : 0;
-    if (queueLagMsApprox > 0) {
-      recordBillingMetric('zset_queue_lag_ms', queueLagMsApprox, {});
-      updateBackpressureStage({ queueLagMs: queueLagMsApprox });
-    }
 
     if (callIds.length === 0) {
       return;
@@ -119,6 +194,7 @@ export function startGlobalBillingProcessor(io: Server): void {
   logInfo('Starting global billing batch processor', {
     interval: BILLING_PROCESS_INTERVAL_MS,
     batchSize: BILLING_BATCH_SIZE,
+    adaptiveLagPolicyEnabled: featureFlags.billingAdaptiveLagPolicyEnabled,
   });
 
   processBillingBatch(io).catch((err) => {

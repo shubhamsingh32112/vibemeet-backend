@@ -5,7 +5,26 @@
 export const COIN_MICROS = 1_000_000;
 
 /** How often the ZSET scheduler wakes a call for processing (ms). */
-export const BILLING_PROCESS_INTERVAL_MS = 300;
+const DEFAULT_BILLING_PROCESS_INTERVAL_MS = 450;
+const MIN_BILLING_PROCESS_INTERVAL_MS = 200;
+const MAX_BILLING_PROCESS_INTERVAL_MS = 5000;
+
+function readBillingProcessIntervalMs(): number {
+  const raw = process.env.BILLING_PROCESS_INTERVAL_MS;
+  if (raw === undefined || raw === '') {
+    return DEFAULT_BILLING_PROCESS_INTERVAL_MS;
+  }
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) {
+    return DEFAULT_BILLING_PROCESS_INTERVAL_MS;
+  }
+  return Math.min(
+    MAX_BILLING_PROCESS_INTERVAL_MS,
+    Math.max(MIN_BILLING_PROCESS_INTERVAL_MS, n)
+  );
+}
+
+export const BILLING_PROCESS_INTERVAL_MS = readBillingProcessIntervalMs();
 
 const DEFAULT_MAX_BILLING_DELTA_MS = 5000;
 const MIN_MAX_BILLING_DELTA_MS = 500;
@@ -60,7 +79,7 @@ function readBillingCycleLockTtlMs(): number {
 
 export const BILLING_CYCLE_LOCK_TTL_MS = readBillingCycleLockTtlMs();
 
-export const BILLING_SESSION_SCHEMA_VERSION = 2;
+export const BILLING_SESSION_SCHEMA_VERSION = 3;
 
 const DEFAULT_BILLING_EMIT_INTERVAL_MS = 1000;
 const MIN_BILLING_EMIT_INTERVAL_MS = 250;
