@@ -1,5 +1,40 @@
 import rateLimit from 'express-rate-limit';
 import type { Request } from 'express';
+import RedisStore from 'rate-limit-redis';
+import type { RedisReply } from 'rate-limit-redis';
+import { getRedis } from '../config/redis';
+import { logWarning } from '../utils/logger';
+function createLimiter(
+  config: Parameters<typeof rateLimit>[0],
+  prefix: string
+) {
+  const hasRedisEnv = Boolean(
+    process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || process.env.REDISHOST
+  );
+  if (process.env.RATE_LIMIT_REDIS === '0' || !hasRedisEnv) {
+    return rateLimit(config);
+  }
+  try {
+    const client = getRedis();
+    return rateLimit({
+      ...config,
+      store: new RedisStore({
+        sendCommand: (...args: string[]): Promise<RedisReply> => {
+          const [cmd, ...rest] = args;
+          return client.call(cmd, ...rest) as Promise<RedisReply>;
+        },
+        prefix,
+      }),
+    });
+  } catch (err) {
+    logWarning('Rate limiter Redis store unavailable; falling back to memory', {
+      prefix,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return rateLimit(config);
+  }
+}
+
 
 /**
  * 🔥 FIX 11: Rate Limiting for Video Calling Endpoints
@@ -200,7 +235,7 @@ export const fastLoginLimiter = rateLimit({
  * - 30 requests per minute per user (prevents abuse, allows retries)
  * - Keyed by Firebase UID when available, falls back to IP for edge cases
  */
-export const loginLimiter = rateLimit({
+export const loginLimiter = createLimiter({
   windowMs: 60 * 1000, // 1 minute
   max: 30,
   message: 'Too many login requests. Please wait a moment.',
@@ -213,13 +248,13 @@ export const loginLimiter = rateLimit({
   skip: (_req: Request): boolean => {
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
-});
+}, 'rl:login:');
 
 /**
  * Rate limiter for phone auth precheck endpoint.
  * Returns explicit retry_after to support client-enforced cooldown UX.
  */
-export const phonePrecheckLimiter = rateLimit({
+export const phonePrecheckLimiter = createLimiter({
   windowMs: 60 * 1000, // 1 minute
   max: 5,
   standardHeaders: true,
@@ -244,4 +279,18 @@ export const phonePrecheckLimiter = rateLimit({
   skip: (_req: Request): boolean => {
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
   },
-});
+}, 'rl:phone-precheck:');
+
+export const referralApplyLimiter = createLimiter(
+  {
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => {
+      const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+      return `referral_apply:${firebaseUid}`;
+    },
+  },
+  'rl:referral-apply:'
+);

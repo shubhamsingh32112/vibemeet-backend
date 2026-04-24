@@ -64,6 +64,7 @@ function referralApplyFailure(code: ApplyReferralCodeErrorCode) {
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
+  let createdNow = false;
   let referralApply: { ok: true } | ReturnType<typeof referralApplyFailure> | undefined;
   try {
     logDebug('Login request received', {
@@ -88,6 +89,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
       // ✅ Create user ONLY here (never in middleware)
       if (!user) {
+        createdNow = true;
         logInfo('Creating new user (first login)', { firebaseUid });
         const firstLoginProfile = buildDefaultFirstLoginProfile();
 
@@ -124,6 +126,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           coins: 0, // ✅ New users start with 0 coins - 30 coins are added when they accept the welcome bonus popup
           freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
           welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Set to true if phone number previously claimed bonus
+          onboardingStage: 'welcome',
+          onboardingWelcomeSeenAt: null,
+          onboardingBonusSeenAt: null,
+          onboardingPermissionSeenAt: null,
+          onboardingCompletedAt: null,
         });
 
         // Referral: assign unique code and apply referral if provided
@@ -234,6 +241,31 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const creator = await Creator.findOne({ userId: user._id }).lean();
 
     const needsOnboarding = (user.categories ?? []).length === 0;
+    const onboardingState = {
+      stage:
+        user.onboardingStage === 'permissions'
+          ? 'permission'
+          : (user.onboardingStage ?? 'welcome'),
+      welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
+      bonusSeenAt: user.onboardingBonusSeenAt ?? null,
+      permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
+      completedAt: user.onboardingCompletedAt ?? null,
+    };
+    if (createdNow && user.role !== 'user') {
+      logError('New user created with invalid role', new Error('invalid_role_on_create'), {
+        firebaseUid,
+        role: user.role,
+        userId: user._id.toString(),
+      });
+    }
+    logInfo('Onboarding gate decision', {
+      firebaseUid,
+      userId: user._id.toString(),
+      role: user.role,
+      createdNow,
+      stage: onboardingState.stage,
+      welcomeBonusClaimed: user.welcomeBonusClaimed,
+    });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
 
     // If creator exists, return creator details as primary data
@@ -274,6 +306,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
           needsOnboarding: false, // Creators don't need onboarding
+          createdNow,
+          onboarding: onboardingState,
           referralCode: user.referralCode ?? undefined,
           profileRevision: user.profileRevision ?? 0,
           creatorApplicationPending: appFlags.creatorApplicationPending,
@@ -306,12 +340,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             profileRevision: user.profileRevision ?? 0,
             creatorApplicationPending: appFlags.creatorApplicationPending,
             creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            onboarding: onboardingState,
             ...(appFlags.creatorApplicationRejectionReason
               ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
               : {}),
           },
           creator: null,
           needsOnboarding,
+          createdNow,
           ...(referralApply !== undefined ? { referralApply } : {}),
         },
       });

@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
 import {
   getMe,
   getReferrals,
@@ -10,6 +9,7 @@ import {
   promoteToCreator,
   addCoins,
   claimWelcomeBonus,
+  advanceOnboardingStage,
   getUserTransactions,
   getCallHistory,
   getFavoriteCreators,
@@ -20,15 +20,9 @@ import {
   deleteAccount,
 } from './user.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
+import { referralApplyLimiter } from '../../middlewares/rate-limit.middleware';
 
 const router = Router();
-
-const referralApplyLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
 
 router.get('/me', verifyFirebaseToken, getMe);
 router.get('/referrals', verifyFirebaseToken, getReferrals);
@@ -38,6 +32,7 @@ router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search 
 router.put('/profile', verifyFirebaseToken, updateProfile);
 router.post('/coins', verifyFirebaseToken, addCoins); // Add coins to user account
 router.post('/welcome-bonus', verifyFirebaseToken, claimWelcomeBonus); // Claim 30 coin welcome bonus (new users only)
+router.post('/onboarding/stage', verifyFirebaseToken, advanceOnboardingStage);
 router.get('/transactions', verifyFirebaseToken, getUserTransactions); // Get user transaction history
 router.get('/call-history', verifyFirebaseToken, getCallHistory); // Get call history (users + creators)
 router.get('/favorites', verifyFirebaseToken, getFavoriteCreators); // Get favorite creators (user only)

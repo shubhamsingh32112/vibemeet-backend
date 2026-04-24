@@ -24,6 +24,7 @@ import {
   assignReferralCodeToUser,
   type ApplyReferralCodeErrorCode,
 } from './referral.service';
+import { ReferralEdge } from './referral-edge.model';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
 import {
   ADMIN_USER_SEARCH_QUERY_MAX_LEN,
@@ -503,6 +504,16 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
     const creator = await Creator.findOne({ userId: user._id });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
+    const onboarding = {
+      stage:
+        user.onboardingStage === 'permissions'
+          ? 'permission'
+          : (user.onboardingStage ?? 'welcome'),
+      welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
+      bonusSeenAt: user.onboardingBonusSeenAt ?? null,
+      permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
+      completedAt: user.onboardingCompletedAt ?? null,
+    };
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -546,6 +557,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           referralCode: user.referralCode ?? undefined,
           creatorApplicationPending: appFlags.creatorApplicationPending,
           creatorApplicationRejected: appFlags.creatorApplicationRejected,
+          onboarding,
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
@@ -576,6 +588,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             referralCode: user.referralCode ?? undefined,
             creatorApplicationPending: appFlags.creatorApplicationPending,
             creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            onboarding,
             ...(appFlags.creatorApplicationRejectionReason
               ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
               : {}),
@@ -611,29 +624,37 @@ export const getReferrals = async (req: Request, res: Response): Promise<void> =
     }
 
     const referralCode = user.referralCode ?? null;
-    const referralsRaw = user.referrals ?? [];
-
-    // Populate referred users for name/display
-    const referrals = await Promise.all(
-      referralsRaw.map(async (entry) => {
-        const referredUser = await User.findById(entry.user).lean();
-        const creatorProfile = referredUser
-          ? await Creator.findOne({ userId: referredUser._id }).lean()
-          : null;
-        const displayName =
-          creatorProfile?.name ??
-          referredUser?.username ??
-          referredUser?.email?.split('@')[0] ??
-          'User';
-
-        return {
-          userId: (entry.user as mongoose.Types.ObjectId).toString(),
-          name: displayName,
-          rewardGranted: entry.rewardGranted ?? false,
-          joinedAt: entry.createdAt?.toISOString?.() ?? new Date().toISOString(),
-        };
-      })
+    const edges = await ReferralEdge.find({ referrerId: user._id })
+      .sort({ createdAt: -1 })
+      .select('referredUserId rewardGranted createdAt')
+      .lean();
+    const referredUserIds = edges.map((e) => e.referredUserId);
+    const referredUsers =
+      referredUserIds.length > 0
+        ? await User.find({ _id: { $in: referredUserIds } }).select('_id username email').lean()
+        : [];
+    const userById = new Map(referredUsers.map((u) => [u._id.toString(), u] as const));
+    const creatorProfiles =
+      referredUserIds.length > 0
+        ? await Creator.find({ userId: { $in: referredUserIds } }).select('userId name').lean()
+        : [];
+    const creatorByUserId = new Map(
+      creatorProfiles.map((c) => [c.userId.toString(), c] as const)
     );
+
+    const referrals = edges.map((edge) => {
+      const uid = edge.referredUserId.toString();
+      const referredUser = userById.get(uid);
+      const creatorProfile = creatorByUserId.get(uid);
+      const displayName =
+        creatorProfile?.name ?? referredUser?.username ?? referredUser?.email?.split('@')[0] ?? 'User';
+      return {
+        userId: uid,
+        name: displayName,
+        rewardGranted: edge.rewardGranted ?? false,
+        joinedAt: edge.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      };
+    });
 
     res.json({
       success: true,
@@ -648,6 +669,89 @@ export const getReferrals = async (req: Request, res: Response): Promise<void> =
       success: false,
       error: 'Internal server error',
     });
+  }
+};
+
+type OnboardingStageInput = 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
+const onboardingStageOrder: Record<OnboardingStageInput, number> = {
+  welcome: 1,
+  bonus: 2,
+  permission: 3,
+  permissions: 3,
+  completed: 4,
+};
+
+export const advanceOnboardingStage = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const stageRaw = req.body?.stage as string | undefined;
+    const stage = stageRaw === 'permission' ? 'permissions' : (stageRaw as OnboardingStageInput | undefined);
+    if (!stage || !onboardingStageOrder[stage]) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid onboarding stage',
+      });
+      return;
+    }
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    const current = (user.onboardingStage as OnboardingStageInput | undefined) ?? 'welcome';
+    if (onboardingStageOrder[stage] < onboardingStageOrder[current]) {
+      res.json({
+        success: true,
+        data: {
+          stage: current,
+          ignored: true,
+        },
+      });
+      return;
+    }
+    const now = new Date();
+    const fromStage = current;
+    user.onboardingStage = stage;
+    if (stage === 'welcome' && !user.onboardingWelcomeSeenAt) user.onboardingWelcomeSeenAt = now;
+    if (stage === 'bonus' && !user.onboardingBonusSeenAt) user.onboardingBonusSeenAt = now;
+    if (stage === 'permissions' && !user.onboardingPermissionSeenAt) user.onboardingPermissionSeenAt = now;
+    if (stage === 'completed' && !user.onboardingCompletedAt) user.onboardingCompletedAt = now;
+    await user.save();
+    console.log(
+      `📊 [ONBOARDING METRIC] onboarding_stage_transition from=${fromStage} to=${stage} userId=${user._id.toString()}`
+    );
+    if (stage === 'welcome') {
+      console.log(`📊 [ONBOARDING METRIC] onboarding_started userId=${user._id.toString()}`);
+    }
+    if (stage === 'bonus') {
+      console.log(`📊 [ONBOARDING METRIC] drop_off_after_welcome userId=${user._id.toString()}`);
+    }
+    if (stage === 'permissions') {
+      console.log(`📊 [ONBOARDING METRIC] drop_off_after_bonus userId=${user._id.toString()}`);
+    }
+    if (stage === 'completed') {
+      console.log(`📊 [ONBOARDING METRIC] onboarding_completed userId=${user._id.toString()}`);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        stage:
+          user.onboardingStage === 'permissions'
+            ? 'permission'
+            : user.onboardingStage,
+        welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
+        bonusSeenAt: user.onboardingBonusSeenAt ?? null,
+        permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
+        completedAt: user.onboardingCompletedAt ?? null,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] advanceOnboardingStage error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 

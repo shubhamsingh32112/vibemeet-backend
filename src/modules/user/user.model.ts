@@ -23,6 +23,11 @@ export interface IUser extends Document {
   coins: number;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
   welcomeBonusClaimed: boolean; // Whether user has claimed the 30-coin welcome bonus
+  onboardingStage?: 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
+  onboardingWelcomeSeenAt?: Date | null;
+  onboardingBonusSeenAt?: Date | null;
+  onboardingPermissionSeenAt?: Date | null;
+  onboardingCompletedAt?: Date | null;
   role: 'user' | 'creator' | 'admin' | 'agent';
   /** Bcrypt hash for agent dashboard login (never store plaintext). */
   passwordHash?: string;
@@ -124,6 +129,28 @@ const userSchema = new Schema<IUser>(
     welcomeBonusClaimed: {
       type: Boolean,
       default: false,
+    },
+    onboardingStage: {
+      type: String,
+      enum: ['welcome', 'bonus', 'permission', 'permissions', 'completed'],
+      default: 'welcome',
+      index: true,
+    },
+    onboardingWelcomeSeenAt: {
+      type: Date,
+      default: null,
+    },
+    onboardingBonusSeenAt: {
+      type: Date,
+      default: null,
+    },
+    onboardingPermissionSeenAt: {
+      type: Date,
+      default: null,
+    },
+    onboardingCompletedAt: {
+      type: Date,
+      default: null,
     },
     role: {
       type: String,
