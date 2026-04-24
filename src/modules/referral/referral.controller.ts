@@ -1,5 +1,7 @@
 import type { Request, Response } from 'express';
 import { previewReferralCode, type ApplyReferralCodeErrorCode } from '../user/referral.service';
+import { getFirebaseAdmin } from '../../config/firebase';
+import { User } from '../user/user.model';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logError } from '../../utils/logger';
 
@@ -13,7 +15,25 @@ function previewHttpStatus(code: ApplyReferralCodeErrorCode): number {
 export const getReferralPreview = async (req: Request, res: Response): Promise<void> => {
   try {
     const raw = typeof req.query.code === 'string' ? req.query.code.trim() : '';
-    const result = await previewReferralCode(raw);
+    const mode = req.query.mode === 'late_attach' ? 'late_attach' : 'signup';
+    let applicant = null;
+
+    if (mode === 'late_attach') {
+      const authHeader = req.headers.authorization;
+      if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.slice('Bearer '.length).trim();
+        if (token) {
+          try {
+            const decoded = await getFirebaseAdmin().auth().verifyIdToken(token);
+            applicant = await User.findOne({ firebaseUid: decoded.uid });
+          } catch {
+            applicant = null;
+          }
+        }
+      }
+    }
+
+    const result = await previewReferralCode(raw, { mode, applicant });
     if (!result.ok) {
       res.status(previewHttpStatus(result.code)).json({
         success: false,

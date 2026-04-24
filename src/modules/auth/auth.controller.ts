@@ -338,6 +338,17 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 };
 
 /**
+ * Lightweight precheck endpoint for phone OTP starts.
+ * Actual OTP send remains client-driven via Firebase verifyPhoneNumber.
+ */
+export const phonePrecheck = async (_req: Request, res: Response): Promise<void> => {
+  res.json({
+    success: true,
+    data: { allowed: true },
+  });
+};
+
+/**
  * Fast Login was removed. Old app builds still call this route — return 410 so clients
  * can show a clear message instead of treating the response as success.
  */

@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
-import { creatorGalleryUploadLimiter } from '../../middlewares/rate-limit.middleware';
+import {
+  appUpdatePublishLimiter,
+  creatorGalleryUploadLimiter,
+} from '../../middlewares/rate-limit.middleware';
 import {
   createAgent,
   listAgents,
@@ -40,6 +43,10 @@ import {
   adminCreatorGalleryDelete,
   adminCreatorGalleryReorder,
 } from './admin.controller';
+import {
+  getCurrentGlobalAppUpdateForAdmin,
+  publishGlobalAppUpdate,
+} from '../app-update/app-update.controller';
 
 const router = Router();
 
@@ -56,6 +63,7 @@ router.get('/wallet-pricing', getWalletPricing);
 router.get('/calls', getCallsAdmin);
 router.get('/calls/:callId/refund-preview', getRefundPreview);
 router.get('/system/health', getSystemHealth);
+router.get('/app-updates/current', getCurrentGlobalAppUpdateForAdmin);
 router.get('/realtime-metrics', getRealtimeMetrics);
 router.get('/actions/log', getAdminActionLog);
 
@@ -91,6 +99,7 @@ router.delete('/creators/:id/gallery/:imageId', adminCreatorGalleryDelete);
 router.patch('/creators/:id/gallery/reorder', adminCreatorGalleryReorder);
 router.post('/calls/:callId/refund', refundCall);
 router.put('/wallet-pricing', updateWalletPricing);
+router.post('/app-updates/publish', appUpdatePublishLimiter, publishGlobalAppUpdate);
 
 // ── Phase 7: Data Integrity Checks ─────────────────────────────────────
 router.get('/integrity-checks', getIntegrityChecks);

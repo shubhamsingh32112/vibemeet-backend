@@ -10,6 +10,7 @@ import supportRoutes from './modules/support/support.routes';
 import paymentRoutes from './modules/payment/payment.routes';
 import agentRoutes from './modules/agent/agent.routes';
 import referralRoutes from './modules/referral/referral.routes';
+import appUpdateRoutes from './modules/app-update/app-update.routes';
 
 const router = Router();
 
@@ -24,5 +25,6 @@ router.use('/agent', agentRoutes);
 router.use('/billing', billingRoutes);
 router.use('/support', supportRoutes);
 router.use('/payment', paymentRoutes);
+router.use('/app-updates', appUpdateRoutes);
 
 export default router;

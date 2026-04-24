@@ -164,19 +164,64 @@ export type PreviewReferralCodeResult =
   | { ok: true; code: string }
   | { ok: false; code: ApplyReferralCodeErrorCode };
 
+type PreviewReferralOptions = {
+  mode?: ApplyReferralCodeMode;
+  applicant?: IUser | null;
+};
+
+async function previewApplicantEligibility(
+  applicant: IUser,
+  mode: ApplyReferralCodeMode
+): Promise<ApplyReferralCodeErrorCode | null> {
+  if (applicant.referredBy) {
+    return 'ALREADY_REFERRED';
+  }
+  if (mode !== 'late_attach') {
+    return null;
+  }
+  if (applicant.role !== 'user') {
+    return 'NOT_ELIGIBLE_ROLE';
+  }
+  const creatorProf = await Creator.findOne({ userId: applicant._id }).select('_id').lean();
+  if (creatorProf) {
+    return 'NOT_ELIGIBLE_ROLE';
+  }
+  const createdAt = applicant.createdAt ? new Date(applicant.createdAt).getTime() : 0;
+  if (Date.now() - createdAt > getReferralAttachWindowMs()) {
+    return 'WINDOW_EXPIRED';
+  }
+  if (await userHasCompletedCoinPurchase(applicant._id)) {
+    return 'PURCHASE_ALREADY';
+  }
+  return null;
+}
+
 /**
  * Validate a referral code for pre-login preview (existence + creator/agent rules).
  */
 export async function previewReferralCode(
-  referralCodeRaw: string | null | undefined
+  referralCodeRaw: string | null | undefined,
+  options?: PreviewReferralOptions
 ): Promise<PreviewReferralCodeResult> {
+  const mode: ApplyReferralCodeMode = options?.mode ?? 'signup';
+  const applicant = options?.applicant ?? null;
+
   if (!referralCodeRaw || !isValidReferralCodeFormat(referralCodeRaw)) {
     return { ok: false, code: 'INVALID_FORMAT' };
+  }
+  if (applicant) {
+    const applicantError = await previewApplicantEligibility(applicant, mode);
+    if (applicantError) {
+      return { ok: false, code: applicantError };
+    }
   }
   const code = normalizeReferralCode(referralCodeRaw);
   const referrer = await User.findOne({ referralCode: code });
   if (!referrer) {
     return { ok: false, code: 'NOT_FOUND' };
+  }
+  if (applicant && referrer._id.equals(applicant._id)) {
+    return { ok: false, code: 'SELF' };
   }
   if (referrer.role === 'agent' && referrer.agentDisabled) {
     return { ok: false, code: 'AGENT_DISABLED' };

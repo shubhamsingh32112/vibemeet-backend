@@ -143,6 +143,25 @@ export const creatorGalleryUploadLimiter = rateLimit({
 });
 
 /**
+ * Rate limiter for publishing global app updates (admin endpoint).
+ * - Prevent rapid repeated publish actions across admin sessions.
+ */
+export const appUpdatePublishLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,
+  message: 'Too many update publish attempts. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `app_update_publish:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/**
  * Rate limiter for chat endpoints (pre-send, other-member, quota)
  * - 60 requests per minute per user (1 msg/sec; 1000 users/day, 200 creators)
  * - Prevents abuse while allowing normal usage
@@ -190,6 +209,37 @@ export const loginLimiter = rateLimit({
   keyGenerator: (req: Request): string => {
     const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
     return `login:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/**
+ * Rate limiter for phone auth precheck endpoint.
+ * Returns explicit retry_after to support client-enforced cooldown UX.
+ */
+export const phonePrecheckLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const phone = typeof req.body?.phoneNumber === 'string'
+      ? req.body.phoneNumber.trim()
+      : 'unknown';
+    return `phone_precheck:${req.ip}:${phone}`;
+  },
+  handler: (req, res) => {
+    const resetTime = req.rateLimit?.resetTime instanceof Date
+      ? req.rateLimit.resetTime.getTime()
+      : Date.now() + 60 * 1000;
+    const retryAfter = Math.max(1, Math.ceil((resetTime - Date.now()) / 1000));
+    res.status(429).json({
+      success: false,
+      error: 'too_many_requests',
+      retry_after: retryAfter,
+    });
   },
   skip: (_req: Request): boolean => {
     return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
