@@ -8,6 +8,9 @@ declare global {
         phone?: string;
         email?: string;
       };
+      rateLimit?: {
+        resetTime?: Date;
+      };
     }
   }
 }
