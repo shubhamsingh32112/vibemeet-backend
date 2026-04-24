@@ -63,6 +63,71 @@ function agentPeriodBounds(period: string): { start: Date | null; end: Date } {
 
 type CallAggRow = { talkSeconds: number; periodCoinsEarned: number; callCount: number };
 
+type AgentWithdrawalDetails = {
+  id: string;
+  creatorUserId: string;
+  creatorName: string;
+  creatorEmail: string | null;
+  amount: number;
+  status: 'pending' | 'approved' | 'rejected' | 'paid';
+  requestedAt: Date;
+  processedAt: Date | null;
+  notes: string | null;
+  name: string | null;
+  number: string | null;
+  upi: string | null;
+  accountNumber: string | null;
+  ifsc: string | null;
+  createdAt: Date;
+};
+
+function normalizeNullableText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function mapAgentWithdrawalDto(
+  withdrawal: {
+    _id: mongoose.Types.ObjectId;
+    creatorUserId?: mongoose.Types.ObjectId;
+    amount: number;
+    status: 'pending' | 'approved' | 'rejected' | 'paid';
+    requestedAt: Date;
+    processedAt?: Date;
+    notes?: string;
+    name?: string;
+    number?: string;
+    upi?: string;
+    accountNumber?: string;
+    ifsc?: string;
+    createdAt: Date;
+  },
+  userById: Map<string, { email?: string; username?: string }>,
+  creatorByUserId: Map<string, { name?: string }>,
+): AgentWithdrawalDetails {
+  const creatorUserId = withdrawal.creatorUserId?.toString() ?? '';
+  const user = creatorUserId ? userById.get(creatorUserId) : undefined;
+  const creator = creatorUserId ? creatorByUserId.get(creatorUserId) : undefined;
+  return {
+    id: withdrawal._id.toString(),
+    creatorUserId,
+    creatorName: normalizeNullableText(creator?.name) ?? normalizeNullableText(user?.username) ?? 'Unknown',
+    creatorEmail: normalizeNullableText(user?.email),
+    amount: withdrawal.amount,
+    status: withdrawal.status,
+    requestedAt: withdrawal.requestedAt,
+    processedAt: withdrawal.processedAt ?? null,
+    notes: normalizeNullableText(withdrawal.notes),
+    name: normalizeNullableText(withdrawal.name),
+    number: normalizeNullableText(withdrawal.number),
+    upi: normalizeNullableText(withdrawal.upi),
+    accountNumber: normalizeNullableText(withdrawal.accountNumber),
+    ifsc: normalizeNullableText(withdrawal.ifsc),
+    createdAt: withdrawal.createdAt,
+  };
+}
+
 async function aggregateCallStatsByUser(
   userObjectIds: mongoose.Types.ObjectId[],
   start: Date | null,
@@ -988,7 +1053,7 @@ export const getAgentWithdrawals = async (req: Request, res: Response): Promise<
 
     const statusFilter = req.query.status as string | undefined;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
 
     const filter: Record<string, unknown> = { assignedAgentId: agent._id };
@@ -1001,33 +1066,39 @@ export const getAgentWithdrawals = async (req: Request, res: Response): Promise<
       Withdrawal.countDocuments(filter),
     ]);
 
-    const enriched = await Promise.all(
-      withdrawals.map(async (w) => {
-        const u = w.creatorUserId
-          ? await User.findById(w.creatorUserId).select('username email phone').lean()
-          : null;
-        const c = w.creatorUserId
-          ? await Creator.findOne({ userId: w.creatorUserId }).select('name photo').lean()
-          : null;
-        return {
-          id: w._id.toString(),
-          creatorUserId: w.creatorUserId?.toString() || '',
-          creatorName: c?.name || u?.username || 'Unknown',
-          creatorEmail: u?.email || null,
-          amount: w.amount,
-          status: w.status,
-          requestedAt: w.requestedAt,
-          processedAt: w.processedAt || null,
-          notes: w.notes || null,
-          name: w.name || null,
-          number: w.number || null,
-          upi: w.upi || null,
-          accountNumber: w.accountNumber || null,
-          ifsc: w.ifsc || null,
-          createdAt: w.createdAt,
-        };
-      }),
+    const creatorUserIds = [...new Set(withdrawals.map((w) => w.creatorUserId?.toString()).filter(Boolean))].map(
+      (id) => new mongoose.Types.ObjectId(id),
     );
+    const [users, creators] = await Promise.all([
+      creatorUserIds.length > 0
+        ? User.find({ _id: { $in: creatorUserIds } }).select('_id username email').lean()
+        : [],
+      creatorUserIds.length > 0
+        ? Creator.find({ userId: { $in: creatorUserIds } }).select('userId name').lean()
+        : [],
+    ]);
+
+    const userById = new Map(users.map((u) => [u._id.toString(), u]));
+    const creatorByUserId = new Map(creators.map((c) => [c.userId.toString(), c]));
+    const enriched = withdrawals.map((w) => mapAgentWithdrawalDto(w, userById, creatorByUserId));
+    const missingAssignmentCount = await Withdrawal.countDocuments({
+      assignedAgentId: { $exists: false },
+      status: statusFilter && ['pending', 'approved', 'rejected', 'paid'].includes(statusFilter)
+        ? statusFilter
+        : 'pending',
+    });
+    const missingPayoutDetailsCount = enriched.filter(
+      (row) => !row.upi && (!row.accountNumber || !row.ifsc),
+    ).length;
+    logInfo('agent_withdrawal_visibility_metrics', {
+      agentId: agent._id.toString(),
+      agent_withdrawal_rows_returned: enriched.length,
+      agent_withdrawal_rows_missing_assignment: missingAssignmentCount,
+      agent_withdrawal_rows_missing_payout_details: missingPayoutDetailsCount,
+      statusFilter: statusFilter ?? null,
+      page,
+      limit,
+    });
 
     res.json({
       success: true,

@@ -105,6 +105,7 @@ const withdrawalSchema = new Schema<IWithdrawal>(
 
 // Compound indexes for common queries
 withdrawalSchema.index({ assignedAgentId: 1, status: 1, createdAt: -1 });
+withdrawalSchema.index({ assignedAgentId: 1, createdAt: -1 });
 withdrawalSchema.index({ creatorUserId: 1, status: 1 });
 withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });

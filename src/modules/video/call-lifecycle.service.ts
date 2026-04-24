@@ -4,16 +4,17 @@ import { WebhookEvent } from './webhook-event.model';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { pricingService } from './pricing.service';
-import { getStreamClient } from '../../config/stream';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from '../billing/billing.gateway';
 import { getRedis, callSessionKey, webhookIdKey, WEBHOOK_IDEMPOTENCY_TTL } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { transitionCallStatus } from './call-state.service';
-import { releaseCreatorCallLock, updateCreatorAvailabilityAfterCall } from './creator-call-lock.service';
+import {
+  finalizeCreatorAvailabilityForCall,
+  markCreatorBusyForCall,
+  releaseCreatorCallLock,
+} from './creator-call-lock.service';
 import { recordCallMetric } from '../../utils/monitoring';
-import { setAvailability, getAvailability } from '../availability/availability.service';
-import { emitCreatorStatus } from '../availability/availability.socket';
 
 export interface StreamVideoWebhookPayload {
   type: string;
@@ -282,7 +283,7 @@ export class CallLifecycleService {
 
     // Delegate lock release & availability updates to creator-call-lock.service
     await releaseCreatorCallLock(call.creatorUserId.toString());
-    await updateCreatorAvailabilityAfterCall(call.creatorUserId.toString());
+    await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
 
     await call.save();
     logInfo('Call marked as ended (call.ended)', { callId });
@@ -329,7 +330,7 @@ export class CallLifecycleService {
           callId,
           creatorFirebaseUid,
         });
-        await this.markCreatorBusy(creatorFirebaseUid);
+        await markCreatorBusyForCall(callId, creatorFirebaseUid, 'session_started');
       }
       return;
     }
@@ -347,7 +348,7 @@ export class CallLifecycleService {
           callId,
           creatorFirebaseUid: creatorUser.firebaseUid,
         });
-        await this.markCreatorBusy(creatorUser.firebaseUid);
+        await markCreatorBusyForCall(callId, creatorUser.firebaseUid, 'session_started');
       }
       return;
     }
@@ -390,14 +391,7 @@ export class CallLifecycleService {
         callId,
         creatorFirebaseUid: creatorUser.firebaseUid,
       });
-      const success = await this.markCreatorBusy(creatorUser.firebaseUid);
-      if (!success) {
-        logError(
-          'Failed to mark creator busy on session_started',
-          new Error('markCreatorBusy returned false'),
-          { callId, creatorFirebaseUid: creatorUser.firebaseUid }
-        );
-      }
+      await markCreatorBusyForCall(callId, creatorUser.firebaseUid, 'session_started');
     } else {
       logError(
         'Cannot mark creator busy: creator user missing firebaseUid',
@@ -490,8 +484,9 @@ export class CallLifecycleService {
     }
 
     if (call.isSettled) {
-      logInfo('Call already settled, just releasing creator lock', { callId });
+      logInfo('Call already settled, releasing creator lock and finalizing availability', { callId });
       await releaseCreatorCallLock(call.creatorUserId.toString());
+      await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
       return;
     }
 
@@ -517,7 +512,7 @@ export class CallLifecycleService {
     call.isSettled = true;
 
     await releaseCreatorCallLock(call.creatorUserId.toString());
-    await updateCreatorAvailabilityAfterCall(call.creatorUserId.toString());
+    await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
     await call.save();
 
     // Note: Chat activity message is posted by settleCall() in billing-settlement.service.ts
@@ -560,14 +555,7 @@ export class CallLifecycleService {
     }
 
     logInfo('Marking creator busy (call ringing)', { callId, creatorFirebaseUid });
-    const success = await this.markCreatorBusy(creatorFirebaseUid);
-    if (!success) {
-      logError(
-        'Failed to mark creator busy on call ringing',
-        new Error('markCreatorBusy returned false'),
-        { callId, creatorFirebaseUid }
-      );
-    }
+    await markCreatorBusyForCall(callId, creatorFirebaseUid, 'ringing');
   }
 
   /**
@@ -605,104 +593,7 @@ export class CallLifecycleService {
     }
 
     logInfo('Marking creator busy (call accepted)', { callId, creatorFirebaseUid });
-    const success = await this.markCreatorBusy(creatorFirebaseUid);
-    if (!success) {
-      logError(
-        'Failed to mark creator busy on call accepted',
-        new Error('markCreatorBusy returned false'),
-        { callId, creatorFirebaseUid }
-      );
-    }
-  }
-
-  /**
-   * Mark creator as busy when on a call.
-   * 
-   * 🔥 CRITICAL FIX: Updates ALL availability systems:
-   * 1. Redis (backend-authoritative availability)
-   * 2. Socket.IO (real-time updates to all clients)
-   * 3. Stream Chat (legacy compatibility)
-   * 
-   * 🔥 SCALABILITY OPTIMIZATION: Idempotency checks prevent unnecessary operations
-   * - Checks Redis status before updating (avoids redundant SET operations)
-   * - Only broadcasts Socket.IO if status actually changed
-   * - Handles race conditions gracefully
-   * 
-   * This ensures users on the homepage see creators as busy immediately.
-   * 
-   * @param creatorFirebaseUid - The creator's Firebase UID
-   * @returns true if update was successful, false otherwise
-   */
-  private async markCreatorBusy(creatorFirebaseUid: string): Promise<boolean> {
-    try {
-      // 🔥 SCALABILITY: Idempotency check - avoid unnecessary Redis operations
-      // For 1000 users/day + 200 creators, this saves ~50-100 redundant operations/day
-      const currentStatus = await getAvailability(creatorFirebaseUid);
-      
-      // Only update if not already busy (optimization for scalability)
-      const shouldUpdate = currentStatus !== 'busy';
-      
-      if (shouldUpdate) {
-        // 🔥 FIX: Update Redis (backend-authoritative availability)
-        // This is what the user homepage reads from
-        await setAvailability(creatorFirebaseUid, 'busy');
-        logInfo('Creator marked busy in Redis', { creatorFirebaseUid });
-
-        // 🔥 FIX: Emit Socket.IO event (real-time updates to all clients)
-        // This ensures users on homepage see status change instantly
-        emitCreatorStatus(creatorFirebaseUid, 'busy');
-        logInfo('Creator busy status broadcast via Socket.IO', { creatorFirebaseUid });
-      } else {
-        // Already busy - skip Redis/Socket.IO update (idempotency optimization)
-        logInfo('Creator already busy in Redis, skipping update (idempotent)', {
-          creatorFirebaseUid,
-        });
-      }
-
-      // Legacy: Update Stream Chat (for backwards compatibility)
-      // Stream Chat updates are separate and don't block the main flow
-      try {
-        const streamClient = getStreamClient();
-        const currentUser = await streamClient.queryUsers({
-          filter: { id: { $eq: creatorFirebaseUid } },
-        });
-
-        if (currentUser.users.length > 0 && currentUser.users[0].busy === true) {
-          logInfo('Creator already busy in Stream Chat, skipping Stream Chat update', {
-            creatorFirebaseUid,
-          });
-        } else {
-          await streamClient.partialUpdateUser({
-            id: creatorFirebaseUid,
-            set: {
-              busy: true,
-            },
-          });
-          logInfo('Creator marked busy in Stream Chat', { creatorFirebaseUid });
-        }
-      } catch (streamError) {
-        // Non-critical: Stream Chat update failure shouldn't block the main flow
-        logError('Failed to set creator busy state in Stream Chat (non-critical)', streamError, {
-          creatorFirebaseUid,
-        });
-      }
-
-      return true;
-    } catch (error) {
-      // 🔥 ERROR HANDLING: Even if idempotency check fails, try to update
-      // This ensures eventual consistency
-      try {
-        await setAvailability(creatorFirebaseUid, 'busy');
-        emitCreatorStatus(creatorFirebaseUid, 'busy');
-        logInfo('Creator marked busy (fallback after error)', { creatorFirebaseUid });
-      } catch (fallbackError) {
-        logError('Failed to mark creator as busy (fallback also failed)', fallbackError, {
-          creatorFirebaseUid,
-        });
-        return false;
-      }
-      return true;
-    }
+    await markCreatorBusyForCall(callId, creatorFirebaseUid, 'accepted');
   }
 
   /**
@@ -767,7 +658,7 @@ export class CallLifecycleService {
       logInfo('Call record created from webhook', { callId });
       
       if (creatorUser.firebaseUid) {
-        await this.markCreatorBusy(creatorUser.firebaseUid);
+        await markCreatorBusyForCall(callId, creatorUser.firebaseUid, 'ringing');
         logInfo('Creator marked busy after call record creation', {
           callId,
           creatorFirebaseUid: creatorUser.firebaseUid,
@@ -780,7 +671,7 @@ export class CallLifecycleService {
       // 🔥 FIX: Even if call record creation failed, try to mark creator busy
       // This handles the case where call record exists but creator wasn't marked busy
       if (creatorUser.firebaseUid) {
-        await this.markCreatorBusy(creatorUser.firebaseUid);
+        await markCreatorBusyForCall(callId, creatorUser.firebaseUid, 'ringing');
         logInfo('Creator marked busy after call record creation failure (fallback)', {
           callId,
           creatorFirebaseUid: creatorUser.firebaseUid,

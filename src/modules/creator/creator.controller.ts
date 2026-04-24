@@ -2288,8 +2288,20 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
     }
 
     const creatorProfile = await Creator.findOne({ userId: currentUser._id })
-      .select('assignedAgentId')
+      .select('_id assignedAgentId')
       .lean();
+    if (!creatorProfile) {
+      res.status(404).json({ success: false, error: 'Creator profile not found' });
+      return;
+    }
+
+    const assignedAgentId = creatorProfile.assignedAgentId ?? undefined;
+    if (!assignedAgentId) {
+      logInfo('withdrawal_created_without_assignment', {
+        creatorUserId: currentUser._id.toString(),
+        creatorId: creatorProfile._id.toString(),
+      });
+    }
 
     // Create withdrawal record — coins NOT deducted yet
     const withdrawal = await Withdrawal.create({
@@ -2302,7 +2314,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       upi: upi?.trim() || undefined,
       accountNumber: accountNumber?.trim() || undefined,
       ifsc: ifsc?.trim() || undefined,
-      assignedAgentId: creatorProfile?.assignedAgentId ?? undefined,
+      assignedAgentId,
     });
 
     console.log(`✅ [CREATOR] Withdrawal requested: ${withdrawal._id} for ${amount} coins by user ${currentUser._id}`);
@@ -2323,6 +2335,12 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
         amount: withdrawal.amount,
         status: withdrawal.status,
         requestedAt: withdrawal.requestedAt.toISOString(),
+        name: withdrawal.name ?? null,
+        number: withdrawal.number ?? null,
+        upi: withdrawal.upi ?? null,
+        accountNumber: withdrawal.accountNumber ?? null,
+        ifsc: withdrawal.ifsc ?? null,
+        assignedAgentId: withdrawal.assignedAgentId?.toString() ?? null,
         message: 'Withdrawal request submitted. Coins will be deducted upon admin approval.',
       },
     });
