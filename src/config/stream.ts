@@ -27,6 +27,17 @@ export const isDeletedStreamUserError = (error: unknown): boolean => {
   );
 };
 
+const isRestoreUsersUserNotDeletedError = (error: unknown): boolean => {
+  const e = error as StreamLikeError | undefined;
+  const code = String(e?.code ?? '');
+  const message = String(e?.message ?? '').toLowerCase();
+  return (
+    code === '4' &&
+    message.includes('is not deleted') &&
+    message.includes("can't be restored")
+  );
+};
+
 /**
  * Get or initialize Stream Chat client
  */
@@ -160,8 +171,16 @@ export const ensureStreamUser = async (
         await client.restoreUsers([firebaseUid]);
         logInfo('stream_user_reactivate_success_restoreUsers', { firebaseUid });
       } catch (restoreError) {
+        if (isRestoreUsersUserNotDeletedError(restoreError)) {
+          // Concurrent recovery can make this request race with another successful
+          // reactivation path. Treat "already active" as a successful recovery.
+          logInfo('stream_user_reactivate_restoreUsers_already_active', {
+            firebaseUid,
+          });
+        } else {
         logError('stream_user_reactivate_failed', restoreError, { firebaseUid });
         throw new Error('STREAM_USER_RECOVERY_FAILED');
+        }
       }
     }
 
