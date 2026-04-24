@@ -84,6 +84,16 @@ export const getChatToken = async (
     res.json({ success: true, data: { token } });
   } catch (error) {
     console.error('❌ [CHAT] Error generating token:', error);
+    const errorText =
+      error instanceof Error ? error.message : String(error ?? '');
+    if (errorText.includes('STREAM_USER_RECOVERY_FAILED')) {
+      res.status(503).json({
+        success: false,
+        error: 'STREAM_USER_RECOVERY_FAILED',
+        message: 'Chat account recovery is in progress. Please retry shortly.',
+      });
+      return;
+    }
     res
       .status(500)
       .json({ success: false, error: 'Failed to generate chat token' });
@@ -158,7 +168,21 @@ export const createOrGetChannel = async (
       name: correctName,
     });
 
-    await channel.create();
+    try {
+      await channel.create();
+      console.log(`♻️ [CHAT] Recreated channel after purge or first contact: ${channelId}`);
+    } catch (createErr) {
+      const createErrText =
+        createErr instanceof Error ? createErr.message : String(createErr ?? '');
+      if (
+        createErrText.toLowerCase().includes('already exists') ||
+        createErrText.toLowerCase().includes('channel exists')
+      ) {
+        console.log(`ℹ️ [CHAT] Channel already exists, continuing with existing channel: ${channelId}`);
+      } else {
+        throw createErr;
+      }
+    }
 
     // ── Keep channel title in sync when the other user's display name changes ──
     const existingName =

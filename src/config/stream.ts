@@ -7,6 +7,26 @@ import { logInfo, logWarning, logError, logDebug } from '../utils/logger';
  */
 let streamClient: StreamChat | null = null;
 
+type StreamLikeError = {
+  code?: number | string;
+  response?: {
+    status?: number;
+  };
+  message?: string;
+};
+
+export const isDeletedStreamUserError = (error: unknown): boolean => {
+  const e = error as StreamLikeError | undefined;
+  const code = String(e?.code ?? '');
+  const status = e?.response?.status;
+  const message = String(e?.message ?? '').toLowerCase();
+  return (
+    code === '16' ||
+    status === 404 ||
+    (message.includes('was deleted') && message.includes('user'))
+  );
+};
+
 /**
  * Get or initialize Stream Chat client
  */
@@ -99,34 +119,66 @@ export const ensureStreamUser = async (
     mongoId?: string; // MongoDB _id so frontend can start calls without extra lookups
   }
 ): Promise<void> => {
+  const client = getStreamClient();
+  const payload = {
+    id: firebaseUid,
+    name: userData.name || 'User',
+    image: userData.image,
+    // role is intentionally omitted - Stream defaults to "user"
+    extraData: {
+      appRole: userData.appRole || 'user', // Store app role in metadata
+      username: userData.username, // Store username as single source of truth
+      ...(userData.mongoId ? { mongoId: userData.mongoId } : {}), // MongoDB _id for call initiation
+    },
+  };
+
   try {
-    const client = getStreamClient();
-    
     // Do NOT set role - Stream roles are separate from app roles
     // Stream will default to "user" role which is correct for all users
     // Store app role, username and mongoId in extraData for business logic
-    await client.upsertUser({
-      id: firebaseUid,
-      name: userData.name || 'User',
-      image: userData.image,
-      // role is intentionally omitted - Stream defaults to "user"
-      extraData: {
-        appRole: userData.appRole || 'user', // Store app role in metadata
-        username: userData.username, // Store username as single source of truth
-        ...(userData.mongoId ? { mongoId: userData.mongoId } : {}), // MongoDB _id for call initiation
-      },
-    });
-
-    logDebug('Stream user ensured', {
-      firebaseUid,
-      appRole: userData.appRole || 'user',
-      username: userData.username || null,
-    });
+    await client.upsertUser(payload);
   } catch (error) {
-    logError('Failed to ensure Stream user', error, {
-      firebaseUid,
-      appRole: userData.appRole,
-    });
-    throw error;
+    if (!isDeletedStreamUserError(error)) {
+      logError('Failed to ensure Stream user', error, {
+        firebaseUid,
+        appRole: userData.appRole,
+      });
+      throw error;
+    }
+
+    logInfo('stream_user_reactivate_attempt', { firebaseUid });
+    try {
+      await client.reactivateUser(firebaseUid, {
+        restore_messages: true,
+      });
+      logInfo('stream_user_reactivate_success', { firebaseUid });
+    } catch (reactivateError) {
+      logWarning('stream_user_reactivate_failed_reactivateUser_fallback_restoreUsers', {
+        firebaseUid,
+      });
+      try {
+        await client.restoreUsers([firebaseUid]);
+        logInfo('stream_user_reactivate_success_restoreUsers', { firebaseUid });
+      } catch (restoreError) {
+        logError('stream_user_reactivate_failed', restoreError, { firebaseUid });
+        throw new Error('STREAM_USER_RECOVERY_FAILED');
+      }
+    }
+
+    try {
+      await client.upsertUser(payload);
+      logInfo('stream_user_reactivate_upsert_retry_success', { firebaseUid });
+    } catch (retryError) {
+      logError('stream_user_reactivate_upsert_retry_failed', retryError, {
+        firebaseUid,
+      });
+      throw new Error('STREAM_USER_RECOVERY_FAILED');
+    }
   }
+
+  logDebug('Stream user ensured', {
+    firebaseUid,
+    appRole: userData.appRole || 'user',
+    username: userData.username || null,
+  });
 };
