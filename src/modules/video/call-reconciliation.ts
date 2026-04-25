@@ -5,7 +5,6 @@ import { randomUUID } from 'crypto';
 import { Call } from './call.model';
 import { User } from '../user/user.model';
 import { generateServerSideToken } from '../../config/stream-video';
-import { transitionCallStatus } from './call-state.service';
 import { setAvailability, getAvailability } from '../availability/availability.service';
 import { emitCreatorStatus } from '../availability/availability.socket';
 import {
@@ -15,6 +14,8 @@ import {
 } from '../../config/redis';
 import { logInfo, logError } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
+import { finalizeCallEnd } from './call-finalization.service';
+import { getIO } from '../../config/socket';
 
 let reconciliationTimer: NodeJS.Timeout | null = null;
 
@@ -272,28 +273,15 @@ async function reconcileActiveCalls(): Promise<void> {
           return;
         }
 
-        // If Stream says ended but our Call is still not ended/settled, close it
-        // via the centralised Call state helper so timestamps/durations and
-        // metrics stay consistent with the rest of the system.
+        // If Stream says ended but our Call is still not ended/settled, run the
+        // same centralized end finalizer used by webhooks/socket handlers.
         if (call.status !== 'ended' || !call.isSettled) {
           logInfo('Reconciling ended call from Stream', {
             callId,
             currentStatus: call.status,
             isSettled: call.isSettled,
           });
-
-          if (!call.endedAt && streamCall?.ended_at) {
-            call.endedAt = new Date(streamCall.ended_at);
-          }
-
-          transitionCallStatus(call, 'ended', {
-            source: 'call.reconciliation',
-            eventType: 'stream_call_reconciled',
-          });
-
-          // We do not attempt to re‑run billing here; billing is already guarded
-          // by Redis + settlement idempotency. We only mark the record consistent.
-          await call.save();
+          await finalizeCallEnd(getIO(), callId, 'reconciliation_stream_ended');
         }
       } catch (err: any) {
         // 404 from Stream: call unknown → treat as ended and close locally
@@ -301,16 +289,7 @@ async function reconcileActiveCalls(): Promise<void> {
         if (status === 404) {
           logInfo('Reconciling locally for call missing in Stream', { callId });
           if (call.status !== 'ended' || !call.isSettled) {
-            if (!call.endedAt) {
-              call.endedAt = new Date();
-            }
-
-            transitionCallStatus(call, 'ended', {
-              source: 'call.reconciliation',
-              eventType: 'stream_call_missing_404',
-            });
-
-            await call.save();
+            await finalizeCallEnd(getIO(), callId, 'reconciliation_stream_404');
           }
         } else {
           logError('Error reconciling call with Stream', err, { callId });

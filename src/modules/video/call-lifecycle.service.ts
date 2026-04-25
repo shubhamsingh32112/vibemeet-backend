@@ -5,16 +5,15 @@ import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { pricingService } from './pricing.service';
 import { getIO } from '../../config/socket';
-import { handleCallStartedHttp, settleCallHttp } from '../billing/billing.gateway';
+import { handleCallStartedHttp } from '../billing/billing.gateway';
 import { getRedis, callSessionKey, webhookIdKey, WEBHOOK_IDEMPOTENCY_TTL } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { transitionCallStatus } from './call-state.service';
 import {
-  finalizeCreatorAvailabilityForCall,
   markCreatorBusyForCall,
-  releaseCreatorCallLock,
 } from './creator-call-lock.service';
 import { recordCallMetric } from '../../utils/monitoring';
+import { finalizeCallEnd } from './call-finalization.service';
 
 export interface StreamVideoWebhookPayload {
   type: string;
@@ -220,10 +219,10 @@ export class CallLifecycleService {
 
     try {
       const io = getIO();
-      await settleCallHttp(io, callId);
-      logInfo('Redis billing settled for call', { callId });
+      await finalizeCallEnd(io, callId, 'webhook_call_ended');
+      logInfo('Call finalized for call.ended webhook', { callId });
     } catch (error) {
-      logError('Failed to settle billing for call.ended', error, { callId });
+      logError('Failed to finalize call for call.ended', error, { callId });
     }
 
     let call = await Call.findOne({ callId });
@@ -280,10 +279,6 @@ export class CallLifecycleService {
     if (!call.isSettled) {
       call.isSettled = true;
     }
-
-    // Delegate lock release & availability updates to creator-call-lock.service
-    await releaseCreatorCallLock(call.creatorUserId.toString());
-    await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
 
     await call.save();
     logInfo('Call marked as ended (call.ended)', { callId });
@@ -471,10 +466,10 @@ export class CallLifecycleService {
 
     try {
       const io = getIO();
-      await settleCallHttp(io, callId);
-      logInfo('Redis billing settled for call (session_ended)', { callId });
+      await finalizeCallEnd(io, callId, 'webhook_session_ended');
+      logInfo('Call finalized for session_ended webhook', { callId });
     } catch (error) {
-      logError('Failed to settle billing for session_ended', error, { callId });
+      logError('Failed to finalize call for session_ended', error, { callId });
     }
 
     const call = await Call.findOne({ callId });
@@ -484,9 +479,7 @@ export class CallLifecycleService {
     }
 
     if (call.isSettled) {
-      logInfo('Call already settled, releasing creator lock and finalizing availability', { callId });
-      await releaseCreatorCallLock(call.creatorUserId.toString());
-      await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
+      logInfo('Call already settled after finalizer run', { callId });
       return;
     }
 
@@ -511,8 +504,6 @@ export class CallLifecycleService {
 
     call.isSettled = true;
 
-    await releaseCreatorCallLock(call.creatorUserId.toString());
-    await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
     await call.save();
 
     // Note: Chat activity message is posted by settleCall() in billing-settlement.service.ts

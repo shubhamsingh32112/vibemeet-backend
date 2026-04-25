@@ -10,6 +10,7 @@ import {
   addCoins,
   claimWelcomeBonus,
   advanceOnboardingStage,
+  submitOnboardingPermissionsDecision,
   getUserTransactions,
   getCallHistory,
   getFavoriteCreators,
@@ -33,6 +34,11 @@ router.put('/profile', verifyFirebaseToken, updateProfile);
 router.post('/coins', verifyFirebaseToken, addCoins); // Add coins to user account
 router.post('/welcome-bonus', verifyFirebaseToken, claimWelcomeBonus); // Claim 30 coin welcome bonus (new users only)
 router.post('/onboarding/stage', verifyFirebaseToken, advanceOnboardingStage);
+router.post(
+  '/onboarding/permissions-decision',
+  verifyFirebaseToken,
+  submitOnboardingPermissionsDecision
+);
 router.get('/transactions', verifyFirebaseToken, getUserTransactions); // Get user transaction history
 router.get('/call-history', verifyFirebaseToken, getCallHistory); // Get call history (users + creators)
 router.get('/favorites', verifyFirebaseToken, getFavoriteCreators); // Get favorite creators (user only)

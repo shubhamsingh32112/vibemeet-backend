@@ -16,8 +16,7 @@ import { isCallActive } from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
-import { Call } from '../video/call.model';
-import { finalizeCreatorAvailabilityForCall, releaseCreatorCallLock } from '../video/creator-call-lock.service';
+import { finalizeCallEnd } from '../video/call-finalization.service';
 
 /** Shape of Redis billing session JSON (recover-state handler). */
 interface BillingRecoverSession {
@@ -147,13 +146,7 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        await settleCall(io, data.callId);
-
-        const call = await Call.findOne({ callId: data.callId });
-        if (call) {
-          await releaseCreatorCallLock(call.creatorUserId.toString());
-          await finalizeCreatorAvailabilityForCall(data.callId, call.creatorUserId.toString());
-        }
+        await finalizeCallEnd(io, data.callId, 'socket_call_ended');
       } catch (err) {
         logError('Error in call:ended', err, { callId: data.callId, firebaseUid });
       }

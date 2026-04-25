@@ -88,7 +88,14 @@ app.use(
     origin: buildCorsOrigin(),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Accept',
+      'X-Requested-With',
+      'x-idempotency-key',
+      'X-Idempotency-Key',
+    ],
     exposedHeaders: ['Content-Length', 'Content-Type'],
     maxAge: 86400,
   })

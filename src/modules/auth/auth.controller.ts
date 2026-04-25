@@ -131,6 +131,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           onboardingBonusSeenAt: null,
           onboardingPermissionSeenAt: null,
           onboardingCompletedAt: null,
+          permissionsIntroAcceptedAt: null,
+          cameraMicPermissionStatus: 'unknown',
+          notificationPermissionStatus: 'unknown',
+          permissionsLastCheckedAt: null,
+          lastPermissionsDecisionRequestId: null,
         });
 
         // Referral: assign unique code and apply referral if provided
@@ -180,6 +185,18 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         }
         if (!Array.isArray(user.categories) || user.categories.length === 0) {
           user.categories = existingDefaults.categories;
+          profileBackfilled = true;
+        }
+        if (!user.cameraMicPermissionStatus) {
+          user.cameraMicPermissionStatus = 'unknown';
+          profileBackfilled = true;
+        }
+        if (!user.notificationPermissionStatus) {
+          user.notificationPermissionStatus = 'unknown';
+          profileBackfilled = true;
+        }
+        if (typeof user.lastPermissionsDecisionRequestId === 'undefined') {
+          user.lastPermissionsDecisionRequestId = null;
           profileBackfilled = true;
         }
       }
@@ -250,6 +267,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       bonusSeenAt: user.onboardingBonusSeenAt ?? null,
       permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
       completedAt: user.onboardingCompletedAt ?? null,
+      permissionsIntroAcceptedAt: user.permissionsIntroAcceptedAt ?? null,
+      cameraMicStatus: user.cameraMicPermissionStatus ?? 'unknown',
+      notificationStatus: user.notificationPermissionStatus ?? 'unknown',
+      permissionsLastCheckedAt: user.permissionsLastCheckedAt ?? null,
     };
     if (createdNow && user.role !== 'user') {
       logError('New user created with invalid role', new Error('invalid_role_on_create'), {

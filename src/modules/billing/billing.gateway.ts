@@ -12,6 +12,7 @@ import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
 import { closeTerminationRetryQueue } from './billing-termination.queue';
 import { isCallActive } from './billing-active-call.service';
 import { setupBillingGateway } from './billing-socket.gateway';
+import { finalizeCallEnd } from '../video/call-finalization.service';
 import {
   startGlobalBillingProcessor,
   stopGlobalBillingProcessor,
@@ -101,7 +102,7 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
     return;
   }
 
-  await settleCall(io, callId);
+  await finalizeCallEnd(io, callId, 'http_settle_call');
 }
 
 export async function cleanupBillingIntervals(): Promise<void> {

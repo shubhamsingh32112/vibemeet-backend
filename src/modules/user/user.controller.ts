@@ -38,6 +38,44 @@ function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
 }
 
+type PermissionStatus = 'unknown' | 'granted' | 'denied' | 'permanentlyDenied';
+type PermissionsDecision = 'accept' | 'not_now';
+type OnboardingStageInput = 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
+const onboardingStageOrder: Record<OnboardingStageInput, number> = {
+  welcome: 1,
+  bonus: 2,
+  permission: 3,
+  permissions: 3,
+  completed: 4,
+};
+
+function buildOnboardingPayload(user: {
+  onboardingStage?: string | null;
+  onboardingWelcomeSeenAt?: Date | null;
+  onboardingBonusSeenAt?: Date | null;
+  onboardingPermissionSeenAt?: Date | null;
+  onboardingCompletedAt?: Date | null;
+  permissionsIntroAcceptedAt?: Date | null;
+  cameraMicPermissionStatus?: PermissionStatus;
+  notificationPermissionStatus?: PermissionStatus;
+  permissionsLastCheckedAt?: Date | null;
+}) {
+  return {
+    stage:
+      user.onboardingStage === 'permissions'
+        ? 'permission'
+        : (user.onboardingStage ?? 'welcome'),
+    welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
+    bonusSeenAt: user.onboardingBonusSeenAt ?? null,
+    permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
+    completedAt: user.onboardingCompletedAt ?? null,
+    permissionsIntroAcceptedAt: user.permissionsIntroAcceptedAt ?? null,
+    cameraMicStatus: user.cameraMicPermissionStatus ?? 'unknown',
+    notificationStatus: user.notificationPermissionStatus ?? 'unknown',
+    permissionsLastCheckedAt: user.permissionsLastCheckedAt ?? null,
+  };
+}
+
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.auth) {
@@ -504,16 +542,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
     const creator = await Creator.findOne({ userId: user._id });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
-    const onboarding = {
-      stage:
-        user.onboardingStage === 'permissions'
-          ? 'permission'
-          : (user.onboardingStage ?? 'welcome'),
-      welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
-      bonusSeenAt: user.onboardingBonusSeenAt ?? null,
-      permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
-      completedAt: user.onboardingCompletedAt ?? null,
-    };
+    const onboarding = buildOnboardingPayload(user);
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -672,15 +701,6 @@ export const getReferrals = async (req: Request, res: Response): Promise<void> =
   }
 };
 
-type OnboardingStageInput = 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
-const onboardingStageOrder: Record<OnboardingStageInput, number> = {
-  welcome: 1,
-  bonus: 2,
-  permission: 3,
-  permissions: 3,
-  completed: 4,
-};
-
 export const advanceOnboardingStage = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.auth) {
@@ -706,7 +726,7 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
       res.json({
         success: true,
         data: {
-          stage: current,
+          ...buildOnboardingPayload(user),
           ignored: true,
         },
       });
@@ -739,18 +759,114 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
     res.json({
       success: true,
       data: {
-        stage:
-          user.onboardingStage === 'permissions'
-            ? 'permission'
-            : user.onboardingStage,
-        welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
-        bonusSeenAt: user.onboardingBonusSeenAt ?? null,
-        permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
-        completedAt: user.onboardingCompletedAt ?? null,
+        ...buildOnboardingPayload(user),
       },
     });
   } catch (error) {
     console.error('❌ [USER] advanceOnboardingStage error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const submitOnboardingPermissionsDecision = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const decision = req.body?.decision as PermissionsDecision | undefined;
+    const requestIdRaw = req.body?.requestId;
+    const requestId = typeof requestIdRaw === 'string' ? requestIdRaw.trim() : '';
+    const cameraMicStatus = req.body?.cameraMicStatus as PermissionStatus | undefined;
+    const notificationStatus = req.body?.notificationStatus as PermissionStatus | undefined;
+    const validStatuses: PermissionStatus[] = [
+      'unknown',
+      'granted',
+      'denied',
+      'permanentlyDenied',
+    ];
+    if (decision !== 'accept' && decision !== 'not_now') {
+      res.status(400).json({
+        success: false,
+        error: 'decision must be either accept or not_now',
+      });
+      return;
+    }
+    if (requestId.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'requestId is required',
+      });
+      return;
+    }
+    if (cameraMicStatus && !validStatuses.includes(cameraMicStatus)) {
+      res.status(400).json({ success: false, error: 'Invalid cameraMicStatus' });
+      return;
+    }
+    if (notificationStatus && !validStatuses.includes(notificationStatus)) {
+      res.status(400).json({ success: false, error: 'Invalid notificationStatus' });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    // Idempotency guarantee for retries from flaky mobile networks.
+    if (user.lastPermissionsDecisionRequestId === requestId) {
+      res.json({
+        success: true,
+        data: {
+          ...buildOnboardingPayload(user),
+          idempotentReplay: true,
+        },
+      });
+      return;
+    }
+
+    const now = new Date();
+    const current = (user.onboardingStage as OnboardingStageInput | undefined) ?? 'welcome';
+    user.lastPermissionsDecisionRequestId = requestId;
+    if (!user.onboardingPermissionSeenAt) {
+      user.onboardingPermissionSeenAt = now;
+    }
+    if (decision === 'accept' && !user.permissionsIntroAcceptedAt) {
+      user.permissionsIntroAcceptedAt = now;
+    }
+    if (cameraMicStatus) {
+      user.cameraMicPermissionStatus = cameraMicStatus;
+    }
+    if (notificationStatus) {
+      user.notificationPermissionStatus = notificationStatus;
+    }
+    user.permissionsLastCheckedAt = now;
+
+    const targetStage: OnboardingStageInput =
+      decision === 'accept' ? 'completed' : 'permissions';
+    if (onboardingStageOrder[targetStage] >= onboardingStageOrder[current]) {
+      user.onboardingStage = targetStage;
+      if (targetStage === 'completed' && !user.onboardingCompletedAt) {
+        user.onboardingCompletedAt = now;
+      }
+    }
+
+    await user.save();
+    console.log(
+      `📊 [ONBOARDING METRIC] permission_decision decision=${decision} cameraMic=${
+        user.cameraMicPermissionStatus ?? 'unknown'
+      } notifications=${user.notificationPermissionStatus ?? 'unknown'} userId=${user._id.toString()}`
+    );
+    res.json({
+      success: true,
+      data: buildOnboardingPayload(user),
+    });
+  } catch (error) {
+    console.error('❌ [USER] submitOnboardingPermissionsDecision error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

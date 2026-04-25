@@ -28,6 +28,11 @@ export interface IUser extends Document {
   onboardingBonusSeenAt?: Date | null;
   onboardingPermissionSeenAt?: Date | null;
   onboardingCompletedAt?: Date | null;
+  permissionsIntroAcceptedAt?: Date | null;
+  cameraMicPermissionStatus?: 'unknown' | 'granted' | 'denied' | 'permanentlyDenied';
+  notificationPermissionStatus?: 'unknown' | 'granted' | 'denied' | 'permanentlyDenied';
+  permissionsLastCheckedAt?: Date | null;
+  lastPermissionsDecisionRequestId?: string | null;
   role: 'user' | 'creator' | 'admin' | 'agent';
   /** Bcrypt hash for agent dashboard login (never store plaintext). */
   passwordHash?: string;
@@ -151,6 +156,30 @@ const userSchema = new Schema<IUser>(
     onboardingCompletedAt: {
       type: Date,
       default: null,
+    },
+    permissionsIntroAcceptedAt: {
+      type: Date,
+      default: null,
+    },
+    cameraMicPermissionStatus: {
+      type: String,
+      enum: ['unknown', 'granted', 'denied', 'permanentlyDenied'],
+      default: 'unknown',
+    },
+    notificationPermissionStatus: {
+      type: String,
+      enum: ['unknown', 'granted', 'denied', 'permanentlyDenied'],
+      default: 'unknown',
+    },
+    permissionsLastCheckedAt: {
+      type: Date,
+      default: null,
+    },
+    lastPermissionsDecisionRequestId: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 128,
     },
     role: {
       type: String,
