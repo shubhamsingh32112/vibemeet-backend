@@ -461,7 +461,7 @@ export async function submitPermissionsDecisionEvent(params: {
     set.notificationPermissionStatus = notificationStatus;
   }
 
-  let toStage = fromStage;
+  let toStage: OnboardingStageCanonical = fromStage;
   if (fromStage !== targetStage && valid) {
     toStage = targetStage;
     set.onboardingStage = targetStage;
