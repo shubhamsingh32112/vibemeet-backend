@@ -324,26 +324,31 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
  * Website endpoint: creates Razorpay order from short-lived checkout token.
  */
 export const createWebOrder = async (req: Request, res: Response): Promise<void> => {
+  const startedAt = Date.now();
   try {
     const { checkoutToken } = req.body;
     if (!checkoutToken || typeof checkoutToken !== 'string') {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'missing_checkout_token' });
       res.status(400).json({ success: false, error: 'Missing checkoutToken' });
       return;
     }
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'invalid_or_expired_session' });
       res.status(401).json({ success: false, error: 'Invalid or expired checkout token' });
       return;
     }
 
     const user = await User.findOne({ firebaseUid: session.firebaseUid });
     if (!user) {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'user_not_found' });
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
 
     if (user._id.toString() !== session.userId || user.role !== 'user') {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'invalid_session_user' });
       res.status(403).json({ success: false, error: 'Checkout session is not valid for this user' });
       return;
     }
@@ -351,6 +356,7 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
     const pricingTier = await resolveUserPricingTier(user._id.toString());
     const activePack = await getActiveCoinPackByPackageIdForTier(session.packageId, pricingTier);
     if (!activePack) {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'invalid_session_package' });
       res.status(400).json({ success: false, error: 'Invalid checkout session package' });
       return;
     }
@@ -375,10 +381,13 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
     await createPendingCoinTransaction(user._id.toString(), order.id, activePack.coins, activePack.priceInr);
 
     if (!process.env.RAZORPAY_KEY_ID) {
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'missing_razorpay_key_id' });
       res.status(500).json({ success: false, error: 'Payment checkout is currently unavailable' });
       return;
     }
 
+    recordPaymentMetric('web.create_order_success', 1);
+    recordPaymentMetric('web.create_order_duration_ms', Date.now() - startedAt, { status: 'success' });
     res.json({
       success: true,
       data: {
@@ -392,6 +401,8 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown';
     console.error(`❌ [PAYMENT] createWebOrder error: ${message}`);
+    recordPaymentMetric('web.create_order_failed', 1, { reason: 'internal_error' });
+    recordPaymentMetric('web.create_order_duration_ms', Date.now() - startedAt, { status: 'failed' });
     res.status(500).json({ success: false, error: 'Failed to create checkout order' });
   }
 };

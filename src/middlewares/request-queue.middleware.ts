@@ -34,6 +34,8 @@ const BYPASS_PATHS = [
 ];
 
 function shouldBypass(req: Request): boolean {
+  // Never queue CORS preflight requests; browsers expect fast OPTIONS responses.
+  if (req.method === 'OPTIONS') return true;
   const path = req.originalUrl?.split('?')[0] ?? req.path;
   return BYPASS_PATHS.some((p) => path === p || path.endsWith(p));
 }

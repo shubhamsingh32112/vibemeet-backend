@@ -65,21 +65,43 @@ app.use(helmet({
   crossOriginOpenerPolicy: false, // Allow popups for OAuth
 }));
 
+function escapeRegexLiteral(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function corsOriginEntryToMatcher(entry: string): string | RegExp {
+  const trimmed = entry.trim();
+  if (!trimmed) return '*';
+  if (trimmed === '*') return '*';
+
+  // Allow simple wildcard patterns like:
+  // - https://*.example.com
+  // - *.example.com
+  // This compiles into a safe regex that matches full origins.
+  if (trimmed.includes('*')) {
+    const safe = escapeRegexLiteral(trimmed).replace(/\\\*/g, '.*');
+    return new RegExp(`^${safe}$`);
+  }
+  return trimmed;
+}
+
 function buildCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
-  const raw = process.env.CORS_ORIGIN;
+  const raw = (process.env.CORS_ORIGIN || '').trim();
   if (!raw || raw === '*') {
     if (process.env.NODE_ENV === 'production') {
       logWarning('CORS_ORIGIN is * or unset in production — set explicit origins for web clients', {});
     }
     return '*';
   }
-  const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  if (parts.length === 0) {
-    return '*';
-  }
-  if (parts.length === 1) {
-    return parts[0];
-  }
+
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(corsOriginEntryToMatcher);
+
+  if (parts.length === 0) return '*';
+  if (parts.length === 1) return parts[0];
   return parts;
 }
 
@@ -98,6 +120,8 @@ app.use(
     ],
     exposedHeaders: ['Content-Length', 'Content-Type'],
     maxAge: 86400,
+    optionsSuccessStatus: 204,
+    preflightContinue: false,
   })
 );
 
@@ -630,6 +654,20 @@ function assertProductionSecurity(): void {
   }
 }
 
+/** Web checkout depends on stable public URLs; warn early if unset. */
+function warnIfMissingPublicUrls(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  const apiBase =
+    (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || process.env.BACKEND_PUBLIC_URL || '').trim();
+  const webBase = (process.env.WEB_CHECKOUT_BASE_URL || '').trim();
+  if (!apiBase) {
+    logWarning('PUBLIC_API_BASE_URL is not set in production; checkout links may embed the wrong apiBase', {});
+  }
+  if (!webBase) {
+    logWarning('WEB_CHECKOUT_BASE_URL is not set in production; /payment/web/initiate may generate broken checkoutUrl', {});
+  }
+}
+
 /** Billing is Redis-backed; fail fast in production if not wired (e.g. Railway variable reference). */
 function assertProductionRedis(): void {
   if (process.env.NODE_ENV !== 'production') return;
@@ -646,6 +684,7 @@ const startServer = async () => {
     initializeFirebase();
 
     assertProductionSecurity();
+    warnIfMissingPublicUrls();
     assertProductionRedis();
 
     // 🔥 FIX 12: Validate pricing configuration on startup
