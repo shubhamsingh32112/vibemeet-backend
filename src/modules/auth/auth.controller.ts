@@ -136,6 +136,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           notificationPermissionStatus: 'unknown',
           permissionsLastCheckedAt: null,
           lastPermissionsDecisionRequestId: null,
+          lastOnboardingStageIdempotencyKey: null,
+          permissionOnboardingStatus: 'unknown',
         });
 
         // Referral: assign unique code and apply referral if provided
@@ -199,6 +201,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           user.lastPermissionsDecisionRequestId = null;
           profileBackfilled = true;
         }
+        if (typeof user.lastOnboardingStageIdempotencyKey === 'undefined') {
+          user.lastOnboardingStageIdempotencyKey = null;
+          profileBackfilled = true;
+        }
+        if (!user.permissionOnboardingStatus) {
+          user.permissionOnboardingStatus = 'unknown';
+          profileBackfilled = true;
+        }
       }
 
       // Keep user contact info in sync (DB writes are OK here)
@@ -259,15 +269,13 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const needsOnboarding = (user.categories ?? []).length === 0;
     const onboardingState = {
-      stage:
-        user.onboardingStage === 'permissions'
-          ? 'permission'
-          : (user.onboardingStage ?? 'welcome'),
+      stage: user.onboardingStage === 'permissions' ? 'permission' : (user.onboardingStage ?? 'welcome'),
       welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
       bonusSeenAt: user.onboardingBonusSeenAt ?? null,
       permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
       completedAt: user.onboardingCompletedAt ?? null,
       permissionsIntroAcceptedAt: user.permissionsIntroAcceptedAt ?? null,
+      permissionOnboardingStatus: user.permissionOnboardingStatus ?? 'unknown',
       cameraMicStatus: user.cameraMicPermissionStatus ?? 'unknown',
       notificationStatus: user.notificationPermissionStatus ?? 'unknown',
       permissionsLastCheckedAt: user.permissionsLastCheckedAt ?? null,

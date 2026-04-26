@@ -4,11 +4,21 @@ import { logInfo, logError, logWarning } from '../utils/logger';
 
 let redis: Redis | null = null;
 
+/** 0 = IPv4+IPv6 (A/AAAA), 4 = IPv4, 6 = IPv6. Use REDIS_FAMILY=0 if Railway DNS is flaky. */
+function getRedisFamily(): number | undefined {
+  const raw = process.env.REDIS_FAMILY;
+  if (raw === undefined || raw === '') return undefined;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return n;
+}
+
 export const getRedis = (): Redis => {
   if (!redis) {
     // Railway Redis connection - supports both REDIS_URL and individual variables
     const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
-    
+    const family = getRedisFamily();
+
     if (!redisUrl && !process.env.REDISHOST) {
       const error = new Error(
         'CRITICAL: Redis not configured. Billing will not work.\n' +
@@ -22,6 +32,7 @@ export const getRedis = (): Redis => {
     if (redisUrl) {
       // Use connection URL if provided
       redis = new Redis(redisUrl, {
+        ...(family !== undefined ? { family } : {}),
         retryStrategy: (times) => {
           const delay = Math.min(times * 50, 2000);
           return delay;
@@ -45,6 +56,7 @@ export const getRedis = (): Redis => {
         port,
         password,
         username,
+        ...(family !== undefined ? { family } : {}),
         retryStrategy: (times) => {
           const delay = Math.min(times * 50, 2000);
           return delay;

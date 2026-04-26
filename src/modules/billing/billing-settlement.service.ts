@@ -362,6 +362,8 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
   const dbSession = await mongoose.startSession();
   dbSession.startTransaction();
 
+  let mongoTransactionCommitted = false;
+
   try {
     const user = await User.findById(session.userMongoId).session(dbSession);
     if (!user) {
@@ -530,6 +532,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
     const txnStartedAt = Date.now();
     await dbSession.commitTransaction();
+    mongoTransactionCommitted = true;
     recordBillingMetric('settlement_transaction_ms', Date.now() - txnStartedAt, { callId });
     logInfo('Settlement transaction committed', { callId });
 
@@ -652,6 +655,13 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       recordBillingMetric('settlement_transaction_failed', 1, { callId });
     } catch (abortErr) {
       logError('Failed to abort transaction', abortErr, { callId });
+    }
+    if (!mongoTransactionCommitted) {
+      try {
+        await redis.del(settledKey);
+      } catch {
+        /* allow settlement retry if a mistaken settled flag was set pre-commit */
+      }
     }
     throw err;
   } finally {

@@ -504,6 +504,10 @@ app.get('/health', (_req, res) => {
     version: '1.0.0',
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development',
+    redis: {
+      configured: isRedisConfigured(),
+      note: 'Use GET /ready for write/read probe',
+    },
   });
 });
 
@@ -626,13 +630,24 @@ function assertProductionSecurity(): void {
   }
 }
 
+/** Billing is Redis-backed; fail fast in production if not wired (e.g. Railway variable reference). */
+function assertProductionRedis(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (!isRedisConfigured()) {
+    throw new Error(
+      'NODE_ENV=production requires Redis. Add variable references: REDIS_URL (private) or REDISHOST, REDISPORT, REDIS_PASSWORD, REDISUSER from your Railway Redis service.',
+    );
+  }
+}
+
 const startServer = async () => {
   try {
     // Initialize Firebase Admin
     initializeFirebase();
 
     assertProductionSecurity();
-    
+    assertProductionRedis();
+
     // 🔥 FIX 12: Validate pricing configuration on startup
     validatePricingConfig();
     if (!eventLoopProbe) {
@@ -710,10 +725,19 @@ const startServer = async () => {
     // Multi-node Socket.IO: same Redis pub/sub for all replicas (opt-out via env)
     if (isRedisConfigured() && process.env.SOCKET_IO_REDIS_ADAPTER !== 'false') {
       try {
+        const rawFamily = process.env.REDIS_FAMILY;
+        const socketAdapterFamily =
+          rawFamily === undefined || rawFamily === ''
+            ? undefined
+            : (() => {
+                const n = parseInt(rawFamily, 10);
+                return Number.isFinite(n) && n >= 0 ? n : undefined;
+              })();
         const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
         let pubClient: Redis | null = null;
         if (redisUrl) {
           pubClient = new Redis(redisUrl, {
+            ...(socketAdapterFamily !== undefined ? { family: socketAdapterFamily } : {}),
             maxRetriesPerRequest: 20,
             enableReadyCheck: true,
           });
@@ -723,6 +747,7 @@ const startServer = async () => {
             port: parseInt(process.env.REDISPORT || '6379', 10),
             password: process.env.REDIS_PASSWORD || process.env.REDISPASSWORD,
             username: process.env.REDISUSER,
+            ...(socketAdapterFamily !== undefined ? { family: socketAdapterFamily } : {}),
             maxRetriesPerRequest: 20,
             enableReadyCheck: true,
           });
@@ -798,8 +823,9 @@ const startServer = async () => {
           impact: 'Billing will not work - coins will not be deducted, creators will not earn',
           requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
         });
-        // Optionally: throw error to prevent server start
-        // throw new Error('Redis connection required for billing');
+        if (process.env.NODE_ENV === 'production') {
+          throw new Error('Redis connection required for production billing');
+        }
       }
     } else {
       logError('CRITICAL: Redis not configured', {
@@ -807,6 +833,9 @@ const startServer = async () => {
         impact: 'Billing will not work - coins will not be deducted, creators will not earn',
         requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
       });
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('Redis is required in production (assertProductionRedis should have failed)');
+      }
     }
 
     // 💳 Check Razorpay configuration

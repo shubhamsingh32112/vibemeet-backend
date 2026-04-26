@@ -33,21 +33,18 @@ import {
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
+import {
+  applyOnboardingStageEvent,
+  stageForClient,
+  submitPermissionsDecisionEvent,
+  type OnboardingStageInput,
+  type PermissionStatus,
+  type PermissionsDecision,
+} from './onboarding-transition.service';
 
 function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
 }
-
-type PermissionStatus = 'unknown' | 'granted' | 'denied' | 'permanentlyDenied';
-type PermissionsDecision = 'accept' | 'not_now';
-type OnboardingStageInput = 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
-const onboardingStageOrder: Record<OnboardingStageInput, number> = {
-  welcome: 1,
-  bonus: 2,
-  permission: 3,
-  permissions: 3,
-  completed: 4,
-};
 
 function buildOnboardingPayload(user: {
   onboardingStage?: string | null;
@@ -56,20 +53,19 @@ function buildOnboardingPayload(user: {
   onboardingPermissionSeenAt?: Date | null;
   onboardingCompletedAt?: Date | null;
   permissionsIntroAcceptedAt?: Date | null;
+  permissionOnboardingStatus?: 'accepted' | 'skipped' | 'unknown';
   cameraMicPermissionStatus?: PermissionStatus;
   notificationPermissionStatus?: PermissionStatus;
   permissionsLastCheckedAt?: Date | null;
 }) {
   return {
-    stage:
-      user.onboardingStage === 'permissions'
-        ? 'permission'
-        : (user.onboardingStage ?? 'welcome'),
+    stage: stageForClient(user.onboardingStage),
     welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
     bonusSeenAt: user.onboardingBonusSeenAt ?? null,
     permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
     completedAt: user.onboardingCompletedAt ?? null,
     permissionsIntroAcceptedAt: user.permissionsIntroAcceptedAt ?? null,
+    permissionOnboardingStatus: user.permissionOnboardingStatus ?? 'unknown',
     cameraMicStatus: user.cameraMicPermissionStatus ?? 'unknown',
     notificationStatus: user.notificationPermissionStatus ?? 'unknown',
     permissionsLastCheckedAt: user.permissionsLastCheckedAt ?? null,
@@ -708,51 +704,72 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
       return;
     }
     const stageRaw = req.body?.stage as string | undefined;
-    const stage = stageRaw === 'permission' ? 'permissions' : (stageRaw as OnboardingStageInput | undefined);
-    if (!stage || !onboardingStageOrder[stage]) {
+    const stage = stageRaw as OnboardingStageInput | undefined;
+    if (
+      stage !== 'welcome' &&
+      stage !== 'bonus' &&
+      stage !== 'permission' &&
+      stage !== 'permissions' &&
+      stage !== 'completed'
+    ) {
       res.status(400).json({
         success: false,
         error: 'Invalid onboarding stage',
       });
       return;
     }
-    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    const event =
+      stage === 'welcome'
+        ? 'welcome_seen'
+        : stage === 'bonus'
+          ? 'bonus_seen'
+          : stage === 'permissions' || stage === 'permission'
+            ? 'permissions_not_now'
+            : 'permissions_accept';
+    const transition = await applyOnboardingStageEvent({
+      firebaseUid: req.auth.firebaseUid,
+      event,
+      idempotencyKey:
+        typeof req.headers['x-idempotency-key'] === 'string'
+          ? req.headers['x-idempotency-key']
+          : undefined,
+    });
+    if (transition.invalidTransition) {
+      res.status(409).json({
+        success: false,
+        error: 'Invalid onboarding transition',
+        code: 'INVALID_ONBOARDING_TRANSITION',
+        reason: transition.invalidReason,
+      });
+      return;
+    }
+    const user = transition.user;
     if (!user) {
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    const current = (user.onboardingStage as OnboardingStageInput | undefined) ?? 'welcome';
-    if (onboardingStageOrder[stage] < onboardingStageOrder[current]) {
-      res.json({
-        success: true,
-        data: {
-          ...buildOnboardingPayload(user),
-          ignored: true,
-        },
-      });
-      return;
-    }
-    const now = new Date();
-    const fromStage = current;
-    user.onboardingStage = stage;
-    if (stage === 'welcome' && !user.onboardingWelcomeSeenAt) user.onboardingWelcomeSeenAt = now;
-    if (stage === 'bonus' && !user.onboardingBonusSeenAt) user.onboardingBonusSeenAt = now;
-    if (stage === 'permissions' && !user.onboardingPermissionSeenAt) user.onboardingPermissionSeenAt = now;
-    if (stage === 'completed' && !user.onboardingCompletedAt) user.onboardingCompletedAt = now;
-    await user.save();
     console.log(
-      `📊 [ONBOARDING METRIC] onboarding_stage_transition from=${fromStage} to=${stage} userId=${user._id.toString()}`
+      `📊 [ONBOARDING METRIC] onboarding_stage_transition from=${transition.fromStage} to=${transition.toStage} userId=${user._id.toString()} ignored=${transition.ignored}`
     );
-    if (stage === 'welcome') {
-      console.log(`📊 [ONBOARDING METRIC] onboarding_started userId=${user._id.toString()}`);
-    }
-    if (stage === 'bonus') {
+    console.log(
+      `📊 [ONBOARDING METRIC] invalid_transition_rate value=${transition.metrics.invalidTransition ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] idempotent_replay_rate value=${transition.metrics.idempotentReplay ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] stage_transition_success_rate value=${transition.metrics.success ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] atomic_conflict_replay_rate value=${transition.metrics.atomicConflictReplay ? 1 : 0} userId=${user._id.toString()}`
+    );
+    if (transition.toStage === 'bonus') {
       console.log(`📊 [ONBOARDING METRIC] drop_off_after_welcome userId=${user._id.toString()}`);
     }
-    if (stage === 'permissions') {
+    if (transition.toStage === 'permissions') {
       console.log(`📊 [ONBOARDING METRIC] drop_off_after_bonus userId=${user._id.toString()}`);
     }
-    if (stage === 'completed') {
+    if (transition.toStage === 'completed') {
       console.log(`📊 [ONBOARDING METRIC] onboarding_completed userId=${user._id.toString()}`);
     }
 
@@ -760,6 +777,8 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
       success: true,
       data: {
         ...buildOnboardingPayload(user),
+        ignored: transition.ignored,
+        idempotentReplay: transition.idempotentReplay ?? false,
       },
     });
   } catch (error) {
@@ -811,59 +830,51 @@ export const submitOnboardingPermissionsDecision = async (
       return;
     }
 
-    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    const transition = await submitPermissionsDecisionEvent({
+      firebaseUid: req.auth.firebaseUid,
+      decision,
+      requestId,
+      cameraMicStatus,
+      notificationStatus,
+    });
+    if (transition.invalidTransition) {
+      res.status(409).json({
+        success: false,
+        error: 'Invalid onboarding transition',
+        code: 'INVALID_ONBOARDING_TRANSITION',
+        reason: transition.invalidReason,
+      });
+      return;
+    }
+    const user = transition.user;
     if (!user) {
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-
-    // Idempotency guarantee for retries from flaky mobile networks.
-    if (user.lastPermissionsDecisionRequestId === requestId) {
-      res.json({
-        success: true,
-        data: {
-          ...buildOnboardingPayload(user),
-          idempotentReplay: true,
-        },
-      });
-      return;
-    }
-
-    const now = new Date();
-    const current = (user.onboardingStage as OnboardingStageInput | undefined) ?? 'welcome';
-    user.lastPermissionsDecisionRequestId = requestId;
-    if (!user.onboardingPermissionSeenAt) {
-      user.onboardingPermissionSeenAt = now;
-    }
-    if (decision === 'accept' && !user.permissionsIntroAcceptedAt) {
-      user.permissionsIntroAcceptedAt = now;
-    }
-    if (cameraMicStatus) {
-      user.cameraMicPermissionStatus = cameraMicStatus;
-    }
-    if (notificationStatus) {
-      user.notificationPermissionStatus = notificationStatus;
-    }
-    user.permissionsLastCheckedAt = now;
-
-    const targetStage: OnboardingStageInput =
-      decision === 'accept' ? 'completed' : 'permissions';
-    if (onboardingStageOrder[targetStage] >= onboardingStageOrder[current]) {
-      user.onboardingStage = targetStage;
-      if (targetStage === 'completed' && !user.onboardingCompletedAt) {
-        user.onboardingCompletedAt = now;
-      }
-    }
-
-    await user.save();
     console.log(
       `📊 [ONBOARDING METRIC] permission_decision decision=${decision} cameraMic=${
         user.cameraMicPermissionStatus ?? 'unknown'
       } notifications=${user.notificationPermissionStatus ?? 'unknown'} userId=${user._id.toString()}`
     );
+    console.log(
+      `📊 [ONBOARDING METRIC] invalid_transition_rate value=${transition.metrics.invalidTransition ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] idempotent_replay_rate value=${transition.metrics.idempotentReplay ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] stage_transition_success_rate value=${transition.metrics.success ? 1 : 0} userId=${user._id.toString()}`
+    );
+    console.log(
+      `📊 [ONBOARDING METRIC] atomic_conflict_replay_rate value=${transition.metrics.atomicConflictReplay ? 1 : 0} userId=${user._id.toString()}`
+    );
     res.json({
       success: true,
-      data: buildOnboardingPayload(user),
+      data: {
+        ...buildOnboardingPayload(user),
+        ignored: transition.ignored,
+        idempotentReplay: transition.idempotentReplay ?? false,
+      },
     });
   } catch (error) {
     console.error('❌ [USER] submitOnboardingPermissionsDecision error:', error);

@@ -28,7 +28,7 @@ async function handleCallStarted(
     creatorFirebaseUid: string;
     creatorMongoId: string;
   },
-  opts?: { source?: BillingSessionStartSource }
+  opts?: { source?: BillingSessionStartSource; requestReceivedAtMs?: number }
 ): Promise<void> {
   await billingService.startBillingSession(io, userFirebaseUid, data, opts);
 
@@ -46,7 +46,7 @@ export async function handleCallStartedHttp(
   io: Server,
   userFirebaseUid: string,
   data: { callId: string; creatorFirebaseUid: string; creatorMongoId: string },
-  opts?: { source?: BillingSessionStartSource }
+  opts?: { source?: BillingSessionStartSource; requestReceivedAtMs?: number }
 ): Promise<void> {
   logInfo('handleCallStartedHttp', {
     callId: data.callId,

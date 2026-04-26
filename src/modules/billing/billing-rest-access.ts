@@ -3,22 +3,25 @@ import { parseAppVideoCallId } from './billing-call-id.util';
 
 export type BillingRestDeny = { ok: false; status: number; error: string };
 export type BillingRestAllow = { ok: true };
+export type BillingRestCallStartedResult =
+  | BillingRestDeny
+  | { ok: true; payerFirebaseUid: string };
 
 /**
- * Ensures the authenticated user is the payer encoded in `callId` and body fields match.
+ * HTTP billing start: the payer is `userFirebaseUid` in the body when the creator
+ * initiates billing on behalf of the user; otherwise the authenticated user pays.
+ * Matches socket: `payer = data.userFirebaseUid || socket.firebaseUid`
  */
 export function assertBillingRestCallStartedAccess(
   firebaseUid: string,
   callId: string,
   creatorFirebaseUid: string,
-  creatorMongoId: string
-): BillingRestDeny | BillingRestAllow {
+  creatorMongoId: string,
+  userFirebaseUid?: string | null
+): BillingRestCallStartedResult {
   const parsed = parseAppVideoCallId(callId);
   if (!parsed) {
     return { ok: false, status: 400, error: 'Invalid callId format' };
-  }
-  if (parsed.callerFirebaseUid !== firebaseUid) {
-    return { ok: false, status: 403, error: 'callId does not match authenticated user' };
   }
   if (parsed.creatorMongoId !== creatorMongoId) {
     return {
@@ -30,7 +33,45 @@ export function assertBillingRestCallStartedAccess(
   if (!creatorFirebaseUid) {
     return { ok: false, status: 400, error: 'Missing creatorFirebaseUid' };
   }
-  return { ok: true };
+
+  const hasExplicitPayer = !!userFirebaseUid && String(userFirebaseUid).trim().length > 0;
+  const payerFirebaseUid = hasExplicitPayer ? String(userFirebaseUid).trim() : firebaseUid;
+
+  if (payerFirebaseUid === creatorFirebaseUid) {
+    return { ok: false, status: 400, error: 'Payer cannot be the same as the creator' };
+  }
+
+  const caller = parsed.callerFirebaseUid;
+  const auth = firebaseUid;
+
+  if (auth === creatorFirebaseUid) {
+    if (caller !== creatorFirebaseUid) {
+      return { ok: false, status: 400, error: 'callId is not a creator-originated call' };
+    }
+    if (!hasExplicitPayer) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'userFirebaseUid is required when the creator starts billing (HTTP)',
+      };
+    }
+    if (payerFirebaseUid === auth) {
+      return { ok: false, status: 400, error: 'Payer must be the fan, not the creator' };
+    }
+    return { ok: true, payerFirebaseUid };
+  }
+
+  if (auth === payerFirebaseUid) {
+    if (caller === auth) {
+      return { ok: true, payerFirebaseUid };
+    }
+    if (caller === creatorFirebaseUid && auth !== creatorFirebaseUid) {
+      return { ok: true, payerFirebaseUid };
+    }
+    return { ok: false, status: 403, error: 'callId does not match this billing request' };
+  }
+
+  return { ok: false, status: 403, error: 'Not authorized to start billing for this call' };
 }
 
 /**

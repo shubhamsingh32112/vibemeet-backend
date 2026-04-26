@@ -23,6 +23,7 @@ const router = Router();
 // POST /api/v1/billing/call-started
 // 🔥 FIX 11: Rate limiting - 30 billing events per minute per user
 router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Request, res: Response) => {
+  const callStartedRequestAt = Date.now();
   try {
     const firebaseUid = req.auth?.firebaseUid;
     if (!firebaseUid) {
@@ -30,7 +31,12 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
       return;
     }
 
-    const { callId, creatorFirebaseUid, creatorMongoId } = req.body;
+    const { callId, creatorFirebaseUid, creatorMongoId, userFirebaseUid: bodyPayer } = req.body as {
+      callId?: string;
+      creatorFirebaseUid?: string;
+      creatorMongoId?: string;
+      userFirebaseUid?: string;
+    };
 
     if (!callId || !creatorFirebaseUid || !creatorMongoId) {
       res.status(400).json({
@@ -44,13 +50,15 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
       firebaseUid,
       callId,
       creatorFirebaseUid,
+      bodyPayer,
     });
 
     const access = assertBillingRestCallStartedAccess(
       firebaseUid,
       callId,
       creatorFirebaseUid,
-      creatorMongoId
+      creatorMongoId,
+      bodyPayer
     );
     if (!access.ok) {
       res.status(access.status).json({ success: false, error: access.error });
@@ -58,15 +66,17 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
     }
 
     const io = getIO();
+    const payerUid = access.payerFirebaseUid;
+
     await handleCallStartedHttp(
       io,
-      firebaseUid,
+      payerUid,
       {
         callId,
         creatorFirebaseUid,
         creatorMongoId,
       },
-      { source: 'client_http' }
+      { source: 'client_http', requestReceivedAtMs: callStartedRequestAt }
     );
 
     res.json({ success: true, message: 'Billing started' });

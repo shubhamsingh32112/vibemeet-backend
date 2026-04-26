@@ -60,6 +60,7 @@ export function setupBillingGateway(io: Server): void {
         creatorMongoId: string;
         userFirebaseUid?: string;
       }) => {
+        const callStartedRequestAt = Date.now();
         try {
           const payerFirebaseUid = data.userFirebaseUid || firebaseUid;
 
@@ -107,6 +108,7 @@ export function setupBillingGateway(io: Server): void {
 
           await billingService.startBillingSession(io, payerFirebaseUid, data, {
             source: 'client_socket',
+            requestReceivedAtMs: callStartedRequestAt,
           });
 
           const redis = getRedis();

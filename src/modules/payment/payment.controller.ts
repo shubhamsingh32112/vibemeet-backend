@@ -104,6 +104,21 @@ const buildPaymentStatusDeepLink = (
   return buildAppOpenUrl(params);
 };
 
+const resolveApiBaseUrlForCheckout = (req: Request): string => {
+  const explicit =
+    process.env.PUBLIC_API_BASE_URL ||
+    process.env.API_BASE_URL ||
+    process.env.BACKEND_PUBLIC_URL;
+  if (explicit && explicit.trim().length > 0) {
+    return explicit.trim().replace(/\/$/, '');
+  }
+  const host = req.get('host');
+  if (host && host.trim().length > 0) {
+    return `${req.protocol}://${host}/api/v1`;
+  }
+  return 'http://localhost:3000/api/v1';
+};
+
 const signCheckoutSession = (payload: CheckoutSessionPayload): string =>
   jwt.sign(payload, getCheckoutSessionSecret(), { expiresIn: CHECKOUT_SESSION_TTL_SECONDS });
 
@@ -277,7 +292,12 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       pricingTier,
     });
 
-    const checkoutUrl = `${WEB_CHECKOUT_BASE_URL.replace(/\/$/, '')}/wallet-checkout?session=${encodeURIComponent(checkoutToken)}`;
+    const checkoutBase = WEB_CHECKOUT_BASE_URL.replace(/\/$/, '');
+    const checkoutParams = new URLSearchParams({
+      session: checkoutToken,
+      apiBase: resolveApiBaseUrlForCheckout(req),
+    });
+    const checkoutUrl = `${checkoutBase}/wallet-checkout?${checkoutParams.toString()}`;
 
     res.json({
       success: true,

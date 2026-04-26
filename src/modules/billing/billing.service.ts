@@ -94,6 +94,45 @@ async function releaseBillingCycleLock(
 }
 
 /** One active billed call per user/creator slot — blocks double session balance snapshots. */
+/**
+ * If a user/creator slot still references a `callId` with no live billing session, clear it
+ * and retry the reservation once (stuck slots after bad settlement / TTL expiry).
+ */
+async function tryClearOrphanActiveCallSlots(
+  redis: ReturnType<typeof getRedis>,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<void> {
+  for (const [roomUid, key] of [
+    [userFirebaseUid, activeCallByUserKey(userFirebaseUid)],
+    [creatorFirebaseUid, activeCallByUserKey(creatorFirebaseUid)],
+  ] as const) {
+    const v = await redis.get(key);
+    if (!v) continue;
+    const hasSession = await redis.get(callSessionKey(String(v)));
+    if (!hasSession) {
+      await redis.del(key).catch(() => {});
+      recordBillingMetric('session_start_active_slot_orphan_recovered', 1, {
+        staleCallId: v,
+        roomUid,
+      });
+    }
+  }
+}
+
+async function tryReserveActiveCallSlotsWithOrphanRetry(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<'ok' | 'conflict'> {
+  let r = await tryReserveActiveCallSlots(redis, callId, userFirebaseUid, creatorFirebaseUid);
+  if (r === 'ok') return 'ok';
+  await tryClearOrphanActiveCallSlots(redis, userFirebaseUid, creatorFirebaseUid);
+  r = await tryReserveActiveCallSlots(redis, callId, userFirebaseUid, creatorFirebaseUid);
+  return r;
+}
+
 async function tryReserveActiveCallSlots(
   redis: ReturnType<typeof getRedis>,
   callId: string,
@@ -365,7 +404,7 @@ export class BillingService {
       creatorFirebaseUid: string;
       creatorMongoId: string;
     },
-    opts?: { source?: BillingSessionStartSource }
+    opts?: { source?: BillingSessionStartSource; requestReceivedAtMs?: number }
   ): Promise<void> {
     const redis = getRedis();
     const { callId, creatorFirebaseUid, creatorMongoId } = data;
@@ -416,7 +455,7 @@ export class BillingService {
       return;
     }
 
-    const slotReserve = await tryReserveActiveCallSlots(
+    const slotReserve = await tryReserveActiveCallSlotsWithOrphanRetry(
       redis,
       callId,
       userFirebaseUid,
@@ -449,7 +488,8 @@ export class BillingService {
     }
     if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
 
-    const pricing = await pricingService.snapshotForCreator(creator._id.toString());
+    const pricing = pricingService.snapshotFromLoadedCreator(creator);
+    void pricingService.warmSnapshotCache(creator._id.toString(), pricing);
     const pricePerSecondMicros = pricing.pricePerSecondMicros;
     const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
 
@@ -522,24 +562,6 @@ export class BillingService {
         .exec();
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
-      if (featureFlags.billingDeltaCursorV3Enabled) {
-        await upsertBillingCheckpointSnapshot({
-          callId,
-          userMongoId: session.userMongoId,
-          creatorMongoId: session.creatorMongoId,
-          userFirebaseUid: session.userFirebaseUid,
-          creatorFirebaseUid: session.creatorFirebaseUid,
-          startTimeMs: session.startTime,
-          lastProcessedAtMs: session.lastProcessedAt,
-          remainingUserBalanceMicros: balanceMicros,
-          pricePerSecondMicros: session.pricePerSecondMicros,
-          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
-          totalDeductedMicros: session.totalDeductedMicros,
-          totalEarnedMicros: session.totalEarnedMicros,
-          status: 'active',
-        });
-      }
-
       logInfo('Billing session started - Redis keys seeded', {
         callId,
         initialBalanceMicros: balanceMicros,
@@ -599,6 +621,37 @@ export class BillingService {
       source,
       callIdPrefix,
     });
+    if (opts?.requestReceivedAtMs != null) {
+      recordBillingMetric('billing_start_latency_ms', Date.now() - opts.requestReceivedAtMs, {
+        callId,
+        callIdPrefix,
+        source,
+      });
+    }
+
+    if (featureFlags.billingDeltaCursorV3Enabled) {
+      try {
+        await upsertBillingCheckpointSnapshot({
+          callId,
+          userMongoId: session.userMongoId,
+          creatorMongoId: session.creatorMongoId,
+          userFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+          startTimeMs: session.startTime,
+          lastProcessedAtMs: session.lastProcessedAt,
+          remainingUserBalanceMicros: balanceMicros,
+          pricePerSecondMicros: session.pricePerSecondMicros,
+          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+          totalDeductedMicros: session.totalDeductedMicros,
+          totalEarnedMicros: session.totalEarnedMicros,
+          status: 'active',
+        });
+      } catch (cpErr) {
+        logError('Checkpoint snapshot after billing:started failed (non-fatal)', cpErr, {
+          callId,
+        });
+      }
+    }
 
     try {
       await refreshActiveCallSlotsTtl(redis, userFirebaseUid, creatorFirebaseUid);

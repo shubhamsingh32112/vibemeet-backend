@@ -23,7 +23,7 @@ export interface IUser extends Document {
   coins: number;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
   welcomeBonusClaimed: boolean; // Whether user has claimed the 30-coin welcome bonus
-  onboardingStage?: 'welcome' | 'bonus' | 'permission' | 'permissions' | 'completed';
+  onboardingStage?: 'welcome' | 'bonus' | 'permissions' | 'completed';
   onboardingWelcomeSeenAt?: Date | null;
   onboardingBonusSeenAt?: Date | null;
   onboardingPermissionSeenAt?: Date | null;
@@ -33,6 +33,8 @@ export interface IUser extends Document {
   notificationPermissionStatus?: 'unknown' | 'granted' | 'denied' | 'permanentlyDenied';
   permissionsLastCheckedAt?: Date | null;
   lastPermissionsDecisionRequestId?: string | null;
+  lastOnboardingStageIdempotencyKey?: string | null;
+  permissionOnboardingStatus?: 'accepted' | 'skipped' | 'unknown';
   role: 'user' | 'creator' | 'admin' | 'agent';
   /** Bcrypt hash for agent dashboard login (never store plaintext). */
   passwordHash?: string;
@@ -137,7 +139,7 @@ const userSchema = new Schema<IUser>(
     },
     onboardingStage: {
       type: String,
-      enum: ['welcome', 'bonus', 'permission', 'permissions', 'completed'],
+      enum: ['welcome', 'bonus', 'permissions', 'completed'],
       default: 'welcome',
       index: true,
     },
@@ -180,6 +182,17 @@ const userSchema = new Schema<IUser>(
       default: null,
       trim: true,
       maxlength: 128,
+    },
+    lastOnboardingStageIdempotencyKey: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 160,
+    },
+    permissionOnboardingStatus: {
+      type: String,
+      enum: ['accepted', 'skipped', 'unknown'],
+      default: 'unknown',
     },
     role: {
       type: String,

@@ -44,6 +44,7 @@ import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
 import { normalizeGalleryImages, resolveGalleryImageUrlsForApi } from './creator-gallery-resolve';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { invalidateCreatorPricingCache } from '../video/pricing.service';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
 import {
   parseCreatorLocationForCreate,
@@ -524,6 +525,10 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
     }
     
     await creator.save();
+
+    if (price !== undefined) {
+      await invalidateCreatorPricingCache(creator._id.toString());
+    }
     
     await bumpCreatorProfileRevisionForAdmin(creator.userId, {
       syncAvatarFromCreatorPhoto: photoInBody ? creator.photo : undefined,
