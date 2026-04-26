@@ -36,6 +36,13 @@ async function resolveAuthedUser(req: Request) {
   return User.findOne({ firebaseUid: req.auth.firebaseUid }).select('_id role firebaseUid').lean();
 }
 
+function resolveFirebaseUid(req: Request): string | null {
+  const uid = req.auth?.firebaseUid;
+  if (!uid) return null;
+  const s = String(uid).trim();
+  return s.length > 0 ? s : null;
+}
+
 async function cacheActiveUpdate(update: unknown): Promise<void> {
   if (!isRedisConfigured()) return;
   try {
@@ -186,8 +193,15 @@ export const publishGlobalAppUpdate = async (req: Request, res: Response): Promi
     await cacheActiveUpdate(payload);
     try {
       const io = getIO();
+      const consumersRoomSize = io.sockets.adapter.rooms.get('consumers')?.size ?? 0;
+      const creatorsRoomSize = io.sockets.adapter.rooms.get('creators')?.size ?? 0;
       io.to('consumers').emit('app_update:published', payload);
       io.to('creators').emit('app_update:published', payload);
+      logInfo('Global app update socket broadcast emitted', {
+        updateId: payload.id,
+        consumersRoomSize,
+        creatorsRoomSize,
+      });
     } catch (emitErr) {
       logError('Failed to emit app_update:published event', emitErr, { updateId: payload.id });
     }
@@ -234,8 +248,13 @@ export const getCurrentGlobalAppUpdateForAdmin = async (req: Request, res: Respo
 export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
   try {
+    const firebaseUid = resolveFirebaseUid(req);
     const actor = await resolveAuthedUser(req);
-    if (!actor || (actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin')) {
+    if (!firebaseUid) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+    if (actor && actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin') {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -259,16 +278,22 @@ export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Pr
       return;
     }
 
+    // Critical: dedupe ACK across identity modes.
+    // If the same Firebase identity later gets a Mongo User row, treat either ACK as sufficient.
     const ack = await GlobalAppUpdateAck.findOne({
       updateId: activeData.id,
-      userId: actor._id,
       ackType: 'update_now_clicked',
+      $or: [
+        ...(actor?._id ? [{ userId: actor._id }] : []),
+        { firebaseUid },
+      ],
     })
       .select('_id')
       .lean();
 
     logInfo('Global app update pending lookup complete', {
-      userId: actor._id.toString(),
+      userId: actor?._id?.toString(),
+      firebaseUid,
       cacheHit: Boolean(activeCached),
       hasAck: Boolean(ack),
       durationMs: Date.now() - startedAt,
@@ -286,8 +311,13 @@ export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Pr
 
 export const ackGlobalAppUpdateNow = async (req: Request, res: Response): Promise<void> => {
   try {
+    const firebaseUid = resolveFirebaseUid(req);
     const actor = await resolveAuthedUser(req);
-    if (!actor || (actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin')) {
+    if (!firebaseUid) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+    if (actor && actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin') {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -304,15 +334,32 @@ export const ackGlobalAppUpdateNow = async (req: Request, res: Response): Promis
       return;
     }
 
+    // Critical: idempotent across identity modes.
+    // This prevents duplicate ACK rows when:
+    // 1) a user ACKs before having a Mongo row (firebaseUid), then
+    // 2) later gets a Mongo userId and ACKs again.
+    const ackFilter: Record<string, any> = {
+      updateId: update._id,
+      ackType: 'update_now_clicked',
+      $or: [
+        ...(actor?._id ? [{ userId: actor._id }] : []),
+        { firebaseUid },
+      ],
+    };
+
+    // Insert the "canonical" ack shape when we have userId: store BOTH userId + firebaseUid.
+    // This ensures future reads match regardless of which identifier is available.
+    const ackInsert: Record<string, any> = {
+      ackedAt: new Date(),
+      firebaseUid,
+      ...(actor?._id ? { userId: actor._id } : {}),
+    };
+
     await GlobalAppUpdateAck.updateOne(
-      {
-        updateId: update._id,
-        userId: actor._id,
-        ackType: 'update_now_clicked',
-      },
+      ackFilter,
       {
         $setOnInsert: {
-          ackedAt: new Date(),
+          ...ackInsert,
         },
       },
       {

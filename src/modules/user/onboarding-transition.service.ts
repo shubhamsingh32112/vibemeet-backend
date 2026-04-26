@@ -37,6 +37,13 @@ const allowedTransitions: Record<OnboardingStageCanonical, OnboardingStageCanoni
   completed: [],
 };
 
+function stageRank(stage: OnboardingStageCanonical): number {
+  if (stage === 'welcome') return 1;
+  if (stage === 'bonus') return 2;
+  if (stage === 'permissions') return 3;
+  return 4;
+}
+
 export function canonicalizeStage(stage?: string | null): OnboardingStageCanonical {
   if (stage === 'permission' || stage === 'permissions') return 'permissions';
   if (stage === 'bonus' || stage === 'completed' || stage === 'welcome') {
@@ -130,6 +137,70 @@ export async function applyOnboardingStageEvent(params: {
     };
   }
   const toStage = toNextStageFromEvent(event);
+  const fromRank = stageRank(fromStage);
+  const toRank = stageRank(toStage);
+
+  // Monotonic enforcement: never allow regressions.
+  if (toRank < fromRank) {
+    const invalidReason = `regression:${fromStage}->${toStage}`;
+    console.warn(
+      `[ONBOARDING_TRANSITION] mode=${mode} uid=${firebaseUid} event=${event} ${invalidReason}`
+    );
+    return {
+      user,
+      fromStage,
+      toStage: fromStage,
+      ignored: true,
+      invalidTransition: true,
+      invalidReason,
+      metrics: {
+        invalidTransition: true,
+        idempotentReplay: false,
+        success: false,
+        atomicConflictReplay: false,
+      },
+    };
+  }
+
+  // Equal-rank handling: only allow true idempotent replay (requires idempotency key).
+  if (toRank === fromRank && fromStage === toStage && !idempotencyKey) {
+    const invalidReason = `equal_rank_without_idempotency:${fromStage}`;
+    console.warn(
+      `[ONBOARDING_TRANSITION] mode=${mode} uid=${firebaseUid} event=${event} ${invalidReason}`
+    );
+    if (shouldRejectTransition(mode)) {
+      return {
+        user,
+        fromStage,
+        toStage: fromStage,
+        ignored: false,
+        invalidTransition: true,
+        invalidReason,
+        metrics: {
+          invalidTransition: true,
+          idempotentReplay: false,
+          success: false,
+          atomicConflictReplay: false,
+        },
+      };
+    }
+    if (shouldIgnoreInvalidTransition(mode)) {
+      return {
+        user,
+        fromStage,
+        toStage: fromStage,
+        ignored: true,
+        invalidTransition: true,
+        invalidReason,
+        metrics: {
+          invalidTransition: true,
+          idempotentReplay: false,
+          success: false,
+          atomicConflictReplay: false,
+        },
+      };
+    }
+  }
   const valid = isAllowedTransition(fromStage, toStage);
   if (!valid) {
     const invalidReason = `invalid_transition:${fromStage}->${toStage}`;
@@ -280,6 +351,53 @@ export async function submitPermissionsDecisionEvent(params: {
   }
 
   const fromStage = canonicalizeStage(user.onboardingStage);
+
+  // Reconciliation safety: if onboarding is already completed, only update fields.
+  // Do NOT apply stage transitions in this mode.
+  if (fromStage === 'completed') {
+    const now = new Date();
+    const set: Record<string, unknown> = {
+      lastPermissionsDecisionRequestId: requestId,
+      permissionsLastCheckedAt: now,
+    };
+    if (cameraMicStatus) {
+      set.cameraMicPermissionStatus = cameraMicStatus;
+    }
+    if (notificationStatus) {
+      set.notificationPermissionStatus = notificationStatus;
+    }
+    const updated = await User.findOneAndUpdate(
+      {
+        firebaseUid,
+        onboardingStage: { $in: ['completed'] },
+        lastPermissionsDecisionRequestId: { $ne: requestId },
+      },
+      { $set: set },
+      { new: true }
+    );
+    const latest = updated ?? (await User.findOne({ firebaseUid }));
+    if (!latest) {
+      throw new Error('USER_NOT_FOUND');
+    }
+    console.log(
+      `[ONBOARDING_PERMISSION_RECONCILE] uid=${firebaseUid} requestId=${requestId} result=${
+        updated ? 'success' : 'conflict_replay'
+      }`
+    );
+    return {
+      user: latest,
+      fromStage: 'completed',
+      toStage: 'completed',
+      ignored: !updated,
+      idempotentReplay: !updated,
+      metrics: {
+        invalidTransition: false,
+        idempotentReplay: !updated,
+        success: Boolean(updated),
+        atomicConflictReplay: !updated,
+      },
+    };
+  }
   const event: OnboardingTransitionEvent =
     decision === 'accept' ? 'permissions_accept' : 'permissions_not_now';
   const targetStage = toNextStageFromEvent(event);

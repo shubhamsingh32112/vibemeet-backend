@@ -734,6 +734,10 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
           ? req.headers['x-idempotency-key']
           : undefined,
     });
+    const onboardingSessionId =
+      typeof req.headers['x-onboarding-session-id'] === 'string'
+        ? req.headers['x-onboarding-session-id']
+        : undefined;
     if (transition.invalidTransition) {
       res.status(409).json({
         success: false,
@@ -749,7 +753,7 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
       return;
     }
     console.log(
-      `📊 [ONBOARDING METRIC] onboarding_stage_transition from=${transition.fromStage} to=${transition.toStage} userId=${user._id.toString()} ignored=${transition.ignored}`
+      `📊 [ONBOARDING METRIC] onboarding_stage_transition from=${transition.fromStage} to=${transition.toStage} userId=${user._id.toString()} ignored=${transition.ignored} sessionId=${onboardingSessionId ?? 'none'}`
     );
     console.log(
       `📊 [ONBOARDING METRIC] invalid_transition_rate value=${transition.metrics.invalidTransition ? 1 : 0} userId=${user._id.toString()}`
@@ -837,6 +841,10 @@ export const submitOnboardingPermissionsDecision = async (
       cameraMicStatus,
       notificationStatus,
     });
+    const onboardingSessionId =
+      typeof req.headers['x-onboarding-session-id'] === 'string'
+        ? req.headers['x-onboarding-session-id']
+        : undefined;
     if (transition.invalidTransition) {
       res.status(409).json({
         success: false,
@@ -854,7 +862,7 @@ export const submitOnboardingPermissionsDecision = async (
     console.log(
       `📊 [ONBOARDING METRIC] permission_decision decision=${decision} cameraMic=${
         user.cameraMicPermissionStatus ?? 'unknown'
-      } notifications=${user.notificationPermissionStatus ?? 'unknown'} userId=${user._id.toString()}`
+      } notifications=${user.notificationPermissionStatus ?? 'unknown'} userId=${user._id.toString()} sessionId=${onboardingSessionId ?? 'none'}`
     );
     console.log(
       `📊 [ONBOARDING METRIC] invalid_transition_rate value=${transition.metrics.invalidTransition ? 1 : 0} userId=${user._id.toString()}`
@@ -878,6 +886,64 @@ export const submitOnboardingPermissionsDecision = async (
     });
   } catch (error) {
     console.error('❌ [USER] submitOnboardingPermissionsDecision error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const reconcileOnboardingPermissionsStatus = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const requestIdRaw = req.body?.requestId;
+    const requestId = typeof requestIdRaw === 'string' ? requestIdRaw.trim() : '';
+    const cameraMicStatus = req.body?.cameraMicStatus as PermissionStatus | undefined;
+    const notificationStatus = req.body?.notificationStatus as PermissionStatus | undefined;
+    const validStatuses: PermissionStatus[] = [
+      'unknown',
+      'granted',
+      'denied',
+      'permanentlyDenied',
+    ];
+    if (requestId.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'requestId is required',
+      });
+      return;
+    }
+    if (cameraMicStatus && !validStatuses.includes(cameraMicStatus)) {
+      res.status(400).json({ success: false, error: 'Invalid cameraMicStatus' });
+      return;
+    }
+    if (notificationStatus && !validStatuses.includes(notificationStatus)) {
+      res.status(400).json({ success: false, error: 'Invalid notificationStatus' });
+      return;
+    }
+
+    // Use the same transition function, which bypasses stage changes when stage=completed.
+    const transition = await submitPermissionsDecisionEvent({
+      firebaseUid: req.auth.firebaseUid,
+      decision: 'accept',
+      requestId,
+      cameraMicStatus,
+      notificationStatus,
+    });
+    const user = transition.user;
+    res.json({
+      success: true,
+      data: {
+        ...buildOnboardingPayload(user),
+        ignored: transition.ignored,
+        idempotentReplay: transition.idempotentReplay ?? false,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] reconcileOnboardingPermissionsStatus error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -1611,6 +1677,13 @@ export const claimWelcomeBonus = async (req: Request, res: Response): Promise<vo
         coins: user.coins,
         bonusAmount: WELCOME_BONUS,
         welcomeBonusClaimed: true,
+        updatedUser: {
+          id: user._id.toString(),
+          coins: user.coins,
+          welcomeBonusClaimed: true,
+          role: user.role,
+          onboarding: buildOnboardingPayload(user),
+        },
       },
     });
   } catch (error) {

@@ -16,7 +16,8 @@ export interface IGlobalAppUpdate extends Document {
 export interface IGlobalAppUpdateAck extends Document {
   _id: mongoose.Types.ObjectId;
   updateId: mongoose.Types.ObjectId;
-  userId: mongoose.Types.ObjectId;
+  userId?: mongoose.Types.ObjectId;
+  firebaseUid?: string;
   ackType: 'update_now_clicked';
   ackedAt: Date;
   createdAt: Date;
@@ -87,7 +88,14 @@ const globalAppUpdateAckSchema = new Schema<IGlobalAppUpdateAck>(
     userId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
+      required: false,
+      index: true,
+    },
+    firebaseUid: {
+      type: String,
+      required: false,
+      trim: true,
+      maxlength: 128,
       index: true,
     },
     ackType: {
@@ -107,9 +115,31 @@ const globalAppUpdateAckSchema = new Schema<IGlobalAppUpdateAck>(
   }
 );
 
+globalAppUpdateAckSchema.pre('validate', function (next) {
+  // Require an identifier for the ack: either Mongo userId (preferred) or firebaseUid fallback.
+  // This makes the feature robust even if a Firebase user exists without a Mongo User row.
+  if (!this.userId && !this.firebaseUid) {
+    return next(new Error('GlobalAppUpdateAck requires either userId or firebaseUid'));
+  }
+  next();
+});
+
 globalAppUpdateAckSchema.index(
   { updateId: 1, userId: 1, ackType: 1 },
-  { unique: true, name: 'uniq_update_user_ack_type' }
+  {
+    unique: true,
+    partialFilterExpression: { userId: { $exists: true, $type: 'objectId' } },
+    name: 'uniq_update_user_ack_type',
+  }
+);
+
+globalAppUpdateAckSchema.index(
+  { updateId: 1, firebaseUid: 1, ackType: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { firebaseUid: { $exists: true, $type: 'string' } },
+    name: 'uniq_update_firebase_uid_ack_type',
+  }
 );
 
 // Enforce single active update at DB level when partial indexes are available.

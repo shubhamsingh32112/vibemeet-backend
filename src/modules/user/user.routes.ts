@@ -11,6 +11,7 @@ import {
   claimWelcomeBonus,
   advanceOnboardingStage,
   submitOnboardingPermissionsDecision,
+  reconcileOnboardingPermissionsStatus,
   getUserTransactions,
   getCallHistory,
   getFavoriteCreators,
@@ -38,6 +39,11 @@ router.post(
   '/onboarding/permissions-decision',
   verifyFirebaseToken,
   submitOnboardingPermissionsDecision
+);
+router.post(
+  '/onboarding/permissions-reconcile',
+  verifyFirebaseToken,
+  reconcileOnboardingPermissionsStatus
 );
 router.get('/transactions', verifyFirebaseToken, getUserTransactions); // Get user transaction history
 router.get('/call-history', verifyFirebaseToken, getCallHistory); // Get call history (users + creators)

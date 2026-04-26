@@ -203,6 +203,13 @@ export function setupAvailabilityGateway(io: Server): void {
         isUser = user?.role === 'user' || !user?.role || user?.role === null;
       } catch (err) {
         logError('Failed to resolve user role for socket', err, { firebaseUid, socketId: socket.id });
+        // Fail open: join consumers so global broadcasts (like app updates) still reach the client.
+        isCreator = false;
+        isUser = true;
+        logWarning('Defaulting socket role to consumer due to role lookup error', {
+          firebaseUid,
+          socketId: socket.id,
+        });
       }
     }
     socket.data.isCreator = isCreator;
