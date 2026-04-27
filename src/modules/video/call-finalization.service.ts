@@ -42,10 +42,13 @@ export async function finalizeCallEnd(
   }
 
   try {
-    await settleCall(io, callId);
-
     const call = await Call.findOne({ callId });
     if (call) {
+      // Restore creator availability ASAP so creators don’t appear “offline/busy”
+      // for the entire settlement duration (which can be seconds).
+      await releaseCreatorCallLock(call.creatorUserId.toString());
+      await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
+
       if (call.status !== 'ended') {
         transitionCallStatus(call, 'ended', {
           source: `call.finalizer.${source}`,
@@ -56,9 +59,12 @@ export async function finalizeCallEnd(
         call.isSettled = true;
       }
 
-      await releaseCreatorCallLock(call.creatorUserId.toString());
-      await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
+      // Billing settlement can be slow; run after availability restoration.
+      await settleCall(io, callId);
       await call.save();
+    } else {
+      // No Call record yet — still settle so billing keys are flushed.
+      await settleCall(io, callId);
     }
 
     await redis.set(doneKey, source, 'EX', FINALIZE_DONE_TTL_SECONDS);

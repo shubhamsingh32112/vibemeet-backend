@@ -295,6 +295,12 @@ export function setupAvailabilityGateway(io: Server): void {
               if (status === 'online') {
                 await redis.setex(availabilityKey(firebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
                 logDebug('Heartbeat refreshed TTL', { firebaseUid });
+              } else {
+                // 🔥 PRODUCT: creators should remain online while app is running.
+                // If the creator was marked busy during the call, flip them back to
+                // online as soon as the active-call slot is gone (no reconnect needed).
+                await setCreatorAvailability(io, firebaseUid, 'online');
+                logInfo('Heartbeat restored creator to online (post-call)', { firebaseUid });
               }
             }
           } catch (err) {
