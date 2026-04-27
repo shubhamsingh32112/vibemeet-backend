@@ -738,7 +738,8 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
       typeof req.headers['x-onboarding-session-id'] === 'string'
         ? req.headers['x-onboarding-session-id']
         : undefined;
-    if (transition.invalidTransition) {
+    // Reject only when invalid and not safely ignored (log-only / soft no-op).
+    if (transition.invalidTransition && !transition.ignored) {
       res.status(409).json({
         success: false,
         error: 'Invalid onboarding transition',

@@ -78,15 +78,13 @@ function shouldIgnoreInvalidTransition(mode: OnboardingStrictMode): boolean {
   return mode === 'soft-enforce';
 }
 
-function buildCompletionUpdate(
+/** Exported for contract tests; Mongo forbids overlapping $set / $setOnInsert paths. */
+export function buildCompletionUpdate(
   fromStage: OnboardingStageCanonical,
   toStage: OnboardingStageCanonical,
   now: Date
 ) {
   const set: Record<string, unknown> = {
-    onboardingStage: toStage,
-  };
-  const setOnInsert = {
     onboardingStage: toStage,
   };
 
@@ -101,7 +99,9 @@ function buildCompletionUpdate(
     set.onboardingCompletedAt = now;
   }
 
-  return { $set: set, $setOnInsert: setOnInsert };
+  // $set only: MongoDB rejects the same path in both $set and $setOnInsert
+  // (ConflictingUpdateOperators). This path does not upsert users.
+  return { $set: set };
 }
 
 export function stageForClient(stage: string | undefined | null): string {
@@ -200,6 +200,20 @@ export async function applyOnboardingStageEvent(params: {
         },
       };
     }
+    return {
+      user,
+      fromStage,
+      toStage: fromStage,
+      ignored: true,
+      invalidTransition: true,
+      invalidReason,
+      metrics: {
+        invalidTransition: true,
+        idempotentReplay: false,
+        success: false,
+        atomicConflictReplay: false,
+      },
+    };
   }
   const valid = isAllowedTransition(fromStage, toStage);
   if (!valid) {
@@ -239,6 +253,23 @@ export async function applyOnboardingStageEvent(params: {
         },
       };
     }
+    // log-only (and any other mode that did not return above): never persist an
+    // illegal stage jump — previously execution fell through and could corrupt
+    // Mongo state or surface 500s to the client.
+    return {
+      user,
+      fromStage,
+      toStage: fromStage,
+      ignored: true,
+      invalidTransition: true,
+      invalidReason,
+      metrics: {
+        invalidTransition: true,
+        idempotentReplay: false,
+        success: false,
+        atomicConflictReplay: false,
+      },
+    };
   }
 
   if (fromStage === toStage) {

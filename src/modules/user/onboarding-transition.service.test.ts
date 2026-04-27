@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildCompletionUpdate,
   canonicalizeStage,
   isAllowedTransition,
   toNextStageFromEvent,
@@ -25,4 +26,14 @@ test('event mapping advances to expected next stage', () => {
   assert.equal(toNextStageFromEvent('bonus_seen'), 'permissions');
   assert.equal(toNextStageFromEvent('permissions_not_now'), 'permissions');
   assert.equal(toNextStageFromEvent('permissions_accept'), 'completed');
+});
+
+test('buildCompletionUpdate uses $set only (no ConflictingUpdateOperators)', () => {
+  const now = new Date();
+  const doc = buildCompletionUpdate('welcome', 'bonus', now);
+  assert.ok('$set' in doc);
+  assert.equal('$setOnInsert' in doc, false);
+  const set = (doc as { $set: Record<string, unknown> }).$set;
+  assert.equal(set.onboardingStage, 'bonus');
+  assert.ok(set.onboardingWelcomeSeenAt instanceof Date);
 });
