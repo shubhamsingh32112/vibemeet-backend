@@ -11,6 +11,7 @@ import {
   agentApproveWithdrawal,
   agentRejectWithdrawal,
   agentMarkWithdrawalPaid,
+  rejectAgentReferredUser,
 } from './agent.controller';
 
 const router = Router();
@@ -18,6 +19,7 @@ router.use(verifyFirebaseToken);
 
 router.get('/summary', getAgentDashboardSummary);
 router.get('/referred-users', getAgentReferredUsers);
+router.post('/referred-users/:userId/reject', rejectAgentReferredUser);
 router.get('/search-users', searchUsersForAgent);
 router.post('/creators', postAgentCreateCreator);
 router.get('/creators', getAgentCreators);

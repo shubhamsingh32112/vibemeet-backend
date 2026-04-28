@@ -38,6 +38,7 @@ import {
   getFullAuditReport,
   updateWalletPricing,
   patchCreatorLinkedUser,
+  postAdminTransferCreatorToAgent,
   adminCreatorGalleryUploadUrl,
   adminCreatorGalleryCommit,
   adminCreatorGalleryDelete,
@@ -89,6 +90,7 @@ router.patch('/support/:id/assign', assignTicket);
 router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/force-offline', forceCreatorOffline);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
+router.post('/creators/:id/transfer-agent', postAdminTransferCreatorToAgent);
 router.post(
   '/creators/:id/gallery/upload-url',
   creatorGalleryUploadLimiter,

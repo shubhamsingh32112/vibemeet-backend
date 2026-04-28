@@ -33,7 +33,9 @@ function isValidHttpsUrl(raw: string): boolean {
 
 async function resolveAuthedUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
-  return User.findOne({ firebaseUid: req.auth.firebaseUid }).select('_id role firebaseUid').lean();
+  return User.findOne({ firebaseUid: req.auth.firebaseUid })
+    .select('_id role firebaseUid createdAt')
+    .lean();
 }
 
 function resolveFirebaseUid(req: Request): string | null {
@@ -258,6 +260,12 @@ export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Pr
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
+    // If we cannot resolve a Mongo user row, treat as "new/unknown" and suppress update popup.
+    // This keeps the popup scoped to already-existing users only.
+    if (!actor) {
+      res.status(200).json({ success: true, data: null });
+      return;
+    }
 
     const activeCached = await getActiveUpdateCached();
     let activeData: Record<string, any> | null = activeCached;
@@ -278,13 +286,31 @@ export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Pr
       return;
     }
 
+    // Product rule: show the global update popup only to users who already existed
+    // at the time this update was published.
+    const actorCreatedAtMs = actor.createdAt ? new Date(actor.createdAt).getTime() : 0;
+    const publishedAtMs =
+      activeData.publishedAt != null ? Date.parse(String(activeData.publishedAt)) : NaN;
+    if (Number.isFinite(publishedAtMs) && actorCreatedAtMs > 0 && actorCreatedAtMs > publishedAtMs) {
+      logInfo('Global app update suppressed for new user', {
+        userId: actor._id.toString(),
+        firebaseUid,
+        updateId: activeData.id,
+        actorCreatedAt: actor.createdAt,
+        publishedAt: activeData.publishedAt,
+        durationMs: Date.now() - startedAt,
+      });
+      res.status(200).json({ success: true, data: null });
+      return;
+    }
+
     // Critical: dedupe ACK across identity modes.
     // If the same Firebase identity later gets a Mongo User row, treat either ACK as sufficient.
     const ack = await GlobalAppUpdateAck.findOne({
       updateId: activeData.id,
       ackType: 'update_now_clicked',
       $or: [
-        ...(actor?._id ? [{ userId: actor._id }] : []),
+        { userId: actor._id },
         { firebaseUid },
       ],
     })

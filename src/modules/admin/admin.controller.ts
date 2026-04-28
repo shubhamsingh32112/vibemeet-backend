@@ -40,6 +40,7 @@ import {
 import { verifyUserBalance, batchVerifyBalances } from '../../utils/balance-integrity';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assertAdmin, assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
+import { transferCreatorToAgent } from './creator-transfer.service';
 import {
   processWithdrawalApproval,
   processWithdrawalRejection,
@@ -345,6 +346,33 @@ async function computeCreatorsPerformance() {
   const users = await User.find({ _id: { $in: userIds } }).lean();
   const userMap = new Map(users.map((u) => [u._id.toString(), u]));
 
+  const assignedAgentIds = [
+    ...new Set(
+      creators
+        .map((c) => c.assignedAgentId?.toString())
+        .filter((id): id is string => !!id)
+    ),
+  ].map((id) => new mongoose.Types.ObjectId(id));
+
+  const assignedAgents =
+    assignedAgentIds.length > 0
+      ? await User.find({ _id: { $in: assignedAgentIds } })
+          .select('_id email displayName username referralCode role agentDisabled')
+          .lean()
+      : [];
+
+  const agentLabelById = new Map(
+    assignedAgents.map((a) => {
+      const label =
+        (a.displayName && a.displayName.trim()) ||
+        a.email ||
+        a.username ||
+        a.referralCode ||
+        a._id.toString();
+      return [a._id.toString(), label];
+    })
+  );
+
   // All-time call stats per creator
   const callStatsPerCreator = await CallHistory.aggregate([
     { $match: { ownerRole: 'creator', ownerUserId: { $in: userIds } } },
@@ -475,6 +503,10 @@ async function computeCreatorsPerformance() {
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
+      assignedAgentId: creator.assignedAgentId?.toString() ?? null,
+      assignedAgentLabel: creator.assignedAgentId
+        ? agentLabelById.get(creator.assignedAgentId.toString()) ?? null
+        : null,
       email: user?.email || null,
       phone: user?.phone || null,
       coins: user?.coins ?? 0,
@@ -2523,6 +2555,64 @@ export const getFullAuditReport = async (req: Request, res: Response): Promise<v
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+export const postAdminTransferCreatorToAgent = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+    if (!(await assertAdmin(req, res))) return;
+
+    const adminUser = await getAdminUser(req);
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetAgentId = String(req.body?.targetAgentId ?? '').trim();
+    const reason = String(req.body?.reason ?? '').trim();
+    const idempotencyKey =
+      String(req.header('x-idempotency-key') ?? req.body?.idempotencyKey ?? '').trim() || null;
+
+    if (!targetAgentId) {
+      res.status(400).json({ success: false, error: 'targetAgentId is required' });
+      return;
+    }
+    if (!reason || reason.length < 3) {
+      res
+        .status(400)
+        .json({ success: false, error: 'reason is required (min 3 characters)' });
+      return;
+    }
+    if (reason.length > 500) {
+      res.status(400).json({ success: false, error: 'reason is too long (max 500 chars)' });
+      return;
+    }
+
+    const transfer = await transferCreatorToAgent(creatorId, targetAgentId, { idempotencyKey });
+    if (!transfer.ok) {
+      res.status(transfer.status).json({ success: false, error: transfer.error });
+      return;
+    }
+
+    invalidateAdminCaches('overview', 'users_analytics', 'creators_performance').catch(() => {});
+
+    await logAdminAction(
+      adminUser,
+      'CREATOR_TRANSFER_AGENT',
+      'creator',
+      creatorId,
+      reason,
+      transfer.data
+    );
+
+    res.json({ success: true, data: transfer.data });
+  } catch (error) {
+    console.error('❌ [ADMIN] postAdminTransferCreatorToAgent error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
 
 export const patchCreatorLinkedUser = async (req: Request, res: Response): Promise<void> => {
   try {

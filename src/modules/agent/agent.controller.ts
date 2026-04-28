@@ -45,6 +45,98 @@ async function earningsInWindow(userMongoId: mongoose.Types.ObjectId, since: Dat
   return agg[0]?.total ?? 0;
 }
 
+export const rejectAgentReferredUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgent(req, res))) return;
+    const agent = await loadStaffUserByAuth(req);
+    if (!agent) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUserIdRaw = String(req.params.userId ?? '').trim();
+    if (!mongoose.isValidObjectId(targetUserIdRaw)) {
+      res.status(400).json({ success: false, error: 'Invalid userId' });
+      return;
+    }
+    const targetUserId = new mongoose.Types.ObjectId(targetUserIdRaw);
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length > 2000) {
+      res.status(400).json({ success: false, error: 'reason is too long (max 2000 chars)' });
+      return;
+    }
+
+    const targetUser = await User.findById(targetUserId).select('_id referredBy').lean();
+    if (!targetUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (!targetUser.referredBy || !targetUser.referredBy.equals(agent._id)) {
+      res.status(403).json({ success: false, error: 'User was not referred by this agent' });
+      return;
+    }
+
+    // If the user is already a creator, this is not a "referred user awaiting promotion".
+    const creator = await Creator.findOne({ userId: targetUserId }).select('_id').lean();
+    if (creator) {
+      res.status(409).json({
+        success: false,
+        error: 'Cannot reject: user already has a creator profile',
+      });
+      return;
+    }
+
+    const session = await mongoose.startSession();
+    let unlinkModified = 0;
+    let edgeDeleted = 0;
+    try {
+      await session.withTransaction(async () => {
+        const unlink = await User.updateOne(
+          { _id: targetUserId, referredBy: agent._id },
+          { $set: { referredBy: null } },
+          { session },
+        );
+        unlinkModified = unlink.modifiedCount ?? 0;
+
+        // Remove from agent's referrals array (best-effort; may not exist in legacy data).
+        await User.updateOne(
+          { _id: agent._id },
+          { $pull: { referrals: { user: targetUserId } } },
+          { session },
+        );
+
+        const del = await ReferralEdge.deleteOne(
+          { referredUserId: targetUserId, referrerId: agent._id },
+          { session },
+        );
+        edgeDeleted = del.deletedCount ?? 0;
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    logInfo('agent_referral_rejected', {
+      agentId: agent._id.toString(),
+      targetUserId: targetUserId.toString(),
+      unlinkModified,
+      referralEdgeDeleted: edgeDeleted,
+      hasReason: reason.length > 0,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        userId: targetUserId.toString(),
+        unlinked: unlinkModified > 0,
+      },
+    });
+  } catch (error) {
+    logError('rejectAgentReferredUser', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 /** Local calendar day 00:00 → now (agent dashboard "today"). */
 function startOfLocalToday(): Date {
   const d = new Date();

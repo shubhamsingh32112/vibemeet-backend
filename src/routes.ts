@@ -11,6 +11,7 @@ import paymentRoutes from './modules/payment/payment.routes';
 import agentRoutes from './modules/agent/agent.routes';
 import referralRoutes from './modules/referral/referral.routes';
 import appUpdateRoutes from './modules/app-update/app-update.routes';
+import availabilityRoutes from './modules/availability/availability.routes';
 
 const router = Router();
 
@@ -26,5 +27,6 @@ router.use('/billing', billingRoutes);
 router.use('/support', supportRoutes);
 router.use('/payment', paymentRoutes);
 router.use('/app-updates', appUpdateRoutes);
+router.use('/availability', availabilityRoutes);
 
 export default router;
