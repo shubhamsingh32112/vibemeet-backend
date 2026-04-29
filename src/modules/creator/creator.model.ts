@@ -6,6 +6,8 @@ export interface ICreatorGalleryImage {
   id: string;
   url: string;
   storagePath: string;
+  /** Optional resized URL (Firebase Resize Images extension: *_400x400.jpg). */
+  thumbnailUrl?: string | null;
   position: number;
   createdAt: Date;
 }
@@ -15,8 +17,12 @@ export interface ICreator extends Document {
   name: string;
   about: string;
   photo: string; // URL or path to photo
+  /** Optional avatar thumbnail URL (~100px) when Resize Images extension is enabled. */
+  thumbnailPhoto?: string | null;
   galleryImages: ICreatorGalleryImage[];
   userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
+  /** Denormalized Firebase UID (used for feed/presence hot paths). */
+  firebaseUid?: string;
   categories: string[]; // Array of category names (optional)
   price: number; // Coins per minute — must be 60, 90, or 120 (set by admin or assigned agent)
   age?: number; // Creator's age (optional)
@@ -46,6 +52,11 @@ const creatorGalleryImageSchema = new Schema<ICreatorGalleryImage>(
     storagePath: {
       type: String,
       required: true,
+      trim: true,
+    },
+    thumbnailUrl: {
+      type: String,
+      default: null,
       trim: true,
     },
     position: {
@@ -83,6 +94,11 @@ const creatorSchema = new Schema<ICreator>(
       required: true,
       trim: true,
     },
+    thumbnailPhoto: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     galleryImages: {
       type: [creatorGalleryImageSchema],
       default: [],
@@ -97,6 +113,12 @@ const creatorSchema = new Schema<ICreator>(
       ref: 'User',
       required: true,
       unique: true, // DB-level constraint: No two creators can point to the same user (prevents double promotion)
+      index: true,
+    },
+    firebaseUid: {
+      type: String,
+      trim: true,
+      sparse: true,
       index: true,
     },
     categories: {
@@ -148,5 +170,7 @@ const creatorSchema = new Schema<ICreator>(
 );
 
 creatorSchema.index({ assignedAgentId: 1, updatedAt: -1 });
+creatorSchema.index({ createdAt: -1 });
+creatorSchema.index({ isOnline: 1, createdAt: -1 });
 
 export const Creator = mongoose.model<ICreator>('Creator', creatorSchema);

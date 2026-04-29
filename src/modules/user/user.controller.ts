@@ -1052,13 +1052,6 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    // Debug: Check all users in database
-    const allUsersDebug = await User.find({}).select('firebaseUid role username').limit(10);
-    console.log(`🔍 [USER] Debug - All users in DB (first 10):`);
-    allUsersDebug.forEach((u) => {
-      console.log(`   - ${u.firebaseUid}: role=${u.role}, username=${u.username || 'N/A'}`);
-    });
-
     // 🔥 SCALABILITY: Add pagination support
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500); // Default 100, max 500
     const page = parseInt(req.query.page as string) || 1;
@@ -1367,6 +1360,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
             about,
             photo,
             userId: targetUser._id,
+            ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
             categories: Array.isArray(categories) ? categories : [],
             price: validatedPrice,
             ...(assignedAgentId ? { assignedAgentId } : {}),

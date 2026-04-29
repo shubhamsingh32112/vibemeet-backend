@@ -80,6 +80,29 @@ export async function deleteGalleryStorageObject(storagePath: string): Promise<v
   await getBucket().file(storagePath).delete({ ignoreNotFound: true });
 }
 
+/** Resized object path for Firebase Resize Images extension (suffix before extension). */
+export function buildResizedStoragePath(
+  storagePath: string,
+  size: '100x100' | '400x400',
+): string {
+  const lastDot = storagePath.lastIndexOf('.');
+  if (lastDot <= 0) {
+    return `${storagePath}_${size}`;
+  }
+  return `${storagePath.slice(0, lastDot)}_${size}${storagePath.slice(lastDot)}`;
+}
+
+/** Same as buildPublicGalleryDownloadUrl but returns null if object missing (e.g. resize not ready yet). */
+export async function tryBuildPublicGalleryDownloadUrl(
+  storagePath: string,
+): Promise<string | null> {
+  try {
+    return await buildPublicGalleryDownloadUrl(storagePath);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Firebase client URLs need `firebaseStorageDownloadTokens` for typical Storage rules.
  * Unsigned `?alt=media` alone returns 403 from the app. This ensures metadata + token URL.

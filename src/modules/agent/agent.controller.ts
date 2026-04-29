@@ -1023,6 +1023,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
             photo: typeof photo === 'string' ? photo.trim() : String(photo),
             galleryImages: [],
             userId: targetUser._id,
+            ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
             categories: Array.isArray(categories) ? categories : [],
             price: validatedPrice,
             age: age !== undefined ? age : undefined,

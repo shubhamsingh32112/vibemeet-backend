@@ -6,7 +6,10 @@ import {
   creatorGalleryUploadLimiter,
 } from '../../middlewares/rate-limit.middleware';
 import {
-  getAllCreators,
+  getCreatorCatalogGone,
+  getCreatorFeed,
+  getCreatorFirebaseUids,
+  getCreatorByFirebaseUid,
   getCreatorById,
   createCreator,
   updateCreator,
@@ -30,8 +33,11 @@ import {
 const router = Router();
 
 // Routes that require authentication to check user role
-router.get('/', verifyFirebaseToken, getAllCreators);
+router.get('/', verifyFirebaseToken, getCreatorCatalogGone);
 // IMPORTANT: Specific routes must come before parameterized routes
+router.get('/feed', verifyFirebaseToken, getCreatorFeed);
+router.get('/uids', verifyFirebaseToken, getCreatorFirebaseUids);
+router.get('/by-firebase-uid/:uid', verifyFirebaseToken, getCreatorByFirebaseUid);
 router.get('/dashboard', verifyFirebaseToken, getCreatorDashboard); // Consolidated creator dashboard (cached)
 router.get('/earnings', verifyFirebaseToken, getCreatorEarnings); // Get creator earnings summary
 router.get('/transactions', verifyFirebaseToken, getCreatorTransactions); // Get creator transaction history
@@ -49,7 +55,7 @@ router.post(
 router.post('/profile/gallery/commit', verifyFirebaseToken, commitGalleryImage);
 router.delete('/profile/gallery/:imageId', verifyFirebaseToken, deleteGalleryImage);
 router.patch('/profile/gallery/reorder', verifyFirebaseToken, reorderGalleryImages);
-router.get('/:id', getCreatorById);
+router.get('/:id', verifyFirebaseToken, getCreatorById);
 
 // Protected routes (require authentication)
 router.post('/', verifyFirebaseToken, createCreator);

@@ -314,6 +314,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       about,
       photo,
       userId: targetUser._id,
+      ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
       categories: Array.isArray(categories) ? categories : [],
       price: validatedPrice,
       ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),

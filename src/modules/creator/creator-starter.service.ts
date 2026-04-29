@@ -80,6 +80,7 @@ export async function promoteUserToCreatorWithStarterProfile(
     about: STARTER_CREATOR_ABOUT,
     photo: starterCreatorPhotoUrl(user),
     userId: user._id,
+    ...(user.firebaseUid ? { firebaseUid: user.firebaseUid.trim() } : {}),
     categories: [] as string[],
     price: DEFAULT_CREATOR_STARTER_PRICE,
     ...(options.assignedAgentId

@@ -273,3 +273,99 @@ export const invalidateAdminCaches = async (
     logError('Failed to invalidate admin caches', err, { sections });
   }
 };
+
+// ── Creator public catalog / detail caches (feed, uids, by-id) ───────────
+export const CREATOR_FEED_PREFIX = 'creator:feed:';
+export const CREATOR_FEED_INDEX_KEY = 'creator:feed:index';
+export const CREATOR_FEED_TTL = 30;
+
+export const CREATOR_UIDS_CACHE_KEY = 'creator:uids:v1';
+export const CREATOR_UIDS_TTL = 60;
+
+export const CREATOR_DETAIL_PREFIX = 'creator:detail:';
+export const CREATOR_DETAIL_INDEX_KEY = 'creator:detail:index';
+export const CREATOR_DETAIL_TTL = 60;
+
+export const CREATOR_FEED_HIT_KEY = 'creator:feed:metrics:hits';
+export const CREATOR_FEED_MISS_KEY = 'creator:feed:metrics:misses';
+
+export const creatorFeedCacheKey = (page: number, limit: number): string =>
+  `${CREATOR_FEED_PREFIX}p${page}:l${limit}`;
+
+export const creatorDetailCacheKey = (creatorId: string): string =>
+  `${CREATOR_DETAIL_PREFIX}${creatorId}`;
+
+export async function registerCreatorFeedCacheKey(key: string): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    await redis.sadd(CREATOR_FEED_INDEX_KEY, key);
+  } catch (err) {
+    logError('Failed to register creator feed cache key', err, { key });
+  }
+}
+
+export async function registerCreatorDetailCacheKey(key: string): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    await redis.sadd(CREATOR_DETAIL_INDEX_KEY, key);
+  } catch (err) {
+    logError('Failed to register creator detail cache key', err, { key });
+  }
+}
+
+export async function invalidateCreatorFeedCaches(): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    const keys = await redis.smembers(CREATOR_FEED_INDEX_KEY);
+    if (keys.length > 0) {
+      await redis.del(...keys, CREATOR_FEED_INDEX_KEY);
+    } else {
+      await redis.del(CREATOR_FEED_INDEX_KEY);
+    }
+    logInfo('Invalidated creator feed caches', { keysRemoved: keys.length });
+  } catch (err) {
+    logError('Failed to invalidate creator feed caches', err);
+  }
+}
+
+export async function invalidateCreatorUidsCache(): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    await redis.del(CREATOR_UIDS_CACHE_KEY);
+    logInfo('Invalidated creator UIDs cache');
+  } catch (err) {
+    logError('Failed to invalidate creator UIDs cache', err);
+  }
+}
+
+export async function invalidateCreatorDetailCache(creatorId: string): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    const k = creatorDetailCacheKey(creatorId);
+    await redis.del(k);
+    await redis.srem(CREATOR_DETAIL_INDEX_KEY, k);
+    logInfo('Invalidated creator detail cache', { creatorId });
+  } catch (err) {
+    logError('Failed to invalidate creator detail cache', err, { creatorId });
+  }
+}
+
+/** Clears paginated feed + presence UID list (call when catalog membership or list-facing fields change). */
+export async function invalidateCreatorCatalogCaches(): Promise<void> {
+  await Promise.all([invalidateCreatorFeedCaches(), invalidateCreatorUidsCache()]);
+}
+
+export async function bumpCreatorFeedCacheMetric(kind: 'hit' | 'miss'): Promise<void> {
+  if (!isRedisConfigured()) return;
+  try {
+    const redis = getRedis();
+    await redis.incr(kind === 'hit' ? CREATOR_FEED_HIT_KEY : CREATOR_FEED_MISS_KEY);
+  } catch {
+    // best-effort metrics
+  }
+}
