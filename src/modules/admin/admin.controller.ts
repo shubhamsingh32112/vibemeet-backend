@@ -56,6 +56,7 @@ import {
   IWalletCoinPack,
   getOrCreateWalletPricingConfig,
 } from '../payment/wallet-pricing.model';
+import { parseAdminDateRange } from './admin-date-range';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -138,9 +139,12 @@ async function getCachedOrCompute<T>(
 // ══════════════════════════════════════════════════════════════════════════
 export const getOverview = async (req: Request, res: Response): Promise<void> => {
   try {
-    if (!(await assertAdmin(req, res))) return;
+    await assertAdmin(req);
 
-    const data = await getCachedOrCompute('overview', computeOverview);
+    const range = parseAdminDateRange(req);
+    const data = range.hasRange
+      ? await computeOverview(range.from!, range.to!, range.fromIso!, range.toIso!)
+      : await getCachedOrCompute('overview', () => computeOverview());
 
     res.json({ success: true, data });
   } catch (error) {
@@ -149,11 +153,12 @@ export const getOverview = async (req: Request, res: Response): Promise<void> =>
   }
 };
 
-async function computeOverview() {
+async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?: string) {
   const now = new Date();
   const today = daysAgo(0);
   const sevenDaysAgo = daysAgo(7);
   const thirtyDaysAgo = daysAgo(30);
+  const rangeMatch = from && to ? { createdAt: { $gte: from, $lt: to } } : null;
 
   const [
     totalUsers,
@@ -186,7 +191,7 @@ async function computeOverview() {
     User.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]),
     User.aggregate([{ $group: { _id: null, total: { $sum: '$coins' } } }]),
     CoinTransaction.aggregate([
-      { $match: { createdAt: { $gte: today }, status: 'completed' } },
+      { $match: { ...(rangeMatch ? rangeMatch : { createdAt: { $gte: today } }), status: 'completed' } },
       { $group: { _id: '$type', total: { $sum: '$coins' }, count: { $sum: 1 } } },
     ]),
     CoinTransaction.aggregate([
@@ -216,7 +221,7 @@ async function computeOverview() {
       },
     ]),
     CallHistory.aggregate([
-      { $match: { createdAt: { $gte: today }, ownerRole: 'user' } },
+      { $match: { ...(rangeMatch ? rangeMatch : { createdAt: { $gte: today } }), ownerRole: 'user' } },
       { $group: { _id: null, totalCalls: { $sum: 1 }, totalDurationSec: { $sum: '$durationSeconds' }, totalCoinsSpent: { $sum: '$coinsDeducted' } } },
     ]),
     CallHistory.countDocuments({ ownerRole: 'user' }),
@@ -231,12 +236,12 @@ async function computeOverview() {
         },
       },
     ]),
-    User.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
+    rangeMatch ? User.countDocuments({ createdAt: { $gte: from!, $lt: to! } }) : User.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
     User.countDocuments({ role: 'user', categories: { $exists: true, $ne: [] } }),
     User.countDocuments({ welcomeBonusClaimed: true }),
     Withdrawal.countDocuments({ status: 'pending' }),
     Withdrawal.aggregate([
-      { $match: { status: { $in: ['approved', 'paid'] }, createdAt: { $gte: thirtyDaysAgo } } },
+      { $match: { status: { $in: ['approved', 'paid'] }, ...(rangeMatch ? rangeMatch : { createdAt: { $gte: thirtyDaysAgo } }) } },
       { $group: { _id: null, total: { $sum: '$amount' } } },
     ]),
     SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } }),
@@ -317,6 +322,24 @@ async function computeOverview() {
       openTickets: openSupportTickets,
       highPriorityTickets: highPrioritySupportTickets,
     },
+    ...(rangeMatch
+      ? {
+          selectedRange: { from: fromIso!, to: toIso! },
+          rangeMetrics: {
+            users: { signups: recentSignups7d },
+            coins: parseCoinFlow(coinFlowToday),
+            calls: callToday,
+            withdrawals: {
+              totalCount: 0,
+              totalAmount: totalWithdrawn30d[0]?.total ?? 0,
+            },
+            support: {
+              totalCount: openSupportTickets,
+              highPriorityCount: highPrioritySupportTickets,
+            },
+          },
+        }
+      : {}),
     generatedAt: now.toISOString(),
   };
 }
@@ -557,6 +580,7 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
     const searchQuery = firstQueryString(query);
     const roleFilter = firstQueryString(role);
     const sortField = firstQueryString(sort);
+    const range = parseAdminDateRange(req);
 
     if (searchQuery && searchQuery.trim().length > ADMIN_USER_SEARCH_QUERY_MAX_LEN) {
       res.status(400).json({
@@ -580,10 +604,18 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
       (searchQuery && searchQuery.trim()) ||
       (roleFilter && roleFilter !== 'all') ||
       sortField ||
-      !!referrerAgentOid;
+      !!referrerAgentOid ||
+      range.hasRange;
 
     const data = hasFilters
-      ? await computeUsersAnalytics(searchQuery, roleFilter, sortField, referrerAgentOid)
+      ? await computeUsersAnalytics(
+          searchQuery,
+          roleFilter,
+          sortField,
+          referrerAgentOid,
+          range.hasRange ? range.from : undefined,
+          range.hasRange ? range.to : undefined
+        )
       : await getCachedOrCompute('users_analytics', () =>
           computeUsersAnalytics(undefined, undefined, undefined, undefined)
         );
@@ -599,7 +631,9 @@ async function computeUsersAnalytics(
   searchQuery?: string,
   roleFilter?: string,
   sortField?: string,
-  referrerAgentId?: mongoose.Types.ObjectId
+  referrerAgentId?: mongoose.Types.ObjectId,
+  from?: Date,
+  to?: Date
 ) {
   const filter: Record<string, unknown> = {};
   if (roleFilter && roleFilter !== 'all') filter.role = roleFilter;
@@ -609,6 +643,9 @@ async function computeUsersAnalytics(
   }
   if (referrerAgentId) {
     filter.referredBy = referrerAgentId;
+  }
+  if (from && to) {
+    filter.createdAt = { $gte: from, $lt: to };
   }
 
   const users = await User.find(filter)
@@ -657,15 +694,35 @@ async function computeUsersAnalytics(
 
   const [spendingAgg, creditAgg, callAgg, chatAgg, creatorExistence] = await Promise.all([
     CoinTransaction.aggregate([
-      { $match: { userId: { $in: userIds }, type: 'debit', status: 'completed' } },
+      {
+        $match: {
+          userId: { $in: userIds },
+          type: 'debit',
+          status: 'completed',
+          ...(from && to ? { createdAt: { $gte: from, $lt: to } } : {}),
+        },
+      },
       { $group: { _id: '$userId', totalSpent: { $sum: '$coins' }, txCount: { $sum: 1 } } },
     ]),
     CoinTransaction.aggregate([
-      { $match: { userId: { $in: userIds }, type: 'credit', status: 'completed' } },
+      {
+        $match: {
+          userId: { $in: userIds },
+          type: 'credit',
+          status: 'completed',
+          ...(from && to ? { createdAt: { $gte: from, $lt: to } } : {}),
+        },
+      },
       { $group: { _id: '$userId', totalCredited: { $sum: '$coins' } } },
     ]),
     CallHistory.aggregate([
-      { $match: { ownerUserId: { $in: userIds }, ownerRole: 'user' } },
+      {
+        $match: {
+          ownerUserId: { $in: userIds },
+          ownerRole: 'user',
+          ...(from && to ? { createdAt: { $gte: from, $lt: to } } : {}),
+        },
+      },
       { $group: { _id: '$ownerUserId', callCount: { $sum: 1 }, totalMinutes: { $sum: '$durationSeconds' } } },
     ]),
     ChatMessageQuota.aggregate([
@@ -827,7 +884,10 @@ export const getCoinEconomy = async (req: Request, res: Response): Promise<void>
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const data = await getCachedOrCompute('coins', computeCoinEconomy);
+    const range = parseAdminDateRange(req);
+    const data = range.hasRange
+      ? await computeCoinEconomy(range.from!, range.to!)
+      : await getCachedOrCompute('coins', () => computeCoinEconomy());
 
     res.json({ success: true, data });
   } catch (error) {
@@ -987,8 +1047,9 @@ export const updateWalletPricing = async (req: Request, res: Response): Promise<
   }
 };
 
-async function computeCoinEconomy() {
+async function computeCoinEconomy(from?: Date, to?: Date) {
   const thirtyDaysAgo = daysAgo(30);
+  const windowMatch = from && to ? { createdAt: { $gte: from, $lt: to } } : { createdAt: { $gte: thirtyDaysAgo } };
 
   const [
     totalInCirculation,
@@ -1004,7 +1065,7 @@ async function computeCoinEconomy() {
     CoinTransaction.aggregate([{ $match: { type: 'credit', status: 'completed' } }, { $group: { _id: null, total: { $sum: '$coins' }, count: { $sum: 1 } } }]),
     CoinTransaction.aggregate([{ $match: { type: 'debit', status: 'completed' } }, { $group: { _id: null, total: { $sum: '$coins' }, count: { $sum: 1 } } }]),
     CoinTransaction.aggregate([
-      { $match: { type: 'debit', status: 'completed', createdAt: { $gte: thirtyDaysAgo } } },
+      { $match: { type: 'debit', status: 'completed', ...windowMatch } },
       { $group: { _id: '$userId', totalSpent: { $sum: '$coins' }, txCount: { $sum: 1 } } },
       { $sort: { totalSpent: -1 } },
       { $limit: 10 },
@@ -1013,7 +1074,7 @@ async function computeCoinEconomy() {
       { $project: { userId: '$_id', totalSpent: 1, txCount: 1, username: '$user.username', email: '$user.email', role: '$user.role' } },
     ]),
     CoinTransaction.aggregate([
-      { $match: { type: 'credit', status: 'completed', createdAt: { $gte: thirtyDaysAgo } } },
+      { $match: { type: 'credit', status: 'completed', ...windowMatch } },
       { $group: { _id: '$userId', totalEarned: { $sum: '$coins' }, txCount: { $sum: 1 } } },
       { $sort: { totalEarned: -1 } },
       { $limit: 10 },
@@ -1022,12 +1083,12 @@ async function computeCoinEconomy() {
       { $project: { userId: '$_id', totalEarned: 1, txCount: 1, username: '$user.username', email: '$user.email', role: '$user.role' } },
     ]),
     CoinTransaction.aggregate([
-      { $match: { createdAt: { $gte: thirtyDaysAgo }, status: 'completed' } },
+      { $match: { ...windowMatch, status: 'completed' } },
       { $group: { _id: { date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, type: '$type' }, total: { $sum: '$coins' }, count: { $sum: 1 } } },
       { $sort: { '_id.date': 1 } },
     ]),
-    CoinTransaction.find({ coins: { $gt: 50 } }).sort({ createdAt: -1 }).limit(20).populate('userId', 'username email role').lean(),
-    CoinTransaction.find({ status: 'failed' }).sort({ createdAt: -1 }).limit(20).lean(),
+    CoinTransaction.find({ coins: { $gt: 50 }, ...windowMatch }).sort({ createdAt: -1 }).limit(20).populate('userId', 'username email role').lean(),
+    CoinTransaction.find({ status: 'failed', ...windowMatch }).sort({ createdAt: -1 }).limit(20).lean(),
   ]);
 
   const dailyFlowMap: Record<string, { credited: number; debited: number; creditCount: number; debitCount: number }> = {};
@@ -1068,6 +1129,7 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
     const anomalyOnly = req.query.anomaly === 'true';
+    const range = parseAdminDateRange(req);
 
     const filter: any = { ownerRole: 'user' };
     if (anomalyOnly) {
@@ -1075,6 +1137,9 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
         { durationSeconds: 0, coinsDeducted: { $gt: 0 } },
         { durationSeconds: { $lt: 5 }, coinsDeducted: { $gt: 10 } },
       ];
+    }
+    if (range.hasRange) {
+      filter.createdAt = { $gte: range.from, $lt: range.to };
     }
 
     const [calls, total] = await Promise.all([
@@ -1692,6 +1757,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
+    const range = parseAdminDateRange(req);
 
     const filter: any = {};
     if (statusFilter && ['pending', 'approved', 'rejected', 'paid'].includes(statusFilter)) {
@@ -1702,6 +1768,9 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
       filter.assignedAgentId = { $exists: true, $ne: null };
     } else if (hasAssignedAgent === 'false') {
       filter.$or = [{ assignedAgentId: null }, { assignedAgentId: { $exists: false } }];
+    }
+    if (range.hasRange) {
+      filter.createdAt = { $gte: range.from, $lt: range.to };
     }
 
     const [withdrawals, total] = await Promise.all([
@@ -1741,13 +1810,16 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
     );
 
     // Summary stats
+    const windowMatch = range.hasRange
+      ? { createdAt: { $gte: range.from, $lt: range.to } }
+      : { createdAt: { $gte: daysAgo(30) } };
     const [pendingCount, totalWithdrawn30d, topWithdrawingCreators] = await Promise.all([
-      Withdrawal.countDocuments({ status: 'pending' }),
+      Withdrawal.countDocuments({ status: 'pending', ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}) }),
       Withdrawal.aggregate([
         {
           $match: {
             status: { $in: ['approved', 'paid'] },
-            createdAt: { $gte: daysAgo(30) },
+            ...windowMatch,
           },
         },
         { $group: { _id: null, total: { $sum: '$amount' } } },
@@ -1756,7 +1828,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
         {
           $match: {
             status: { $in: ['approved', 'paid'] },
-            createdAt: { $gte: daysAgo(30) },
+            ...windowMatch,
           },
         },
         {
@@ -1951,6 +2023,7 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
+    const range = parseAdminDateRange(req);
 
     const filter: any = {};
     if (roleFilter && ['user', 'creator'].includes(roleFilter)) filter.role = roleFilter;
@@ -1962,6 +2035,9 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
         { reportedCreatorUserId: { $exists: true } },
         { reportedCreatorFirebaseUid: { $exists: true, $ne: null } },
       ];
+    }
+    if (range.hasRange) {
+      filter.createdAt = { $gte: range.from, $lt: range.to };
     }
 
     const [tickets, total] = await Promise.all([
@@ -2005,11 +2081,37 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
       unassigned,
       agingTickets,
     ] = await Promise.all([
-      SupportTicket.countDocuments({ role: 'user', status: { $in: ['open', 'in_progress'] } }),
-      SupportTicket.countDocuments({ role: 'creator', status: { $in: ['open', 'in_progress'] } }),
-      SupportTicket.countDocuments({ priority: { $in: ['high', 'urgent'] }, status: { $in: ['open', 'in_progress'] } }),
-      SupportTicket.countDocuments({ assignedAdminId: { $exists: false }, status: { $in: ['open', 'in_progress'] } }),
-      SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] }, createdAt: { $lt: twentyFourHoursAgo } }),
+      SupportTicket.countDocuments({
+        role: 'user',
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
+      }),
+      SupportTicket.countDocuments({
+        role: 'creator',
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
+      }),
+      SupportTicket.countDocuments({
+        priority: { $in: ['high', 'urgent'] },
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
+      }),
+      SupportTicket.countDocuments({
+        assignedAdminId: { $exists: false },
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
+      }),
+      SupportTicket.countDocuments({
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange
+          ? {
+              $and: [
+                { createdAt: { $gte: range.from, $lt: range.to } },
+                { createdAt: { $lt: twentyFourHoursAgo } },
+              ],
+            }
+          : { createdAt: { $lt: twentyFourHoursAgo } }),
+      }),
     ]);
 
     res.json({
