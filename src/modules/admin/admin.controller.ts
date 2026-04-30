@@ -139,7 +139,7 @@ async function getCachedOrCompute<T>(
 // ══════════════════════════════════════════════════════════════════════════
 export const getOverview = async (req: Request, res: Response): Promise<void> => {
   try {
-    await assertAdmin(req);
+    if (!(await assertAdmin(req, res))) return;
 
     const range = parseAdminDateRange(req);
     const data = range.hasRange
