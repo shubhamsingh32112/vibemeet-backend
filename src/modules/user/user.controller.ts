@@ -6,6 +6,7 @@ import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { DeletedUserPhone } from './deleted-user-phone.model';
+import { checkDeletedStatus, upsertDeletedIdentities } from './deleted-identity.service';
 import { tryClaimBonusInLedger } from './identity.service';
 import { randomUUID } from 'crypto';
 import { invalidateAdminCaches } from '../../config/redis';
@@ -485,6 +486,22 @@ export const deleteAccount = async (req: Request, res: Response): Promise<void> 
         console.error('⚠️ [USER] Failed to store deleted user phone:', phoneError);
         // Continue with deletion even if phone storage fails
       }
+    }
+
+    // Store email/phone identities to prevent re-claiming welcome bonus after deletion.
+    try {
+      await upsertDeletedIdentities({
+        email: user.email ?? null,
+        phone: user.phone ?? null,
+        welcomeBonusClaimed: user.welcomeBonusClaimed || false,
+        deletedAt: new Date(),
+      });
+      console.log(
+        `📝 [USER] Stored deleted identities (email: ${user.email ? 'yes' : 'no'}, phone: ${user.phone ? 'yes' : 'no'})`
+      );
+    } catch (identityError) {
+      console.error('⚠️ [USER] Failed to store deleted identities:', identityError);
+      // Continue with deletion even if identity storage fails
     }
 
     await Promise.all([
@@ -1606,6 +1623,18 @@ export const claimWelcomeBonus = async (req: Request, res: Response): Promise<vo
     // Only regular users can claim (not creators/admins)
     if (user.role !== 'user') {
       res.status(403).json({ success: false, error: 'Only regular users can claim welcome bonus' });
+      return;
+    }
+
+    // Backstop: previously deleted identities can never claim welcome bonus again.
+    const deletedStatus = await checkDeletedStatus({
+      email: (req.auth.email ?? user.email) ?? null,
+      phone: (req.auth.phone ?? user.phone) ?? null,
+    });
+    if (deletedStatus.isDeleted) {
+      user.welcomeBonusClaimed = true;
+      await user.save();
+      res.status(400).json({ success: false, error: 'Welcome bonus not available for returning accounts' });
       return;
     }
 

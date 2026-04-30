@@ -5,6 +5,7 @@ import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { checkBonusEligibility } from '../user/identity.service';
+import { checkDeletedStatus } from '../user/deleted-identity.service';
 import {
   assignReferralCodeToUser,
   applyReferralCode,
@@ -85,6 +86,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const firebaseUid = req.auth.firebaseUid;
     logDebug('Looking up user in database', { firebaseUid });
 
+    const deletedStatus = await checkDeletedStatus({
+      email: req.auth.email ?? null,
+      phone: req.auth.phone ?? null,
+    });
+    const showWelcomeBackDialog = deletedStatus.isDeleted;
+
     let user = await User.findOne({ firebaseUid });
 
       // ✅ Create user ONLY here (never in middleware)
@@ -108,7 +115,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           googleId: googleId ?? null,
           phone: req.auth.phone ?? null,
         });
-        const welcomeBonusClaimed = !welcomeBonusEligible;
+        const welcomeBonusClaimed = showWelcomeBackDialog ? true : !welcomeBonusEligible;
 
         // 🔥 CRITICAL: Only regular users can claim welcome bonus (not creators)
         // New users start with 0 coins - they get 30 free coins when they accept the welcome bonus popup
@@ -125,7 +132,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           categories: firstLoginProfile.categories,
           coins: 0, // ✅ New users start with 0 coins - 30 coins are added when they accept the welcome bonus popup
           freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
-          welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Set to true if phone number previously claimed bonus
+          welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Forced true for returning deleted identities
           onboardingStage: 'welcome',
           onboardingWelcomeSeenAt: null,
           onboardingBonusSeenAt: null,
@@ -163,6 +170,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           username: firstLoginProfile.username,
           categories: firstLoginProfile.categories,
           welcomeBonusClaimed: welcomeBonusClaimed,
+          showWelcomeBackDialog,
         });
     } else {
       // Keep older users smooth: backfill profile defaults if onboarding fields are missing.
@@ -216,9 +224,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         (req.auth.email && user.email !== req.auth.email) ||
         (req.auth.phone && user.phone !== req.auth.phone);
 
-      if (needsContactUpdate || profileBackfilled) {
+      const needsWelcomeBonusLock = showWelcomeBackDialog && !user.welcomeBonusClaimed;
+
+      if (needsContactUpdate || profileBackfilled || needsWelcomeBonusLock) {
         if (req.auth.email) user.email = req.auth.email;
         if (req.auth.phone) user.phone = req.auth.phone;
+        if (needsWelcomeBonusLock) user.welcomeBonusClaimed = true;
         await user.save();
         if (profileBackfilled) {
           logInfo('Backfilled existing user onboarding defaults', {
@@ -294,6 +305,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       createdNow,
       stage: onboardingState.stage,
       welcomeBonusClaimed: user.welcomeBonusClaimed,
+      showWelcomeBackDialog,
     });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
 
@@ -345,6 +357,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
           ...(referralApply !== undefined ? { referralApply } : {}),
+          meta: {
+            showWelcomeBackDialog,
+          },
         },
       });
     } else {
@@ -378,6 +393,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           needsOnboarding,
           createdNow,
           ...(referralApply !== undefined ? { referralApply } : {}),
+          meta: {
+            showWelcomeBackDialog,
+          },
         },
       });
     }
