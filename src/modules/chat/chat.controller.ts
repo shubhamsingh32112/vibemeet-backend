@@ -160,7 +160,23 @@ export const createOrGetChannel = async (
     const channelId = generateChannelId(currentUid, otherUid);
     const client = getStreamClient();
 
-    const correctName = otherStreamPayload.name;
+    // For user↔creator DMs, always title the channel with the creator's public name
+    // so Stream defaults / notifications match fan expectations regardless of who
+    // created the channel first (legacy behavior used "other" only, which could
+    // freeze the fan's username as channel name when the creator opened chat first).
+    const otherCreatorLike =
+      otherUser.role === 'creator' || otherUser.role === 'admin';
+    const currentCreatorLike =
+      currentUser.role === 'creator' || currentUser.role === 'admin';
+    const isUserCreatorPair =
+      (currentUser.role === 'user' && otherCreatorLike) ||
+      (otherUser.role === 'user' && currentCreatorLike);
+
+    const correctName = isUserCreatorPair
+      ? otherCreatorLike
+        ? otherStreamPayload.name
+        : currentStreamPayload.name
+      : otherStreamPayload.name;
 
     const channel = client.channel('messaging', channelId, {
       members: [currentUid, otherUid],

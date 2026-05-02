@@ -82,3 +82,20 @@ If `PUBLIC_API_BASE_URL` is missing, the backend may embed an incorrect `apiBase
 - Request queue timeouts `api.request_queue_timeout` > 0
 - Elevated `api.http_5xx`
 
+## 6) UPI missing in Razorpay checkout (troubleshooting)
+
+### Razorpay Dashboard (merchant)
+- Confirm **UPI** (and UPI Intent if you use it) is enabled for the account and not blocked by risk rules.
+- Domestic **INR** settlement and appropriate **MCC** affect which instruments appear.
+
+### User environment
+- **Web checkout** opens in the device browser (`externalApplication`). **iOS Safari** historically shows fewer UPI entry paths than **Android Chrome**; test both.
+- VPN, non-India IP, corporate DNS, ad blockers, or strict private mode can hide instruments or block `checkout.razorpay.com`.
+
+### Website (`WalletCheckout.tsx`)
+- Checkout uses Razorpay **Standard Checkout** with **default instruments only** (no custom `display.blocks`), so every user sees the same Razorpay UI and UPI appears whenever Razorpay + the merchant account expose it for that device.
+- If many users still lack UPI, inspect Razorpay **failed payments** and the `payment.failed` payload in browser devtools for that session.
+
+### Backend
+- `POST /payment/web/create-order` does not restrict payment methods on the Razorpay **order** object; instrument availability is decided by Razorpay + dashboard settings + client environment.
+
