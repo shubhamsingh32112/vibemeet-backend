@@ -49,15 +49,15 @@ const walletPricingConfigSchema = new Schema<IWalletPricingConfig>(
 );
 
 export const DEFAULT_WALLET_COIN_PACKAGES: IWalletCoinPack[] = [
-  { coins: 250, tier1PriceInr: 75, tier2PriceInr: 149, oldPriceInr: 149, badge: 'Flat 50% off', isActive: true, sortOrder: 1 },
-  { coins: 300, tier1PriceInr: 199, tier2PriceInr: 199, isActive: true, sortOrder: 2 },
-  { coins: 350, tier1PriceInr: 299, tier2PriceInr: 299, isActive: true, sortOrder: 3 },
-  { coins: 550, tier1PriceInr: 499, tier2PriceInr: 499, isActive: true, sortOrder: 4 },
-  { coins: 850, tier1PriceInr: 799, tier2PriceInr: 799, isActive: true, sortOrder: 5 },
-  { coins: 1400, tier1PriceInr: 999, tier2PriceInr: 999, isActive: true, sortOrder: 6 },
-  { coins: 3500, tier1PriceInr: 2099, tier2PriceInr: 2099, isActive: true, sortOrder: 7 },
-  { coins: 7500, tier1PriceInr: 3999, tier2PriceInr: 3999, isActive: true, sortOrder: 8 },
-  { coins: 11500, tier1PriceInr: 7999, tier2PriceInr: 7999, isActive: true, sortOrder: 9 },
+  { coins: 250, tier1PriceInr: 75, tier2PriceInr: 149, oldPriceInr: 149, isActive: true, sortOrder: 1 },
+  { coins: 300, tier1PriceInr: 199, tier2PriceInr: 199, oldPriceInr: 399, isActive: true, sortOrder: 2 },
+  { coins: 350, tier1PriceInr: 299, tier2PriceInr: 299, oldPriceInr: 599, isActive: true, sortOrder: 3 },
+  { coins: 550, tier1PriceInr: 499, tier2PriceInr: 499, oldPriceInr: 999, isActive: true, sortOrder: 4 },
+  { coins: 850, tier1PriceInr: 799, tier2PriceInr: 799, oldPriceInr: 1599, isActive: true, sortOrder: 5 },
+  { coins: 1400, tier1PriceInr: 999, tier2PriceInr: 999, oldPriceInr: 1999, isActive: true, sortOrder: 6 },
+  { coins: 3500, tier1PriceInr: 2099, tier2PriceInr: 2099, oldPriceInr: 4199, isActive: true, sortOrder: 7 },
+  { coins: 7500, tier1PriceInr: 3999, tier2PriceInr: 3999, oldPriceInr: 7999, isActive: true, sortOrder: 8 },
+  { coins: 11500, tier1PriceInr: 7999, tier2PriceInr: 7999, oldPriceInr: 15999, isActive: true, sortOrder: 9 },
 ];
 
 export const WalletPricingConfig = mongoose.model<IWalletPricingConfig>(
