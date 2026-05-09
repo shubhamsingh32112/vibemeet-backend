@@ -8,6 +8,8 @@ import {
   getRedis,
   callSessionKey,
   callUserCoinsKey,
+  callUserIntroMicrosKey,
+  callUserWalletMicrosKey,
   callCreatorEarningsKey,
   ACTIVE_BILLING_CALLS_KEY,
   activeCallByUserKey,
@@ -28,6 +30,7 @@ import { retryWithBackoff } from '../../utils/retry';
 import { dlqBillingKey, DLQ_BILLING_TTL } from '../../config/redis';
 import { addToDLQSet } from './billing-reconciliation';
 import { pricingService } from '../video/pricing.service';
+import { Call } from '../video/call.model';
 import {
   BILLING_PROCESS_INTERVAL_MS,
   BILLING_SESSION_SCHEMA_VERSION,
@@ -72,6 +75,14 @@ const BILLING_SESSION_START_LOCK_PREFIX = 'billing:start_lock:';
 const BILLING_SESSION_START_LOCK_TTL_SECONDS = 30;
 function billingSessionStartLockKey(callId: string): string {
   return `${BILLING_SESSION_START_LOCK_PREFIX}${callId}`;
+}
+
+const CALLPAIR_LOCK_PREFIX = 'callpair:';
+function callpairKey(uid1: string, uid2: string): string {
+  const a = String(uid1 || '');
+  const b = String(uid2 || '');
+  const [min, max] = a <= b ? [a, b] : [b, a];
+  return `${CALLPAIR_LOCK_PREFIX}${min}:${max}`;
 }
 
 const RELEASE_BILLING_CYCLE_LOCK_LUA = `
@@ -186,6 +197,8 @@ async function refreshActiveCallSlotsTtl(
   await Promise.all([
     redis.expire(activeCallByUserKey(userFirebaseUid), ACTIVE_CALL_BY_USER_TTL),
     redis.expire(activeCallByUserKey(creatorFirebaseUid), ACTIVE_CALL_BY_USER_TTL),
+    // Keep pair lock alive during active billing.
+    redis.expire(callpairKey(userFirebaseUid, creatorFirebaseUid), CALL_SESSION_TTL),
   ]);
 }
 
@@ -217,11 +230,23 @@ export type BillingTickResult =
 
 export interface CallSession {
   schemaVersion: number;
+  billingVersion?: number;
+  /** Snapshot at billing start — never overwritten mid-call */
+  initialIntroMicros?: number;
+  initialWalletMicros?: number;
+  /** Frozen rate for this session (equals pricePerSecondMicros at start) */
+  billingPricePerSecondMicros?: number;
+  introPromoActive?: boolean;
+  introPromoSessionId?: string;
+  totalIntroDeductedMicros?: number;
+  totalWalletDeductedMicros?: number;
   callId: string;
   userFirebaseUid: string;
   creatorFirebaseUid: string;
   userMongoId: string;
   creatorMongoId: string;
+  initiatedByFirebaseUid?: string;
+  initiatedByRole?: 'user' | 'creator' | 'admin';
   pricePerMinute: number;
   /** Integer micro-coins charged from user per second */
   pricePerSecondMicros: number;
@@ -259,21 +284,40 @@ function emitSoon(fn: () => void): void {
   });
 }
 
+export function normalizeV4SessionFields(session: CallSession): void {
+  session.billingVersion = session.billingVersion ?? 1;
+  session.introPromoActive = session.introPromoActive ?? false;
+  session.introPromoSessionId = session.introPromoSessionId ?? session.callId;
+  session.initialIntroMicros = session.initialIntroMicros ?? 0;
+  session.initialWalletMicros = session.initialWalletMicros ?? 0;
+  session.billingPricePerSecondMicros =
+    session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
+  session.totalIntroDeductedMicros = session.totalIntroDeductedMicros ?? 0;
+  session.totalWalletDeductedMicros = session.totalWalletDeductedMicros ?? 0;
+}
+
 function migrateSession(
   raw: Record<string, unknown>,
   coinsRaw: string | null,
   earningsRaw: string | null
-): { session: CallSession; balanceMicros: number; earningsMicros: number } {
+): { session: CallSession; earningsMicros: number } {
   const v = Number(raw.schemaVersion) || 0;
-  let balanceMicros: number;
   let earningsMicros: number;
 
   if (v >= BILLING_SESSION_SCHEMA_VERSION) {
-    balanceMicros = Math.max(0, parseInt(String(coinsRaw ?? '0'), 10) || 0);
     earningsMicros = Math.max(0, parseInt(String(earningsRaw ?? '0'), 10) || 0);
     const session = raw as unknown as CallSession;
-    return { session, balanceMicros, earningsMicros };
+    normalizeV4SessionFields(session);
+    return { session, earningsMicros };
   }
+
+  if (v === 3 || v === 2) {
+    earningsMicros = Math.max(0, parseInt(String(earningsRaw ?? '0'), 10) || 0);
+    const session = { ...raw, schemaVersion: BILLING_SESSION_SCHEMA_VERSION } as unknown as CallSession;
+    normalizeV4SessionFields(session);
+    return { session, earningsMicros };
+  }
+
 
   // v1 migration
   const pricePerSecond = Number(raw.pricePerSecond) || 0;
@@ -286,9 +330,6 @@ function migrateSession(
   const elapsedSeconds = Math.max(0, Math.floor(Number(raw.elapsedSeconds) || 0));
   const startTime = Number(raw.startTime) || Date.now();
   const lastProcessedAt = startTime + elapsedSeconds * 1000;
-
-  const coinsFloat = parseFloat(String(coinsRaw ?? '0')) || 0;
-  balanceMicros = Math.max(0, Math.round(coinsFloat * COIN_MICROS));
 
   const eRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
   earningsMicros = Math.max(0, Math.round((eRaw * COIN_MICROS) / LEGACY_EARNINGS_MICRO_FACTOR));
@@ -326,7 +367,10 @@ function migrateSession(
         : undefined,
   };
 
-  return { session, balanceMicros, earningsMicros };
+  normalizeV4SessionFields(session);
+  void coinsRaw;
+
+  return { session, earningsMicros };
 }
 
 function buildSessionFromCheckpoint(
@@ -380,6 +424,8 @@ function buildSessionFromCheckpoint(
     expectedNextTickAtMs: lastProcessedAtMs + BILLING_PROCESS_INTERVAL_MS,
   };
 
+  normalizeV4SessionFields(session);
+
   return {
     session,
     balanceMicros: remainingUserBalanceMicros,
@@ -404,11 +450,18 @@ export class BillingService {
       creatorFirebaseUid: string;
       creatorMongoId: string;
     },
-    opts?: { source?: BillingSessionStartSource; requestReceivedAtMs?: number }
+    opts?: {
+      source?: BillingSessionStartSource;
+      requestReceivedAtMs?: number;
+      initiatedByFirebaseUid?: string;
+      initiatedByRole?: 'user' | 'creator' | 'admin';
+    }
   ): Promise<void> {
     const redis = getRedis();
     const { callId, creatorFirebaseUid, creatorMongoId } = data;
     const source: BillingSessionStartSource = opts?.source ?? 'unknown';
+    const initiatedByFirebaseUid = opts?.initiatedByFirebaseUid;
+    const initiatedByRole = opts?.initiatedByRole;
     const callIdPrefix = callId.length > 16 ? callId.slice(0, 16) : callId;
     const startLockToken = randomUUID();
     const startLockKey = billingSessionStartLockKey(callId);
@@ -455,6 +508,19 @@ export class BillingService {
       return;
     }
 
+    // Pair anti-race lock: prevents dual billing sessions for the same user↔creator pair.
+    const pairKey = callpairKey(userFirebaseUid, creatorFirebaseUid);
+    const pairLock = await redis.set(pairKey, callId, 'EX', CALL_SESSION_TTL, 'NX');
+    if (pairLock !== 'OK') {
+      recordBillingMetric('session_start_callpair_conflict', 1, { source, callIdPrefix });
+      io.to(`user:${userFirebaseUid}`).emit('billing:error', {
+        callId,
+        error: 'CALLPAIR_CONFLICT',
+        message: 'A call is already being started with this creator/user. Please try again.',
+      });
+      return;
+    }
+
     const slotReserve = await tryReserveActiveCallSlotsWithOrphanRetry(
       redis,
       callId,
@@ -481,6 +547,19 @@ export class BillingService {
     try {
     const user = await User.findOne({ firebaseUid: userFirebaseUid });
     if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
+    if (user.role !== 'user') {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      slotsToReleaseOnFailure = false;
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: 'unknown',
+        creatorReason: 'unknown',
+        userPayload: { message: 'Invalid call participants.' },
+      }).catch(() => {});
+      return;
+    }
 
     let creator = await Creator.findById(creatorMongoId);
     if (!creator) {
@@ -488,24 +567,54 @@ export class BillingService {
     }
     if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
 
-    const pricing = pricingService.snapshotFromLoadedCreator(creator);
-    void pricingService.warmSnapshotCache(creator._id.toString(), pricing);
-    const pricePerSecondMicros = pricing.pricePerSecondMicros;
-    const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
-
-    const balanceMicros = coinsWholeToMicros(user.coins);
-    const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
-    if (balanceMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
+    // Server-authoritative validation: creatorMongoId must belong to creatorFirebaseUid.
+    // Also prevents creator↔creator and spoofed payout attempts.
+    const creatorUser = await User.findById(creator.userId).select('firebaseUid role').lean();
+    const creatorUserFirebaseUid = creatorUser?.firebaseUid || '';
+    const creatorUserRole = creatorUser?.role || null;
+    const creatorRoleOk = creatorUserRole === 'creator' || creatorUserRole === 'admin';
+    if (!creatorRoleOk || !creatorUserFirebaseUid || creatorUserFirebaseUid !== creatorFirebaseUid) {
       await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
       slotsToReleaseOnFailure = false;
       void forceTerminateCall(io, {
         callId,
         userFirebaseUid,
         creatorFirebaseUid,
-        reason: balanceMicros < minEntryMicros ? 'min_coins_not_met' : 'insufficient_coins',
+        reason: 'unknown',
+        creatorReason: 'unknown',
+        userPayload: { message: 'Invalid call participants.' },
+      }).catch(() => {});
+      recordBillingMetric('session_start_invalid_participants', 1, {
+        callIdPrefix,
+        source,
+      });
+      return;
+    }
+
+    const pricing = pricingService.snapshotFromLoadedCreator(creator);
+    void pricingService.warmSnapshotCache(creator._id.toString(), pricing);
+    const pricePerSecondMicros = pricing.pricePerSecondMicros;
+    const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
+
+    const introCreditsLive = Number((user as { introFreeCallCredits?: number }).introFreeCallCredits) || 0;
+    const consumedAt = (user as { welcomeFreeCallConsumedAt?: Date | null }).welcomeFreeCallConsumedAt;
+    const introPromoActive =
+      user.role === 'user' && !consumedAt && introCreditsLive > 0;
+    const initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
+    const initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
+    const spendableMicros = initialIntroMicros + initialWalletMicros;
+    const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
+    if (spendableMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      slotsToReleaseOnFailure = false;
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: spendableMicros < minEntryMicros ? 'min_coins_not_met' : 'insufficient_coins',
         creatorReason: 'user_out_of_coins',
         userPayload: {
-          remainingCoins: user.coins,
+          remainingCoins: microsToWholeCoinsFloor(spendableMicros),
           minCoinsRequired: MIN_COINS_TO_CALL,
         },
       }).catch((err) => {
@@ -523,20 +632,31 @@ export class BillingService {
     const userLimit =
       (user as { maxCallDurationSeconds?: number }).maxCallDurationSeconds ??
       DEFAULT_USER_CALL_DURATION_SECONDS;
-    const effectiveDurationLimitSeconds = Math.min(
-      creatorLimit,
-      userLimit,
-      MAX_CALL_DURATION_SECONDS
-    );
+    const platformCapSeconds = Math.min(creatorLimit, userLimit, MAX_CALL_DURATION_SECONDS);
+    let effectiveDurationLimitSeconds = platformCapSeconds;
+    if (introPromoActive && pricePerSecondMicros > 0) {
+      const promoSeconds = Math.floor(initialIntroMicros / pricePerSecondMicros);
+      effectiveDurationLimitSeconds = Math.min(platformCapSeconds, promoSeconds);
+    }
 
     const startTime = Date.now();
     const session: CallSession = {
       schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+      billingVersion: 1,
+      initialIntroMicros,
+      initialWalletMicros,
+      billingPricePerSecondMicros: pricePerSecondMicros,
+      introPromoActive,
+      introPromoSessionId: callId,
+      totalIntroDeductedMicros: 0,
+      totalWalletDeductedMicros: 0,
       callId,
       userFirebaseUid,
       creatorFirebaseUid,
       userMongoId: user._id.toString(),
       creatorMongoId: creator._id.toString(),
+      initiatedByFirebaseUid,
+      initiatedByRole,
       pricePerMinute: pricing.pricePerMinute,
       pricePerSecondMicros,
       creatorEarningsPerSecondMicros,
@@ -551,20 +671,41 @@ export class BillingService {
       lastCheckpointAtMs: 0,
       expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
     };
+    normalizeV4SessionFields(session);
+
+    // Best-effort durable metadata: persist initiator into Mongo Call record for recovery/analytics.
+    // Do not block billing on this write.
+    void Call.updateOne(
+      { callId },
+      {
+        $setOnInsert: {
+          callId,
+          callerUserId: user._id,
+          creatorUserId: creator.userId,
+          status: 'ringing',
+        },
+        ...(initiatedByFirebaseUid ? { $set: { initiatedByFirebaseUid } } : {}),
+        ...(initiatedByRole ? { $set: { initiatedByRole } } : {}),
+      },
+      { upsert: true }
+    ).catch(() => {});
 
     try {
-      recordBillingMetric('redis_ops', 3, { callId, path: 'session_seed' });
+      recordBillingMetric('redis_ops', 5, { callId, path: 'session_seed' });
       await redis
         .multi()
         .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
-        .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+        .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(initialIntroMicros))
+        .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
         .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
         .exec();
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
       logInfo('Billing session started - Redis keys seeded', {
         callId,
-        initialBalanceMicros: balanceMicros,
+        introPromoActive,
+        initialIntroMicros,
+        initialWalletMicros,
         billingStartSource: source,
       });
     } catch (redisError) {
@@ -585,14 +726,16 @@ export class BillingService {
     slotsToReleaseOnFailure = false;
 
     const maxSeconds =
-      pricePerSecondMicros > 0
-        ? Math.floor(balanceMicros / pricePerSecondMicros)
-        : 0;
+      pricePerSecondMicros > 0 ? Math.floor(spendableMicros / pricePerSecondMicros) : 0;
     const serverTimestamp = Date.now();
 
     io.to(`user:${userFirebaseUid}`).emit('billing:started', {
       callId,
       coins: user.coins,
+      introCreditsRemainingApprox: introPromoActive
+        ? microsToWholeCoinsFloor(initialIntroMicros)
+        : 0,
+      introPromoActive,
       pricePerSecond: pricing.pricePerSecondMicros / COIN_MICROS,
       pricePerSecondMicros: pricing.pricePerSecondMicros,
       maxSeconds,
@@ -639,7 +782,7 @@ export class BillingService {
           creatorFirebaseUid: session.creatorFirebaseUid,
           startTimeMs: session.startTime,
           lastProcessedAtMs: session.lastProcessedAt,
-          remainingUserBalanceMicros: balanceMicros,
+          remainingUserBalanceMicros: spendableMicros,
           pricePerSecondMicros: session.pricePerSecondMicros,
           creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
           totalDeductedMicros: session.totalDeductedMicros,
@@ -797,10 +940,10 @@ export class BillingService {
       }
 
       let session: CallSession;
-      let balanceMicros = 0;
+      let introMicros = 0;
+      let walletMicros = 0;
       let earningsMicros = 0;
       let parsed: Record<string, unknown> = {};
-      let coinsRaw: string | null = null;
       let earningsRaw: string | null = null;
 
       if (!sessionRaw) {
@@ -819,56 +962,83 @@ export class BillingService {
           return 'stop_no_session';
         }
         session = reconstructed.session;
-        balanceMicros = reconstructed.balanceMicros;
+        const rem = reconstructed.balanceMicros;
+        introMicros = 0;
+        walletMicros = rem;
         earningsMicros = reconstructed.earningsMicros;
+        normalizeV4SessionFields(session);
       } else {
         parsed = JSON.parse(sessionRaw) as Record<string, unknown>;
-        [coinsRaw, earningsRaw] = await Promise.all([
+        const [introRaw, walletRaw, legacyMerged, earningsR] = await Promise.all([
+          redis.get(callUserIntroMicrosKey(callId)),
+          redis.get(callUserWalletMicrosKey(callId)),
           redis.get(callUserCoinsKey(callId)),
           redis.get(callCreatorEarningsKey(callId)),
         ]);
+        earningsRaw = earningsR;
 
-        const migrated = migrateSession(parsed, coinsRaw as string | null, earningsRaw as string | null);
+        if (introRaw !== null || walletRaw !== null) {
+          introMicros = Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0);
+          walletMicros = Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+        } else if (legacyMerged !== null && legacyMerged !== undefined) {
+          walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
+          introMicros = 0;
+        }
+
+        const migrated = migrateSession(
+          parsed,
+          legacyMerged ?? null,
+          earningsRaw as string | null
+        );
         session = migrated.session;
-        balanceMicros = migrated.balanceMicros;
         earningsMicros = migrated.earningsMicros;
 
         if (
           featureFlags.billingDeltaCursorV3Enabled &&
-          (coinsRaw === null || earningsRaw === null)
+          (introRaw === null || walletRaw === null || earningsRaw === null)
         ) {
           const checkpoint = await getBillingCheckpoint(callId);
           const reconstructed = checkpoint
             ? buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId)
             : null;
           if (reconstructed) {
-            balanceMicros = reconstructed.balanceMicros;
+            const rem = reconstructed.balanceMicros;
+            introMicros = 0;
+            walletMicros = rem;
             earningsMicros = reconstructed.earningsMicros;
             session.lastProcessedAt = reconstructed.session.lastProcessedAt;
             session.totalDeductedMicros = reconstructed.session.totalDeductedMicros;
             session.totalEarnedMicros = reconstructed.session.totalEarnedMicros;
             session.version = Math.max(session.version, reconstructed.session.version);
+            normalizeV4SessionFields(session);
           }
         }
       }
+
+      let balanceMicros = introMicros + walletMicros;
+      normalizeV4SessionFields(session);
+      const introPromoBilling = session.introPromoActive === true;
 
       if (
         sessionRaw &&
         (parsed.schemaVersion === undefined ||
           Number(parsed.schemaVersion) < BILLING_SESSION_SCHEMA_VERSION)
       ) {
-        recordBillingMetric('redis_ops', 5, { callId, path: 'session_migration' });
+        recordBillingMetric('redis_ops', 7, { callId, path: 'session_migration' });
         await redis
           .multi()
           .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
-          .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+          .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(introMicros))
+          .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(walletMicros))
           .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros))
           .exec();
+        await redis.del(callUserCoinsKey(callId)).catch(() => {});
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_migration' });
       }
 
-      const pricePerSecondMicros = session.pricePerSecondMicros;
+      const pricePerSecondMicros =
+        session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
       const creatorEarningsPerSecondMicros = session.creatorEarningsPerSecondMicros;
       const previousDeductedMicros = session.totalDeductedMicros;
       const previousEarnedMicros = session.totalEarnedMicros;
@@ -896,20 +1066,23 @@ export class BillingService {
         return 'tick_ok';
       }
 
+      const activeSpendMicros = introPromoBilling ? introMicros : walletMicros;
+
       const potentialDeduct = Math.floor((deltaMs * pricePerSecondMicros) / 1000);
-      const actualDeduct = Math.min(potentialDeduct, balanceMicros);
+      const actualDeduct = Math.min(potentialDeduct, activeSpendMicros);
 
       if (actualDeduct <= 0) {
-        if (balanceMicros < pricePerSecondMicros) {
+        if (activeSpendMicros < pricePerSecondMicros) {
+          const userReason = introPromoBilling ? 'intro_promo_exhausted' : 'insufficient_coins';
           emitSoon(() => {
             void forceTerminateCall(io, {
               callId,
               userFirebaseUid: session.userFirebaseUid,
               creatorFirebaseUid: session.creatorFirebaseUid,
-              reason: 'insufficient_coins',
+              reason: userReason,
               creatorReason: 'user_out_of_coins',
               userPayload: {
-                remainingCoins: microsToWholeCoinsFloor(balanceMicros),
+                remainingCoins: microsToWholeCoinsFloor(introMicros + walletMicros),
               },
             }).catch((err) => {
               logError('Failed force termination for insufficient balance', err, { callId });
@@ -923,7 +1096,14 @@ export class BillingService {
       const timeCoveredMs = Math.floor((actualDeduct * 1000) / pricePerSecondMicros);
       const earnMicros = Math.floor((timeCoveredMs * creatorEarningsPerSecondMicros) / 1000);
 
-      balanceMicros -= actualDeduct;
+      if (introPromoBilling) {
+        introMicros -= actualDeduct;
+        session.totalIntroDeductedMicros = (session.totalIntroDeductedMicros ?? 0) + actualDeduct;
+      } else {
+        walletMicros -= actualDeduct;
+        session.totalWalletDeductedMicros = (session.totalWalletDeductedMicros ?? 0) + actualDeduct;
+      }
+      balanceMicros = introMicros + walletMicros;
       earningsMicros += earnMicros;
       session.lastProcessedAt += timeCoveredMs;
       session.totalDeductedMicros += actualDeduct;
@@ -1043,10 +1223,11 @@ export class BillingService {
 
       const redisWriteStartedAt = Date.now();
       try {
-        recordBillingMetric('redis_ops', 5, { callId, path: 'tick_persist' });
+        recordBillingMetric('redis_ops', 7, { callId, path: 'tick_persist' });
         await redis
           .multi()
-          .setex(callUserCoinsKey(callId), CALL_SESSION_TTL, String(balanceMicros))
+          .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(introMicros))
+          .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(walletMicros))
           .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros))
           .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
           .exec();
@@ -1082,7 +1263,8 @@ export class BillingService {
       const nowMs = Date.now();
       const timeSinceLastEmit = nowMs - (session.lastEmitAtMs || 0);
       const isEmitDue = session.lastEmitAtMs === undefined || timeSinceLastEmit >= emitIntervalMs;
-      const isLowBalance = balanceMicros < pricePerSecondMicros * 3;
+      const activeRemain = introPromoBilling ? introMicros : walletMicros;
+      const isLowBalance = activeRemain < pricePerSecondMicros * 3;
       const shouldEmitUpdate =
         (isEmitDue || isLowBalance) && redisWriteMs <= backpressureMs && activeStage < 3;
 
@@ -1102,6 +1284,7 @@ export class BillingService {
             durationLimit: effectiveLimit,
             serverTimestamp,
             callStartTime: session.startTime,
+            introPromoActive: introPromoBilling,
             pricePerSecondMicros,
           });
 
@@ -1123,13 +1306,13 @@ export class BillingService {
         });
       }
 
-      if (balanceMicros < pricePerSecondMicros) {
+      if (activeRemain < pricePerSecondMicros) {
         emitSoon(() => {
           void forceTerminateCall(io, {
             callId,
             userFirebaseUid: session.userFirebaseUid,
             creatorFirebaseUid: session.creatorFirebaseUid,
-            reason: 'insufficient_coins',
+            reason: introPromoBilling ? 'intro_promo_exhausted' : 'insufficient_coins',
             creatorReason: 'user_out_of_coins',
             userPayload: {
               remainingCoins: microsToWholeCoinsFloor(balanceMicros),

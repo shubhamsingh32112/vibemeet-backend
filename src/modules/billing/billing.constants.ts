@@ -79,7 +79,7 @@ function readBillingCycleLockTtlMs(): number {
 
 export const BILLING_CYCLE_LOCK_TTL_MS = readBillingCycleLockTtlMs();
 
-export const BILLING_SESSION_SCHEMA_VERSION = 3;
+export const BILLING_SESSION_SCHEMA_VERSION = 4;
 
 const DEFAULT_BILLING_EMIT_INTERVAL_MS = 1000;
 const MIN_BILLING_EMIT_INTERVAL_MS = 250;

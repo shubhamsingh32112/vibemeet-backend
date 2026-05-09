@@ -20,6 +20,7 @@ export interface ICallHistory extends Document {
   otherAvatar?: string;              // Avatar URL/path of the other party
   otherFirebaseUid: string;          // Firebase UID of the other party (for chat channel creation)
   ownerRole: 'user' | 'creator';    // Role of the owner in this call
+  direction?: 'incoming' | 'outgoing'; // Relative to owner (durable; do not derive dynamically)
   durationSeconds: number;           // Call duration in seconds
   coinsDeducted: number;             // Coins deducted (user) or 0 (creator)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
@@ -71,6 +72,12 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: String,
       enum: ['user', 'creator'],
       required: true,
+    },
+    direction: {
+      type: String,
+      enum: ['incoming', 'outgoing'],
+      sparse: true,
+      index: true,
     },
     durationSeconds: {
       type: Number,

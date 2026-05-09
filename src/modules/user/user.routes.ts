@@ -8,7 +8,6 @@ import {
   searchUsers,
   promoteToCreator,
   addCoins,
-  claimWelcomeBonus,
   advanceOnboardingStage,
   submitOnboardingPermissionsDecision,
   reconcileOnboardingPermissionsStatus,
@@ -33,7 +32,6 @@ router.get('/list', verifyFirebaseToken, getAllUsers);
 router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search users
 router.put('/profile', verifyFirebaseToken, updateProfile);
 router.post('/coins', verifyFirebaseToken, addCoins); // Add coins to user account
-router.post('/welcome-bonus', verifyFirebaseToken, claimWelcomeBonus); // Claim 30 coin welcome bonus (new users only)
 router.post('/onboarding/stage', verifyFirebaseToken, advanceOnboardingStage);
 router.post(
   '/onboarding/permissions-decision',

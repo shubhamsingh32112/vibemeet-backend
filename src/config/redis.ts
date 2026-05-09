@@ -122,16 +122,29 @@ export const AVAILABILITY_KEY_PREFIX = 'creator:availability:';
 export const availabilityKey = (firebaseUid: string): string =>
   `${AVAILABILITY_KEY_PREFIX}${firebaseUid}`;
 
+/** Epoch ms when creator Redis presence last flipped busy → online (for daily online-time stats). */
+export const creatorAvailOnlineSinceKey = (firebaseUid: string): string =>
+  `creator:avail_online_since:${firebaseUid}`;
+
 // Call billing Redis key helpers
 export const CALL_SESSION_PREFIX = 'call:session:';
 export const CALL_USER_COINS_PREFIX = 'call:user_coins:';
+export const CALL_USER_INTRO_MICROS_PREFIX = 'call:user_intro_micros:';
+export const CALL_USER_WALLET_MICROS_PREFIX = 'call:user_wallet_micros:';
 export const CALL_CREATOR_EARNINGS_PREFIX = 'call:creator_earnings:';
 
 export const callSessionKey = (callId: string): string =>
   `${CALL_SESSION_PREFIX}${callId}`;
 
+/** @deprecated Legacy merged balance; prefer callUserIntroMicrosKey + callUserWalletMicrosKey. */
 export const callUserCoinsKey = (callId: string): string =>
   `${CALL_USER_COINS_PREFIX}${callId}`;
+
+export const callUserIntroMicrosKey = (callId: string): string =>
+  `${CALL_USER_INTRO_MICROS_PREFIX}${callId}`;
+
+export const callUserWalletMicrosKey = (callId: string): string =>
+  `${CALL_USER_WALLET_MICROS_PREFIX}${callId}`;
 
 export const callCreatorEarningsKey = (callId: string): string =>
   `${CALL_CREATOR_EARNINGS_PREFIX}${callId}`;

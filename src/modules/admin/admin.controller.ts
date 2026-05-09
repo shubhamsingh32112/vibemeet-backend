@@ -11,7 +11,8 @@ import {
   ChatMessageQuota,
   FREE_MESSAGES_PER_CREATOR,
 } from '../chat/chat-message-quota.model';
-import { CREATOR_TASKS } from '../creator/creator-tasks.config';
+import { getCurrentChatQuotaPeriodStart } from '../chat/chat-quota-period.util';
+import { CREATOR_TASKS, getDailyPeriodBounds } from '../creator/creator-tasks.config';
 import {
   getRedis,
   adminCacheKey,
@@ -25,6 +26,7 @@ import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { normalizeGalleryImages } from '../creator/creator-gallery-resolve';
+import { CreatorDailyOnline } from '../availability/creator-daily-online.model';
 import {
   buildPublicGalleryDownloadUrl,
   createCreatorGallerySignedUpload,
@@ -177,12 +179,13 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
     chatQuotaStats,
     recentSignups7d,
     onboardedUsers,
-    welcomeBonusClaimed,
+    // Bonus program removed.
     // Phase 2+3: Withdrawal & Support stats in overview
     pendingWithdrawals,
     totalWithdrawn30d,
     openSupportTickets,
     highPrioritySupportTickets,
+    creatorsOnlineTodayRows,
   ] = await Promise.all([
     User.countDocuments({ role: 'user' }),
     Creator.countDocuments({}),
@@ -225,20 +228,23 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
       { $group: { _id: null, totalCalls: { $sum: 1 }, totalDurationSec: { $sum: '$durationSeconds' }, totalCoinsSpent: { $sum: '$coinsDeducted' } } },
     ]),
     CallHistory.countDocuments({ ownerRole: 'user' }),
-    ChatMessageQuota.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalChannels: { $sum: 1 },
-          totalFreeMessages: { $sum: '$freeMessagesSent' },
-          totalPaidMessages: { $sum: '$paidMessagesSent' },
-          exhaustedQuotas: { $sum: { $cond: [{ $gte: ['$freeMessagesSent', FREE_MESSAGES_PER_CREATOR] }, 1, 0] } },
+    (() => {
+      const periodStart = getCurrentChatQuotaPeriodStart();
+      return ChatMessageQuota.aggregate([
+        { $match: { freeQuotaPeriodStart: periodStart } },
+        {
+          $group: {
+            _id: null,
+            totalChannels: { $sum: 1 },
+            totalFreeMessages: { $sum: '$freeMessagesSent' },
+            totalPaidMessages: { $sum: '$paidMessagesSent' },
+            exhaustedQuotas: { $sum: { $cond: [{ $gte: ['$freeMessagesSent', FREE_MESSAGES_PER_CREATOR] }, 1, 0] } },
+          },
         },
-      },
-    ]),
+      ]);
+    })(),
     rangeMatch ? User.countDocuments({ createdAt: { $gte: from!, $lt: to! } }) : User.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
     User.countDocuments({ role: 'user', categories: { $exists: true, $ne: [] } }),
-    User.countDocuments({ welcomeBonusClaimed: true }),
     Withdrawal.countDocuments({ status: 'pending' }),
     Withdrawal.aggregate([
       { $match: { status: { $in: ['approved', 'paid'] }, ...(rangeMatch ? rangeMatch : { createdAt: { $gte: thirtyDaysAgo } }) } },
@@ -246,6 +252,28 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
     ]),
     SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } }),
     SupportTicket.countDocuments({ priority: { $in: ['high', 'urgent'] }, status: { $in: ['open', 'in_progress'] } }),
+    (async () => {
+      const { periodStart } = getDailyPeriodBounds();
+      const topOnline = await CreatorDailyOnline.find({ periodStart })
+        .sort({ onlineSeconds: -1 })
+        .limit(50)
+        .lean();
+      const uids = topOnline.map((t) => t.creatorFirebaseUid);
+      if (uids.length === 0) return [];
+      const creatorRows = await Creator.find({ firebaseUid: { $in: uids } })
+        .select('firebaseUid name')
+        .lean();
+      const nameByUid = new Map(
+        creatorRows
+          .filter((c) => c.firebaseUid)
+          .map((c) => [c.firebaseUid as string, c.name] as const)
+      );
+      return topOnline.map((row) => ({
+        firebaseUid: row.creatorFirebaseUid,
+        displayName: nameByUid.get(row.creatorFirebaseUid) ?? row.creatorFirebaseUid,
+        onlineSeconds: row.onlineSeconds,
+      }));
+    })(),
   ]);
 
   const parseCoinFlow = (agg: any[]) => {
@@ -280,7 +308,6 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
       onlineCreators,
       recentSignups7d,
       onboarded: onboardedUsers,
-      welcomeBonusClaimed,
       byRole: usersByRole.reduce((acc: Record<string, number>, r: any) => { acc[r._id || 'unknown'] = r.count; return acc; }, {}),
     },
     coins: {
@@ -314,6 +341,9 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
         ? Math.round((chat.exhaustedQuotas / chat.totalChannels) * 10000) / 100
         : 0,
     },
+    creatorsOnlineToday: creatorsOnlineTodayRows,
+    creatorsOnlineTodayNote:
+      'Time spent with availability “online” (available) in the current task period (server-local 23:59 boundary). Resets at period end.',
     withdrawals: {
       pendingCount: pendingWithdrawals,
       totalWithdrawn30d: totalWithdrawn30d[0]?.total ?? 0,
@@ -649,9 +679,7 @@ async function computeUsersAnalytics(
   }
 
   const users = await User.find(filter)
-    .select(
-      'firebaseUid email phone gender username avatar categories coins welcomeBonusClaimed role usernameChangeCount createdAt referredBy'
-    )
+    .select('firebaseUid email phone gender username avatar categories coins role usernameChangeCount createdAt referredBy')
     .sort({ createdAt: -1 })
     .limit(200)
     .lean();
@@ -726,7 +754,12 @@ async function computeUsersAnalytics(
       { $group: { _id: '$ownerUserId', callCount: { $sum: 1 }, totalMinutes: { $sum: '$durationSeconds' } } },
     ]),
     ChatMessageQuota.aggregate([
-      { $match: { userFirebaseUid: { $in: users.map((u) => u.firebaseUid) } } },
+      {
+        $match: {
+          userFirebaseUid: { $in: users.map((u) => u.firebaseUid) },
+          freeQuotaPeriodStart: getCurrentChatQuotaPeriodStart(),
+        },
+      },
       { $group: { _id: '$userFirebaseUid', chatChannels: { $sum: 1 }, totalFreeMessages: { $sum: '$freeMessagesSent' }, totalPaidMessages: { $sum: '$paidMessagesSent' } } },
     ]),
     Creator.find({ userId: { $in: userIds } }).select('userId').lean(),
@@ -758,7 +791,6 @@ async function computeUsersAnalytics(
       gender: user.gender,
       role: user.role,
       coins: user.coins,
-      welcomeBonusClaimed: user.welcomeBonusClaimed,
       categories: user.categories,
       isCreator: creatorUserIds.has(uid),
       createdAt: user.createdAt,
@@ -827,7 +859,6 @@ export const getUserLedger = async (req: Request, res: Response): Promise<void> 
           gender: user.gender,
           role: user.role,
           coins: user.coins,
-          welcomeBonusClaimed: user.welcomeBonusClaimed,
           categories: user.categories,
           usernameChangeCount: user.usernameChangeCount,
           createdAt: user.createdAt,

@@ -16,6 +16,7 @@ type ForceTerminationReason =
   | 'insufficient_coins'
   | 'user_out_of_coins'
   | 'duration_limit_reached'
+  | 'intro_promo_exhausted'
   | 'min_coins_not_met'
   | 'unknown';
 

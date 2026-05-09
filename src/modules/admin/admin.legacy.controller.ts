@@ -10,6 +10,7 @@ import {
   ChatMessageQuota,
   FREE_MESSAGES_PER_CREATOR,
 } from '../chat/chat-message-quota.model';
+import { getCurrentChatQuotaPeriodStart } from '../chat/chat-quota-period.util';
 import { CREATOR_TASKS } from '../creator/creator-tasks.config';
 import {
   getRedis,
@@ -162,7 +163,7 @@ async function computeOverview() {
     chatQuotaStats,
     recentSignups7d,
     onboardedUsers,
-    welcomeBonusClaimed,
+    // Bonus program removed.
     // Phase 2+3: Withdrawal & Support stats in overview
     pendingWithdrawals,
     totalWithdrawn30d,
@@ -210,20 +211,23 @@ async function computeOverview() {
       { $group: { _id: null, totalCalls: { $sum: 1 }, totalDurationSec: { $sum: '$durationSeconds' }, totalCoinsSpent: { $sum: '$coinsDeducted' } } },
     ]),
     CallHistory.countDocuments({ ownerRole: 'user' }),
-    ChatMessageQuota.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalChannels: { $sum: 1 },
-          totalFreeMessages: { $sum: '$freeMessagesSent' },
-          totalPaidMessages: { $sum: '$paidMessagesSent' },
-          exhaustedQuotas: { $sum: { $cond: [{ $gte: ['$freeMessagesSent', FREE_MESSAGES_PER_CREATOR] }, 1, 0] } },
+    (() => {
+      const periodStart = getCurrentChatQuotaPeriodStart();
+      return ChatMessageQuota.aggregate([
+        { $match: { freeQuotaPeriodStart: periodStart } },
+        {
+          $group: {
+            _id: null,
+            totalChannels: { $sum: 1 },
+            totalFreeMessages: { $sum: '$freeMessagesSent' },
+            totalPaidMessages: { $sum: '$paidMessagesSent' },
+            exhaustedQuotas: { $sum: { $cond: [{ $gte: ['$freeMessagesSent', FREE_MESSAGES_PER_CREATOR] }, 1, 0] } },
+          },
         },
-      },
-    ]),
+      ]);
+    })(),
     User.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
     User.countDocuments({ role: 'user', categories: { $exists: true, $ne: [] } }),
-    User.countDocuments({ welcomeBonusClaimed: true }),
     Withdrawal.countDocuments({ status: 'pending' }),
     Withdrawal.aggregate([
       { $match: { status: { $in: ['approved', 'paid'] }, createdAt: { $gte: thirtyDaysAgo } } },
@@ -265,7 +269,6 @@ async function computeOverview() {
       onlineCreators,
       recentSignups7d,
       onboarded: onboardedUsers,
-      welcomeBonusClaimed,
       byRole: usersByRole.reduce((acc: Record<string, number>, r: any) => { acc[r._id || 'unknown'] = r.count; return acc; }, {}),
     },
     coins: {
@@ -538,7 +541,7 @@ async function computeUsersAnalytics(
   }
 
   const users = await User.find(filter)
-    .select('firebaseUid email phone gender username avatar categories coins welcomeBonusClaimed role usernameChangeCount createdAt')
+    .select('firebaseUid email phone gender username avatar categories coins role usernameChangeCount createdAt')
     .sort({ createdAt: -1 })
     .limit(200)
     .lean();
@@ -559,7 +562,12 @@ async function computeUsersAnalytics(
       { $group: { _id: '$ownerUserId', callCount: { $sum: 1 }, totalMinutes: { $sum: '$durationSeconds' } } },
     ]),
     ChatMessageQuota.aggregate([
-      { $match: { userFirebaseUid: { $in: users.map((u) => u.firebaseUid) } } },
+      {
+        $match: {
+          userFirebaseUid: { $in: users.map((u) => u.firebaseUid) },
+          freeQuotaPeriodStart: getCurrentChatQuotaPeriodStart(),
+        },
+      },
       { $group: { _id: '$userFirebaseUid', chatChannels: { $sum: 1 }, totalFreeMessages: { $sum: '$freeMessagesSent' }, totalPaidMessages: { $sum: '$paidMessagesSent' } } },
     ]),
     Creator.find({ userId: { $in: userIds } }).select('userId').lean(),
@@ -588,7 +596,6 @@ async function computeUsersAnalytics(
       gender: user.gender,
       role: user.role,
       coins: user.coins,
-      welcomeBonusClaimed: user.welcomeBonusClaimed,
       categories: user.categories,
       isCreator: creatorUserIds.has(uid),
       createdAt: user.createdAt,
@@ -653,7 +660,6 @@ export const getUserLedger = async (req: Request, res: Response): Promise<void> 
           gender: user.gender,
           role: user.role,
           coins: user.coins,
-          welcomeBonusClaimed: user.welcomeBonusClaimed,
           categories: user.categories,
           usernameChangeCount: user.usernameChangeCount,
           createdAt: user.createdAt,

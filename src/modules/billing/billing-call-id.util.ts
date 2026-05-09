@@ -1,9 +1,9 @@
 /**
- * Parses app-generated Stream call IDs: `{callerFirebaseUid}_{creatorMongoId}_{unixSeconds}`.
+ * Parses app-generated Stream call IDs: `{initiatorFirebaseUid}_{creatorMongoId}_{unixSeconds}`.
  * Firebase UIDs do not contain `_`, so two underscores from the right delimit segments.
  */
 export function parseAppVideoCallId(callId: string): {
-  callerFirebaseUid: string;
+  initiatorFirebaseUid: string;
   creatorMongoId: string;
   unixSeconds: string;
 } | null {
@@ -14,10 +14,10 @@ export function parseAppVideoCallId(callId: string): {
 
   const unixSeconds = callId.slice(last + 1);
   const creatorMongoId = callId.slice(secondLast + 1, last);
-  const callerFirebaseUid = callId.slice(0, secondLast);
+  const initiatorFirebaseUid = callId.slice(0, secondLast);
 
-  if (!callerFirebaseUid || !/^\d+$/.test(unixSeconds)) return null;
+  if (!initiatorFirebaseUid || !/^\d+$/.test(unixSeconds)) return null;
   if (!/^[a-f0-9]{24}$/i.test(creatorMongoId)) return null;
 
-  return { callerFirebaseUid, creatorMongoId, unixSeconds };
+  return { initiatorFirebaseUid, creatorMongoId, unixSeconds };
 }

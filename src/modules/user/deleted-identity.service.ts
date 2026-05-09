@@ -22,11 +22,9 @@ function buildHash(type: DeletedIdentityType, valueNormalized: string): string {
 export async function upsertDeletedIdentities(input: {
   email?: string | null;
   phone?: string | null;
-  welcomeBonusClaimed?: boolean;
   deletedAt?: Date;
 }): Promise<void> {
   const deletedAt = input.deletedAt ?? new Date();
-  const welcomeBonusClaimed = input.welcomeBonusClaimed ?? false;
 
   const ops: Array<Promise<unknown>> = [];
 
@@ -36,7 +34,7 @@ export async function upsertDeletedIdentities(input: {
     ops.push(
       DeletedUserIdentity.findOneAndUpdate(
         { type: 'email', valueHash },
-        { type: 'email', valueHash, valueNormalized, welcomeBonusClaimed, deletedAt },
+        { type: 'email', valueHash, valueNormalized, deletedAt },
         { upsert: true, new: true }
       )
     );
@@ -48,7 +46,7 @@ export async function upsertDeletedIdentities(input: {
     ops.push(
       DeletedUserIdentity.findOneAndUpdate(
         { type: 'phone', valueHash },
-        { type: 'phone', valueHash, valueNormalized, welcomeBonusClaimed, deletedAt },
+        { type: 'phone', valueHash, valueNormalized, deletedAt },
         { upsert: true, new: true }
       )
     );

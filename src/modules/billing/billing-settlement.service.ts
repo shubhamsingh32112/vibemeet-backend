@@ -10,6 +10,8 @@ import {
   getRedis,
   callSessionKey,
   callUserCoinsKey,
+  callUserIntroMicrosKey,
+  callUserWalletMicrosKey,
   callCreatorEarningsKey,
   invalidateCreatorDashboard,
   invalidateCreatorTasks,
@@ -41,6 +43,13 @@ import { featureFlags } from '../../config/feature-flags';
 
 interface CallSession {
   schemaVersion?: number;
+  billingVersion?: number;
+  introPromoActive?: boolean;
+  totalIntroDeductedMicros?: number;
+  totalWalletDeductedMicros?: number;
+  billingPricePerSecondMicros?: number;
+  initialIntroMicros?: number;
+  initialWalletMicros?: number;
   callId: string;
   userFirebaseUid: string;
   creatorFirebaseUid: string;
@@ -147,6 +156,13 @@ end
 return 0
 `;
 
+function callpairKey(uid1: string, uid2: string): string {
+  const a = String(uid1 || '');
+  const b = String(uid2 || '');
+  const [min, max] = a <= b ? [a, b] : [b, a];
+  return `callpair:${min}:${max}`;
+}
+
 /** Remove live billing keys only after Mongo commit (or idempotent cleanup). */
 async function deleteBillingSessionRedisKeys(
   redis: ReturnType<typeof getRedis>,
@@ -156,12 +172,16 @@ async function deleteBillingSessionRedisKeys(
 ): Promise<void> {
   const userSlotKey = activeCallByUserKey(userFirebaseUid);
   const creatorSlotKey = activeCallByUserKey(creatorFirebaseUid);
+  const pairKey = callpairKey(userFirebaseUid, creatorFirebaseUid);
   await Promise.all([
     redis.del(callSessionKey(callId)),
     redis.del(callUserCoinsKey(callId)),
+    redis.del(callUserIntroMicrosKey(callId)),
+    redis.del(callUserWalletMicrosKey(callId)),
     redis.del(callCreatorEarningsKey(callId)),
     redis.eval(RELEASE_IF_MATCH_LUA, 1, userSlotKey, callId),
     redis.eval(RELEASE_IF_MATCH_LUA, 1, creatorSlotKey, callId),
+    redis.eval(RELEASE_IF_MATCH_LUA, 1, pairKey, callId),
   ]);
 }
 
@@ -207,7 +227,8 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     callId,
     redisKeys: {
       session: callSessionKey(callId),
-      coins: callUserCoinsKey(callId),
+      introMicros: callUserIntroMicrosKey(callId),
+      walletMicros: callUserWalletMicrosKey(callId),
       earnings: callCreatorEarningsKey(callId),
     },
   });
@@ -277,10 +298,20 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
   let finalEarningsRaw: string | null;
 
   try {
-    [finalCoinsRaw, finalEarningsRaw] = await Promise.all([
+    const [introR, walletR, legacyMerged, earnR] = await Promise.all([
+      redis.get(callUserIntroMicrosKey(callId)),
+      redis.get(callUserWalletMicrosKey(callId)),
       redis.get(callUserCoinsKey(callId)),
       redis.get(callCreatorEarningsKey(callId)),
     ]);
+    finalEarningsRaw = earnR;
+    let introRemain = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
+    let walletRemain = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
+    if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
+      walletRemain = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
+      introRemain = 0;
+    }
+    finalCoinsRaw = String(introRemain + walletRemain);
   } catch (redisError) {
     logError('CRITICAL: Redis error reading coins/earnings during settlement', redisError, {
       callId,
@@ -318,6 +349,12 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
   const billedSeconds = Math.max(0, Math.floor(Number(session.elapsedSeconds) || 0));
   const durationSeconds = billedSeconds;
+
+  const introDeductedMicros = Math.max(0, Number(session.totalIntroDeductedMicros) || 0);
+  let walletDeductedMicros = session.totalWalletDeductedMicros;
+  if (walletDeductedMicros === undefined || walletDeductedMicros === null) {
+    walletDeductedMicros = Math.max(0, (session.totalDeductedMicros ?? 0) - introDeductedMicros);
+  }
 
   let totalDeducted = microsToUserDebitWholeCoins(session.totalDeductedMicros ?? 0);
   let totalEarnedCreator = microsToCreatorCreditWholeCoins(earningsMicros);
@@ -370,14 +407,14 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       throw new Error(`User not found: ${session.userMongoId}`);
     }
 
-    const targetUserDebit = Math.max(0, totalDeducted);
+    const targetWalletDebitWhole = Math.max(0, microsToUserDebitWholeCoins(walletDeductedMicros));
     const existingUserDebitTxn = await CoinTransaction.findOne({
       callId,
       userId: session.userMongoId,
       type: 'debit',
     }).session(dbSession);
     const alreadyDebited = Math.max(0, existingUserDebitTxn?.coins || 0);
-    const userDebitDelta = Math.max(0, targetUserDebit - alreadyDebited);
+    const userDebitDelta = Math.max(0, targetWalletDebitWhole - alreadyDebited);
 
     let updatedUserCoins = user.coins || 0;
     if (userDebitDelta > 0) {
@@ -403,14 +440,14 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       updatedUserCoins = updatedUser.coins || 0;
     }
 
-    if (totalDeducted > 0) {
+    if (targetWalletDebitWhole > 0) {
       await CoinTransaction.findOneAndUpdate(
         { callId, userId: session.userMongoId, type: 'debit' },
         {
           transactionId: `call_debit_${callId}`,
           userId: session.userMongoId,
           type: 'debit',
-          coins: totalDeducted,
+          coins: targetWalletDebitWhole,
           source: 'video_call',
           description: `Video call (${durationSeconds}s) @ ${session.pricePerMinute} coins/min`,
           callId,
@@ -420,64 +457,107 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       );
     }
 
+    if (session.introPromoActive === true && introDeductedMicros > 0) {
+      await User.findOneAndUpdate(
+        {
+          _id: user._id,
+          welcomeFreeCallConsumedAt: null,
+          introFreeCallCredits: { $gt: 0 },
+        },
+        {
+          $set: {
+            welcomeFreeCallConsumedAt: new Date(),
+            introFreeCallCredits: 0,
+          },
+        },
+        { session: dbSession }
+      );
+    }
+
     let creatorUser: (mongoose.Document<unknown, object, IUser> & IUser) | null = null;
     if (totalEarnedCreator > 0) {
-      const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
-      if (!creator) {
-        throw new Error(`Creator not found: ${session.creatorMongoId}`);
-      }
+      // Settlement safety rule: do not hard-fail settlement if creator docs are missing.
+      // We settle conservatively (user debit) and alert via logs/metrics for reconciliation.
+      try {
+        const creator = await Creator.findById(session.creatorMongoId).session(dbSession);
+        if (!creator) {
+          logWarning('Creator missing during settlement; settling without creator credit', {
+            callId,
+            creatorMongoId: session.creatorMongoId,
+          });
+          totalEarnedCreator = 0;
+        } else {
+          creatorUser = await User.findById(creator.userId).session(dbSession);
+          if (!creatorUser) {
+            logWarning('Creator user missing during settlement; settling without creator credit', {
+              callId,
+              creatorUserId: creator.userId?.toString(),
+            });
+            totalEarnedCreator = 0;
+          } else {
+            const existingCreatorCreditTxn = await CoinTransaction.findOne({
+              callId,
+              userId: creator.userId,
+              type: 'credit',
+            }).session(dbSession);
+            const alreadyCredited = Math.max(0, existingCreatorCreditTxn?.coins || 0);
+            const targetCreatorCredit = Math.max(0, totalEarnedCreator);
+            const creatorCreditDelta = Math.max(0, targetCreatorCredit - alreadyCredited);
 
-      creatorUser = await User.findById(creator.userId).session(dbSession);
-      if (!creatorUser) {
-        throw new Error(`Creator user not found: ${creator.userId}`);
-      }
+            let creatorCoinsBefore = creatorUser.coins || 0;
+            if (creatorCreditDelta > 0) {
+              const updatedCreatorUser = await User.findByIdAndUpdate(
+                creatorUser._id,
+                { $inc: { coins: creatorCreditDelta } },
+                { new: true, session: dbSession }
+              );
+              if (!updatedCreatorUser) {
+                logWarning('Creator user missing during credit update; skipping creator credit', {
+                  callId,
+                  creatorUserId: creator.userId?.toString(),
+                });
+                totalEarnedCreator = 0;
+              } else {
+                creatorCoinsBefore = Math.max(
+                  0,
+                  (updatedCreatorUser.coins || 0) - creatorCreditDelta
+                );
+                creatorUser = updatedCreatorUser;
+              }
+            }
 
-      const existingCreatorCreditTxn = await CoinTransaction.findOne({
-        callId,
-        userId: creator.userId,
-        type: 'credit',
-      }).session(dbSession);
-      const alreadyCredited = Math.max(0, existingCreatorCreditTxn?.coins || 0);
-      const targetCreatorCredit = Math.max(0, totalEarnedCreator);
-      const creatorCreditDelta = Math.max(0, targetCreatorCredit - alreadyCredited);
+            if (totalEarnedCreator > 0) {
+              logInfo('Settling call - Creator coins updated', {
+                callId,
+                creatorMongoId: session.creatorMongoId,
+                creatorUserId: creator.userId,
+                coinsBefore: creatorCoinsBefore,
+                coinsAfter: creatorUser.coins,
+                coinsEarned: totalEarnedCreator,
+              });
 
-      let creatorCoinsBefore = creatorUser.coins || 0;
-      if (creatorCreditDelta > 0) {
-        const updatedCreatorUser = await User.findByIdAndUpdate(
-          creatorUser._id,
-          { $inc: { coins: creatorCreditDelta } },
-          { new: true, session: dbSession }
-        );
-        if (!updatedCreatorUser) {
-          throw new Error(`Creator user not found during credit update: ${creator.userId}`);
+              await CoinTransaction.findOneAndUpdate(
+                { callId, userId: creator.userId, type: 'credit' },
+                {
+                  transactionId: `call_credit_${callId}`,
+                  userId: creator.userId,
+                  type: 'credit',
+                  coins: totalEarnedCreator,
+                  source: 'video_call',
+                  description: `Earned from video call (${durationSeconds}s)`,
+                  callId,
+                  status: 'completed',
+                },
+                { upsert: true, new: true, session: dbSession }
+              );
+            }
+          }
         }
-        creatorCoinsBefore = Math.max(0, (updatedCreatorUser.coins || 0) - creatorCreditDelta);
-        creatorUser = updatedCreatorUser;
+      } catch (e) {
+        logError('Creator settlement credit failed; proceeding without creator credit', e, { callId });
+        totalEarnedCreator = 0;
+        creatorUser = null;
       }
-
-      logInfo('Settling call - Creator coins updated', {
-        callId,
-        creatorMongoId: session.creatorMongoId,
-        creatorUserId: creator.userId,
-        coinsBefore: creatorCoinsBefore,
-        coinsAfter: creatorUser.coins,
-        coinsEarned: totalEarnedCreator,
-      });
-
-      await CoinTransaction.findOneAndUpdate(
-        { callId, userId: creator.userId, type: 'credit' },
-        {
-          transactionId: `call_credit_${callId}`,
-          userId: creator.userId,
-          type: 'credit',
-          coins: totalEarnedCreator,
-          source: 'video_call',
-          description: `Earned from video call (${durationSeconds}s)`,
-          callId,
-          status: 'completed',
-        },
-        { upsert: true, new: true, session: dbSession }
-      );
     }
 
     const creatorDoc = await Creator.findById(session.creatorMongoId).session(dbSession);
@@ -493,6 +573,11 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     const creatorOwnerUserId = creatorDoc?.userId;
     const creatorFirebaseUid = creatorUserDoc?.firebaseUid || session.creatorFirebaseUid;
 
+    const initiatedByRole = (session as any).initiatedByRole as string | undefined;
+    const creatorInitiated = initiatedByRole === 'creator' || initiatedByRole === 'admin';
+    const userDirection = creatorInitiated ? 'incoming' : 'outgoing';
+    const creatorDirection = creatorInitiated ? 'outgoing' : 'incoming';
+
     await CallHistory.findOneAndUpdate(
       { callId, ownerUserId: session.userMongoId },
       {
@@ -504,6 +589,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
         otherAvatar: creatorAvatar,
         otherFirebaseUid: creatorFirebaseUid,
         ownerRole: 'user',
+        direction: userDirection,
         durationSeconds,
         coinsDeducted: totalDeducted,
         coinsEarned: 0,
@@ -522,6 +608,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
           otherAvatar: userAvatar,
           otherFirebaseUid: session.userFirebaseUid,
           ownerRole: 'creator',
+          direction: creatorDirection,
           durationSeconds,
           coinsDeducted: 0,
           coinsEarned: totalEarnedCreator,

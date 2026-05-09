@@ -13,6 +13,10 @@ import {
   FREE_MESSAGES_PER_CREATOR,
   COST_PER_MESSAGE,
 } from './chat-message-quota.model';
+import {
+  getCurrentChatQuotaPeriodStart,
+  normalizeQuotaForCurrentPeriod,
+} from './chat-quota-period.util';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 
@@ -247,6 +251,9 @@ export const createOrGetChannel = async (
           userFirebaseUid: currentUid,
           creatorFirebaseUid: creatorUid,
         });
+        if (quota) {
+          await normalizeQuotaForCurrentPeriod(quota);
+        }
         const sent = quota?.freeMessagesSent ?? 0;
         freeRemaining = Math.max(0, FREE_MESSAGES_PER_CREATOR - sent);
         costPerMessage = freeRemaining > 0 ? 0 : COST_PER_MESSAGE;
@@ -443,11 +450,14 @@ export const preSendMessage = async (
                 channelId,
                 freeMessagesSent: 0,
                 paidMessagesSent: 0,
+                freeQuotaPeriodStart: getCurrentChatQuotaPeriodStart(),
               },
             ],
             { session },
           );
         }
+
+        await normalizeQuotaForCurrentPeriod(quota, { session });
 
         // ── Free slot available? ──────────────────────────────────────
         if (quota.freeMessagesSent < FREE_MESSAGES_PER_CREATOR) {
@@ -611,6 +621,9 @@ export const getMessageQuota = async (
     // If quota exists, we can use creatorFirebaseUid from it for compound index lookup
     // This is more efficient, but we need creatorFirebaseUid first (handled above)
 
+    if (quota) {
+      await normalizeQuotaForCurrentPeriod(quota);
+    }
     const sent = quota?.freeMessagesSent ?? 0;
     const freeRemaining = Math.max(0, FREE_MESSAGES_PER_CREATOR - sent);
 

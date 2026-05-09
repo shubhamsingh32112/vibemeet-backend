@@ -10,6 +10,7 @@ import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds } fro
 import { getIO } from '../../config/socket';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { setCreatorAvailability } from '../availability/availability.gateway';
+import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
 import { getBatchAvailability } from '../availability/availability.service';
 import {
   getRedis,
@@ -392,7 +393,9 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
     }
 
     const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (currentUser?.role === 'creator') {
+    // Allow creators to look up *themselves* (needed for creator-initiated call flow
+    // to resolve their own Creator._id). Still deny looking up other creators.
+    if (currentUser?.role === 'creator' && req.auth.firebaseUid !== uidRaw) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Creators cannot view other creators.',
@@ -730,7 +733,6 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
     try {
       session.startTransaction();
 
-      targetUser.welcomeBonusClaimed = true;
       targetUser.coins = 0;
       if (targetUser.role !== 'creator' && targetUser.role !== 'admin') {
         targetUser.role = 'creator';
@@ -2463,6 +2465,12 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       return;
     }
 
+    const attachLiveOnline = async (data: Record<string, unknown>): Promise<void> => {
+      const live = await getOnlineTodaySecondsLive(currentUser.firebaseUid);
+      data.onlineTodaySeconds = live.onlineTodaySeconds;
+      data.onlineTodayResetsAt = live.onlineTodayResetsAt;
+    };
+
     // ── Try Redis cache first ────────────────────────────────────────────
     const cacheKey = creatorDashboardKey(currentUser._id.toString());
     try {
@@ -2472,6 +2480,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         const data = typeof cached === 'string' ? JSON.parse(cached) : cached;
         // Update coins in cached data (coins can change outside of cache invalidation)
         data.coins = currentUser.coins;
+        await attachLiveOnline(data);
         console.log('⚡ [CREATOR] Dashboard served from Redis cache');
         res.json({ success: true, data });
         return;
@@ -2628,6 +2637,8 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     }
 
     console.log(`✅ [CREATOR] Dashboard: ${totalEarnings} earnings, ${totalCalls} calls, ${tasks.length} tasks, ${currentUser.coins} coins`);
+
+    await attachLiveOnline(dashboardData as unknown as Record<string, unknown>);
 
     res.json({ success: true, data: dashboardData });
   } catch (error) {

@@ -6,6 +6,8 @@ export interface ICall extends Document {
   callerUserId: mongoose.Types.ObjectId; // Reference to User (caller)
   creatorUserId: mongoose.Types.ObjectId; // Reference to User (creator)
   status: 'ringing' | 'accepted' | 'rejected' | 'ended' | 'missed' | 'cancelled';
+  initiatedByFirebaseUid?: string; // Durable initiator identity (do not infer payer from callId)
+  initiatedByRole?: 'user' | 'creator' | 'admin';
 
   // Price snapshots (aligned with pricingService + billing session)
   priceAtCallTime?: number; // Creator's price per minute at call start
@@ -54,6 +56,18 @@ const callSchema = new Schema<ICall>(
       enum: ['ringing', 'accepted', 'rejected', 'ended', 'missed', 'cancelled'],
       required: true,
       default: 'ringing',
+      index: true,
+    },
+    initiatedByFirebaseUid: {
+      type: String,
+      trim: true,
+      sparse: true,
+      index: true,
+    },
+    initiatedByRole: {
+      type: String,
+      enum: ['user', 'creator', 'admin'],
+      sparse: true,
       index: true,
     },
     priceAtCallTime: {

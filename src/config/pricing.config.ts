@@ -54,6 +54,15 @@ export const MIN_COINS_TO_CALL: number = parseInt(
 );
 
 /**
+ * Welcome intro: promo-only credits for the first introductory call (never mixed into `coins`).
+ * Environment variable: WELCOME_INTRO_CALL_CREDITS
+ */
+export const WELCOME_INTRO_CALL_CREDITS: number = parseInt(
+  process.env.WELCOME_INTRO_CALL_CREDITS || '60',
+  10
+);
+
+/**
  * Maximum call duration in seconds (hard cap)
  * Default: 3600 seconds (1 hour)
  * 

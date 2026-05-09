@@ -3,6 +3,8 @@ import {
   getRedis,
   callSessionKey,
   callUserCoinsKey,
+  callUserIntroMicrosKey,
+  callUserWalletMicrosKey,
   callCreatorEarningsKey,
   activeCallByUserKey,
   pendingCallEndKey,
@@ -63,6 +65,8 @@ export function setupBillingGateway(io: Server): void {
         const callStartedRequestAt = Date.now();
         try {
           const payerFirebaseUid = data.userFirebaseUid || firebaseUid;
+          const initiatedByFirebaseUid = firebaseUid;
+          const initiatedByRole = socket.data.isCreator ? 'creator' : 'user';
 
           logInfo('call:started received', {
             callId: data.callId,
@@ -109,6 +113,8 @@ export function setupBillingGateway(io: Server): void {
           await billingService.startBillingSession(io, payerFirebaseUid, data, {
             source: 'client_socket',
             requestReceivedAtMs: callStartedRequestAt,
+            initiatedByFirebaseUid,
+            initiatedByRole,
           });
 
           const redis = getRedis();
@@ -198,18 +204,20 @@ export function setupBillingGateway(io: Server): void {
             ? JSON.parse(sessionRaw)
             : (sessionRaw as BillingRecoverSession);
 
-        const [coinsRaw, earningsRaw] = await Promise.all([
+        const [introR, walletR, legacyMerged, earningsRaw] = await Promise.all([
+          redis.get(callUserIntroMicrosKey(callId)),
+          redis.get(callUserWalletMicrosKey(callId)),
           redis.get(callUserCoinsKey(callId)),
           redis.get(callCreatorEarningsKey(callId)),
         ]);
 
-        const coinsStr = String(coinsRaw ?? '0');
-        let balanceMicros: number;
-        if (coinsStr.includes('.')) {
-          balanceMicros = Math.round(parseFloat(coinsStr) * COIN_MICROS);
-        } else {
-          balanceMicros = parseInt(coinsStr, 10) || 0;
+        let introMicros = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
+        let walletMicros = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
+        if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
+          walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
+          introMicros = 0;
         }
+        const balanceMicros = introMicros + walletMicros;
 
         const earnRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
         let earningsMicros = earnRaw;

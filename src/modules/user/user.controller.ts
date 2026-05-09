@@ -6,8 +6,7 @@ import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { DeletedUserPhone } from './deleted-user-phone.model';
-import { checkDeletedStatus, upsertDeletedIdentities } from './deleted-identity.service';
-import { tryClaimBonusInLedger } from './identity.service';
+import { upsertDeletedIdentities } from './deleted-identity.service';
 import { randomUUID } from 'crypto';
 import { invalidateAdminCaches } from '../../config/redis';
 import { getIO } from '../../config/socket';
@@ -42,6 +41,18 @@ import {
   type PermissionStatus,
   type PermissionsDecision,
 } from './onboarding-transition.service';
+
+function welcomeFreeCallEligible(user: {
+  role: string;
+  welcomeFreeCallConsumedAt?: Date | null;
+  introFreeCallCredits?: number;
+}): boolean {
+  return (
+    user.role === 'user' &&
+    !user.welcomeFreeCallConsumedAt &&
+    (Number(user.introFreeCallCredits) || 0) > 0
+  );
+}
 
 function referralErrorHttpStatus(code: ApplyReferralCodeErrorCode): number {
   return code === 'NOT_FOUND' ? 404 : 400;
@@ -468,7 +479,7 @@ export const deleteAccount = async (req: Request, res: Response): Promise<void> 
       console.log(`   Note: ${note.trim()}`);
     }
 
-    // Store phone number before deletion to prevent welcome bonus abuse
+    // Store phone number before deletion (legacy deletion tracking).
     if (user.phone) {
       try {
         // Upsert: update if exists, create if not
@@ -476,24 +487,22 @@ export const deleteAccount = async (req: Request, res: Response): Promise<void> 
           { phone: user.phone },
           {
             phone: user.phone,
-            welcomeBonusClaimed: user.welcomeBonusClaimed || false,
             deletedAt: new Date(),
           },
           { upsert: true, new: true }
         );
-        console.log(`📝 [USER] Stored phone number for deleted account: ${user.phone} (welcomeBonusClaimed: ${user.welcomeBonusClaimed})`);
+        console.log(`📝 [USER] Stored phone number for deleted account: ${user.phone}`);
       } catch (phoneError) {
         console.error('⚠️ [USER] Failed to store deleted user phone:', phoneError);
         // Continue with deletion even if phone storage fails
       }
     }
 
-    // Store email/phone identities to prevent re-claiming welcome bonus after deletion.
+    // Store email/phone identities for deletion tracking.
     try {
       await upsertDeletedIdentities({
         email: user.email ?? null,
         phone: user.phone ?? null,
-        welcomeBonusClaimed: user.welcomeBonusClaimed || false,
         deletedAt: new Date(),
       });
       console.log(
@@ -584,7 +593,8 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           price: creator.price,
           // User-specific data (coins, role, etc.)
           coins: user.coins,
-          welcomeBonusClaimed: user.welcomeBonusClaimed,
+          introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
+          welcomeFreeCallEligible: welcomeFreeCallEligible(user),
           role: user.role,
           userId: user._id.toString(), // Reference to user document
           // Additional user fields that might be useful
@@ -621,7 +631,8 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
             coins: user.coins,
-            welcomeBonusClaimed: user.welcomeBonusClaimed,
+            introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
+            welcomeFreeCallEligible: welcomeFreeCallEligible(user),
             blockedCreatorCount: (user.blockedCreatorIds || []).length,
             role: user.role,
             profileRevision: user.profileRevision ?? 0,
@@ -1349,9 +1360,8 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       
       // 🔥 CRITICAL: Prevent welcome bonus claim and remove welcome bonus coins
       // Creators don't need coins to receive calls/texts, so they shouldn't get the welcome bonus
-      // Set coins to 0 and mark welcome bonus as claimed so they can't claim it later
+      // Set coins to 0 (creators don't need coins)
       const previousCoins = targetUser.coins || 0;
-      targetUser.welcomeBonusClaimed = true; // Mark as claimed so they can't claim it later (even if demoted back to user)
       targetUser.coins = 0; // Set coins to 0 - creators don't need coins
       
       if (previousCoins > 0) {
@@ -1601,118 +1611,6 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       success: false,
       error: 'Internal server error',
     });
-  }
-};
-
-// Claim welcome bonus (30 coins for new users only)
-export const claimWelcomeBonus = async (req: Request, res: Response): Promise<void> => {
-  try {
-    console.log('🎁 [USER] Claim welcome bonus request');
-
-    if (!req.auth) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!user) {
-      res.status(404).json({ success: false, error: 'User not found' });
-      return;
-    }
-
-    // Only regular users can claim (not creators/admins)
-    if (user.role !== 'user') {
-      res.status(403).json({ success: false, error: 'Only regular users can claim welcome bonus' });
-      return;
-    }
-
-    // Backstop: previously deleted identities can never claim welcome bonus again.
-    const deletedStatus = await checkDeletedStatus({
-      email: (req.auth.email ?? user.email) ?? null,
-      phone: (req.auth.phone ?? user.phone) ?? null,
-    });
-    if (deletedStatus.isDeleted) {
-      user.welcomeBonusClaimed = true;
-      await user.save();
-      res.status(400).json({ success: false, error: 'Welcome bonus not available for returning accounts' });
-      return;
-    }
-
-    // Check if already claimed (user flag)
-    if (user.welcomeBonusClaimed) {
-      res.status(400).json({ success: false, error: 'Welcome bonus already claimed' });
-      return;
-    }
-
-    // Atomic claim in ledger — only first request succeeds; concurrent requests get false
-    const wonClaim = await tryClaimBonusInLedger({
-      deviceFingerprint: user.deviceFingerprint ?? undefined,
-      googleId: user.firebaseUid?.startsWith('fast_') ? undefined : user.firebaseUid,
-      phone: user.phone ?? undefined,
-      firstUserId: user._id,
-    });
-    if (!wonClaim) {
-      user.welcomeBonusClaimed = true;
-      await user.save();
-      res.status(400).json({ success: false, error: 'Welcome bonus already claimed' });
-      return;
-    }
-
-    const WELCOME_BONUS = 30;
-
-    // Create transaction record
-    const transaction = new CoinTransaction({
-      transactionId: `welcome_bonus_${user._id}`,
-      userId: user._id,
-      type: 'credit',
-      coins: WELCOME_BONUS,
-      source: 'admin',
-      description: 'Welcome bonus - 30 free coins',
-      status: 'completed',
-    });
-
-    // Update user
-    user.coins = (user.coins || 0) + WELCOME_BONUS;
-    user.welcomeBonusClaimed = true;
-
-    await transaction.save();
-    await user.save();
-
-    console.log(`✅ [USER] Welcome bonus claimed: ${user._id} now has ${user.coins} coins`);
-
-    // Balance integrity check (fire-and-forget)
-    verifyUserBalance(user._id).catch(() => {});
-
-    // Emit coins_updated socket event so all open screens update in real-time
-    try {
-      const io = getIO();
-      io.to(`user:${user.firebaseUid}`).emit('coins_updated', {
-        userId: user._id.toString(),
-        coins: user.coins,
-      });
-      console.log(`📡 [USER] Emitted coins_updated to ${user.firebaseUid} (${user.coins} coins)`);
-    } catch (socketErr) {
-      console.error('⚠️ [USER] Failed to emit coins_updated:', socketErr);
-    }
-
-    res.json({
-      success: true,
-      data: {
-        coins: user.coins,
-        bonusAmount: WELCOME_BONUS,
-        welcomeBonusClaimed: true,
-        updatedUser: {
-          id: user._id.toString(),
-          coins: user.coins,
-          welcomeBonusClaimed: true,
-          role: user.role,
-          onboarding: buildOnboardingPayload(user),
-        },
-      },
-    });
-  } catch (error) {
-    console.error('❌ [USER] Claim welcome bonus error:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 

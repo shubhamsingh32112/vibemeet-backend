@@ -62,7 +62,6 @@ export async function promoteUserToCreatorWithStarterProfile(
 ): Promise<ICreator> {
   const session = options.session;
   const previousCoins = user.coins || 0;
-  user.welcomeBonusClaimed = true;
   user.coins = 0;
   user.role = 'creator';
   await user.save({ session });

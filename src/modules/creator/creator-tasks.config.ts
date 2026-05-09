@@ -51,32 +51,35 @@ export const isValidTaskKey = (key: string): boolean => {
  *   periodEnd   = periodStart + 24 h
  *   resetsAt    = periodEnd        (next reset)
  */
-export function getDailyPeriodBounds(): {
+export function getDailyPeriodBoundsForInstant(when: Date): {
   periodStart: Date;
   periodEnd: Date;
   resetsAt: Date;
 } {
-  const now = new Date();
-
-  // Today at 23:59:00.000 in server-local time
   const todayReset = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
+    when.getFullYear(),
+    when.getMonth(),
+    when.getDate(),
     23, 59, 0, 0,
   );
 
   let periodStart: Date;
 
-  if (now.getTime() >= todayReset.getTime()) {
-    // We're past 23:59 today → current period started at today 23:59
+  if (when.getTime() >= todayReset.getTime()) {
     periodStart = todayReset;
   } else {
-    // Before 23:59 → current period started at yesterday 23:59
     periodStart = new Date(todayReset.getTime() - 24 * 60 * 60 * 1000);
   }
 
   const periodEnd = new Date(periodStart.getTime() + 24 * 60 * 60 * 1000);
 
   return { periodStart, periodEnd, resetsAt: periodEnd };
+}
+
+export function getDailyPeriodBounds(): {
+  periodStart: Date;
+  periodEnd: Date;
+  resetsAt: Date;
+} {
+  return getDailyPeriodBoundsForInstant(new Date());
 }

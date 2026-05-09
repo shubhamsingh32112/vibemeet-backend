@@ -41,11 +41,11 @@ export function assertBillingRestCallStartedAccess(
     return { ok: false, status: 400, error: 'Payer cannot be the same as the creator' };
   }
 
-  const caller = parsed.callerFirebaseUid;
+  const initiator = parsed.initiatorFirebaseUid;
   const auth = firebaseUid;
 
   if (auth === creatorFirebaseUid) {
-    if (caller !== creatorFirebaseUid) {
+    if (initiator !== creatorFirebaseUid) {
       return { ok: false, status: 400, error: 'callId is not a creator-originated call' };
     }
     if (!hasExplicitPayer) {
@@ -62,10 +62,10 @@ export function assertBillingRestCallStartedAccess(
   }
 
   if (auth === payerFirebaseUid) {
-    if (caller === auth) {
+    if (initiator === auth) {
       return { ok: true, payerFirebaseUid };
     }
-    if (caller === creatorFirebaseUid && auth !== creatorFirebaseUid) {
+    if (initiator === creatorFirebaseUid && auth !== creatorFirebaseUid) {
       return { ok: true, payerFirebaseUid };
     }
     return { ok: false, status: 403, error: 'callId does not match this billing request' };
@@ -83,7 +83,7 @@ export async function assertBillingRestCallEndedAccess(
 ): Promise<BillingRestDeny | BillingRestAllow> {
   if (!isRedisConfigured()) {
     const parsed = parseAppVideoCallId(callId);
-    if (parsed && parsed.callerFirebaseUid === firebaseUid) {
+    if (parsed && parsed.initiatorFirebaseUid === firebaseUid) {
       return { ok: true };
     }
     return { ok: false, status: 503, error: 'Billing storage unavailable' };
@@ -110,7 +110,7 @@ export async function assertBillingRestCallEndedAccess(
   }
 
   const parsed = parseAppVideoCallId(callId);
-  if (parsed && parsed.callerFirebaseUid === firebaseUid) {
+  if (parsed && parsed.initiatorFirebaseUid === firebaseUid) {
     return { ok: true };
   }
   return {

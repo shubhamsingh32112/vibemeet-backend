@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
-import { checkBonusEligibility } from '../user/identity.service';
+// Bonus program removed.
 import { checkDeletedStatus } from '../user/deleted-identity.service';
 import {
   assignReferralCodeToUser,
@@ -15,9 +15,8 @@ import { isValidReferralCodeFormat } from '../../utils/referral-code';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
+import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
 
-/** Max length for optional deviceFingerprint on POST /auth/login (bonus eligibility). */
-const DEVICE_FINGERPRINT_MAX = 256;
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
 const DEFAULT_NEW_USER_AVATAR_URL =
@@ -37,6 +36,18 @@ const DEFAULT_USER_CATEGORY_POOL = [
 function buildRandomUsername(): string {
   const suffix = Math.random().toString(36).slice(2, 9);
   return `u${suffix}`.slice(0, 10);
+}
+
+function welcomeFreeCallEligibleForUser(user: {
+  role: string;
+  welcomeFreeCallConsumedAt?: Date | null;
+  introFreeCallCredits?: number;
+}): boolean {
+  return (
+    user.role === 'user' &&
+    !user.welcomeFreeCallConsumedAt &&
+    (Number(user.introFreeCallCredits) || 0) > 0
+  );
 }
 
 function pickRandomCategories(): string[] {
@@ -100,26 +111,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         logInfo('Creating new user (first login)', { firebaseUid });
         const firstLoginProfile = buildDefaultFirstLoginProfile();
 
-        // Identity-based welcome bonus eligibility — pass ALL identities we know
-        // (user may have signed in with Google before, then Fast Login; check all to prevent bypass)
-        let deviceFingerprint: string | undefined;
-        if (typeof req.body?.deviceFingerprint === 'string') {
-          const fp = req.body.deviceFingerprint.trim();
-          if (fp.length > 0 && fp.length <= DEVICE_FINGERPRINT_MAX) {
-            deviceFingerprint = fp;
-          }
-        }
-        const googleId = firebaseUid.startsWith('fast_') ? undefined : firebaseUid;
-        const welcomeBonusEligible = await checkBonusEligibility({
-          deviceFingerprint: deviceFingerprint ?? null,
-          googleId: googleId ?? null,
-          phone: req.auth.phone ?? null,
-        });
-        const welcomeBonusClaimed = showWelcomeBackDialog ? true : !welcomeBonusEligible;
-
-        // 🔥 CRITICAL: Only regular users can claim welcome bonus (not creators)
-        // New users start with 0 coins - they get 30 free coins when they accept the welcome bonus popup
-        // Creators don't need coins to receive calls/texts, so they don't get free coins
+        const grantWelcomeIntro = !showWelcomeBackDialog;
         user = await User.create({
           firebaseUid: req.auth.firebaseUid,
           phone: req.auth.phone,
@@ -130,9 +122,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           username: firstLoginProfile.username,
           avatar: firstLoginProfile.avatar,
           categories: firstLoginProfile.categories,
-          coins: 0, // ✅ New users start with 0 coins - 30 coins are added when they accept the welcome bonus popup
-          freeTextUsed: 0, // ✅ Initialize free text counter (3 free chats for new users)
-          welcomeBonusClaimed: welcomeBonusClaimed, // ✅ Forced true for returning deleted identities
+          coins: 0,
+          introFreeCallCredits: grantWelcomeIntro ? WELCOME_INTRO_CALL_CREDITS : 0,
+          welcomeFreeCallConsumedAt: grantWelcomeIntro ? null : new Date(),
+          freeTextUsed: 0, // Legacy field; chat free quota is per creator in ChatMessageQuota
           onboardingStage: 'welcome',
           onboardingWelcomeSeenAt: null,
           onboardingBonusSeenAt: null,
@@ -164,12 +157,13 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           userId: user._id.toString(),
           firebaseUid,
           initialCoins: 0,
+          introFreeCallCredits: user.introFreeCallCredits,
+          grantWelcomeIntro,
           freeTextUsed: 0,
           gender: firstLoginProfile.gender,
           age: firstLoginProfile.age,
           username: firstLoginProfile.username,
           categories: firstLoginProfile.categories,
-          welcomeBonusClaimed: welcomeBonusClaimed,
           showWelcomeBackDialog,
         });
     } else {
@@ -224,12 +218,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         (req.auth.email && user.email !== req.auth.email) ||
         (req.auth.phone && user.phone !== req.auth.phone);
 
-      const needsWelcomeBonusLock = showWelcomeBackDialog && !user.welcomeBonusClaimed;
-
-      if (needsContactUpdate || profileBackfilled || needsWelcomeBonusLock) {
+      if (needsContactUpdate || profileBackfilled) {
         if (req.auth.email) user.email = req.auth.email;
         if (req.auth.phone) user.phone = req.auth.phone;
-        if (needsWelcomeBonusLock) user.welcomeBonusClaimed = true;
         await user.save();
         if (profileBackfilled) {
           logInfo('Backfilled existing user onboarding defaults', {
@@ -304,7 +295,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       role: user.role,
       createdNow,
       stage: onboardingState.stage,
-      welcomeBonusClaimed: user.welcomeBonusClaimed,
       showWelcomeBackDialog,
     });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
@@ -336,7 +326,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           location: creator.location,
           // User-specific data (coins, role, etc.)
           coins: user.coins,
-          welcomeBonusClaimed: user.welcomeBonusClaimed,
+          introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
+          welcomeFreeCallEligible: welcomeFreeCallEligibleForUser(user),
           role: user.role,
           userId: user._id.toString(), // Reference to user document
           // Additional user fields that might be useful
@@ -378,7 +369,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
             coins: user.coins,
-            welcomeBonusClaimed: user.welcomeBonusClaimed,
+            introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
+            welcomeFreeCallEligible: welcomeFreeCallEligibleForUser(user),
             role: user.role,
             referralCode: user.referralCode ?? undefined,
             profileRevision: user.profileRevision ?? 0,

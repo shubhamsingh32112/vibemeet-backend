@@ -2,7 +2,7 @@
  * Chat Policy — Centralised rules for chat behaviour.
  *
  * Pricing:
- *   - Users get 3 free messages per creator, then 5 coins per message.
+ *   - Users get FREE_MESSAGES_PER_CREATOR free messages per creator per task day, then 5 coins per message.
  *   - Creators always chat for free.
  *
  * Content rules:
@@ -11,8 +11,10 @@
  *   - Voice: all roles.
  */
 
-export const FREE_MESSAGES_PER_CREATOR = 3;
-export const COST_PER_MESSAGE_COINS = 5;
+import { FREE_MESSAGES_PER_CREATOR as FREE_MESSAGES_PER_CREATOR_MODEL, COST_PER_MESSAGE } from './chat-message-quota.model';
+
+export const FREE_MESSAGES_PER_CREATOR = FREE_MESSAGES_PER_CREATOR_MODEL;
+export const COST_PER_MESSAGE_COINS = COST_PER_MESSAGE;
 
 export interface ChatPolicy {
   allowText: boolean;

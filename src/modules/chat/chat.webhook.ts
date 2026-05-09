@@ -5,6 +5,7 @@ import {
   FREE_MESSAGES_PER_CREATOR,
   COST_PER_MESSAGE,
 } from './chat-message-quota.model';
+import { normalizeQuotaForCurrentPeriod } from './chat-quota-period.util';
 
 /**
  * Stream Chat webhook handler.
@@ -119,6 +120,10 @@ export const handleStreamWebhook = async (
           userFirebaseUid: userId,
           channelId,
         });
+
+        if (quota) {
+          await normalizeQuotaForCurrentPeriod(quota);
+        }
 
         if (quota && quota.freeMessagesSent >= FREE_MESSAGES_PER_CREATOR) {
           // Beyond free quota — user should have been charged via pre-send.

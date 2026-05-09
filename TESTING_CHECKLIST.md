@@ -45,35 +45,31 @@
 
 ## Chat Billing Tests
 
-### Test 3: 3 free messages
+### Test 3: 10 free messages per creator per task day
 **Setup:**
-- New user (freeTextUsed = 0)
-- Send 3 text messages
+- User role `user` chatting with a creator (per-channel quota)
+- Send up to 10 text messages in the **current** task period
 
 **Expected:**
-- First 3 messages are free
-- `freeTextUsed` increments: 0 → 1 → 2 → 3
-- User coins unchanged
+- First 10 messages are free (per `ChatMessageQuota` for that user+creator pair)
+- User coins unchanged while `freeRemaining > 0`
 - Messages are sent successfully
 
 **Verify:**
-- Check user.freeTextUsed = 3 after 3 messages
-- Check user.coins unchanged
-- Check messages appear in chat
+- Check `ChatMessageQuota` for the pair: `freeMessagesSent` increments, `freeQuotaPeriodStart` matches current period from `getDailyPeriodBounds()`
+- After period rollover (23:59 server-local), `freeMessagesSent` resets to 0 on next send/read
 
 ---
 
-### Test 4: 4th message costs 5 coins
+### Test 4: 11th message costs 5 coins
 **Setup:**
-- User with freeTextUsed = 3
-- User with coins >= 5
-- Send 4th text message
+- Same channel: user has used all **10** free messages **in the current period**
+- User has coins >= 5
 
 **Expected:**
 - Message costs 5 coins
 - User coins decrease by 5
 - Transaction record created (type: 'debit', source: 'chat_message')
-- Message is sent successfully
 
 **Verify:**
 - Check user.coins decreased by 5
@@ -84,7 +80,7 @@
 
 ### Test 5: Insufficient coins blocks message
 **Setup:**
-- User with freeTextUsed = 3 (all free messages used)
+- User with **no** free quota left for the channel in the current period
 - User with coins < 5 (e.g., 3 coins)
 - Attempt to send text message
 

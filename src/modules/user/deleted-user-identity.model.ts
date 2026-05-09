@@ -7,7 +7,6 @@ export interface IDeletedUserIdentity extends Document {
   valueNormalized: string;
   valueHash: string;
   deletedAt: Date;
-  welcomeBonusClaimed: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -37,11 +36,6 @@ const deletedUserIdentitySchema = new Schema<IDeletedUserIdentity>(
       type: Date,
       required: true,
       default: Date.now,
-    },
-    welcomeBonusClaimed: {
-      type: Boolean,
-      required: true,
-      default: false,
     },
   },
   {

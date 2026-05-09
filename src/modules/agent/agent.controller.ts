@@ -1000,7 +1000,6 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
     session.startTransaction();
     try {
       const previousCoins = targetUser.coins || 0;
-      targetUser.welcomeBonusClaimed = true;
       targetUser.coins = 0;
       if (targetUser.role !== 'creator') {
         targetUser.role = 'creator';

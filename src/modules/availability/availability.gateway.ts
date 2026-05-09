@@ -10,6 +10,10 @@ import {
   refreshUserAvailability,
   getBatchUserAvailability,
 } from './user-availability.service';
+import {
+  recordCreatorAvailabilityBecameBusy,
+  recordCreatorAvailabilityBecameOnline,
+} from './creator-daily-online.service';
 
 // Keep this aligned with the availability service TTL.
 const AVAILABILITY_TTL_SECONDS = 120;
@@ -662,8 +666,9 @@ export async function setCreatorAvailability(
 
   if (status === 'online') {
     await redis.setex(key, AVAILABILITY_TTL_SECONDS, 'online');
+    await recordCreatorAvailabilityBecameOnline(creatorFirebaseUid);
   } else {
-    // Delete key — absence = busy (the universal default)
+    await recordCreatorAvailabilityBecameBusy(creatorFirebaseUid);
     await redis.del(key);
   }
 

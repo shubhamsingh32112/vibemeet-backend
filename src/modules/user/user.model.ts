@@ -21,8 +21,11 @@ export interface IUser extends Document {
   blockedCreatorIds: mongoose.Types.ObjectId[]; // Users can block creators (creator _id values)
   usernameChangeCount: number; // Track how many times username was changed
   coins: number;
+  /** Promo-only intro call allowance (face-value coin units; billing uses micros). Never IAP/refund wallet. */
+  introFreeCallCredits: number;
+  /** Set when the welcome intro program is atomically consumed after a qualifying billed session. */
+  welcomeFreeCallConsumedAt?: Date | null;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
-  welcomeBonusClaimed: boolean; // Whether user has claimed the 30-coin welcome bonus
   onboardingStage?: 'welcome' | 'bonus' | 'permissions' | 'completed';
   onboardingWelcomeSeenAt?: Date | null;
   onboardingBonusSeenAt?: Date | null;
@@ -84,6 +87,15 @@ const userSchema = new Schema<IUser>(
       default: 0,
       min: 0,
     },
+    introFreeCallCredits: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    welcomeFreeCallConsumedAt: {
+      type: Date,
+      default: null,
+    },
     freeTextUsed: {
       type: Number,
       default: 0,
@@ -132,10 +144,6 @@ const userSchema = new Schema<IUser>(
       type: Number,
       default: 0,
       min: 0,
-    },
-    welcomeBonusClaimed: {
-      type: Boolean,
-      default: false,
     },
     onboardingStage: {
       type: String,
