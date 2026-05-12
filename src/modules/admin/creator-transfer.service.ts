@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
 import { ReferralEdge } from '../user/referral-edge.model';
+import { isBdRole } from '../../utils/staff-roles';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { getReferralRewardCoins } from '../user/referral.service';
@@ -28,6 +29,10 @@ export type TransferCreatorToAgentResult =
         oldReferralCodeUsed: string | null;
         newReferralCodeUsed: string;
         rewardMoved: boolean;
+        /** UTC instant from payload or transfer completion time; forward attribution baseline. */
+        assignmentEffectiveFrom: string;
+        /** True when caller explicitly opted into legacy reward coin moves (attempted; see rewardMoved). */
+        moveGrantedReferralRewardsAttempted: boolean;
         pendingWithdrawalsReassigned: number;
       };
     }
@@ -40,6 +45,13 @@ export type TransferCreatorToAgentResult =
 type TransferOptions = {
   /** Optional idempotency scope key (used in transactionId strings). */
   idempotencyKey?: string | null;
+  /**
+   * When true, moves already-granted referral reward coins between agents (legacy / dangerous).
+   * Default false: reassignment applies to attribution + future economics only; past ledger unchanged.
+   */
+  moveGrantedReferralRewards?: boolean;
+  /** Optional instant for reporting; does not alter immutable past settlements. */
+  assignmentEffectiveFrom?: Date | string;
 };
 
 /**
@@ -70,6 +82,12 @@ export async function transferCreatorToAgent(
     let result: TransferCreatorToAgentResult | null = null;
 
     await session.withTransaction(async () => {
+      const effectiveFromRaw = options?.assignmentEffectiveFrom;
+      const assignmentEffectiveFromIso =
+        effectiveFromRaw != null
+          ? new Date(effectiveFromRaw).toISOString()
+          : new Date().toISOString();
+
       const creator = await Creator.findById(creatorOid).session(session);
       if (!creator) {
         result = { ok: false, status: 404, error: 'Creator not found' };
@@ -83,7 +101,7 @@ export async function transferCreatorToAgent(
 
       const targetAgent = await User.findOne({
         _id: targetAgentOid,
-        role: 'agent',
+        role: { $in: ['agent', 'bd'] },
         agentDisabled: { $ne: true },
       })
         .select('_id role agentDisabled referralCode email displayName username')
@@ -129,7 +147,8 @@ export async function transferCreatorToAgent(
         oldReferredBy !== targetAgentOid.toString();
 
       let rewardMoveEligible = false;
-      if (rewardGranted && isReferrerChanging) {
+      const allowRewardCoinMove = options?.moveGrantedReferralRewards === true;
+      if (allowRewardCoinMove && rewardGranted && isReferrerChanging) {
         const rewardCoins = getReferralRewardCoins();
         const oldRefOid = new mongoose.Types.ObjectId(oldReferredBy!);
         const oldRef = await User.findById(oldRefOid).select('role coins').session(session).lean();
@@ -138,7 +157,7 @@ export async function transferCreatorToAgent(
           throw new Error('ABORT_TX');
         }
         // Only move already-granted referral rewards between agents.
-        if (oldRef.role === 'agent') {
+        if (isBdRole(oldRef.role)) {
           const oldCoins = typeof oldRef.coins === 'number' ? oldRef.coins : 0;
           if (oldCoins < rewardCoins) {
             result = {
@@ -236,9 +255,10 @@ export async function transferCreatorToAgent(
         { session }
       );
 
-      // Reward move: only if already granted and referrer actually changed
+      // Reward coin move (optional; default off — future settlements use new assignment via ledger)
       let rewardMoved = false;
       if (
+        allowRewardCoinMove &&
         rewardGranted &&
         rewardMoveEligible &&
         oldReferredBy &&
@@ -311,6 +331,8 @@ export async function transferCreatorToAgent(
           oldReferralCodeUsed,
           newReferralCodeUsed: targetReferralCode,
           rewardMoved,
+          assignmentEffectiveFrom: assignmentEffectiveFromIso,
+          moveGrantedReferralRewardsAttempted: allowRewardCoinMove,
           pendingWithdrawalsReassigned: wdUpdate.modifiedCount ?? 0,
         },
       };

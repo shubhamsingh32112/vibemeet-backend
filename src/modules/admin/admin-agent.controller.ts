@@ -13,6 +13,9 @@ import { logError, logInfo } from '../../utils/logger';
 
 const BCRYPT_ROUNDS = 12;
 
+/** Legacy Mongo stored `agent`; new rows use `bd`. */
+const BD_ROLE_QUERY = { $in: ['agent', 'bd'] as const };
+
 export const createAgent = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
@@ -38,17 +41,27 @@ export const createAgent = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    const firebaseUid = `agent_${randomUUID().replace(/-/g, '')}`;
+    let agencyId: mongoose.Types.ObjectId | undefined;
+    const rawAgencyId = req.body.agencyId;
+    if (typeof rawAgencyId === 'string' && mongoose.Types.ObjectId.isValid(rawAgencyId)) {
+      const ag = await User.findById(rawAgencyId).select('role').lean();
+      if (ag?.role === 'agency') {
+        agencyId = new mongoose.Types.ObjectId(rawAgencyId);
+      }
+    }
+
+    const firebaseUid = `bd_${randomUUID().replace(/-/g, '')}`;
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
     const agent = await User.create({
       firebaseUid,
       email,
-      role: 'agent',
+      role: 'bd',
       passwordHash,
       displayName: displayName || undefined,
       coins: 0,
       agentDisabled: false,
+      ...(agencyId ? { agencyId } : {}),
     });
 
     await assignReferralCodeToUser(agent);
@@ -82,13 +95,13 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
     const skip = (page - 1) * limit;
 
     const [agents, total] = await Promise.all([
-      User.find({ role: 'agent' })
+      User.find({ role: BD_ROLE_QUERY })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('email displayName referralCode agentDisabled createdAt')
+        .select('email displayName referralCode agentDisabled agencyId createdAt')
         .lean(),
-      User.countDocuments({ role: 'agent' }),
+      User.countDocuments({ role: BD_ROLE_QUERY }),
     ]);
 
     const ids = agents.map((a) => a._id);
@@ -127,6 +140,7 @@ export const listAgents = async (req: Request, res: Response): Promise<void> => 
           displayName: a.displayName ?? null,
           referralCode: a.referralCode ?? null,
           agentDisabled: a.agentDisabled ?? false,
+          agencyId: (a as { agencyId?: mongoose.Types.ObjectId }).agencyId?.toString() ?? null,
           createdAt: a.createdAt,
           /** Referred users not yet promoted to creator (legacy field name). */
           pendingApplications: pendingMap.get(a._id.toString()) ?? 0,
@@ -147,7 +161,7 @@ export const listAgentsBrief = async (req: Request, res: Response): Promise<void
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const agents = await User.find({ role: 'agent' })
+    const agents = await User.find({ role: BD_ROLE_QUERY })
       .sort({ email: 1 })
       .select('_id email displayName')
       .lean();
@@ -173,8 +187,8 @@ export const getAgentDetail = async (req: Request, res: Response): Promise<void>
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agent = await User.findOne({ _id: id, role: 'agent' })
-      .select('email displayName referralCode agentDisabled createdAt updatedAt')
+    const agent = await User.findOne({ _id: id, role: BD_ROLE_QUERY })
+      .select('email displayName referralCode agentDisabled agencyId createdAt updatedAt')
       .lean();
     if (!agent) {
       res.status(404).json({ success: false, error: 'Agent not found' });
@@ -223,6 +237,7 @@ export const getAgentDetail = async (req: Request, res: Response): Promise<void>
           displayName: agent.displayName ?? null,
           referralCode: agent.referralCode ?? null,
           agentDisabled: agent.agentDisabled ?? false,
+          agencyId: (agent as { agencyId?: mongoose.Types.ObjectId }).agencyId?.toString() ?? null,
           createdAt: agent.createdAt,
           updatedAt: agent.updatedAt,
         },
@@ -263,7 +278,7 @@ export const patchAgent = async (req: Request, res: Response): Promise<void> => 
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agent = await User.findOne({ _id: id, role: 'agent' });
+    const agent = await User.findOne({ _id: id, role: BD_ROLE_QUERY });
     if (!agent) {
       res.status(404).json({ success: false, error: 'Agent not found' });
       return;
@@ -285,7 +300,11 @@ export const patchAgent = async (req: Request, res: Response): Promise<void> => 
         res.status(400).json({ success: false, error: 'Invalid reassignCreatorsToAgentId' });
         return;
       }
-      const target = await User.findOne({ _id: targetId, role: 'agent', agentDisabled: false });
+      const target = await User.findOne({
+        _id: targetId,
+        role: BD_ROLE_QUERY,
+        agentDisabled: false,
+      });
       if (!target) {
         res.status(404).json({ success: false, error: 'Target agent not found or disabled' });
         return;

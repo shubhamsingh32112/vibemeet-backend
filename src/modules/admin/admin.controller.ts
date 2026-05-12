@@ -40,8 +40,15 @@ import {
   CloudflareImagesError,
 } from '../images/cloudflare.client';
 import { verifyUserBalance, batchVerifyBalances } from '../../utils/balance-integrity';
+import { appendAuditEvent, extractAuditContext } from '../audit/audit-event.service';
+import { getLastStaffWalletReconciliationSummary } from '../billing/staff-wallet-reconciliation.service';
+import { getDomainEventWorkerStatsExtended } from '../events/domain-event.worker';
 import { Withdrawal } from '../creator/withdrawal.model';
-import { assertAdmin, assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
+import {
+  assertAdmin,
+  assertAdminOrOwningAgentForCreator,
+  assertSuperAdminStaffCapability,
+} from '../../middlewares/staff.middleware';
 import { transferCreatorToAgent } from './creator-transfer.service';
 import {
   processWithdrawalApproval,
@@ -58,7 +65,12 @@ import {
   IWalletCoinPack,
   getOrCreateWalletPricingConfig,
 } from '../payment/wallet-pricing.model';
+import {
+  PlatformRevenueConfig,
+  getOrCreatePlatformRevenueConfig,
+} from '../payment/platform-revenue-config.model';
 import { parseAdminDateRange } from './admin-date-range';
+import { isBdRole, isSuperAdminRole } from '../../utils/staff-roles';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -190,7 +202,7 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
     User.countDocuments({ role: 'user' }),
     Creator.countDocuments({}),
     Creator.countDocuments({ isOnline: true }),
-    User.countDocuments({ role: 'admin' }),
+    User.countDocuments({ role: { $in: ['admin', 'super_admin'] } }),
     User.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]),
     User.aggregate([{ $group: { _id: null, total: { $sum: '$coins' } } }]),
     CoinTransaction.aggregate([
@@ -804,7 +816,7 @@ async function computeUsersAnalytics(
       referredByUserId: refId ?? null,
       referralCodeUsed: edgeCodeByUser.get(uid) ?? null,
       referrerLabel: refInfo?.label ?? null,
-      referrerIsAgent: refInfo?.role === 'agent',
+      referrerIsAgent: refInfo ? isBdRole(refInfo.role) : false,
     };
   });
 
@@ -929,6 +941,85 @@ export const getCoinEconomy = async (req: Request, res: Response): Promise<void>
 // ══════════════════════════════════════════════════════════════════════════
 // GET /admin/wallet-pricing — Wallet package tier pricing config (live)
 // ══════════════════════════════════════════════════════════════════════════
+export const getPlatformRevenueConfigAdmin = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const cfg = await getOrCreatePlatformRevenueConfig();
+    res.json({ success: true, data: cfg });
+  } catch (error) {
+    console.error('❌ [ADMIN] Get platform revenue config error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const updatePlatformRevenueConfigAdmin = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!(await assertSuperAdminStaffCapability(req, res, 'managePlatformRevenue'))) return;
+
+    const bdBps = Number(req.body?.bdBps);
+    const agencyBps = Number(req.body?.agencyBps);
+    if (
+      !Number.isFinite(bdBps) ||
+      bdBps < 0 ||
+      bdBps > 10000 ||
+      !Number.isFinite(agencyBps) ||
+      agencyBps < 0 ||
+      agencyBps > 10000
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'bdBps and agencyBps must be numbers between 0 and 10000 (basis points)',
+      });
+      return;
+    }
+
+    await PlatformRevenueConfig.findOneAndUpdate(
+      { singletonKey: 'global' },
+      {
+        $set: {
+          bdBps: Math.floor(bdBps),
+          agencyBps: Math.floor(agencyBps),
+        },
+        $setOnInsert: { singletonKey: 'global' },
+      },
+      { upsert: true, new: true }
+    );
+
+    invalidateAdminCaches('overview').catch(() => {});
+    emitToAdmin('wallet_pricing_updated', { kind: 'platform_revenue' });
+
+    const cfg = await getOrCreatePlatformRevenueConfig();
+
+    const actor = await User.findOne({ firebaseUid: req.auth?.firebaseUid })
+      .select('_id role')
+      .lean();
+    const ctx = extractAuditContext(req);
+    void appendAuditEvent({
+      actorUserId: actor?._id ?? null,
+      actorRole: actor?.role,
+      eventType: 'platform_revenue_updated',
+      targetType: 'platform_config',
+      targetId: 'global',
+      metadata: {
+        bdBps: cfg.bdBps,
+        agencyBps: cfg.agencyBps,
+      },
+      ...ctx,
+    });
+
+    res.json({ success: true, data: cfg });
+  } catch (error) {
+    console.error('❌ [ADMIN] Update platform revenue config error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 export const getWalletPricing = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
@@ -1272,6 +1363,13 @@ export const getSystemHealth = async (req: Request, res: Response): Promise<void
     // Batch balance integrity check (up to 20 users)
     const balanceCheck = await batchVerifyBalances(20);
 
+    let domainEvents: Awaited<ReturnType<typeof getDomainEventWorkerStatsExtended>> | null = null;
+    try {
+      domainEvents = await getDomainEventWorkerStatsExtended();
+    } catch {
+      domainEvents = null;
+    }
+
     res.json({
       success: true,
       data: {
@@ -1286,6 +1384,8 @@ export const getSystemHealth = async (req: Request, res: Response): Promise<void
           balanceMismatchFlag: balanceCheck.mismatchCount > 0,
           balanceMismatches: balanceCheck.mismatches,
         },
+        staffWalletReconciliation: getLastStaffWalletReconciliationSummary(),
+        domainEvents,
         serverTime: new Date().toISOString(),
         uptime: process.uptime(),
         memoryUsage: process.memoryUsage(),
@@ -2289,7 +2389,7 @@ export const assignTicket = async (req: Request, res: Response): Promise<void> =
     if (adminId) {
       // Verify the admin user exists and is an admin
       const assignee = await User.findById(adminId).lean();
-      if (!assignee || assignee.role !== 'admin') {
+      if (!assignee || !isSuperAdminRole(assignee.role)) {
         res.status(400).json({ success: false, error: 'Assignee must be a valid admin user' });
         return;
       }
@@ -2722,7 +2822,16 @@ export const postAdminTransferCreatorToAgent = async (
       return;
     }
 
-    const transfer = await transferCreatorToAgent(creatorId, targetAgentId, { idempotencyKey });
+    const moveGrantedReferralRewards = req.body?.moveGrantedReferralRewards === true;
+    const assignmentEffectiveFromRaw = req.body?.assignmentEffectiveFrom;
+    const transfer = await transferCreatorToAgent(creatorId, targetAgentId, {
+      idempotencyKey,
+      moveGrantedReferralRewards,
+      assignmentEffectiveFrom:
+        assignmentEffectiveFromRaw !== undefined && assignmentEffectiveFromRaw !== null
+          ? assignmentEffectiveFromRaw
+          : undefined,
+    });
     if (!transfer.ok) {
       res.status(transfer.status).json({ success: false, error: transfer.error });
       return;
@@ -2738,6 +2847,17 @@ export const postAdminTransferCreatorToAgent = async (
       reason,
       transfer.data
     );
+
+    const actx = extractAuditContext(req);
+    void appendAuditEvent({
+      actorUserId: adminUser._id as mongoose.Types.ObjectId,
+      actorRole: adminUser.role,
+      eventType: 'creator_transfer_agent',
+      targetType: 'creator',
+      targetId: creatorId,
+      metadata: transfer.data as Record<string, unknown>,
+      ...actx,
+    });
 
     res.json({ success: true, data: transfer.data });
   } catch (error) {

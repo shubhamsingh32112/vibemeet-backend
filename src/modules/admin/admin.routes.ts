@@ -11,6 +11,12 @@ import {
   patchAgent,
 } from './admin-agent.controller';
 import {
+  createAgency,
+  listAgencies,
+  getAgencyDetail,
+  patchAgency,
+} from './admin-agency.controller';
+import {
   getOverview,
   getCreatorsPerformance,
   getUsersAnalytics,
@@ -36,6 +42,8 @@ import {
   getSecurityFlags,
   getFullAuditReport,
   updateWalletPricing,
+  getPlatformRevenueConfigAdmin,
+  updatePlatformRevenueConfigAdmin,
   patchCreatorLinkedUser,
   postAdminTransferCreatorToAgent,
   adminCreatorGalleryCommit,
@@ -52,6 +60,19 @@ import {
   rejectImage,
   getImagePipelineHealth,
 } from './admin-image-moderation.controller';
+import {
+  getStaffWalletReconciliationLogs,
+  postStaffWalletReconciliationRun,
+} from '../billing/staff-wallet-reconciliation.controller';
+import { getAuditEvents } from '../audit/audit-event.controller';
+import { postReplayDomainEvent } from '../events/domain-event.controller';
+import { postAdminAnalyticsRebuild } from '../analytics/analytics.controller';
+import {
+  getFraudSignals,
+  getFraudInvestigations,
+  postFraudInvestigationNote,
+  postFraudRulesRun,
+} from '../fraud/fraud.controller';
 
 const router = Router();
 
@@ -65,14 +86,23 @@ router.get('/users/analytics', getUsersAnalytics);
 router.get('/users/:id/ledger', getUserLedger);
 router.get('/coins', getCoinEconomy);
 router.get('/wallet-pricing', getWalletPricing);
+router.get('/platform-revenue', getPlatformRevenueConfigAdmin);
+router.put('/platform-revenue', updatePlatformRevenueConfigAdmin);
 router.get('/calls', getCallsAdmin);
 router.get('/calls/:callId/refund-preview', getRefundPreview);
 router.get('/system/health', getSystemHealth);
 router.get('/app-updates/current', getCurrentGlobalAppUpdateForAdmin);
 router.get('/realtime-metrics', getRealtimeMetrics);
 router.get('/actions/log', getAdminActionLog);
+router.get('/audit-events', getAuditEvents);
 
-// ── Agents (super-admin) ────────────────────────────────────────────────
+// ── Agencies (super-admin) ───────────────────────────────────────────────
+router.post('/agencies', createAgency);
+router.get('/agencies', listAgencies);
+router.get('/agencies/:id', getAgencyDetail);
+router.patch('/agencies/:id', patchAgency);
+
+// ── BD / agents (super-admin) ─────────────────────────────────────────────
 router.post('/agents', createAgent);
 router.get('/agents/brief', listAgentsBrief);
 router.get('/agents', listAgents);
@@ -104,6 +134,17 @@ router.post('/app-updates/publish', appUpdatePublishLimiter, publishGlobalAppUpd
 
 // ── Phase 7: Data Integrity Checks ─────────────────────────────────────
 router.get('/integrity-checks', getIntegrityChecks);
+
+// ── Staff wallet reconciliation (ledger vs cached balance) ────────────
+router.get('/staff-wallet-reconciliation', getStaffWalletReconciliationLogs);
+router.post('/staff-wallet-reconciliation/run', postStaffWalletReconciliationRun);
+router.post('/domain-events/:eventId/replay', postReplayDomainEvent);
+router.post('/analytics/rebuild', postAdminAnalyticsRebuild);
+
+router.get('/fraud/signals', getFraudSignals);
+router.get('/fraud/investigations', getFraudInvestigations);
+router.post('/fraud/investigations/:id/notes', postFraudInvestigationNote);
+router.post('/fraud/rules/run', postFraudRulesRun);
 
 // ── Phase 9: Security & Abuse Controls ─────────────────────────────────
 router.get('/creators/security-flags', getSecurityFlags);

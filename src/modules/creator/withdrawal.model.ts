@@ -31,6 +31,8 @@ export interface IWithdrawal extends Document {
   ifsc?: string;
   /** Copied from Creator.assignedAgentId at request time for indexed agent queues. */
   assignedAgentId?: mongoose.Types.ObjectId;
+  /** When set, deduction uses `User.staffCoinsBalance` (BD/agency staff wallets). */
+  staffUserId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -97,6 +99,12 @@ const withdrawalSchema = new Schema<IWithdrawal>(
       sparse: true,
       index: true,
     },
+    staffUserId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      sparse: true,
+      index: true,
+    },
   },
   {
     timestamps: true,
@@ -111,5 +119,6 @@ withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });
 // Index for cooldown check: find recent withdrawals by creator
 withdrawalSchema.index({ creatorUserId: 1, requestedAt: -1 });
+withdrawalSchema.index({ staffUserId: 1, createdAt: -1 }, { sparse: true });
 
 export const Withdrawal = mongoose.model<IWithdrawal>('Withdrawal', withdrawalSchema);

@@ -41,6 +41,10 @@ import {
 import { billingService, finalFlushMarkerKey } from './billing.service';
 import { getBillingCheckpoint } from './billing-checkpoint.service';
 import { featureFlags } from '../../config/feature-flags';
+import { isBdRole } from '../../utils/staff-roles';
+import { StaffWalletLedger } from './staff-wallet-ledger.model';
+import { resolveStaffCommissionBps } from '../payment/commission-resolve.service';
+import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
 
 interface CallSession {
   schemaVersion?: number;
@@ -551,6 +555,108 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
                 },
                 { upsert: true, new: true, session: dbSession }
               );
+
+              // Staff revenue: BD/agency % of host-earned coins (gross). Snapshots stored on ledger rows.
+              const bdOid = creator.assignedAgentId;
+              if (bdOid && totalEarnedCreator > 0) {
+                const bdUser = await User.findById(bdOid)
+                  .select('role agencyId')
+                  .session(dbSession)
+                  .lean();
+                if (bdUser && isBdRole(bdUser.role)) {
+                  const rates = await resolveStaffCommissionBps({
+                    bdUserId: bdOid as mongoose.Types.ObjectId,
+                    agencyId: bdUser.agencyId ?? null,
+                  });
+                  const bdBpsSnap = rates.bdBps;
+                  const agencyBpsSnap = rates.agencyBps;
+                  const bdCut = Math.floor((totalEarnedCreator * bdBpsSnap) / 10000);
+                  const agencyCut =
+                    bdUser.agencyId != null
+                      ? Math.floor((totalEarnedCreator * agencyBpsSnap) / 10000)
+                      : 0;
+
+                  const bdKey = `staff_ledger_call_${callId}_bd_credit`;
+                  const agKey = `staff_ledger_call_${callId}_agency_credit`;
+
+                  if (bdCut > 0) {
+                    const existingBdLine = await StaffWalletLedger.findOne({ idempotencyKey: bdKey })
+                      .session(dbSession)
+                      .select('_id')
+                      .lean();
+                    if (!existingBdLine) {
+                      const bdAfterDoc = await User.findByIdAndUpdate(
+                        bdOid,
+                        { $inc: { staffCoinsBalance: bdCut } },
+                        { new: true, session: dbSession }
+                      )
+                        .select('staffCoinsBalance')
+                        .lean();
+                      await StaffWalletLedger.create(
+                        [
+                          {
+                            staffUserId: bdOid,
+                            direction: 'credit',
+                            amountCoins: bdCut,
+                            balanceAfter: bdAfterDoc?.staffCoinsBalance,
+                            sourceType: 'call_settlement',
+                            callId,
+                            hostUserId: creator.userId as mongoose.Types.ObjectId,
+                            creatorMongoId: creator._id,
+                            bdUserId: bdOid,
+                            ...(bdUser.agencyId
+                              ? { agencyUserId: bdUser.agencyId as mongoose.Types.ObjectId }
+                              : {}),
+                            bdBpsSnapshot: bdBpsSnap,
+                            agencyBpsSnapshot: agencyBpsSnap,
+                            description: `BD share from call`,
+                            idempotencyKey: bdKey,
+                          },
+                        ],
+                        { session: dbSession }
+                      );
+                    }
+                  }
+
+                  if (agencyCut > 0 && bdUser.agencyId) {
+                    const agOid = bdUser.agencyId;
+                    const existingAgLine = await StaffWalletLedger.findOne({ idempotencyKey: agKey })
+                      .session(dbSession)
+                      .select('_id')
+                      .lean();
+                    if (!existingAgLine) {
+                      const agAfterDoc = await User.findByIdAndUpdate(
+                        agOid,
+                        { $inc: { staffCoinsBalance: agencyCut } },
+                        { new: true, session: dbSession }
+                      )
+                        .select('staffCoinsBalance')
+                        .lean();
+                      await StaffWalletLedger.create(
+                        [
+                          {
+                            staffUserId: agOid,
+                            direction: 'credit',
+                            amountCoins: agencyCut,
+                            balanceAfter: agAfterDoc?.staffCoinsBalance,
+                            sourceType: 'call_settlement',
+                            callId,
+                            hostUserId: creator.userId as mongoose.Types.ObjectId,
+                            creatorMongoId: creator._id,
+                            bdUserId: bdOid,
+                            agencyUserId: agOid,
+                            bdBpsSnapshot: bdBpsSnap,
+                            agencyBpsSnapshot: agencyBpsSnap,
+                            description: `Agency share from call`,
+                            idempotencyKey: agKey,
+                          },
+                        ],
+                        { session: dbSession }
+                      );
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -630,6 +736,16 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     mongoTransactionCommitted = true;
     recordBillingMetric('settlement_transaction_ms', Date.now() - txnStartedAt, { callId });
     logInfo('Settlement transaction committed', { callId });
+
+    void enqueueSettlementDomainEvents({
+      callId,
+      totalEarnedCreator,
+      durationSeconds,
+    }).catch((err) =>
+      logError('enqueueSettlementDomainEvents failed', err instanceof Error ? err : new Error(String(err)), {
+        callId,
+      })
+    );
 
     try {
       await deleteBillingSessionRedisKeys(

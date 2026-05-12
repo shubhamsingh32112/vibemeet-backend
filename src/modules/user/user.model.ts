@@ -45,11 +45,41 @@ export interface IUser extends Document {
   lastPermissionsDecisionRequestId?: string | null;
   lastOnboardingStageIdempotencyKey?: string | null;
   permissionOnboardingStatus?: 'accepted' | 'skipped' | 'unknown';
-  role: 'user' | 'creator' | 'admin' | 'agent';
-  /** Bcrypt hash for agent dashboard login (never store plaintext). */
+  role:
+    | 'user'
+    | 'creator'
+    | 'admin'
+    | 'agent'
+    | 'super_admin'
+    | 'agency'
+    | 'bd';
+  /** Bcrypt hash for agent/bd/agency dashboard login (never store plaintext). */
   passwordHash?: string;
-  /** When true, agent JWT login is blocked (super-admin toggle). */
+  /** When true, BD/agent JWT login is blocked (super-admin toggle). */
   agentDisabled?: boolean;
+  /** When true, agency JWT login is blocked (super-admin toggle). */
+  agencyDisabled?: boolean;
+  /** Parent agency User._id for BD (`role === 'bd'` or legacy `agent`). */
+  agencyId?: mongoose.Types.ObjectId;
+  /** Staff earnings wallet (coins face units); separate from consumer `coins`. */
+  staffCoinsBalance?: number;
+  /** Host onboarding under BD referral — Flutter reads via creatorApplication* flags. */
+  hostOnboardingStatus?:
+    | 'none'
+    | 'draft'
+    | 'pending_bd_approval'
+    | 'approved'
+    | 'rejected'
+    | 'suspended'
+    | 'blocked'
+    | 'under_review';
+  /** Super-admin capability toggles (optional; default allow). */
+  staffCapabilities?: {
+    editPricing?: boolean;
+    managePlatformRevenue?: boolean;
+  };
+  hostOnboardingRejectedReason?: string;
+  bdApprovedAt?: Date | null;
   /** Optional label for agent management UI. */
   displayName?: string;
   /** Fast Login: 'google' | 'fast'. Omitted for existing users (treated as Google). */
@@ -214,7 +244,7 @@ const userSchema = new Schema<IUser>(
     },
     role: {
       type: String,
-      enum: ['user', 'creator', 'admin', 'agent'],
+      enum: ['user', 'creator', 'admin', 'agent', 'super_admin', 'agency', 'bd'],
       default: 'user',
     },
     passwordHash: {
@@ -225,6 +255,50 @@ const userSchema = new Schema<IUser>(
     agentDisabled: {
       type: Boolean,
       default: false,
+    },
+    agencyDisabled: {
+      type: Boolean,
+      default: false,
+    },
+    agencyId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      sparse: true,
+      index: true,
+    },
+    staffCoinsBalance: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    hostOnboardingStatus: {
+      type: String,
+      enum: [
+        'none',
+        'draft',
+        'pending_bd_approval',
+        'approved',
+        'rejected',
+        'suspended',
+        'blocked',
+        'under_review',
+      ],
+      default: 'none',
+      sparse: true,
+    },
+    staffCapabilities: {
+      editPricing: { type: Boolean, default: true },
+      managePlatformRevenue: { type: Boolean, default: true },
+    },
+    hostOnboardingRejectedReason: {
+      type: String,
+      trim: true,
+      maxlength: 2000,
+      default: undefined,
+    },
+    bdApprovedAt: {
+      type: Date,
+      default: null,
     },
     displayName: {
       type: String,
@@ -304,5 +378,7 @@ userSchema.index({ deviceFingerprint: 1 }, { sparse: true });
 userSchema.index({ installId: 1 }, { unique: true, sparse: true });
 // Index for Fast Login migration (find by installId when fingerprint format changed)
 userSchema.index({ installId: 1, authProvider: 1 }, { sparse: true });
+userSchema.index({ agencyId: 1, role: 1 }, { sparse: true });
+userSchema.index({ hostOnboardingStatus: 1, referredBy: 1 }, { sparse: true });
 
 export const User = mongoose.model<IUser>('User', userSchema);

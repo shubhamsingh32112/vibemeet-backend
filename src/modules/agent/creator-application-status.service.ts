@@ -1,4 +1,5 @@
 import type { Types } from 'mongoose';
+import { User } from '../user/user.model';
 
 export type CreatorApplicationFlags = {
   creatorApplicationPending: boolean;
@@ -7,15 +8,29 @@ export type CreatorApplicationFlags = {
 };
 
 /**
- * Legacy CreatorApplication workflow is retired: agent referrals no longer create pending
- * applications. Clients still receive these flags for backward compatibility; they are always
- * false so the app does not block on verification screens.
+ * BD referral host onboarding — surfaced to Flutter as legacy creatorApplication* flags.
  */
 export async function getCreatorApplicationFlagsForUser(
-  _userId: Types.ObjectId
+  userId: Types.ObjectId
 ): Promise<CreatorApplicationFlags> {
+  const u = await User.findById(userId)
+    .select('hostOnboardingStatus hostOnboardingRejectedReason')
+    .lean();
+  if (!u) {
+    return {
+      creatorApplicationPending: false,
+      creatorApplicationRejected: false,
+    };
+  }
+  const st = u.hostOnboardingStatus ?? 'none';
+  const pending = st === 'pending_bd_approval' || st === 'under_review';
+  const rejected =
+    st === 'rejected' || st === 'suspended' || st === 'blocked';
   return {
-    creatorApplicationPending: false,
-    creatorApplicationRejected: false,
+    creatorApplicationPending: pending,
+    creatorApplicationRejected: rejected,
+    ...(rejected && u.hostOnboardingRejectedReason
+      ? { creatorApplicationRejectionReason: u.hostOnboardingRejectedReason }
+      : {}),
   };
 }

@@ -12,6 +12,9 @@ import { getIO } from '../../config/socket';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { AdminActionLog } from '../admin/admin-action-log.model';
+import { isSuperAdminRole } from '../../utils/staff-roles';
+import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
+import { persistDomainEvent } from '../events/domain-event.service';
 
 type ActingUserLean = {
   _id: Types.ObjectId;
@@ -82,6 +85,111 @@ export async function processWithdrawalApproval(
   const withdrawal = await Withdrawal.findById(withdrawalId);
   if (!withdrawal) {
     return { ok: false, status: 404, error: 'Withdrawal not found' };
+  }
+
+  const staffUserId = (withdrawal as { staffUserId?: Types.ObjectId }).staffUserId;
+  if (staffUserId) {
+    if (!options.isAdmin || !isSuperAdminRole(actingUser.role)) {
+      return { ok: false, status: 403, error: 'Staff withdrawals require super admin approval' };
+    }
+
+    if (withdrawal.status !== 'pending') {
+      return {
+        ok: false,
+        status: 400,
+        error: `Cannot approve withdrawal with status '${withdrawal.status}'. Only pending withdrawals can be approved.`,
+      };
+    }
+
+    const staffUser = await User.findById(staffUserId);
+    if (!staffUser) {
+      return { ok: false, status: 404, error: 'Staff user not found' };
+    }
+
+    const bal = staffUser.staffCoinsBalance ?? 0;
+    if (bal < withdrawal.amount) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Staff wallet balance (${bal}) is less than withdrawal amount (${withdrawal.amount}).`,
+      };
+    }
+
+    const txId = `staff_withdrawal_${withdrawal._id}_${randomUUID()}`;
+    await new CoinTransaction({
+      transactionId: txId,
+      userId: staffUser._id,
+      type: 'debit',
+      coins: withdrawal.amount,
+      source: 'withdrawal',
+      description: `Staff withdrawal approved by ${actingUser.email || actingUser.role}${options.notes ? ': ' + options.notes.trim() : ''}`,
+      status: 'completed',
+    }).save();
+
+    staffUser.staffCoinsBalance = Math.max(0, bal - withdrawal.amount);
+    await staffUser.save();
+
+    await StaffWalletLedger.create({
+      staffUserId: staffUser._id,
+      direction: 'debit',
+      amountCoins: withdrawal.amount,
+      balanceAfter: staffUser.staffCoinsBalance,
+      sourceType: 'withdrawal_reserve',
+      withdrawalId: withdrawal._id,
+      description: `Staff withdrawal approved (balance deducted)`,
+      idempotencyKey: `staff_ledger_withdrawal_${withdrawal._id.toString()}_approve_debit`,
+    });
+
+    withdrawal.status = 'approved';
+    withdrawal.processedAt = new Date();
+    withdrawal.adminUserId = actingUser._id;
+    withdrawal.notes = options.notes?.trim() || undefined;
+    withdrawal.transactionId = txId;
+    await withdrawal.save();
+
+    await logStaffWithdrawalAction(
+      actingUser,
+      'WITHDRAWAL_APPROVED',
+      withdrawal._id.toString(),
+      options.notes?.trim() || 'Staff withdrawal approved',
+      {
+        transactionId: txId,
+        staffUserId: staffUser._id.toString(),
+        amount: withdrawal.amount,
+        actorRole: actingUser.role,
+      }
+    );
+
+    await invalidateAdminCaches('overview', 'coins');
+    emitToAdmin('withdrawal:updated', {
+      withdrawalId: withdrawal._id.toString(),
+      status: 'approved',
+    });
+
+    void persistDomainEvent({
+      eventType: 'WithdrawalCompletedEvent',
+      aggregateId: withdrawal._id.toString(),
+      idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
+      payload: {
+        eventKind: 'WithdrawalCompleted',
+        idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
+        occurredAt: new Date().toISOString(),
+        aggregateType: 'withdrawal',
+        aggregateId: withdrawal._id.toString(),
+        withdrawalId: withdrawal._id.toString(),
+        status: 'approved',
+      },
+    });
+
+    return {
+      ok: true,
+      data: {
+        withdrawalId: withdrawal._id.toString(),
+        status: 'approved',
+        amount: withdrawal.amount,
+        transactionId: txId,
+      },
+    };
   }
 
   if (!options.isAdmin) {
@@ -214,7 +322,12 @@ export async function processWithdrawalRejection(
     return { ok: false, status: 404, error: 'Withdrawal not found' };
   }
 
-  if (!options.isAdmin) {
+  const staffRejectId = (withdrawal as { staffUserId?: Types.ObjectId }).staffUserId;
+  if (staffRejectId) {
+    if (!options.isAdmin || !isSuperAdminRole(actingUser.role)) {
+      return { ok: false, status: 403, error: 'Staff withdrawals require super admin' };
+    }
+  } else if (!options.isAdmin) {
     const allowed = await withdrawalManagedByAgent(withdrawal, actingUser._id);
     if (!allowed) {
       return { ok: false, status: 403, error: 'This withdrawal is not assigned to you' };
@@ -280,6 +393,47 @@ export async function processWithdrawalMarkPaid(
       ok: false,
       status: 400,
       error: `Cannot mark as paid. Withdrawal status is '${withdrawal.status}', expected 'approved'.`,
+    };
+  }
+
+  const staffMarkPaidId = (withdrawal as { staffUserId?: Types.ObjectId }).staffUserId;
+  if (staffMarkPaidId) {
+    if (!options.isAdmin || !isSuperAdminRole(actingUser.role)) {
+      return { ok: false, status: 403, error: 'Staff withdrawals require super admin' };
+    }
+    withdrawal.status = 'paid';
+    withdrawal.processedAt = new Date();
+    if (options.notes?.trim()) {
+      withdrawal.notes =
+        (withdrawal.notes || '') + (withdrawal.notes ? ' | ' : '') + `Paid: ${options.notes.trim()}`;
+    }
+    await withdrawal.save();
+
+    await logStaffWithdrawalAction(
+      actingUser,
+      'WITHDRAWAL_PAID',
+      withdrawal._id.toString(),
+      options.notes?.trim() || 'Marked as paid',
+      {
+        staffUserId: staffMarkPaidId.toString(),
+        amount: withdrawal.amount,
+        actorRole: actingUser.role,
+      }
+    );
+
+    await invalidateAdminCaches('overview', 'coins');
+    emitToAdmin('withdrawal:updated', {
+      withdrawalId: withdrawal._id.toString(),
+      status: 'paid',
+    });
+
+    return {
+      ok: true,
+      data: {
+        withdrawalId: withdrawal._id.toString(),
+        status: 'paid',
+        amount: withdrawal.amount,
+      },
     };
   }
 

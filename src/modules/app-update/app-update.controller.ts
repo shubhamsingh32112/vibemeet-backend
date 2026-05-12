@@ -5,6 +5,7 @@ import { getRedis, isRedisConfigured } from '../../config/redis';
 import { User } from '../user/user.model';
 import { GlobalAppUpdate, GlobalAppUpdateAck } from './app-update.model';
 import { logError, logInfo } from '../../utils/logger';
+import { isSuperAdminRole } from '../../utils/staff-roles';
 
 const ACTIVE_UPDATE_CACHE_KEY = 'app_update:active:v1';
 const ACTIVE_UPDATE_CACHE_TTL_SECONDS = 60;
@@ -107,7 +108,7 @@ export const publishGlobalAppUpdate = async (req: Request, res: Response): Promi
   const startedAt = Date.now();
   try {
     const actor = await resolveAuthedUser(req);
-    if (!actor || actor.role !== 'admin') {
+    if (!actor || !isSuperAdminRole(actor.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Admin access required' });
       return;
     }
@@ -227,7 +228,7 @@ export const publishGlobalAppUpdate = async (req: Request, res: Response): Promi
 export const getCurrentGlobalAppUpdateForAdmin = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolveAuthedUser(req);
-    if (!actor || actor.role !== 'admin') {
+    if (!actor || !isSuperAdminRole(actor.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Admin access required' });
       return;
     }
@@ -256,7 +257,12 @@ export const getPendingGlobalAppUpdate = async (req: Request, res: Response): Pr
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
-    if (actor && actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin') {
+    if (
+      actor &&
+      actor.role !== 'user' &&
+      actor.role !== 'creator' &&
+      !isSuperAdminRole(actor.role)
+    ) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -343,7 +349,12 @@ export const ackGlobalAppUpdateNow = async (req: Request, res: Response): Promis
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
-    if (actor && actor.role !== 'user' && actor.role !== 'creator' && actor.role !== 'admin') {
+    if (
+      actor &&
+      actor.role !== 'user' &&
+      actor.role !== 'creator' &&
+      !isSuperAdminRole(actor.role)
+    ) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }

@@ -4,6 +4,7 @@ import {
   logout,
   adminLogin,
   agentLogin,
+  agencyLogin,
   fastLoginDeprecated,
   phonePrecheck,
 } from './auth.controller';
@@ -27,7 +28,10 @@ router.post('/fast-login', fastLoginLimiter, fastLoginDeprecated);
 // Admin login — email + password (no Firebase token)
 router.post('/admin-login', loginLimiter, adminLogin);
 
-// Agent login — email + password (bcrypt on User.passwordHash)
+// Agent / BD login — email + password (bcrypt on User.passwordHash)
 router.post('/agent-login', loginLimiter, agentLogin);
+
+// Agency login — email + password (bcrypt on User.passwordHash)
+router.post('/agency-login', loginLimiter, agencyLogin);
 
 export default router;

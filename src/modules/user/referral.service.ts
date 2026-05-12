@@ -25,6 +25,7 @@ import {
   getReferralMinPurchaseInr,
   getReferralRewardCoins,
 } from './referral-config';
+import { isBdRole } from '../../utils/staff-roles';
 
 export {
   getReferralAttachWindowMs,
@@ -223,10 +224,10 @@ export async function previewReferralCode(
   if (applicant && referrer._id.equals(applicant._id)) {
     return { ok: false, code: 'SELF' };
   }
-  if (referrer.role === 'agent' && referrer.agentDisabled) {
+  if (isBdRole(referrer.role) && referrer.agentDisabled) {
     return { ok: false, code: 'AGENT_DISABLED' };
   }
-  if (referrer.role !== 'agent') {
+  if (!isBdRole(referrer.role)) {
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
       .lean();
@@ -282,7 +283,7 @@ export async function applyReferralCode(
     return { ok: false, code: 'SELF' };
   }
 
-  if (referrer.role === 'agent' && referrer.agentDisabled) {
+  if (isBdRole(referrer.role) && referrer.agentDisabled) {
     logInfo('Referral skipped: agent account disabled', {
       code,
       referrerId: referrer._id.toString(),
@@ -290,8 +291,8 @@ export async function applyReferralCode(
     return { ok: false, code: 'AGENT_DISABLED' };
   }
 
-  // Creators cannot refer (non-agent). Agents may refer even if they have a creator profile.
-  if (referrer.role !== 'agent') {
+  // Creators cannot refer (non-BD). BD/agents may refer even if they have a creator profile.
+  if (!isBdRole(referrer.role)) {
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
       .lean();
@@ -304,9 +305,14 @@ export async function applyReferralCode(
     }
   }
 
+  const referredByUpdate: Record<string, unknown> = { referredBy: referrer._id };
+  if (isBdRole(referrer.role)) {
+    referredByUpdate.hostOnboardingStatus = 'pending_bd_approval';
+  }
+
   const claimed = await User.findOneAndUpdate(
     { _id: applicant._id, referredBy: null },
-    { $set: { referredBy: referrer._id } },
+    { $set: referredByUpdate },
     { new: true }
   );
   if (!claimed) {
@@ -349,7 +355,7 @@ export async function applyReferralCode(
     mode,
   });
 
-  if (referrer.role === 'agent') {
+  if (isBdRole(referrer.role)) {
     logInfo('Agent referral: user linked; promotion via agent or admin dashboard', {
       newUserId: applicant._id.toString(),
       agentUserId: referrer._id.toString(),
@@ -357,7 +363,7 @@ export async function applyReferralCode(
     return { ok: true };
   }
 
-  // Non-agent creator referrers are rejected before linkage; no invitee promotion path here.
+  // Non-BD creator referrers are rejected before linkage; no invitee promotion path here.
   return { ok: true };
 }
 

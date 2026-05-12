@@ -4,6 +4,26 @@ import jwt from 'jsonwebtoken';
 import { getFirebaseAdmin } from '../config/firebase';
 import { User } from '../modules/user/user.model';
 import { logError, logInfo, logDebug, logWarning } from '../utils/logger';
+import {
+  isAgencyRole,
+  isBdRole,
+  isStaffRecruiterDisabled,
+  isSuperAdminRole,
+  isAgencyStaffDisabled,
+} from '../utils/staff-roles';
+
+function jwtRoleMatchesMongoStaff(tokenRole: string, mongoRole: string): boolean {
+  if (tokenRole === 'admin' || tokenRole === 'super_admin') {
+    return isSuperAdminRole(mongoRole);
+  }
+  if (tokenRole === 'agent' || tokenRole === 'bd') {
+    return isBdRole(mongoRole);
+  }
+  if (tokenRole === 'agency') {
+    return isAgencyRole(mongoRole);
+  }
+  return false;
+}
 
 /**
  * Verifies either a Firebase ID token (mobile app) or a custom admin JWT (admin website).
@@ -41,36 +61,27 @@ export const verifyFirebaseToken = async (
           email: string;
         };
 
-        if (decoded.role === 'admin' && decoded.userId) {
-          const adminUser = await User.findById(decoded.userId);
-          if (adminUser && adminUser.role === 'admin') {
-            logInfo('Admin JWT verified', {
-              adminId: adminUser._id.toString(),
-              email: adminUser.email || 'N/A',
-              path: req.path,
-            });
-
-            req.auth = {
-              firebaseUid: adminUser.firebaseUid,
-              email: adminUser.email,
-            };
-
-            logInfo('Admin authentication successful', { path: req.path });
-            next();
-            return;
-          }
-        }
-
-        if (decoded.role === 'agent' && decoded.userId) {
-          const agentUser = await User.findById(decoded.userId);
-          if (agentUser && agentUser.role === 'agent' && !agentUser.agentDisabled) {
-            logInfo('Agent JWT verified', {
-              agentId: agentUser._id.toString(),
+        if (decoded.userId) {
+          const staffUser = await User.findById(decoded.userId);
+          if (
+            staffUser &&
+            jwtRoleMatchesMongoStaff(decoded.role, staffUser.role) &&
+            (isSuperAdminRole(staffUser.role) ||
+              (isBdRole(staffUser.role) && !isStaffRecruiterDisabled(staffUser)) ||
+              (isAgencyRole(staffUser.role) && !isAgencyStaffDisabled(staffUser)))
+          ) {
+            const kind = isSuperAdminRole(staffUser.role)
+              ? 'Admin'
+              : isAgencyRole(staffUser.role)
+                ? 'Agency'
+                : 'Agent';
+            logInfo(`${kind} JWT verified`, {
+              staffId: staffUser._id.toString(),
               path: req.path,
             });
             req.auth = {
-              firebaseUid: agentUser.firebaseUid,
-              email: agentUser.email,
+              firebaseUid: staffUser.firebaseUid,
+              email: staffUser.email,
             };
             next();
             return;

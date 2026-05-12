@@ -19,6 +19,14 @@ import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcess
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
 import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
 import { startReconciliationJob, stopReconciliationJob } from './modules/billing/billing-reconciliation';
+import {
+  startStaffWalletReconciliationScheduler,
+  stopStaffWalletReconciliationScheduler,
+} from './modules/billing/staff-wallet-reconciliation.scheduler';
+import {
+  startDomainEventWorker,
+  stopDomainEventWorker,
+} from './modules/events/domain-event.worker';
 import { verifyStartupRecovery } from './modules/billing/billing-recovery';
 import { setupAdminGateway } from './modules/admin/admin.gateway';
 import routes from './routes';
@@ -37,6 +45,7 @@ import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
 import { validatePricingConfig } from './config/pricing.config';
 import { logRequest, logError, logWarning, logInfo } from './utils/logger';
+import { requestContextMiddleware } from './middlewares/request-context.middleware';
 import { logRateLimitConfig } from './utils/rate-limit.service';
 import { requestQueueMiddleware, getRequestQueueStats } from './middlewares/request-queue.middleware';
 import { mongoPoolMonitor } from './utils/mongo-pool-monitor';
@@ -121,6 +130,10 @@ app.use(
       'X-Requested-With',
       'x-idempotency-key',
       'X-Idempotency-Key',
+      'x-request-id',
+      'X-Request-Id',
+      'x-correlation-id',
+      'X-Correlation-Id',
     ],
     exposedHeaders: ['Content-Length', 'Content-Type'],
     maxAge: 86400,
@@ -190,6 +203,8 @@ app.use((req, res, next) => {
   }
   urlEncodedParser(req, res, next);
 });
+
+app.use(requestContextMiddleware);
 
 // Request logging middleware
 app.use((req, _res, next) => {
@@ -822,6 +837,8 @@ const startServer = async () => {
     startTerminationRetryWorker();
     // 🔥 FIX 5: Start reconciliation job for error recovery
     startReconciliationJob(io);
+    startStaffWalletReconciliationScheduler();
+    startDomainEventWorker();
     logInfo('Global billing batch processor started');
     
     // 🔥 FIX: Verify startup recovery for active calls
@@ -960,6 +977,8 @@ process.on('uncaughtException', async (error) => {
   logError('Uncaught exception - cleaning up and exiting', error);
   await cleanupBillingIntervals().catch(() => {});
   stopReconciliationJob();
+  stopStaffWalletReconciliationScheduler();
+  stopDomainEventWorker();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});
@@ -974,6 +993,8 @@ process.on('SIGTERM', async () => {
   logInfo('SIGTERM received — cleaning up', { signal: 'SIGTERM' });
   await cleanupBillingIntervals();
   stopReconciliationJob();
+  stopStaffWalletReconciliationScheduler();
+  stopDomainEventWorker();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});
@@ -988,6 +1009,8 @@ process.on('SIGINT', async () => {
   logInfo('SIGINT received — cleaning up', { signal: 'SIGINT' });
   await cleanupBillingIntervals();
   stopReconciliationJob();
+  stopStaffWalletReconciliationScheduler();
+  stopDomainEventWorker();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});

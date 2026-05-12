@@ -487,21 +487,34 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    // Look up (or create) the admin user in the database
-    let adminUser = await User.findOne({ email: adminEmail, role: 'admin' });
+    // Look up (or create) the super-admin user in the database
+    let adminUser = await User.findOne({
+      email: adminEmail,
+      role: { $in: ['admin', 'super_admin'] },
+    });
 
     if (!adminUser) {
       adminUser = await User.create({
-        firebaseUid: `admin_${Date.now()}`,
+        firebaseUid: `super_admin_${Date.now()}`,
         email: adminEmail,
-        role: 'admin',
+        role: 'super_admin',
         coins: 0,
       });
-      logInfo('Admin user created in database', { userId: adminUser._id.toString(), email: adminEmail });
+      logInfo('Super admin user created in database', {
+        userId: adminUser._id.toString(),
+        email: adminEmail,
+      });
+    } else if (adminUser.role === 'admin') {
+      adminUser.role = 'super_admin';
+      await adminUser.save();
     }
 
     const token = jwt.sign(
-      { userId: adminUser._id.toString(), role: 'admin', email: adminEmail },
+      {
+        userId: adminUser._id.toString(),
+        role: adminUser.role,
+        email: adminEmail,
+      },
       jwtSecret,
       { expiresIn: '7d' },
     );
@@ -548,7 +561,10 @@ export const agentLogin = async (req: Request, res: Response): Promise<void> => 
     }
 
     const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
-    const user = await User.findOne({ email, role: 'agent' }).select('+passwordHash');
+    const user = await User.findOne({
+      email,
+      role: { $in: ['agent', 'bd'] },
+    }).select('+passwordHash');
 
     if (!user || !user.passwordHash || user.agentDisabled) {
       logInfo('Agent login failed', { email, ip: req.ip });
@@ -563,8 +579,17 @@ export const agentLogin = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
+    if (user.agencyId) {
+      const parentAgency = await User.findById(user.agencyId).select('agencyDisabled').lean();
+      if (parentAgency?.agencyDisabled) {
+        logInfo('Agent login blocked: parent agency disabled', { email, ip: req.ip });
+        res.status(403).json({ success: false, error: 'Agency account is disabled' });
+        return;
+      }
+    }
+
     const token = jwt.sign(
-      { userId: user._id.toString(), role: 'agent', email: user.email },
+      { userId: user._id.toString(), role: user.role, email: user.email },
       jwtSecret,
       { expiresIn: '7d' },
     );
@@ -581,11 +606,69 @@ export const agentLogin = async (req: Request, res: Response): Promise<void> => 
           role: user.role,
           displayName: user.displayName ?? null,
           referralCode: user.referralCode ?? null,
+          agencyId: user.agencyId?.toString() ?? null,
         },
       },
     });
   } catch (error) {
     logError('Agent login error', error, { ip: req.ip });
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * Agency dashboard login — email + bcrypt password on User (role agency).
+ */
+export const agencyLogin = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const email = String(req.body.email ?? '')
+      .trim()
+      .toLowerCase();
+    const password = String(req.body.password ?? '');
+
+    if (!email || !password) {
+      res.status(400).json({ success: false, error: 'Email and password are required' });
+      return;
+    }
+
+    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
+    const user = await User.findOne({ email, role: 'agency' }).select('+passwordHash');
+
+    if (!user || !user.passwordHash || user.agencyDisabled) {
+      logInfo('Agency login failed', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      logInfo('Agency login failed: bad password', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const token = jwt.sign(
+      { userId: user._id.toString(), role: user.role, email: user.email },
+      jwtSecret,
+      { expiresIn: '7d' },
+    );
+
+    logInfo('Agency login successful', { userId: user._id.toString(), ip: req.ip });
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+          role: user.role,
+          displayName: user.displayName ?? null,
+        },
+      },
+    });
+  } catch (error) {
+    logError('Agency login error', error, { ip: req.ip });
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

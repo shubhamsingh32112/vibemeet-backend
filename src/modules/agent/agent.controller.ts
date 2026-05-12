@@ -12,6 +12,7 @@ import {
   processWithdrawalMarkPaid,
 } from '../creator/withdrawal-processing.service';
 import { invalidateAdminCaches } from '../../config/redis';
+import { emitToAdmin } from '../admin/admin.gateway';
 import { CallHistory } from '../billing/call-history.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
@@ -19,7 +20,8 @@ import { serializeCreatorGallery } from '../images/creator-image-helpers';
 import { notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
 import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
-import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
+import { isDashboardStaffRole } from '../../utils/staff-roles';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
 
@@ -94,7 +96,14 @@ export const rejectAgentReferredUser = async (req: Request, res: Response): Prom
       await session.withTransaction(async () => {
         const unlink = await User.updateOne(
           { _id: targetUserId, referredBy: agent._id },
-          { $set: { referredBy: null } },
+          {
+            $set: {
+              referredBy: null,
+              hostOnboardingStatus: 'rejected',
+              hostOnboardingRejectedReason:
+                reason.length > 0 ? reason.slice(0, 2000) : undefined,
+            },
+          },
           { session },
         );
         unlinkModified = unlink.modifiedCount ?? 0;
@@ -133,6 +142,82 @@ export const rejectAgentReferredUser = async (req: Request, res: Response): Prom
     });
   } catch (error) {
     logError('rejectAgentReferredUser', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** BD approves referred host onboarding — host may then complete creator profile (mobile or BD-assisted). */
+export const approveAgentReferredUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgent(req, res))) return;
+    const agent = await loadStaffUserByAuth(req);
+    if (!agent) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUserIdRaw = String(req.params.userId ?? '').trim();
+    if (!mongoose.isValidObjectId(targetUserIdRaw)) {
+      res.status(400).json({ success: false, error: 'Invalid userId' });
+      return;
+    }
+    const targetUserId = new mongoose.Types.ObjectId(targetUserIdRaw);
+
+    const existingCreator = await Creator.findOne({ userId: targetUserId }).select('_id').lean();
+    if (existingCreator) {
+      res.status(409).json({
+        success: false,
+        error: 'User already has a creator profile',
+      });
+      return;
+    }
+
+    const updated = await User.updateOne(
+      {
+        _id: targetUserId,
+        referredBy: agent._id,
+        hostOnboardingStatus: 'pending_bd_approval',
+      },
+      {
+        $set: {
+          hostOnboardingStatus: 'approved',
+          bdApprovedAt: new Date(),
+        },
+        $inc: { profileRevision: 1 },
+      },
+    );
+
+    if ((updated.modifiedCount ?? 0) < 1) {
+      const u = await User.findById(targetUserId).select('referredBy hostOnboardingStatus').lean();
+      if (!u) {
+        res.status(404).json({ success: false, error: 'User not found' });
+        return;
+      }
+      if (!u.referredBy?.equals(agent._id)) {
+        res.status(403).json({ success: false, error: 'User was not referred by this agent' });
+        return;
+      }
+      res.status(400).json({
+        success: false,
+        error: 'User is not awaiting BD approval',
+      });
+      return;
+    }
+
+    logInfo('agent_referral_approved', {
+      agentId: agent._id.toString(),
+      targetUserId: targetUserId.toString(),
+    });
+
+    res.json({
+      success: true,
+      data: {
+        userId: targetUserId.toString(),
+        hostOnboardingStatus: 'approved',
+      },
+    });
+  } catch (error) {
+    logError('approveAgentReferredUser', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -339,7 +424,7 @@ export const getAgentReferredUsers = async (req: Request, res: Response): Promis
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('username email phone avatar role createdAt')
+        .select('username email phone avatar role createdAt hostOnboardingStatus')
         .lean(),
       User.countDocuments({ referredBy: agent._id }),
     ]);
@@ -372,6 +457,7 @@ export const getAgentReferredUsers = async (req: Request, res: Response): Promis
             referralCodeUsed: edgeMap.get(id) ?? agentCode,
             hasCreator: creatorByUser.has(id),
             creatorId: creatorByUser.get(id) ?? null,
+            hostOnboardingStatus: u.hostOnboardingStatus ?? 'none',
           };
         }),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
@@ -934,12 +1020,12 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       return;
     }
 
-    const { userId, name, about, photo, price, categories, age, location } = req.body ?? {};
+    const { userId, name, about, photo, categories, age, location } = req.body ?? {};
 
-    if (!name || !about || !photo || !userId || price === undefined) {
+    if (!name || !about || !photo || !userId) {
       res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, about, photo, userId, price',
+        error: 'Missing required fields: name, about, photo, userId',
       });
       return;
     }
@@ -951,13 +1037,6 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
       return;
     }
-
-    const priceCheck = validateCreatorPriceForApi(price);
-    if (!priceCheck.ok) {
-      res.status(400).json({ success: false, error: priceCheck.error });
-      return;
-    }
-    const validatedPrice = priceCheck.price;
 
     if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
       res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
@@ -981,7 +1060,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       return;
     }
 
-    if (targetUser.role === 'admin' || targetUser.role === 'agent') {
+    if (isDashboardStaffRole(targetUser.role)) {
       res.status(400).json({ success: false, error: 'Invalid user for creator profile' });
       return;
     }
@@ -992,11 +1071,22 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
       return;
     }
 
+    if (targetUser.hostOnboardingStatus !== 'approved') {
+      res.status(403).json({
+        success: false,
+        error: 'BD must approve this host before creating a creator profile',
+      });
+      return;
+    }
+
+    const validatedPrice = getSystemDefaultHostPriceForNewHosts();
+
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
       const previousCoins = targetUser.coins || 0;
       targetUser.coins = 0;
+      targetUser.hostOnboardingStatus = 'none';
       if (targetUser.role !== 'creator') {
         targetUser.role = 'creator';
       }
@@ -1093,7 +1183,7 @@ export const searchUsersForAgent = async (req: Request, res: Response): Promise<
 
     const filter: Record<string, unknown> = {
       _id: { $nin: excludeIds },
-      role: { $nin: ['admin', 'agent'] },
+      role: { $nin: ['admin', 'super_admin', 'agent', 'bd', 'agency'] },
       referredBy: agent._id,
     };
 
@@ -1262,6 +1352,62 @@ export const agentMarkWithdrawalPaid = async (req: Request, res: Response): Prom
     res.json({ success: true, data: result.data });
   } catch (error) {
     logError('agentMarkWithdrawalPaid', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** BD requests payout from `staffCoinsBalance` (super admin approves in withdrawals queue). */
+export const postAgentStaffWithdrawalRequest = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!(await assertAgent(req, res))) return;
+    const agent = await loadStaffUserByAuth(req);
+    if (!agent) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const amount = Number(req.body?.amount);
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const number = typeof req.body?.number === 'string' ? req.body.number.trim() : '';
+    const upi = typeof req.body?.upi === 'string' ? req.body.upi.trim() : '';
+    const accountNumber =
+      typeof req.body?.accountNumber === 'string' ? req.body.accountNumber.trim() : '';
+    const ifsc = typeof req.body?.ifsc === 'string' ? req.body.ifsc.trim() : '';
+
+    if (!Number.isFinite(amount) || amount < 1) {
+      res.status(400).json({ success: false, error: 'Invalid amount' });
+      return;
+    }
+
+    const w = await Withdrawal.create({
+      staffUserId: agent._id,
+      amount: Math.floor(amount),
+      status: 'pending',
+      requestedAt: new Date(),
+      name: name || undefined,
+      number: number || undefined,
+      upi: upi || undefined,
+      accountNumber: accountNumber || undefined,
+      ifsc: ifsc || undefined,
+    });
+
+    emitToAdmin('withdrawal:requested', {
+      withdrawalId: w._id.toString(),
+      staffUserId: agent._id.toString(),
+      amount: w.amount,
+    });
+
+    invalidateAdminCaches('overview').catch(() => {});
+
+    res.status(201).json({
+      success: true,
+      data: { id: w._id.toString(), amount: w.amount, status: w.status },
+    });
+  } catch (error) {
+    logError('postAgentStaffWithdrawalRequest', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

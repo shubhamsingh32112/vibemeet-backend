@@ -69,6 +69,7 @@ import {
   serializeCreatorImages,
   serializeCreatorGallery,
 } from '../images/creator-image-helpers';
+import { isAgencyRole, isBdRole, isSuperAdminRole } from '../../utils/staff-roles';
 
 /** Legacy root catalog removed — clients must use GET /creator/feed. */
 export const getCreatorCatalogGone = async (_req: Request, res: Response): Promise<void> => {
@@ -118,10 +119,17 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
       });
       return;
     }
-    if (currentUser?.role === 'agent') {
+    if (isBdRole(currentUser?.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Use GET /agent/creators for your assigned creators.',
+      });
+      return;
+    }
+    if (isAgencyRole(currentUser?.role)) {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Use the agency dashboard for creator lists.',
       });
       return;
     }
@@ -305,7 +313,7 @@ export const getCreatorFirebaseUids = async (req: Request, res: Response): Promi
       });
       return;
     }
-    if (currentUser?.role === 'agent') {
+    if (isBdRole(currentUser?.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Use agent endpoints for assigned creators.',
@@ -410,7 +418,7 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
       });
       return;
     }
-    if (currentUser?.role === 'agent') {
+    if (isBdRole(currentUser?.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Use agent endpoints for your assigned creators.',
@@ -470,7 +478,7 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    if (viewer.role === 'agent') {
+    if (isBdRole(viewer.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Use agent endpoints for creator data.',
@@ -633,7 +641,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
     
     // Check if user is admin
     const adminUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!adminUser || adminUser.role !== 'admin') {
+    if (!adminUser || !isSuperAdminRole(adminUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Admin access required',
@@ -719,7 +727,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       session.startTransaction();
 
       targetUser.coins = 0;
-      if (targetUser.role !== 'creator' && targetUser.role !== 'admin') {
+      if (targetUser.role !== 'creator' && !isSuperAdminRole(targetUser.role)) {
         targetUser.role = 'creator';
       }
       await targetUser.save({ session });
@@ -855,7 +863,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
 
     // Legacy `photo` field was removed in Phase E — body intentionally ignored.
     const { name, about, categories, price, age, location } = req.body;
-    
+
     const creator = await Creator.findById(id);
     if (!creator) {
       res.status(404).json({
@@ -864,7 +872,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       });
       return;
     }
-    
+
     if (!creator.userId) {
       res.status(400).json({
         success: false,
@@ -872,7 +880,27 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       });
       return;
     }
-    
+
+    if (price !== undefined) {
+      const actor = await User.findOne({ firebaseUid: req.auth?.firebaseUid })
+        .select('role staffCapabilities')
+        .lean();
+      if (!actor || !isSuperAdminRole(actor.role)) {
+        res.status(403).json({
+          success: false,
+          error: 'Only super admin can change host per-minute price',
+        });
+        return;
+      }
+      if (actor.staffCapabilities?.editPricing === false) {
+        res.status(403).json({
+          success: false,
+          error: 'Insufficient permission to edit host pricing',
+        });
+        return;
+      }
+    }
+
     let catalogChanged = false;
     
     if (name) {
@@ -1014,9 +1042,9 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
     }
 
     let allowed = false;
-    if (staffUser.role === 'admin') {
+    if (isSuperAdminRole(staffUser.role)) {
       allowed = true;
-    } else if (staffUser.role === 'agent' && !staffUser.agentDisabled && creator.assignedAgentId?.equals(staffUser._id)) {
+    } else if (isBdRole(staffUser.role) && !staffUser.agentDisabled && creator.assignedAgentId?.equals(staffUser._id)) {
       allowed = true;
     }
     if (!allowed) {
@@ -1051,7 +1079,7 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
       await session.commitTransaction();
       
       const actorLabel =
-        staffUser.role === 'admin'
+        isSuperAdminRole(staffUser.role)
           ? `Admin: ${staffUser._id} (${staffUser.email || staffUser.phone})`
           : `Agent: ${staffUser._id} (${staffUser.email || staffUser.phone})`;
       console.log(`📝 [AUDIT] CREATOR_PROFILE_DELETED`);
@@ -1120,7 +1148,7 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
     }
     
     // Only creators can set their online status
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Only creators can set online status',
@@ -1213,7 +1241,7 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
     }
     
     // Only creators can update their own profile
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Only creators can update their profile',
@@ -1510,7 +1538,7 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Only creators can view profile' });
       return;
     }
@@ -1562,7 +1590,7 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Only creators can commit gallery images' });
       return;
     }
@@ -1705,7 +1733,7 @@ export const deleteGalleryImage = async (req: Request, res: Response): Promise<v
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Only creators can delete gallery images' });
       return;
     }
@@ -1777,7 +1805,7 @@ export const reorderGalleryImages = async (req: Request, res: Response): Promise
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Forbidden: Only creators can reorder gallery images' });
       return;
     }
@@ -1852,7 +1880,7 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
     }
 
     // Verify user is a creator
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Only creators can view earnings',
@@ -1986,7 +2014,7 @@ export const getCreatorTransactions = async (req: Request, res: Response): Promi
     }
 
     // Verify user is a creator
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Only creators can view earnings transactions',
@@ -2094,7 +2122,7 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
     }
 
     // Verify user is a creator
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Only creators can view tasks',
@@ -2249,7 +2277,7 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
     }
 
     // Verify user is a creator
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Only creators can claim task rewards',
@@ -2481,7 +2509,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       return;
     }
 
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Only creators can access dashboard' });
       return;
     }
@@ -2704,7 +2732,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Only creators can request withdrawals' });
       return;
     }
@@ -2872,7 +2900,7 @@ export const getMyWithdrawals = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       res.status(403).json({ success: false, error: 'Only creators can view withdrawals' });
       return;
     }

@@ -3,6 +3,7 @@ import { Server as SocketIOServer, Namespace } from 'socket.io';
 import { getIO } from '../../config/socket';
 import { logInfo, logWarning, logDebug } from '../../utils/logger';
 import { User } from '../user/user.model';
+import { isSuperAdminRole } from '../../utils/staff-roles';
 
 let adminNamespace: Namespace | null = null;
 
@@ -36,12 +37,12 @@ export function setupAdminGateway(io: SocketIOServer): void {
 
       const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
       const decoded = jwt.verify(raw, jwtSecret) as { userId?: string; role?: string };
-      if (decoded.role !== 'admin' || !decoded.userId) {
+      if (!decoded.userId || !isSuperAdminRole(decoded.role ?? '')) {
         return next(new Error('Forbidden'));
       }
 
       const adminUser = await User.findById(decoded.userId).select('_id role').lean();
-      if (!adminUser || adminUser.role !== 'admin') {
+      if (!adminUser || !isSuperAdminRole(adminUser.role)) {
         return next(new Error('Forbidden'));
       }
 

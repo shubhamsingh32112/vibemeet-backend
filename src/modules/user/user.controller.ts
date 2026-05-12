@@ -31,8 +31,10 @@ import {
   buildSafeMongoSubstringRegex,
 } from '../../utils/mongo-regex';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
+import { isBdRole, isNonConsumerCoinsRole, isSuperAdminRole } from '../../utils/staff-roles';
 import {
   commitImageAsset,
   CommitImageAssetError,
@@ -1076,7 +1078,7 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
     console.log(`👤 [USER] Current user role: ${currentUser.role}`);
 
     // Only creators can see users
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
       console.log('❌ [USER] Forbidden: User is not a creator or admin');
       res.status(403).json({
         success: false,
@@ -1169,7 +1171,7 @@ export const searchUsers = async (req: Request, res: Response): Promise<void> =>
 
     // Check if user is admin
     const adminUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!adminUser || adminUser.role !== 'admin') {
+    if (!adminUser || !isSuperAdminRole(adminUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Admin access required',
@@ -1285,7 +1287,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
 
     // Check if user is admin
     const adminUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!adminUser || adminUser.role !== 'admin') {
+    if (!adminUser || !isSuperAdminRole(adminUser.role)) {
       res.status(403).json({
         success: false,
         error: 'Forbidden: Admin access required',
@@ -1379,7 +1381,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       let assignedAgentId: mongoose.Types.ObjectId | undefined;
       if (targetUser.referredBy) {
         const refUser = await User.findById(targetUser.referredBy).select('role').session(session).lean();
-        if (refUser?.role === 'agent') {
+        if (refUser && isBdRole(refUser.role)) {
           assignedAgentId = targetUser.referredBy as mongoose.Types.ObjectId;
         }
       }
@@ -1451,6 +1453,166 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
 
   } catch (error) {
     console.error('❌ [USER] Promote to creator error:', error);
+    if (error instanceof Error && error.name === 'ValidationError') {
+      res.status(400).json({
+        success: false,
+        error: error.message,
+      });
+      return;
+    }
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
+/**
+ * POST /user/host-profile/complete — Firebase user completes creator profile after BD approval (default 60 coins/min).
+ */
+export const completeHostProfileAfterBdApproval = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { name, about, photo, categories, location } = req.body ?? {};
+
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!targetUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (targetUser.hostOnboardingStatus !== 'approved') {
+      res.status(403).json({
+        success: false,
+        error: 'BD approval required before completing host profile',
+      });
+      return;
+    }
+
+    if (!targetUser.referredBy) {
+      res.status(400).json({ success: false, error: 'Referral context missing' });
+      return;
+    }
+
+    const refUser = await User.findById(targetUser.referredBy).select('role').lean();
+    if (!refUser || !isBdRole(refUser.role)) {
+      res.status(403).json({ success: false, error: 'Invalid referrer for host onboarding' });
+      return;
+    }
+
+    if (!name || !about || !photo) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required fields: name, about, photo',
+      });
+      return;
+    }
+
+    if (
+      categories !== undefined &&
+      (!Array.isArray(categories) || categories.some((c: unknown) => typeof c !== 'string'))
+    ) {
+      res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
+      return;
+    }
+
+    const locCreate = parseCreatorLocationForCreate(location);
+    if (!locCreate.ok) {
+      res.status(400).json({ success: false, error: locCreate.error });
+      return;
+    }
+
+    const existingCreator = await Creator.findOne({ userId: targetUser._id });
+    if (existingCreator) {
+      res.status(409).json({
+        success: false,
+        error: 'Creator profile already exists',
+      });
+      return;
+    }
+
+    const validatedPrice = getSystemDefaultHostPriceForNewHosts();
+
+    const assignedAgentId = targetUser.referredBy as mongoose.Types.ObjectId;
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      targetUser.role = 'creator';
+      const previousCoins = targetUser.coins || 0;
+      targetUser.coins = 0;
+      targetUser.hostOnboardingStatus = 'none';
+
+      if (previousCoins > 0) {
+        console.log(
+          `💰 [USER] Removed ${previousCoins} coins from user ${targetUser._id} (host profile complete)`
+        );
+      }
+
+      await targetUser.save({ session });
+      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+
+      const creator = await Creator.create(
+        [
+          {
+            name,
+            about,
+            photo,
+            userId: targetUser._id,
+            ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
+            categories: Array.isArray(categories) ? categories : [],
+            price: validatedPrice,
+            assignedAgentId,
+            ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
+          },
+        ],
+        { session }
+      );
+
+      await session.commitTransaction();
+
+      const createdCreator = creator[0];
+
+      invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
+
+      res.status(201).json({
+        success: true,
+        data: {
+          user: {
+            id: targetUser._id.toString(),
+            email: targetUser.email,
+            phone: targetUser.phone,
+            role: targetUser.role,
+          },
+          creator: {
+            id: createdCreator._id.toString(),
+            userId: createdCreator.userId.toString(),
+            name: createdCreator.name,
+            about: createdCreator.about,
+            categories: createdCreator.categories,
+            price: createdCreator.price,
+            location: createdCreator.location,
+            createdAt: createdCreator.createdAt,
+            updatedAt: createdCreator.updatedAt,
+          },
+        },
+      });
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
+    }
+  } catch (error) {
+    console.error('❌ [USER] completeHostProfileAfterBdApproval error:', error);
     if (error instanceof Error && error.name === 'ValidationError') {
       res.status(400).json({
         success: false,
@@ -1726,7 +1888,7 @@ export const addCoins = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.role === 'creator' || user.role === 'admin' || user.role === 'agent') {
+    if (isNonConsumerCoinsRole(user.role)) {
       res.status(403).json({
         success: false,
         error: 'Creators, admins, and agents cannot add coins through this endpoint',
@@ -1875,7 +2037,7 @@ export const getUserTransactions = async (req: Request, res: Response): Promise<
     }
 
     // Only regular users can view their transactions
-    if (user.role === 'creator' || user.role === 'admin') {
+    if (user.role === 'creator' || isSuperAdminRole(user.role)) {
       res.status(403).json({
         success: false,
         error: 'Creators should use /creator/transactions endpoint',
@@ -1989,7 +2151,7 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
         .lean();
 
       const creatorUserIds = otherUsers
-        .filter((u) => u.role === 'creator' || u.role === 'admin')
+        .filter((u) => u.role === 'creator' || isSuperAdminRole(u.role))
         .map((u) => u._id);
       const creators =
         creatorUserIds.length > 0
@@ -2015,7 +2177,7 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
       for (const u of otherUsers) {
         const uid = u._id.toString();
         const cr =
-          u.role === 'creator' || u.role === 'admin'
+          u.role === 'creator' || isSuperAdminRole(u.role)
             ? (creatorByUserId.get(uid) ?? null)
             : null;
         presentationByUserId.set(uid, resolveChatPresentationFromDocs(u, cr));
