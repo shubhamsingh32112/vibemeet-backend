@@ -25,20 +25,20 @@ import { emitToAdmin } from './admin.gateway';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
-import { normalizeGalleryImages } from '../creator/creator-gallery-resolve';
+import { serializeCreatorGallery } from '../images/creator-image-helpers';
 import { CreatorDailyOnline } from '../availability/creator-daily-online.model';
 import {
-  buildPublicGalleryDownloadUrl,
-  createCreatorGallerySignedUpload,
-  deleteGalleryStorageObject,
-  isAllowedGalleryContentType,
-  parseGalleryStoragePath,
-} from '../creator/creator-gallery.storage';
-import {
-  CREATOR_GALLERY_ALLOWED_CONTENT_TYPES,
   CREATOR_GALLERY_MAX_IMAGES,
   CREATOR_GALLERY_MIN_IMAGES,
 } from '../creator/creator-gallery.constants';
+import {
+  commitImageAsset,
+  CommitImageAssetError,
+} from '../images/commit-image-asset';
+import {
+  CloudflareImagesCircuitOpenError,
+  CloudflareImagesError,
+} from '../images/cloudflare.client';
 import { verifyUserBalance, batchVerifyBalances } from '../../utils/balance-integrity';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assertAdmin, assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
@@ -552,7 +552,6 @@ async function computeCreatorsPerformance() {
       name: creator.name,
       username: user?.username ?? null,
       avatar: user?.avatar ?? null,
-      photo: creator.photo,
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
@@ -2787,10 +2786,12 @@ export const patchCreatorLinkedUser = async (req: Request, res: Response): Promi
       }
     }
 
+    // Legacy `avatar: <URL string>` body branch removed in Phase E. Admin
+    // avatar edits now flow through the moderation/commit pipeline.
     if (avatar !== undefined) {
-      const a = avatar === null || avatar === '' ? '' : String(avatar).trim();
-      user.avatar = a || undefined;
-      changed = true;
+      console.log(
+        '⚠️  [ADMIN] Ignoring legacy `avatar` string in updateUser; use the avatar commit pipeline',
+      );
     }
 
     if (categories !== undefined) {
@@ -2849,41 +2850,16 @@ export const patchCreatorLinkedUser = async (req: Request, res: Response): Promi
   }
 };
 
-export const adminCreatorGalleryUploadUrl = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { id: creatorId } = req.params;
-    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
-
-    const creator = await Creator.findById(creatorId);
-    if (!creator) {
-      res.status(404).json({ success: false, error: 'Creator not found' });
-      return;
-    }
-    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
-      res.status(409).json({
-        success: false,
-        error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
-      });
-      return;
-    }
-
-    const contentType = req.body?.contentType;
-    if (!isAllowedGalleryContentType(contentType)) {
-      res.status(400).json({
-        success: false,
-        error: `contentType must be one of: ${CREATOR_GALLERY_ALLOWED_CONTENT_TYPES.join(', ')}`,
-      });
-      return;
-    }
-
-    const signedUpload = await createCreatorGallerySignedUpload(creator._id.toString(), contentType);
-    res.status(201).json({ success: true, data: signedUpload });
-  } catch (error) {
-    console.error('❌ [ADMIN] adminCreatorGalleryUploadUrl error:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
+/**
+ * Cloudflare-Images admin gallery commit.
+ *
+ * Flow:
+ *   1. Admin website calls `POST /images/direct-upload { purpose: 'creator-gallery', ... }`
+ *      to obtain `{ uploadUrl, sessionId }`.
+ *   2. Admin website PUTs/POSTs the file bytes to `uploadUrl`.
+ *   3. Admin website POSTs `{ sessionId }` here. We finalize the asset on the
+ *      target creator's gallery via `commitImageAsset` (admin-moderation purpose).
+ */
 export const adminCreatorGalleryCommit = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id: creatorId } = req.params;
@@ -2895,74 +2871,104 @@ export const adminCreatorGalleryCommit = async (req: Request, res: Response): Pr
       return;
     }
 
-    const { imageId, storagePath } = req.body ?? {};
-    if (
-      typeof imageId !== 'string' ||
-      typeof storagePath !== 'string' ||
-      imageId.trim() === '' ||
-      storagePath.trim() === ''
-    ) {
-      res.status(400).json({ success: false, error: 'imageId and storagePath are required' });
+    const adminUser = await User.findOne({ firebaseUid: req.auth?.firebaseUid });
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'admin user not found' });
       return;
     }
 
-    const parsed = parseGalleryStoragePath(storagePath.trim());
-    if (!parsed || parsed.creatorId !== creator._id.toString() || parsed.imageId !== imageId.trim()) {
-      res.status(422).json({ success: false, error: 'storagePath/imageId mismatch for this creator' });
+    const { sessionId, galleryItemId } = req.body ?? {};
+    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'sessionId is required' });
       return;
     }
 
-    let url: string;
-    try {
-      url = await buildPublicGalleryDownloadUrl(storagePath.trim());
-    } catch {
-      res.status(400).json({
-        success: false,
-        error: 'Upload not found in storage. Finish the upload, then try commit again.',
-      });
-      return;
-    }
+    const newGalleryItemId =
+      typeof galleryItemId === 'string' && galleryItemId.trim().length > 0
+        ? galleryItemId.trim()
+        : new mongoose.Types.ObjectId().toString();
 
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
-    if (!existingImages.some((img) => img.id === imageId.trim())) {
-      if (existingImages.length >= CREATOR_GALLERY_MAX_IMAGES) {
+    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
+      const existingSlot = (creator.galleryImages || []).some(
+        (img) => img.id === newGalleryItemId,
+      );
+      if (!existingSlot) {
         res.status(409).json({
           success: false,
           error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
         });
         return;
       }
-      existingImages.push({
-        id: imageId.trim(),
-        storagePath: storagePath.trim(),
-        url,
-        createdAt: new Date(),
-        position: existingImages.length,
-      });
-    } else {
-      for (let i = 0; i < existingImages.length; i += 1) {
-        if (existingImages[i].id === imageId.trim()) {
-          existingImages[i] = {
-            ...existingImages[i],
-            storagePath: storagePath.trim(),
-            url,
-          };
-          break;
-        }
-      }
     }
 
-    creator.galleryImages = normalizeGalleryImages(existingImages);
-    await creator.save();
+    try {
+      const { asset } = await commitImageAsset({
+        sessionId: sessionId.trim(),
+        userId: adminUser._id.toString(),
+        userObjectId: adminUser._id,
+        purpose: 'creator-gallery',
+        quotaScope: 'gallery',
+        blurhashTarget: {
+          kind: 'creator-gallery',
+          creatorId: creator._id.toString(),
+          galleryItemId: newGalleryItemId,
+        },
+      });
 
-    await bumpCreatorProfileRevisionForAdmin(creator.userId);
+      const existing = creator.galleryImages || [];
+      const idx = existing.findIndex((img) => img.id === newGalleryItemId);
+      if (idx === -1) {
+        existing.push({
+          id: newGalleryItemId,
+          asset,
+          position: existing.length,
+          createdAt: new Date(),
+        });
+      } else {
+        existing[idx] = { ...existing[idx], asset };
+      }
+      creator.galleryImages = [...existing]
+        .sort((a, b) => a.position - b.position)
+        .map((img, i) => ({ ...img, position: i }));
+      await creator.save();
 
-    res.json({
-      success: true,
-      data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
-      },
-    });
+      await bumpCreatorProfileRevisionForAdmin(creator.userId);
+
+      res.json({
+        success: true,
+        data: {
+          galleryItemId: newGalleryItemId,
+          galleryImages: serializeCreatorGallery(creator.galleryImages),
+        },
+      });
+      return;
+    } catch (commitError) {
+      if (commitError instanceof CommitImageAssetError) {
+        res.status(commitError.status).json({
+          success: false,
+          code: commitError.code,
+          error: commitError.message,
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesCircuitOpenError) {
+        res.status(503).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+          error: 'image service is temporarily unavailable; please retry',
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesError) {
+        res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_ERROR',
+          error: commitError.message,
+        });
+        return;
+      }
+      throw commitError;
+    }
   } catch (error) {
     console.error('❌ [ADMIN] adminCreatorGalleryCommit error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -2985,14 +2991,15 @@ export const adminCreatorGalleryDelete = async (req: Request, res: Response): Pr
       return;
     }
 
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
-    const target = existingImages.find((img) => img.id === imageId.trim());
-    if (!target) {
+    const targetRaw = (creator.galleryImages || []).find(
+      (img) => img.id === imageId.trim(),
+    );
+    if (!targetRaw) {
       res.status(404).json({ success: false, error: 'Gallery image not found' });
       return;
     }
 
-    if (existingImages.length <= CREATOR_GALLERY_MIN_IMAGES) {
+    if ((creator.galleryImages?.length ?? 0) <= CREATOR_GALLERY_MIN_IMAGES) {
       res.status(400).json({
         success: false,
         error: `At least ${CREATOR_GALLERY_MIN_IMAGES} gallery image is required`,
@@ -3000,21 +3007,30 @@ export const adminCreatorGalleryDelete = async (req: Request, res: Response): Pr
       return;
     }
 
-    creator.galleryImages = normalizeGalleryImages(
-      existingImages.filter((img) => img.id !== imageId.trim()),
+    const remaining = (creator.galleryImages || []).filter(
+      (img) => img.id !== imageId.trim(),
     );
+    creator.galleryImages = remaining
+      .sort((a, b) => a.position - b.position)
+      .map((img, i) => ({ ...img, position: i }));
     await creator.save();
 
     await bumpCreatorProfileRevisionForAdmin(creator.userId);
 
-    deleteGalleryStorageObject(target.storagePath).catch((err) => {
-      console.error('Failed to delete gallery storage object', err);
-    });
+    if (targetRaw.asset?.imageId) {
+      void import('../images/cloudflare.client').then(async ({ deleteImage }) => {
+        try {
+          await deleteImage(targetRaw.asset!.imageId);
+        } catch (err) {
+          console.error('Failed to delete Cloudflare image on admin gallery delete', err);
+        }
+      });
+    }
 
     res.json({
       success: true,
       data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
+        galleryImages: serializeCreatorGallery(creator.galleryImages),
       },
     });
   } catch (error) {
@@ -3040,7 +3056,7 @@ export const adminCreatorGalleryReorder = async (req: Request, res: Response): P
       return;
     }
 
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    const existingImages = serializeCreatorGallery(creator.galleryImages);
     if (imageIds.length !== existingImages.length) {
       res.status(400).json({ success: false, error: 'imageIds length mismatch with existing gallery images' });
       return;
@@ -3066,7 +3082,7 @@ export const adminCreatorGalleryReorder = async (req: Request, res: Response): P
     res.json({
       success: true,
       data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
+        galleryImages: serializeCreatorGallery(creator.galleryImages),
       },
     });
   } catch (error) {

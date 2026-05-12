@@ -1,7 +1,7 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
-import { Creator } from './creator.model';
+import { Creator, type ICreator } from './creator.model';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -42,23 +42,12 @@ import { assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.midd
 import {
   CREATOR_GALLERY_MAX_IMAGES,
   CREATOR_GALLERY_MIN_IMAGES,
-  CREATOR_GALLERY_ALLOWED_CONTENT_TYPES,
 } from './creator-gallery.constants';
-import {
-  buildPublicGalleryDownloadUrl,
-  buildResizedStoragePath,
-  tryBuildPublicGalleryDownloadUrl,
-  createCreatorGallerySignedUpload,
-  deleteGalleryStorageObject,
-  isAllowedGalleryContentType,
-  parseGalleryStoragePath,
-} from './creator-gallery.storage';
 import { logError, logInfo } from '../../utils/logger';
 import { ensureCreatorPromotionBonusReversalEntry } from './creator-starter.service';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
-import { normalizeGalleryImages, resolveGalleryImageUrlsForApi } from './creator-gallery-resolve';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { invalidateCreatorPricingCache } from '../video/pricing.service';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
@@ -66,6 +55,20 @@ import {
   parseCreatorLocationForCreate,
   parseCreatorLocationForUpdate,
 } from './creator-location.util';
+import {
+  commitImageAsset,
+  CommitImageAssetError,
+} from '../images/commit-image-asset';
+import {
+  CloudflareImagesCircuitOpenError,
+  CloudflareImagesError,
+} from '../images/cloudflare.client';
+import { setDegradedHeader } from '../images/images.controller';
+import { isCloudflareImagesEnabled } from '../../config/cloudflare';
+import {
+  serializeCreatorImages,
+  serializeCreatorGallery,
+} from '../images/creator-image-helpers';
 
 /** Legacy root catalog removed — clients must use GET /creator/feed. */
 export const getCreatorCatalogGone = async (_req: Request, res: Response): Promise<void> => {
@@ -81,8 +84,10 @@ type CreatorFeedBaseRow = {
   userId: string | null;
   firebaseUid: string | null;
   name: string;
-  photo: string;
-  thumbnailPhoto?: string | null;
+  /** @deprecated Legacy Firebase photo URL. Phase 3+ ships `avatar` (AvatarUrls). */
+  photo?: string;
+  /** Cloudflare-Images serialized avatar (Phase 3+). */
+  avatar?: ReturnType<typeof import('../images/serialize-image-asset').serializeAvatar>;
   price: number;
   age?: number;
   location?: string;
@@ -156,7 +161,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
           .skip(skip)
           .limit(limit)
           .select(
-            '_id userId firebaseUid name photo thumbnailPhoto price age location isOnline categories createdAt updatedAt',
+            '_id userId firebaseUid name photo avatar price age location isOnline categories createdAt updatedAt',
           )
           .lean(),
         Creator.countDocuments({}),
@@ -197,26 +202,29 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
         });
       }
 
-      baseRows = creators.map((creator) => ({
-        id: creator._id.toString(),
-        userId: creator.userId ? creator.userId.toString() : null,
-        firebaseUid:
-          creator.firebaseUid && String(creator.firebaseUid).trim() !== ''
-            ? String(creator.firebaseUid).trim()
-            : allowFallbackJoin && creator.userId
-              ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
-              : null,
-        name: creator.name,
-        photo: creator.photo,
-        thumbnailPhoto: (creator as { thumbnailPhoto?: string | null }).thumbnailPhoto ?? null,
-        price: creator.price,
-        age: creator.age,
-        location: creator.location,
-        categories: creator.categories || [],
-        isOnline: creator.isOnline,
-        createdAt: creator.createdAt,
-        updatedAt: creator.updatedAt,
-      }));
+      baseRows = creators.map((creator) => {
+        const avatar = serializeCreatorImages(creator as unknown as ICreator).avatar;
+        return {
+          id: creator._id.toString(),
+          userId: creator.userId ? creator.userId.toString() : null,
+          firebaseUid:
+            creator.firebaseUid && String(creator.firebaseUid).trim() !== ''
+              ? String(creator.firebaseUid).trim()
+              : allowFallbackJoin && creator.userId
+                ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
+                : null,
+          name: creator.name,
+          // Cloudflare-Images shape
+          avatar,
+          price: creator.price,
+          age: creator.age,
+          location: creator.location,
+          categories: creator.categories || [],
+          isOnline: creator.isOnline,
+          createdAt: creator.createdAt,
+          updatedAt: creator.updatedAt,
+        };
+      });
 
       if (isRedisConfigured()) {
         const payload = JSON.stringify({
@@ -411,7 +419,7 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
     }
 
     const creator = await Creator.findOne({ firebaseUid: uidRaw })
-      .select('_id userId firebaseUid name photo thumbnailPhoto createdAt updatedAt')
+      .select('_id userId firebaseUid name photo avatar createdAt updatedAt')
       .lean();
     if (!creator) {
       res.status(404).json({ success: false, error: 'Creator not found' });
@@ -430,8 +438,6 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
           userId: creator.userId ? creator.userId.toString() : null,
           firebaseUid: creator.firebaseUid ? String(creator.firebaseUid) : uidRaw,
           name: creator.name,
-          photo: creator.photo,
-          thumbnailPhoto: (creator as { thumbnailPhoto?: string | null }).thumbnailPhoto ?? null,
           availability,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
@@ -498,8 +504,8 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
             : 'busy';
         const galleryRaw = cached.galleryImages;
         const galleryImages = Array.isArray(galleryRaw)
-          ? normalizeGalleryImages(
-              galleryRaw as Parameters<typeof normalizeGalleryImages>[0],
+          ? serializeCreatorGallery(
+              galleryRaw as Parameters<typeof serializeCreatorGallery>[0],
             )
           : [];
         const { v: _v, ...rest } = cached;
@@ -525,33 +531,10 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    let galleryImages = normalizeGalleryImages(creator.galleryImages);
-    if (process.env.DISABLE_GALLERY_REPAIR_ON_READ !== 'true') {
-      const resolved = await resolveGalleryImageUrlsForApi(creator.galleryImages);
-      galleryImages = resolved.galleryImages;
-      if (resolved.urlsChanged) {
-        await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
-      }
-    }
-
-    if (process.env.ENABLE_GALLERY_THUMB_LAZY_FILL === 'true' && galleryImages.length > 0) {
-      let changed = false;
-      const next = [...galleryImages];
-      for (let i = 0; i < next.length; i += 1) {
-        const img = next[i];
-        if (!img.storagePath || img.thumbnailUrl) continue;
-        const thumbPath = buildResizedStoragePath(img.storagePath, '400x400');
-        const thumbUrl = await tryBuildPublicGalleryDownloadUrl(thumbPath);
-        if (thumbUrl) {
-          next[i] = { ...img, thumbnailUrl: thumbUrl };
-          changed = true;
-        }
-      }
-      if (changed) {
-        galleryImages = normalizeGalleryImages(next);
-        await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
-      }
-    }
+    // Cloudflare-Images: URLs are computed from `asset.imageId` at serialize
+    // time, so the legacy Firebase token-URL repair / thumb-fill loops are
+    // no longer needed. Only normalize the row shape.
+    const galleryImages = serializeCreatorGallery(creator.galleryImages);
 
     let firebaseUid: string | null =
       (creator as unknown as { firebaseUid?: string | null }).firebaseUid ?? null;
@@ -578,14 +561,16 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
         ? (availabilityMap[firebaseUid] ?? 'busy')
         : 'busy';
 
+    const images = serializeCreatorImages(creator);
     const responseCreator = {
       id: creator._id.toString(),
       userId: creator.userId ? creator.userId.toString() : null,
       firebaseUid,
       name: creator.name,
       about: creator.about,
-      photo: creator.photo,
-      thumbnailPhoto: (creator as { thumbnailPhoto?: string | null }).thumbnailPhoto ?? null,
+      // Cloudflare-Images
+      avatar: images.avatar,
+      gallery: images.galleryImages,
       galleryImages,
       categories: creator.categories,
       price: creator.price,
@@ -605,8 +590,8 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
         firebaseUid: responseCreator.firebaseUid,
         name: responseCreator.name,
         about: responseCreator.about,
-        photo: responseCreator.photo,
-        thumbnailPhoto: responseCreator.thumbnailPhoto,
+        avatar: responseCreator.avatar,
+        gallery: responseCreator.gallery,
         galleryImages: responseCreator.galleryImages,
         categories: responseCreator.categories,
         price: responseCreator.price,
@@ -778,8 +763,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
           userId: creator.userId.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages: serializeCreatorGallery(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -847,16 +831,11 @@ export async function notifyCreatorProfileChannels(
  */
 export async function bumpCreatorProfileRevisionForAdmin(
   userMongoId: mongoose.Types.ObjectId | string,
-  options?: { syncAvatarFromCreatorPhoto?: string; invalidateCatalog?: boolean },
+  options?: { invalidateCatalog?: boolean },
 ): Promise<void> {
   const id = typeof userMongoId === 'string' ? userMongoId : userMongoId.toString();
   const user = await User.findById(id);
   if (!user?.firebaseUid) return;
-
-  if (options?.syncAvatarFromCreatorPhoto !== undefined) {
-    const p = options.syncAvatarFromCreatorPhoto.trim();
-    if (p) user.avatar = p;
-  }
 
   user.profileRevision = (user.profileRevision ?? 0) + 1;
   await user.save();
@@ -874,7 +853,8 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
 
     if (!(await assertAdminOrOwningAgentForCreator(req, res, id))) return;
 
-    const { name, about, photo, categories, price, age, location } = req.body;
+    // Legacy `photo` field was removed in Phase E — body intentionally ignored.
+    const { name, about, categories, price, age, location } = req.body;
     
     const creator = await Creator.findById(id);
     if (!creator) {
@@ -893,7 +873,6 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    const photoInBody = photo !== undefined && photo !== null;
     let catalogChanged = false;
     
     if (name) {
@@ -904,11 +883,8 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       }
     }
     if (about) creator.about = about;
-    if (photoInBody) {
-      const nextPhoto = typeof photo === 'string' ? photo.trim() : String(photo).trim();
-      if (creator.photo !== nextPhoto) catalogChanged = true;
-      creator.photo = nextPhoto;
-    }
+    // Legacy `photo` field was removed in Phase E. Avatars now flow exclusively
+    // through the Cloudflare avatar commit endpoint (avatarUploadSessionId).
     
     if (categories !== undefined) {
       if (!Array.isArray(categories) || categories.some((c) => typeof c !== 'string')) {
@@ -962,7 +938,6 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
     }
     
     await bumpCreatorProfileRevisionForAdmin(creator.userId, {
-      syncAvatarFromCreatorPhoto: photoInBody ? creator.photo : undefined,
       invalidateCatalog: false,
     });
 
@@ -981,8 +956,7 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
           userId: creator.userId.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
-          galleryImages: normalizeGalleryImages(creator.galleryImages),
+          galleryImages: serializeCreatorGallery(creator.galleryImages),
           categories: creator.categories,
           price: creator.price,
           age: creator.age,
@@ -1257,10 +1231,87 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       return;
     }
     
-    const { name, about, age, categories, photo, location } = req.body;
-    console.log('📝 [CREATOR] Update request body:', JSON.stringify({ name, about, age, categories, location, photo: photo ? 'present' : 'missing' }));
+    const {
+      name,
+      about,
+      age,
+      categories,
+      photo,
+      location,
+      avatarUploadSessionId,
+    } = req.body;
+    console.log('📝 [CREATOR] Update request body:', JSON.stringify({
+      name,
+      about,
+      age,
+      categories,
+      location,
+      photo: photo ? 'present' : 'missing',
+      avatarUploadSessionId: avatarUploadSessionId ? 'present' : 'missing',
+    }));
     let updated = false;
     let catalogChanged = false;
+    let avatarChanged = false;
+
+    // ── Cloudflare Images: commit a fresh avatar upload ───────────────────
+    if (typeof avatarUploadSessionId === 'string' && avatarUploadSessionId.trim().length > 0) {
+      if (!isCloudflareImagesEnabled()) {
+        res.status(503).json({
+          success: false,
+          code: 'IMAGES_DISABLED',
+          error: 'Cloudflare Images is not enabled on this deployment',
+        });
+        return;
+      }
+      try {
+        const { asset } = await commitImageAsset({
+          sessionId: avatarUploadSessionId.trim(),
+          userId: currentUser._id.toString(),
+          userObjectId: currentUser._id,
+          purpose: 'creator-avatar',
+          quotaScope: 'avatar',
+          blurhashTarget: {
+            kind: 'creator-avatar',
+            creatorId: creator._id.toString(),
+          },
+        });
+        // Preserve the prior avatar so a moderation rejection can roll back.
+        if (creator.avatar) {
+          creator.previousAvatar = creator.avatar;
+        }
+        creator.avatar = asset;
+        updated = true;
+        avatarChanged = true;
+        catalogChanged = true;
+      } catch (commitError) {
+        if (commitError instanceof CommitImageAssetError) {
+          res.status(commitError.status).json({
+            success: false,
+            code: commitError.code,
+            error: commitError.message,
+          });
+          return;
+        }
+        if (commitError instanceof CloudflareImagesCircuitOpenError) {
+          setDegradedHeader(res);
+          res.status(503).json({
+            success: false,
+            code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+            error: 'image service is temporarily unavailable; please retry',
+          });
+          return;
+        }
+        if (commitError instanceof CloudflareImagesError) {
+          res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+            success: false,
+            code: 'CLOUDFLARE_IMAGES_ERROR',
+            error: commitError.message,
+          });
+          return;
+        }
+        throw commitError;
+      }
+    }
     
     // Update name
     if (name !== undefined && name !== null) {
@@ -1308,21 +1359,14 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
       catalogChanged = true;
     }
     
-    // Update photo
+    // Legacy `photo` field was removed in Phase E — avatars now flow
+    // exclusively through the Cloudflare avatar commit pipeline.
     if (photo !== undefined && photo !== null) {
-      if (typeof photo !== 'string' || photo.trim().length === 0) {
-        console.log('❌ [CREATOR] Photo validation failed:', { type: typeof photo, length: typeof photo === 'string' ? photo.length : 'N/A' });
-        res.status(400).json({
-          success: false,
-          error: 'Photo must be a non-empty string',
-        });
-        return;
-      }
-      creator.photo = photo.trim();
-      updated = true;
-      catalogChanged = true;
+      console.log(
+        '⚠️  [CREATOR] Ignoring legacy `photo` field in profile update; use avatarUploadSessionId',
+      );
     }
-    
+
     // Update categories
     if (categories !== undefined && categories !== null) {
       if (!Array.isArray(categories)) {
@@ -1371,17 +1415,14 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
     
     await creator.save();
 
-    const { galleryImages: resolvedGallery, urlsChanged } = await resolveGalleryImageUrlsForApi(
-      creator.galleryImages,
-    );
-    if (urlsChanged) {
-      await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages: resolvedGallery } });
-    }
+    // Cloudflare-Images: no legacy URL repair needed.
+    const resolvedGallery = serializeCreatorGallery(creator.galleryImages);
 
-    // Keep User.avatar aligned with creator photo so legacy paths + Stream stay consistent
-    const photoInRequest = photo !== undefined && photo !== null;
-    if (photoInRequest && creator.photo?.trim()) {
-      currentUser.avatar = creator.photo.trim();
+    // Keep User.avatar in sync with the creator avatar so chat lists + Stream
+    // stay consistent. Cloudflare-Images is now the only path — legacy photo
+    // URL fallback was removed in Phase E.
+    if (avatarChanged && creator.avatar) {
+      currentUser.avatar = creator.avatar;
       await currentUser.save();
     }
 
@@ -1391,6 +1432,8 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
     try {
       const freshUser = await User.findById(currentUser._id);
       if (freshUser) {
+        // Stream Chat: avatar may have changed. Force a fresh upsert so any
+        // cached avatar URLs in Stream don't go stale (§6.9 explicit Stream sync).
         const streamPayload = await getStreamUpsertPayload(freshUser);
         await ensureStreamUser(freshUser.firebaseUid, streamPayload);
         await invalidateOtherMemberCacheForFirebaseUid(freshUser.firebaseUid);
@@ -1412,6 +1455,7 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
 
     console.log(`✅ [CREATOR] Creator profile updated: ${creator._id}`);
 
+    const images = serializeCreatorImages(creator);
     res.json({
       success: true,
       data: {
@@ -1420,8 +1464,10 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
           userId: creator.userId.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
+          // ── Cloudflare-Images shape ───────────────────────────────────
+          avatar: images.avatar,
           galleryImages: resolvedGallery,
+          gallery: images.galleryImages,
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
@@ -1475,11 +1521,9 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(creator.galleryImages);
-    if (urlsChanged) {
-      await Creator.updateOne({ _id: creator._id }, { $set: { galleryImages } });
-    }
+    const galleryImages = serializeCreatorGallery(creator.galleryImages);
 
+    const images = serializeCreatorImages(creator);
     res.json({
       success: true,
       data: {
@@ -1488,8 +1532,10 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
           userId: creator.userId.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
+          // Cloudflare-Images shape
+          avatar: images.avatar,
           galleryImages,
+          gallery: images.galleryImages,
           age: creator.age,
           categories: creator.categories,
           price: creator.price,
@@ -1501,62 +1547,6 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
     });
   } catch (error) {
     logError('Get my creator profile error', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const createGalleryUploadUrl = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!req.auth) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
-    if (!currentUser) {
-      res.status(404).json({ success: false, error: 'User not found' });
-      return;
-    }
-    if (currentUser.role !== 'creator' && currentUser.role !== 'admin') {
-      res.status(403).json({ success: false, error: 'Forbidden: Only creators can upload gallery images' });
-      return;
-    }
-
-    const creator = await Creator.findOne({ userId: currentUser._id });
-    if (!creator) {
-      res.status(404).json({ success: false, error: 'Creator profile not found' });
-      return;
-    }
-    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
-      res.status(409).json({
-        success: false,
-        error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
-      });
-      return;
-    }
-
-    const contentType = req.body?.contentType;
-    if (!isAllowedGalleryContentType(contentType)) {
-      res.status(400).json({
-        success: false,
-        error: `contentType must be one of: ${CREATOR_GALLERY_ALLOWED_CONTENT_TYPES.join(', ')}`,
-      });
-      return;
-    }
-
-    const signedUpload = await createCreatorGallerySignedUpload(creator._id.toString(), contentType);
-    logInfo('Creator gallery upload URL created', {
-      creatorId: creator._id.toString(),
-      imageId: signedUpload.imageId,
-      storagePath: signedUpload.storagePath,
-      contentType,
-    });
-
-    res.status(201).json({
-      success: true,
-      data: signedUpload,
-    });
-  } catch (error) {
-    logError('Create gallery upload URL error', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -1583,86 +1573,115 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const { imageId, storagePath } = req.body ?? {};
-    if (
-      typeof imageId !== 'string' ||
-      typeof storagePath !== 'string' ||
-      imageId.trim() === '' ||
-      storagePath.trim() === ''
-    ) {
+    const { sessionId, galleryItemId } = req.body ?? {};
+
+    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
       res.status(400).json({
         success: false,
-        error: 'imageId and storagePath are required',
+        error: 'sessionId is required',
       });
       return;
     }
 
-    const parsed = parseGalleryStoragePath(storagePath.trim());
-    if (!parsed || parsed.creatorId !== creator._id.toString() || parsed.imageId !== imageId.trim()) {
-      res.status(422).json({ success: false, error: 'storagePath/imageId mismatch for this creator' });
-      return;
-    }
-
-    let url: string;
-    try {
-      url = await buildPublicGalleryDownloadUrl(storagePath.trim());
-    } catch (e) {
-      logError('Gallery commit: object missing or unreadable in Storage', e, {
-        storagePath: storagePath.trim(),
-        imageId: imageId.trim(),
-      });
-      res.status(400).json({
+    if (!isCloudflareImagesEnabled()) {
+      res.status(503).json({
         success: false,
-        error: 'Upload not found in storage. Finish the upload, then try commit again.',
+        code: 'IMAGES_DISABLED',
+        error: 'Cloudflare Images is not enabled on this deployment',
       });
       return;
     }
+    const newGalleryItemId =
+      typeof galleryItemId === 'string' && galleryItemId.trim().length > 0
+        ? galleryItemId.trim()
+        : new mongoose.Types.ObjectId().toString();
 
-    const thumbPath = buildResizedStoragePath(storagePath.trim(), '400x400');
-    const thumbnailUrl = await tryBuildPublicGalleryDownloadUrl(thumbPath);
-
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
-    if (!existingImages.some((img) => img.id === imageId.trim())) {
-      if (existingImages.length >= CREATOR_GALLERY_MAX_IMAGES) {
+    if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
+      // Allow updating an existing slot; reject only when adding net-new images.
+      const existingSlot = (creator.galleryImages || []).some(
+        (img) => img.id === newGalleryItemId,
+      );
+      if (!existingSlot) {
         res.status(409).json({
           success: false,
           error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
         });
         return;
       }
-      existingImages.push({
-        id: imageId.trim(),
-        storagePath: storagePath.trim(),
-        url,
-        ...(thumbnailUrl ? { thumbnailUrl } : {}),
-        createdAt: new Date(),
-        position: existingImages.length,
-      });
-    } else {
-      for (let i = 0; i < existingImages.length; i += 1) {
-        if (existingImages[i].id === imageId.trim()) {
-          existingImages[i] = {
-            ...existingImages[i],
-            storagePath: storagePath.trim(),
-            url,
-            ...(thumbnailUrl ? { thumbnailUrl } : {}),
-          };
-          break;
-        }
-      }
     }
 
-    creator.galleryImages = normalizeGalleryImages(existingImages);
-    await creator.save();
+    try {
+      const { asset } = await commitImageAsset({
+        sessionId: sessionId.trim(),
+        userId: currentUser._id.toString(),
+        userObjectId: currentUser._id,
+        purpose: 'creator-gallery',
+        quotaScope: 'gallery',
+        blurhashTarget: {
+          kind: 'creator-gallery',
+          creatorId: creator._id.toString(),
+          galleryItemId: newGalleryItemId,
+        },
+      });
 
-    invalidateCreatorDetailCache(creator._id.toString()).catch(() => {});
+      const existing = creator.galleryImages || [];
+      const idx = existing.findIndex((img) => img.id === newGalleryItemId);
+      if (idx === -1) {
+        existing.push({
+          id: newGalleryItemId,
+          asset,
+          position: existing.length,
+          createdAt: new Date(),
+        });
+      } else {
+        existing[idx] = {
+          ...existing[idx],
+          asset,
+        };
+      }
+      // Re-pack positions for stable ordering.
+      creator.galleryImages = [...existing]
+        .sort((a, b) => a.position - b.position)
+        .map((img, i) => ({ ...img, position: i }));
+      await creator.save();
+      invalidateCreatorDetailCache(creator._id.toString()).catch(() => {});
 
-    res.json({
-      success: true,
-      data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
-      },
-    });
+      res.json({
+        success: true,
+        data: {
+          galleryItemId: newGalleryItemId,
+          galleryImages: serializeCreatorGallery(creator.galleryImages || []),
+        },
+      });
+      return;
+    } catch (commitError) {
+      if (commitError instanceof CommitImageAssetError) {
+        res.status(commitError.status).json({
+          success: false,
+          code: commitError.code,
+          error: commitError.message,
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesCircuitOpenError) {
+        setDegradedHeader(res);
+        res.status(503).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+          error: 'image service is temporarily unavailable; please retry',
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesError) {
+        res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_ERROR',
+          error: commitError.message,
+        });
+        return;
+      }
+      throw commitError;
+    }
   } catch (error) {
     logError('Commit gallery image error', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1697,14 +1716,13 @@ export const deleteGalleryImage = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
-    const target = existingImages.find((img) => img.id === imageId.trim());
-    if (!target) {
+    const targetItem = (creator.galleryImages || []).find((img) => img.id === imageId.trim());
+    if (!targetItem) {
       res.status(404).json({ success: false, error: 'Gallery image not found' });
       return;
     }
 
-    if (existingImages.length <= CREATOR_GALLERY_MIN_IMAGES) {
+    if ((creator.galleryImages?.length ?? 0) <= CREATOR_GALLERY_MIN_IMAGES) {
       res.status(400).json({
         success: false,
         error: `At least ${CREATOR_GALLERY_MIN_IMAGES} gallery image is required`,
@@ -1712,25 +1730,34 @@ export const deleteGalleryImage = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    creator.galleryImages = normalizeGalleryImages(
-      existingImages.filter((img) => img.id !== imageId.trim()),
-    );
+    const remaining = (creator.galleryImages || []).filter((img) => img.id !== imageId.trim());
+    creator.galleryImages = remaining
+      .sort((a, b) => a.position - b.position)
+      .map((img, i) => ({ ...img, position: i }));
     await creator.save();
 
     invalidateCreatorDetailCache(creator._id.toString()).catch(() => {});
 
-    deleteGalleryStorageObject(target.storagePath).catch((err) => {
-      logError('Failed to delete gallery storage object', err, {
-        creatorId: creator._id.toString(),
-        imageId: target.id,
-        storagePath: target.storagePath,
+    // Best-effort Cloudflare cleanup; the orphan-cleanup worker is the
+    // backstop, so a failure here is not fatal.
+    if (targetItem.asset?.imageId) {
+      // Lazy-import the Cloudflare delete to avoid a hard dep at module load.
+      void import('../images/cloudflare.client').then(async ({ deleteImage }) => {
+        try {
+          await deleteImage(targetItem.asset!.imageId);
+        } catch (err) {
+          logError('Failed to delete Cloudflare image on gallery delete', err, {
+            creatorId: creator._id.toString(),
+            imageId: targetItem.asset!.imageId,
+          });
+        }
       });
-    });
+    }
 
     res.json({
       success: true,
       data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
+        galleryImages: serializeCreatorGallery(creator.galleryImages || []),
       },
     });
   } catch (error) {
@@ -1766,7 +1793,7 @@ export const reorderGalleryImages = async (req: Request, res: Response): Promise
       return;
     }
 
-    const existingImages = normalizeGalleryImages(creator.galleryImages);
+    const existingImages = serializeCreatorGallery(creator.galleryImages);
     if (imageIds.length !== existingImages.length) {
       res.status(400).json({ success: false, error: 'imageIds length mismatch with existing gallery images' });
       return;
@@ -1792,7 +1819,7 @@ export const reorderGalleryImages = async (req: Request, res: Response): Promise
     res.json({
       success: true,
       data: {
-        galleryImages: normalizeGalleryImages(creator.galleryImages),
+        galleryImages: serializeCreatorGallery(creator.galleryImages),
       },
     });
   } catch (error) {

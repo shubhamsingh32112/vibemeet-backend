@@ -246,7 +246,6 @@ export const getAgentDetail = async (req: Request, res: Response): Promise<void>
           id: c._id.toString(),
           userId: c.userId.toString(),
           name: c.name,
-          photo: c.photo,
           earningsCoins: c.earningsCoins,
           createdAt: c.createdAt,
         })),

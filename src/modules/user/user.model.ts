@@ -1,4 +1,8 @@
 import mongoose, { Document, Schema } from 'mongoose';
+import {
+  imageAssetSchema,
+  type IImageAsset,
+} from '../images/image-asset.schema';
 
 /** Sub-document for a single referral entry */
 export interface IReferralEntry {
@@ -15,7 +19,10 @@ export interface IUser extends Document {
   gender?: 'male' | 'female' | 'other';
   age?: number;
   username?: string;
-  avatar?: string; // e.g., 'a1.png' or 'fa1.png'
+  /** Cloudflare-Images avatar (canonical). */
+  avatar?: IImageAsset | null;
+  /** Restored on moderation rejection. */
+  previousAvatar?: IImageAsset | null;
   categories?: string[]; // Array of category names
   favoriteCreatorIds: mongoose.Types.ObjectId[]; // Users can favorite creators (creator _id values)
   blockedCreatorIds: mongoose.Types.ObjectId[]; // Users can block creators (creator _id values)
@@ -120,9 +127,12 @@ const userSchema = new Schema<IUser>(
       maxlength: 10,
     },
     avatar: {
-      type: String,
-      sparse: true,
-      trim: true,
+      type: imageAssetSchema,
+      default: null,
+    },
+    previousAvatar: {
+      type: imageAssetSchema,
+      default: null,
     },
     categories: {
       type: [String],
@@ -282,6 +292,9 @@ const userSchema = new Schema<IUser>(
   }
 );
 
+// Cloudflare-Images indexes for orphan-cleanup + moderation lookups.
+userSchema.index({ 'avatar.imageId': 1 }, { sparse: true });
+userSchema.index({ 'avatar.moderationStatus': 1 }, { sparse: true });
 // Agent / admin: list users referred by a given agent (User._id)
 userSchema.index({ referredBy: 1 }, { sparse: true });
 // Index for Fast Login lookup (find user by device)

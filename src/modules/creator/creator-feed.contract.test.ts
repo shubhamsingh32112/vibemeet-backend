@@ -18,13 +18,17 @@ test('GET /creator root returns 410 gone handler', () => {
   assert.ok(src.includes('.status(410)'));
 });
 
-test('getCreatorFeed must not call resolveGalleryImageUrlsForApi', () => {
+test('getCreatorFeed must not call any per-row gallery URL repair helper', () => {
+  // Cloudflare-Images derives URLs deterministically from imageId at serialize
+  // time, so the feed path must NOT trigger per-row resolution work.
   const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
   const start = src.indexOf('export const getCreatorFeed');
   const end = src.indexOf('export const getCreatorFirebaseUids');
   assert.ok(start > 0 && end > start);
   const block = src.slice(start, end);
   assert.ok(!block.includes('resolveGalleryImageUrlsForApi'));
+  assert.ok(!block.includes('buildPublicGalleryDownloadUrl'));
+  assert.ok(!block.includes('tryBuildPublicGalleryDownloadUrl'));
 });
 
 test('getCreatorFeed enforces deterministic sort by createdAt desc', () => {
@@ -41,10 +45,6 @@ test('creator UID fallback join is env-gated for shadow/cutover', () => {
   assert.ok(src.includes("ENABLE_CREATOR_UID_FALLBACK_JOIN"));
 });
 
-test('getCreatorById uses optional DISABLE_GALLERY_REPAIR_ON_READ', () => {
-  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
-  assert.ok(src.includes('DISABLE_GALLERY_REPAIR_ON_READ'));
-});
 
 test('redis config defines creator feed and uids cache keys', () => {
   const src = readFileSync(join(__dirname, '../../config/redis.ts'), 'utf8');

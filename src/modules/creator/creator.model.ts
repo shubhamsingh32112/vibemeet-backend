@@ -1,13 +1,23 @@
 import mongoose, { Document, Schema } from 'mongoose';
 import { CREATOR_GALLERY_MAX_IMAGES } from './creator-gallery.constants';
 import { CREATOR_LOCATION_MAX_LEN } from './creator-location.util';
+import {
+  imageAssetSchema,
+  type IImageAsset,
+} from '../images/image-asset.schema';
 
+/**
+ * Cloudflare-Images shape:
+ *   - asset: IImageAsset    — the canonical image reference
+ *   - id:    string         — gallery-item ID (stable across asset swaps)
+ *   - position / createdAt  — unchanged
+ *
+ * Legacy Firebase fields (url/storagePath/thumbnailUrl) were removed in
+ * Phase E of the Cloudflare migration. New rows MUST carry an `asset`.
+ */
 export interface ICreatorGalleryImage {
   id: string;
-  url: string;
-  storagePath: string;
-  /** Optional resized URL (Firebase Resize Images extension: *_400x400.jpg). */
-  thumbnailUrl?: string | null;
+  asset?: IImageAsset | null;
   position: number;
   createdAt: Date;
 }
@@ -16,22 +26,20 @@ export interface ICreator extends Document {
   _id: mongoose.Types.ObjectId;
   name: string;
   about: string;
-  photo: string; // URL or path to photo
-  /** Optional avatar thumbnail URL (~100px) when Resize Images extension is enabled. */
-  thumbnailPhoto?: string | null;
+  /** Cloudflare-Images avatar (canonical). */
+  avatar?: IImageAsset | null;
+  /** Previous avatar — restored if the new one is rejected by moderation. */
+  previousAvatar?: IImageAsset | null;
   galleryImages: ICreatorGalleryImage[];
-  userId: mongoose.Types.ObjectId; // Reference to User document (REQUIRED - creator cannot exist without user)
-  /** Denormalized Firebase UID (used for feed/presence hot paths). */
+  userId: mongoose.Types.ObjectId;
   firebaseUid?: string;
-  categories: string[]; // Array of category names (optional)
-  price: number; // Coins per minute — must be 60, 90, or 120 (set by admin or assigned agent)
-  age?: number; // Creator's age (optional)
-  /** Display location (e.g. city or region). */
+  categories: string[];
+  price: number;
+  age?: number;
   location?: string;
-  isOnline: boolean; // Online/offline status for creators
-  currentCallId?: string; // Current active call ID (locks creator from accepting other calls)
-  earningsCoins: number; // Total creator earnings from video calls
-  /** Agent who recruited/manages this creator (set when agent accepts an application). */
+  isOnline: boolean;
+  currentCallId?: string;
+  earningsCoins: number;
   assignedAgentId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -44,20 +52,9 @@ const creatorGalleryImageSchema = new Schema<ICreatorGalleryImage>(
       required: true,
       trim: true,
     },
-    url: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    storagePath: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    thumbnailUrl: {
-      type: String,
+    asset: {
+      type: imageAssetSchema,
       default: null,
-      trim: true,
     },
     position: {
       type: Number,
@@ -89,15 +86,14 @@ const creatorSchema = new Schema<ICreator>(
       minlength: 10,
       maxlength: 1000,
     },
-    photo: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    thumbnailPhoto: {
-      type: String,
+    // ── Cloudflare-Images (canonical) ─────────────────────────────────────
+    avatar: {
+      type: imageAssetSchema,
       default: null,
-      trim: true,
+    },
+    previousAvatar: {
+      type: imageAssetSchema,
+      default: null,
     },
     galleryImages: {
       type: [creatorGalleryImageSchema],
@@ -172,5 +168,10 @@ const creatorSchema = new Schema<ICreator>(
 creatorSchema.index({ assignedAgentId: 1, updatedAt: -1 });
 creatorSchema.index({ createdAt: -1 });
 creatorSchema.index({ isOnline: 1, createdAt: -1 });
+// Cloudflare-Images indexes (Phase 2 §2 — orphan-cleanup, moderation lookups, ownership scans).
+creatorSchema.index({ 'avatar.imageId': 1 }, { sparse: true });
+creatorSchema.index({ 'avatar.moderationStatus': 1 }, { sparse: true });
+creatorSchema.index({ 'galleryImages.asset.imageId': 1 }, { sparse: true });
+creatorSchema.index({ 'galleryImages.asset.moderationStatus': 1 }, { sparse: true });
 
 export const Creator = mongoose.model<ICreator>('Creator', creatorSchema);

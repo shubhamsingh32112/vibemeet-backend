@@ -13,14 +13,15 @@ import {
 } from '../user/referral.service';
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
-import { logInfo, logError, logDebug } from '../../utils/logger';
+import { logInfo, logError, logDebug, logWarning } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
 import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
+import { getDefaultPresetImageId } from '../images/preset-image-ids';
+import { makeImageAssetDoc } from '../images/image-asset.schema';
+import { serializeCreatorGallery } from '../images/creator-image-helpers';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
-const DEFAULT_NEW_USER_AVATAR_URL =
-  'https://firebasestorage.googleapis.com/v0/b/matchvibe-d55f9.firebasestorage.app/o/avatars%2Fpresets%2Fmale%2Fa2.png?alt=media&token=aeb7e524-83f2-492a-a80d-a107374a4fe9';
 const DEFAULT_USER_CATEGORY_POOL = [
   'Trauma',
   'Health',
@@ -57,11 +58,23 @@ function pickRandomCategories(): string[] {
 }
 
 function buildDefaultFirstLoginProfile() {
+  const defaultImageId = getDefaultPresetImageId();
+  if (!defaultImageId) {
+    logWarning(
+      'No default preset Cloudflare imageId available — new user will be created without an avatar',
+    );
+  }
   return {
     gender: DEFAULT_NEW_USER_GENDER,
     age: DEFAULT_NEW_USER_AGE,
     username: buildRandomUsername(),
-    avatar: DEFAULT_NEW_USER_AVATAR_URL,
+    avatar: defaultImageId
+      ? makeImageAssetDoc({
+          imageId: defaultImageId,
+          uploadedBy: null,
+          moderationStatus: 'approved',
+        })
+      : null,
     categories: pickRandomCategories(),
   };
 }
@@ -183,7 +196,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           user.username = existingDefaults.username;
           profileBackfilled = true;
         }
-        if (!user.avatar || user.avatar.trim().length === 0) {
+        // Backfill avatar with the default preset only when the user has
+        // none. Legacy string-URL avatars were normalized out in Phase E.
+        if (user.avatar == null) {
           user.avatar = existingDefaults.avatar;
           profileBackfilled = true;
         }
@@ -308,16 +323,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           id: creator._id.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
-          galleryImages: [...(creator.galleryImages || [])]
-            .sort((a, b) => a.position - b.position)
-            .map((image) => ({
-              id: image.id,
-              url: image.url,
-              storagePath: image.storagePath,
-              position: image.position,
-              createdAt: image.createdAt,
-            })),
+          galleryImages: serializeCreatorGallery(creator.galleryImages || []),
           email: user.email, // Use user's email (identity comes from user)
           phone: user.phone, // Use user's phone (identity comes from user)
           categories: creator.categories,

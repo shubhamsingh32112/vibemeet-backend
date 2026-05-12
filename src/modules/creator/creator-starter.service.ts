@@ -42,12 +42,9 @@ export function starterCreatorDisplayName(user: IUser): string {
   return s.length > 100 ? s.slice(0, 100) : s;
 }
 
-function starterCreatorPhotoUrl(user: IUser): string {
-  const a = user.avatar?.trim();
-  if (a && /^https?:\/\//i.test(a)) return a;
-  const name = encodeURIComponent(starterCreatorDisplayName(user));
-  return `https://ui-avatars.com/api/?name=${name}&size=256&background=6366f1&color=fff`;
-}
+// `creator.photo` was removed in Phase E of the Cloudflare migration. A
+// freshly-promoted creator inherits whatever avatar the user already has
+// (Cloudflare IImageAsset). Display fallbacks happen on the client.
 
 /**
  * Sets creator role + coin rules (aligned with admin promote), creates minimal Creator doc.
@@ -77,7 +74,7 @@ export async function promoteUserToCreatorWithStarterProfile(
   const doc = {
     name: starterCreatorDisplayName(user),
     about: STARTER_CREATOR_ABOUT,
-    photo: starterCreatorPhotoUrl(user),
+    avatar: user.avatar ?? null,
     userId: user._id,
     ...(user.firebaseUid ? { firebaseUid: user.firebaseUid.trim() } : {}),
     categories: [] as string[],

@@ -3,7 +3,6 @@ import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import {
   withdrawalLimiter,
   tasksLimiter,
-  creatorGalleryUploadLimiter,
 } from '../../middlewares/rate-limit.middleware';
 import {
   getCreatorCatalogGone,
@@ -17,7 +16,6 @@ import {
   setCreatorOnlineStatus,
   updateMyCreatorProfile,
   getMyCreatorProfile,
-  createGalleryUploadUrl,
   commitGalleryImage,
   deleteGalleryImage,
   reorderGalleryImages,
@@ -46,12 +44,6 @@ router.post('/tasks/:taskKey/claim', verifyFirebaseToken, claimTaskReward); // C
 router.post('/withdraw', verifyFirebaseToken, withdrawalLimiter, requestWithdrawal); // Request withdrawal (rate limited)
 router.get('/withdrawals', verifyFirebaseToken, getMyWithdrawals); // Get my withdrawal history
 router.get('/profile', verifyFirebaseToken, getMyCreatorProfile); // Get creator's own profile
-router.post(
-  '/profile/gallery/upload-url',
-  verifyFirebaseToken,
-  creatorGalleryUploadLimiter,
-  createGalleryUploadUrl,
-);
 router.post('/profile/gallery/commit', verifyFirebaseToken, commitGalleryImage);
 router.delete('/profile/gallery/:imageId', verifyFirebaseToken, deleteGalleryImage);
 router.patch('/profile/gallery/reorder', verifyFirebaseToken, reorderGalleryImages);

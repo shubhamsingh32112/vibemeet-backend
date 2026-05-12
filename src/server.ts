@@ -28,6 +28,10 @@ import {
   startPaymentWebhookRetryWorker,
   stopPaymentWebhookRetryWorker,
 } from './modules/payment/payment-webhook-retry.service';
+import {
+  startImagePipelineWorkers,
+  stopImagePipelineWorkers,
+} from './modules/images/images.bootstrap';
 import { isRazorpayConfigured } from './config/razorpay';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
@@ -829,6 +833,12 @@ const startServer = async () => {
     startCallReconciliationJob(io);
     startPaymentWebhookRetryWorker();
 
+    // ☁️ Image pipeline workers (blurhash + orphan cleanup).
+    // No-ops when USE_CLOUDFLARE_IMAGES is false or Cloudflare credentials are missing.
+    startImagePipelineWorkers().catch((err) => {
+      logError('Image pipeline workers failed to start', err);
+    });
+
     setupAdminGateway(io);
     logInfo('Socket.IO admin gateway ready');
     
@@ -952,6 +962,7 @@ process.on('uncaughtException', async (error) => {
   stopReconciliationJob();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
+  await stopImagePipelineWorkers().catch(() => {});
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -965,6 +976,7 @@ process.on('SIGTERM', async () => {
   stopReconciliationJob();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
+  await stopImagePipelineWorkers().catch(() => {});
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -978,6 +990,7 @@ process.on('SIGINT', async () => {
   stopReconciliationJob();
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
+  await stopImagePipelineWorkers().catch(() => {});
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;

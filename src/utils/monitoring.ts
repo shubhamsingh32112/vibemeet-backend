@@ -313,3 +313,14 @@ export function recordSystemMetric(
 ): void {
   monitoring.recordMetric(`system.${metric}`, value, tags);
 }
+
+/**
+ * Helper function to record image pipeline metrics (uploads, variants, blurhash).
+ */
+export function recordImageMetric(
+  metric: string,
+  value: number,
+  tags?: Record<string, string>,
+): void {
+  monitoring.recordMetric(`image.${metric}`, value, tags);
+}

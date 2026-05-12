@@ -12,6 +12,8 @@ import agentRoutes from './modules/agent/agent.routes';
 import referralRoutes from './modules/referral/referral.routes';
 import appUpdateRoutes from './modules/app-update/app-update.routes';
 import availabilityRoutes from './modules/availability/availability.routes';
+import imagesRoutes from './modules/images/images.routes';
+import metricsRoutes from './modules/metrics/metrics.routes';
 
 const router = Router();
 
@@ -28,5 +30,7 @@ router.use('/support', supportRoutes);
 router.use('/payment', paymentRoutes);
 router.use('/app-updates', appUpdateRoutes);
 router.use('/availability', availabilityRoutes);
+router.use('/images', imagesRoutes);
+router.use('/metrics', metricsRoutes);
 
 export default router;

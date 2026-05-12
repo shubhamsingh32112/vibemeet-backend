@@ -15,7 +15,7 @@ import { invalidateAdminCaches } from '../../config/redis';
 import { CallHistory } from '../billing/call-history.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
-import { resolveGalleryImageUrlsForApi } from '../creator/creator-gallery-resolve';
+import { serializeCreatorGallery } from '../images/creator-image-helpers';
 import { notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
 import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
@@ -737,7 +737,6 @@ export const getAgentCreators = async (req: Request, res: Response): Promise<voi
           id: c._id.toString(),
           userId: uid,
           name: c.name,
-          photo: c.photo,
           categories: c.categories,
           price: c.price,
           age: c.age,
@@ -833,10 +832,8 @@ export const getAgentCreatorDetail = async (req: Request, res: Response): Promis
       return;
     }
 
-    const { galleryImages, urlsChanged } = await resolveGalleryImageUrlsForApi(creatorDoc.galleryImages);
-    if (urlsChanged) {
-      await Creator.updateOne({ _id: creatorDoc._id }, { $set: { galleryImages } });
-    }
+    // Cloudflare-Images: URLs are derived from imageId at serialize time.
+    const galleryImages = serializeCreatorGallery(creatorDoc.galleryImages);
 
     const creator = creatorDoc.toObject();
     creator.galleryImages = galleryImages;
@@ -883,7 +880,6 @@ export const getAgentCreatorDetail = async (req: Request, res: Response): Promis
           userId: creator.userId.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
           galleryImages,
           categories: creator.categories,
           price: creator.price,
@@ -1055,7 +1051,6 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
             userId: createdCreator.userId.toString(),
             name: createdCreator.name,
             about: createdCreator.about,
-            photo: createdCreator.photo,
             categories: createdCreator.categories,
             price: createdCreator.price,
             age: createdCreator.age,

@@ -31,6 +31,7 @@ import { emitToAdmin } from '../admin/admin.gateway';
 import { getStreamClient } from '../../config/stream';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
+import { buildAvatarUrls } from '../images/image-url';
 import {
   COIN_MICROS,
   BILLING_SESSION_SCHEMA_VERSION,
@@ -568,8 +569,15 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
     const userName = userDoc?.username || userDoc?.phone || userDoc?.email || 'User';
     const creatorName = creatorDoc?.name || 'Creator';
-    const userAvatar = userDoc?.avatar;
-    const creatorAvatar = creatorDoc?.photo;
+    // CallHistory stores avatars as string URLs; resolve the medium avatar
+    // variant from the canonical IImageAsset (post Phase E removal of
+    // `creator.photo` / legacy `user.avatar` string fields).
+    const userAvatar = userDoc?.avatar?.imageId
+      ? buildAvatarUrls(userDoc.avatar.imageId).md
+      : undefined;
+    const creatorAvatar = creatorDoc?.avatar?.imageId
+      ? buildAvatarUrls(creatorDoc.avatar.imageId).md
+      : undefined;
     const creatorOwnerUserId = creatorDoc?.userId;
     const creatorFirebaseUid = creatorUserDoc?.firebaseUid || session.creatorFirebaseUid;
 

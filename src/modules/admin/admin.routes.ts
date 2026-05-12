@@ -2,7 +2,6 @@ import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import {
   appUpdatePublishLimiter,
-  creatorGalleryUploadLimiter,
 } from '../../middlewares/rate-limit.middleware';
 import {
   createAgent,
@@ -39,7 +38,6 @@ import {
   updateWalletPricing,
   patchCreatorLinkedUser,
   postAdminTransferCreatorToAgent,
-  adminCreatorGalleryUploadUrl,
   adminCreatorGalleryCommit,
   adminCreatorGalleryDelete,
   adminCreatorGalleryReorder,
@@ -48,6 +46,12 @@ import {
   getCurrentGlobalAppUpdateForAdmin,
   publishGlobalAppUpdate,
 } from '../app-update/app-update.controller';
+import {
+  listPendingImages,
+  approveImage,
+  rejectImage,
+  getImagePipelineHealth,
+} from './admin-image-moderation.controller';
 
 const router = Router();
 
@@ -91,11 +95,6 @@ router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/force-offline', forceCreatorOffline);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
 router.post('/creators/:id/transfer-agent', postAdminTransferCreatorToAgent);
-router.post(
-  '/creators/:id/gallery/upload-url',
-  creatorGalleryUploadLimiter,
-  adminCreatorGalleryUploadUrl,
-);
 router.post('/creators/:id/gallery/commit', adminCreatorGalleryCommit);
 router.delete('/creators/:id/gallery/:imageId', adminCreatorGalleryDelete);
 router.patch('/creators/:id/gallery/reorder', adminCreatorGalleryReorder);
@@ -111,5 +110,11 @@ router.get('/creators/security-flags', getSecurityFlags);
 
 // ── Phase 10: Full Audit Report ────────────────────────────────────────
 router.get('/full-audit-report', getFullAuditReport);
+
+// ── Image moderation (Cloudflare-Images) ────────────────────────────────
+router.get('/images/pending', listPendingImages);
+router.post('/images/approve', approveImage);
+router.post('/images/reject', rejectImage);
+router.get('/images/health', getImagePipelineHealth);
 
 export default router;

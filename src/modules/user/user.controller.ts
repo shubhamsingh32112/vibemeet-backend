@@ -34,6 +34,21 @@ import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
 import {
+  commitImageAsset,
+  CommitImageAssetError,
+} from '../images/commit-image-asset';
+import {
+  CloudflareImagesCircuitOpenError,
+  CloudflareImagesError,
+} from '../images/cloudflare.client';
+import { setDegradedHeader } from '../images/images.controller';
+import { isCloudflareImagesEnabled } from '../../config/cloudflare';
+import {
+  serializeUserImages,
+  serializeCreatorGallery,
+} from '../images/creator-image-helpers';
+import { makeImageAssetDoc } from '../images/image-asset.schema';
+import {
   applyOnboardingStageEvent,
   stageForClient,
   submitPermissionsDecisionEvent,
@@ -212,7 +227,6 @@ export const getFavoriteCreatorProfiles = async (
             firebaseUid,
             name: creator.name,
             about: creator.about,
-            photo: creator.photo,
             galleryImages: creator.galleryImages || [],
             categories: creator.categories,
             price: creator.price,
@@ -575,16 +589,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           id: creator._id.toString(),
           name: creator.name,
           about: creator.about,
-          photo: creator.photo,
-          galleryImages: [...(creator.galleryImages || [])]
-            .sort((a, b) => a.position - b.position)
-            .map((image) => ({
-              id: image.id,
-              url: image.url,
-              storagePath: image.storagePath,
-              position: image.position,
-              createdAt: image.createdAt,
-            })),
+          galleryImages: serializeCreatorGallery(creator.galleryImages || []),
           age: creator.age, // Include age field
           location: creator.location,
           email: user.email, // Use user's email (identity comes from user)
@@ -1428,7 +1433,6 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
             userId: createdCreator.userId.toString(),
             name: createdCreator.name,
             about: createdCreator.about,
-            photo: createdCreator.photo,
             categories: createdCreator.categories,
             price: createdCreator.price,
             location: createdCreator.location,
@@ -1471,7 +1475,16 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const { gender, age, username, avatar, categories } = req.body;
+    // Legacy plain-URL `avatar` field was dropped in Phase E; only
+    // avatarUploadSessionId / avatarPresetImageId are now honored.
+    const {
+      gender,
+      age,
+      username,
+      avatarUploadSessionId,
+      avatarPresetImageId,
+      categories,
+    } = req.body;
 
     const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
 
@@ -1540,11 +1553,73 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Update avatar
-    if (avatar !== undefined) {
-      user.avatar = avatar;
+    // ── Update avatar via direct-upload session (Cloudflare-Images) ────────
+    if (typeof avatarUploadSessionId === 'string' && avatarUploadSessionId.trim().length > 0) {
+      if (!isCloudflareImagesEnabled()) {
+        res.status(503).json({
+          success: false,
+          code: 'IMAGES_DISABLED',
+          error: 'Cloudflare Images is not enabled on this deployment',
+        });
+        return;
+      }
+      try {
+        const { asset } = await commitImageAsset({
+          sessionId: avatarUploadSessionId.trim(),
+          userId: user._id.toString(),
+          userObjectId: user._id,
+          purpose: 'user-avatar',
+          quotaScope: 'avatar',
+          blurhashTarget: {
+            kind: 'user-avatar',
+            userId: user._id.toString(),
+          },
+        });
+        // Preserve prior avatar so a moderation rejection can roll back.
+        if (user.avatar) {
+          user.previousAvatar = user.avatar;
+        }
+        user.avatar = asset;
+        updated = true;
+      } catch (commitError) {
+        if (commitError instanceof CommitImageAssetError) {
+          res.status(commitError.status).json({
+            success: false,
+            code: commitError.code,
+            error: commitError.message,
+          });
+          return;
+        }
+        if (commitError instanceof CloudflareImagesCircuitOpenError) {
+          setDegradedHeader(res);
+          res.status(503).json({
+            success: false,
+            code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+            error: 'image service is temporarily unavailable; please retry',
+          });
+          return;
+        }
+        if (commitError instanceof CloudflareImagesError) {
+          res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+            success: false,
+            code: 'CLOUDFLARE_IMAGES_ERROR',
+            error: commitError.message,
+          });
+          return;
+        }
+        throw commitError;
+      }
+    } else if (typeof avatarPresetImageId === 'string' && avatarPresetImageId.trim().length > 0) {
+      // Preset selection — no upload, just point at an existing Cloudflare imageId.
+      user.avatar = makeImageAssetDoc({
+        imageId: avatarPresetImageId.trim(),
+        uploadedBy: user._id,
+        moderationStatus: 'approved',
+      });
       updated = true;
     }
+    // Legacy `avatar: <URL string>` body branch was removed in Phase E.
+    // Clients MUST now go through direct-upload + commit OR preset selection.
 
     // Update categories
     if (categories !== undefined) {
@@ -1578,6 +1653,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       }
     }
 
+    const userImages = serializeUserImages(user);
     res.json({
       success: true,
       data: {
@@ -1588,6 +1664,9 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
           gender: user.gender,
           age: user.age,
           username: user.username,
+          // Cloudflare-Images shape (preferred by Flutter)
+          avatarAsset: userImages.avatar,
+          // Legacy shape — either a Firebase URL string or the raw IImageAsset doc
           avatar: user.avatar,
           categories: user.categories,
           usernameChangeCount: user.usernameChangeCount,
@@ -1915,15 +1994,17 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
       const creators =
         creatorUserIds.length > 0
           ? await Creator.find({ userId: { $in: creatorUserIds } })
-              .select('userId name photo')
+              .select('userId name avatar')
               .lean()
           : [];
 
-      const creatorByUserId = new Map<string, { name?: string; photo?: string }>();
+      // Post Phase E: chat presentation reads avatar from the canonical
+      // `IImageAsset` on Creator (legacy `photo` string was removed).
+      const creatorByUserId = new Map<string, { name?: string; avatar?: typeof creators[number]['avatar'] }>();
       for (const c of creators) {
         creatorByUserId.set(c.userId.toString(), {
           name: c.name,
-          photo: c.photo,
+          avatar: c.avatar ?? null,
         });
       }
 
@@ -1947,6 +2028,7 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
           ...c,
           otherName: pres.name,
           otherAvatar: pres.image,
+          otherAvatarAsset: pres.avatarAsset ?? null,
         };
       });
     }

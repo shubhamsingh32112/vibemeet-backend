@@ -159,23 +159,50 @@ export const tasksLimiter = rateLimit({
 });
 
 /**
- * Rate limiter for creator gallery upload-url generation.
- * - 20 requests per minute per creator is sufficient for retries/burst uploads.
+ * Rate limiter for Cloudflare Images direct-upload URL generation.
+ * - 30 requests per minute per user covers retries + multi-image flows
+ *   without giving abusers a cheap way to spawn upload sessions.
  */
-export const creatorGalleryUploadLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  message: 'Too many gallery upload requests. Please wait a moment.',
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req: Request): string => {
-    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
-    return `creator_gallery_upload:${firebaseUid}`;
+export const imageDirectUploadLimiter = createLimiter(
+  {
+    windowMs: 60 * 1000,
+    max: 30,
+    message: 'Too many image upload requests. Please wait a moment.',
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => {
+      const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+      return `image_direct_upload:${firebaseUid}`;
+    },
+    skip: (_req: Request): boolean => {
+      return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+    },
   },
-  skip: (_req: Request): boolean => {
-    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  'rl:image-direct-upload:',
+);
+
+/**
+ * Rate limiter for the client-side image render-latency telemetry endpoint.
+ * Clients ship small batches (~ once per minute) so 60 req/min/user is more
+ * than enough. Excess traffic is silently dropped — telemetry is best-effort
+ * and MUST NEVER cascade into a 429 that the UI surfaces to the end user.
+ */
+export const imageRenderMetricsLimiter = createLimiter(
+  {
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: false,
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => {
+      const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+      return `image_render_metrics:${firebaseUid}`;
+    },
+    skip: (_req: Request): boolean => {
+      return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+    },
   },
-});
+  'rl:image-render-metrics:',
+);
 
 /**
  * Rate limiter for publishing global app updates (admin endpoint).
