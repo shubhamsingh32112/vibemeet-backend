@@ -26,6 +26,7 @@ import {
 } from './referral.service';
 import { ReferralEdge } from './referral-edge.model';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
+import { logError } from '../../utils/logger';
 import {
   ADMIN_USER_SEARCH_QUERY_MAX_LEN,
   buildSafeMongoSubstringRegex,
@@ -43,7 +44,10 @@ import {
   CloudflareImagesCircuitOpenError,
   CloudflareImagesError,
 } from '../images/cloudflare.client';
-import { setDegradedHeader } from '../images/images.controller';
+import {
+  safeCloudflareImagesClientError,
+  setDegradedHeader,
+} from '../images/images.controller';
 import { isCloudflareImagesEnabled } from '../../config/cloudflare';
 import {
   serializeUserImages,
@@ -1762,10 +1766,11 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
           return;
         }
         if (commitError instanceof CloudflareImagesError) {
+          logError('User profile: Cloudflare Images error on avatar commit', commitError);
           res.status(commitError.status >= 500 ? 502 : commitError.status).json({
             success: false,
             code: 'CLOUDFLARE_IMAGES_ERROR',
-            error: commitError.message,
+            error: safeCloudflareImagesClientError(commitError.status),
           });
           return;
         }
