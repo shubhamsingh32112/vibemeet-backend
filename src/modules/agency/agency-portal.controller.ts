@@ -4,7 +4,9 @@ import bcrypt from 'bcrypt';
 import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
+import { CallHistory } from '../billing/call-history.model';
 import { assignReferralCodeToUser } from '../user/referral.service';
+import { checkDeletedStatus } from '../user/deleted-identity.service';
 import { assertAgency, loadStaffUserByAuth } from '../../middlewares/staff.middleware';
 import { invalidateAdminCaches } from '../../config/redis';
 import { emitToAdmin } from '../admin/admin.gateway';
@@ -14,10 +16,22 @@ import { generateStaffPortalPassword } from '../../utils/staff-password';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { AgencyRevenueDaily } from '../analytics/agency-revenue-daily.model';
 import { utcDateKey } from '../analytics/analytics-aggregation.service';
+import { buildAvatarUrls } from '../images/image-url';
+import type { IImageAsset } from '../images/image-asset.schema';
 
 const BCRYPT_ROUNDS = 12;
 
 const BD_ROLE_QUERY = { $in: ['agent', 'bd'] as const };
+
+function staffAvatarSmUrl(avatar: IImageAsset | null | undefined): string | null {
+  const id = typeof avatar?.imageId === 'string' ? avatar.imageId.trim() : '';
+  if (!id) return null;
+  try {
+    return buildAvatarUrls(id).sm;
+  } catch {
+    return null;
+  }
+}
 
 function utcStartOfDay(d: Date): Date {
   const x = new Date(d);
@@ -59,6 +73,7 @@ export const getAgencySummary = async (req: Request, res: Response): Promise<voi
         displayName: agency.displayName ?? null,
         bdCount,
         hostCount,
+        mustChangePassword: agency.staffMustChangePassword === true,
       },
     });
   } catch (error) {
@@ -128,7 +143,7 @@ export const getAgencyDashboard = async (req: Request, res: Response): Promise<v
     const d30 = new Date(now.getTime() - 30 * 86400000);
 
     const bds = await User.find({ agencyId: agencyOid, role: BD_ROLE_QUERY })
-      .select('_id email displayName referralCode agentDisabled createdAt')
+      .select('_id email displayName referralCode agentDisabled createdAt avatar')
       .sort({ createdAt: -1 })
       .lean();
 
@@ -248,6 +263,7 @@ export const getAgencyDashboard = async (req: Request, res: Response): Promise<v
           displayName: b.displayName ?? null,
           referralCode: b.referralCode ?? null,
           agentDisabled: b.agentDisabled ?? false,
+          avatarUrl: staffAvatarSmUrl(b.avatar as IImageAsset | null | undefined),
           hostCount,
           onlineHostCount,
           callsLast7d: callIds7d.filter(Boolean).length,
@@ -256,6 +272,176 @@ export const getAgencyDashboard = async (req: Request, res: Response): Promise<v
         };
       })
     );
+
+    const sortedBds = [...bdAnalytics].sort(
+      (a, b) =>
+        b.bdEarningsCoinsLast7d - a.bdEarningsCoinsLast7d ||
+        b.hostCount - a.hostCount ||
+        b.agencyRevenueFromBdLast7d - a.agencyRevenueFromBdLast7d
+    );
+    const topBdsLeaderboard = sortedBds.slice(0, 5).map((row, i) => ({
+      rank: i + 1,
+      id: row.id,
+      displayLabel: row.displayName || row.email,
+      avatarUrl: row.avatarUrl ?? null,
+      hostCount: row.hostCount,
+      revenueGeneratedCoins: row.bdEarningsCoinsLast7d,
+      commission5PctCoins: Math.round(row.bdEarningsCoinsLast7d * 0.05),
+      activeHosts: row.onlineHostCount,
+    }));
+
+    const creatorsUnderAgency =
+      bdIds.length === 0
+        ? []
+        : await Creator.find({ assignedAgentId: { $in: bdIds } })
+            .select('name userId assignedAgentId avatar _id')
+            .lean();
+
+    const creatorByUserId = new Map(
+      creatorsUnderAgency
+        .filter((c) => c.userId)
+        .map((c) => [c.userId!.toString(), c] as [string, (typeof creatorsUnderAgency)[0]])
+    );
+    const creatorMongoIds = creatorsUnderAgency.map((c) => c._id);
+    const hostUserIds = creatorsUnderAgency
+      .map((c) => c.userId)
+      .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+
+    let topHostsLeaderboard: Array<{
+      rank: number;
+      hostName: string;
+      avatarUrl: string | null;
+      bdName: string;
+      minutes: number;
+      calls: number;
+      earningsCoins: number;
+      incentiveCoins: number;
+    }> = [];
+
+    if (hostUserIds.length > 0) {
+      const hostCallStats = await CallHistory.aggregate<{
+        _id: mongoose.Types.ObjectId;
+        minutes: number;
+        calls: number;
+        earnings: number;
+      }>([
+        {
+          $match: {
+            ownerRole: 'creator',
+            ownerUserId: { $in: hostUserIds },
+            createdAt: { $gte: d7 },
+          },
+        },
+        {
+          $group: {
+            _id: '$ownerUserId',
+            minutes: { $sum: { $divide: ['$durationSeconds', 60] } },
+            calls: { $sum: 1 },
+            earnings: { $sum: '$coinsEarned' },
+          },
+        },
+        { $sort: { earnings: -1 } },
+        { $limit: 5 },
+      ]);
+
+      const bdLabel = new Map(bds.map((b) => [b._id.toString(), b.displayName || b.email || 'BD']));
+
+      topHostsLeaderboard = hostCallStats.map((row, i) => {
+        const creator = creatorByUserId.get(row._id.toString());
+        const bid = creator?.assignedAgentId?.toString();
+        return {
+          rank: i + 1,
+          hostName: creator?.name ?? 'Host',
+          avatarUrl: staffAvatarSmUrl(creator?.avatar as IImageAsset | null | undefined),
+          bdName: bid ? bdLabel.get(bid) ?? '—' : '—',
+          minutes: Math.round((row.minutes ?? 0) * 100) / 100,
+          calls: row.calls ?? 0,
+          earningsCoins: row.earnings ?? 0,
+          incentiveCoins: 0,
+        };
+      });
+    }
+
+    const from14 = new Date(now);
+    from14.setUTCDate(from14.getUTCDate() - 13);
+    from14.setUTCHours(0, 0, 0, 0);
+    const ledgerDaily = await StaffWalletLedger.aggregate<{ _id: string; coins: number }>([
+      {
+        $match: {
+          staffUserId: agencyOid,
+          direction: 'credit',
+          sourceType: 'call_settlement',
+          createdAt: { $gte: from14 },
+        },
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+          coins: { $sum: '$amountCoins' },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+    const seriesMap = new Map(ledgerDaily.map((x) => [x._id, x.coins]));
+    const revenueSeries14d: Array<{ date: string; coins: number }> = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(from14);
+      d.setUTCDate(from14.getUTCDate() + i);
+      const key = d.toISOString().slice(0, 10);
+      revenueSeries14d.push({ date: key, coins: seriesMap.get(key) ?? 0 });
+    }
+
+    let activitySeries7d: Array<{ date: string; calls: number; minutes: number }> = [];
+    if (creatorMongoIds.length > 0) {
+      const act = await CallHistory.aggregate<{
+        _id: string;
+        calls: number;
+        minutes: number;
+      }>([
+        {
+          $match: {
+            ownerRole: 'user',
+            otherCreatorId: { $in: creatorMongoIds },
+            createdAt: { $gte: d7 },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+            calls: { $sum: 1 },
+            minutes: { $sum: { $divide: ['$durationSeconds', 60] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+      activitySeries7d = act.map((r) => ({
+        date: r._id,
+        calls: r.calls,
+        minutes: Math.round((r.minutes ?? 0) * 100) / 100,
+      }));
+    }
+
+    const [pendingWdAmount, processingWdAmount, paidWdAmount] = await Promise.all([
+      Withdrawal.aggregate<{ t: number }>([
+        { $match: { staffUserId: agencyOid, status: 'pending' } },
+        { $group: { _id: null, t: { $sum: '$amount' } } },
+      ]),
+      Withdrawal.aggregate<{ t: number }>([
+        { $match: { staffUserId: agencyOid, status: { $in: ['approved'] } } },
+        { $group: { _id: null, t: { $sum: '$amount' } } },
+      ]),
+      Withdrawal.aggregate<{ t: number }>([
+        { $match: { staffUserId: agencyOid, status: 'paid' } },
+        { $group: { _id: null, t: { $sum: '$amount' } } },
+      ]),
+    ]);
+
+    const recentActivity = recentWithdrawals.slice(0, 12).map((w) => ({
+      id: w._id.toString(),
+      type: 'withdrawal' as const,
+      message: `Withdrawal ${w.status}: ${w.amount.toLocaleString()} coins`,
+      at: (w.requestedAt ?? w.createdAt).toISOString(),
+    }));
 
     res.json({
       success: true,
@@ -285,6 +471,17 @@ export const getAgencyDashboard = async (req: Request, res: Response): Promise<v
           })),
         },
         bdAnalytics,
+        topBdsLeaderboard,
+        topHostsLeaderboard,
+        revenueSeries14d,
+        activitySeries7d,
+        recentActivity,
+        payoutSummary: {
+          pendingCoins: pendingWdAmount[0]?.t ?? 0,
+          processingCoins: processingWdAmount[0]?.t ?? 0,
+          paidCoins: paidWdAmount[0]?.t ?? 0,
+          nextPayoutNote: 'Payout schedule is coordinated with platform finance.',
+        },
       },
     });
   } catch (error) {
@@ -304,52 +501,19 @@ export const postAgencyStaffWithdrawalRequest = async (
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
-    if (agency.agencyDisabled) {
-      res.status(403).json({
-        success: false,
-        error: 'Agency is disabled — new payout requests are blocked',
-      });
-      return;
-    }
 
     const amount = Number(req.body?.amount);
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    const number = typeof req.body?.number === 'string' ? req.body.number.trim() : '';
-    const upi = typeof req.body?.upi === 'string' ? req.body.upi.trim() : '';
-    const accountNumber =
-      typeof req.body?.accountNumber === 'string' ? req.body.accountNumber.trim() : '';
-    const ifsc = typeof req.body?.ifsc === 'string' ? req.body.ifsc.trim() : '';
-
-    if (!Number.isFinite(amount) || amount < 1) {
-      res.status(400).json({ success: false, error: 'Invalid amount' });
+    const { createStaffWithdrawalRequest } = await import('../billing/staff-wallet-portal.service');
+    const data = await createStaffWithdrawalRequest(agency._id, amount, {
+      blockIfAgencyDisabled: true,
+    });
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Internal server error';
+    if (msg !== 'Internal server error') {
+      res.status(400).json({ success: false, error: msg });
       return;
     }
-
-    const w = await Withdrawal.create({
-      staffUserId: agency._id,
-      amount: Math.floor(amount),
-      status: 'pending',
-      requestedAt: new Date(),
-      name: name || undefined,
-      number: number || undefined,
-      upi: upi || undefined,
-      accountNumber: accountNumber || undefined,
-      ifsc: ifsc || undefined,
-    });
-
-    emitToAdmin('withdrawal:requested', {
-      withdrawalId: w._id.toString(),
-      staffUserId: agency._id.toString(),
-      amount: w.amount,
-    });
-
-    invalidateAdminCaches('overview').catch(() => {});
-
-    res.status(201).json({
-      success: true,
-      data: { id: w._id.toString(), amount: w.amount, status: w.status },
-    });
-  } catch (error) {
     logError('postAgencyStaffWithdrawalRequest', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
@@ -375,6 +539,15 @@ export const createAgencyBd = async (req: Request, res: Response): Promise<void>
       return;
     }
 
+    const deletedStatus = await checkDeletedStatus({ email, phone: null });
+    if (deletedStatus.isDeleted) {
+      res.status(409).json({
+        success: false,
+        error: 'This email was previously removed and cannot be reused',
+      });
+      return;
+    }
+
     const existing = await User.findOne({ email }).select('_id').lean();
     if (existing) {
       res.status(409).json({ success: false, error: 'Email already in use' });
@@ -393,6 +566,7 @@ export const createAgencyBd = async (req: Request, res: Response): Promise<void>
       coins: 0,
       agentDisabled: false,
       agencyId: agency._id,
+      staffMustChangePassword: true,
     });
 
     await assignReferralCodeToUser(bd);
@@ -413,6 +587,88 @@ export const createAgencyBd = async (req: Request, res: Response): Promise<void>
     });
   } catch (error) {
     logError('createAgencyBd error', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const patchAgencyProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    if (typeof req.body.displayName !== 'string') {
+      res.status(400).json({ success: false, error: 'displayName is required' });
+      return;
+    }
+
+    const displayName = req.body.displayName.trim().slice(0, 120);
+    if (!displayName) {
+      res.status(400).json({ success: false, error: 'Display name cannot be empty' });
+      return;
+    }
+
+    agency.displayName = displayName;
+    await agency.save();
+
+    res.json({
+      success: true,
+      data: { displayName },
+    });
+  } catch (error) {
+    logError('patchAgencyProfile error', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const changeAgencyPassword = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    if (!req.auth?.firebaseUid) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const agency = await User.findOne({ firebaseUid: req.auth.firebaseUid }).select('+passwordHash');
+    if (!agency || !agency.passwordHash) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const currentPassword = String(req.body.currentPassword ?? '');
+    const newPassword = String(req.body.newPassword ?? '');
+    if (!currentPassword || !newPassword || newPassword.length < 8) {
+      res.status(400).json({
+        success: false,
+        error: 'Current password and new password (at least 8 characters) are required',
+      });
+      return;
+    }
+
+    const match = await bcrypt.compare(currentPassword, agency.passwordHash);
+    if (!match) {
+      res.status(401).json({ success: false, error: 'Current password is incorrect' });
+      return;
+    }
+    if (currentPassword === newPassword) {
+      res.status(400).json({ success: false, error: 'Choose a password that is different from your current one' });
+      return;
+    }
+
+    agency.passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    agency.staffMustChangePassword = false;
+    await agency.save();
+
+    logInfo('Agency changed portal password', { agencyId: agency._id.toString() });
+
+    res.json({
+      success: true,
+      data: { mustChangePassword: false },
+    });
+  } catch (error) {
+    logError('changeAgencyPassword error', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

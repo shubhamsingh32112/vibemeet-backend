@@ -7,6 +7,7 @@ import { emitToAdmin } from '../admin/admin.gateway';
 import { invalidateAdminCaches } from '../../config/redis';
 import { Creator } from '../creator/creator.model';
 import { CallHistory } from '../billing/call-history.model';
+import { isAgencyRole, isBdRole } from '../../utils/staff-roles';
 
 type CreatorResolution = {
   creatorUserId?: any;
@@ -15,6 +16,17 @@ type CreatorResolution = {
 };
 
 const MAX_DAILY_TICKETS = 5;
+
+function resolveTicketRole(userRole: string): 'user' | 'creator' | 'agency' | 'bd' {
+  if (userRole === 'creator') return 'creator';
+  if (isAgencyRole(userRole)) return 'agency';
+  if (isBdRole(userRole)) return 'bd';
+  return 'user';
+}
+
+function isStaffPortalUser(userRole: string): boolean {
+  return isAgencyRole(userRole) || isBdRole(userRole);
+}
 
 const getUtcDayKey = (d: Date): string => d.toISOString().slice(0, 10);
 
@@ -161,22 +173,31 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // Auto-detect role (map admin → user for support purposes)
-    const ticketRole: 'user' | 'creator' = currentUser.role === 'creator' ? 'creator' : 'user';
+    // Auto-detect role for ticket queue (agency / BD tickets go to super-admin support).
+    const ticketRole = resolveTicketRole(currentUser.role);
+    const staffPortal = isStaffPortalUser(currentUser.role);
 
-    const ticketSlotReserved = await reserveDailySupportTicketSlot(currentUser._id.toString());
-    if (!ticketSlotReserved) {
-      res.status(429).json({
-        success: false,
-        error: `You can submit a maximum of ${MAX_DAILY_TICKETS} support tickets per day. Please try again later.`,
-      });
-      return;
+    let ticketSlotReserved = true;
+    if (!staffPortal) {
+      ticketSlotReserved = await reserveDailySupportTicketSlot(currentUser._id.toString());
+      if (!ticketSlotReserved) {
+        res.status(429).json({
+          success: false,
+          error: `You can submit a maximum of ${MAX_DAILY_TICKETS} support tickets per day. Please try again later.`,
+        });
+        return;
+      }
     }
 
     const validPriorities = ['low', 'medium', 'high', 'urgent'];
     const ticketPriority = priority && validPriorities.includes(priority) ? priority : 'medium';
-    const validSources = ['chat', 'post_call', 'other'];
-    const ticketSource = source && validSources.includes(source) ? source : 'other';
+    const validSources = ['chat', 'post_call', 'other', 'staff_portal'];
+    const ticketSource =
+      source && validSources.includes(source)
+        ? source
+        : staffPortal
+          ? 'staff_portal'
+          : 'other';
     const callId = typeof relatedCallId === 'string' && relatedCallId.trim().length > 0
       ? relatedCallId.trim()
       : undefined;
@@ -203,7 +224,9 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
         status: 'open',
       });
     } catch (error) {
-      await releaseDailySupportTicketSlot(currentUser._id.toString()).catch(() => {});
+      if (!staffPortal) {
+        await releaseDailySupportTicketSlot(currentUser._id.toString()).catch(() => {});
+      }
       throw error;
     }
 

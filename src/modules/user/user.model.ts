@@ -59,6 +59,11 @@ export interface IUser extends Document {
   agentDisabled?: boolean;
   /** When true, agency JWT login is blocked (super-admin toggle). */
   agencyDisabled?: boolean;
+  /**
+   * Agency / BD portal: user should change password after first login with an auto-generated password.
+   * Cleared when they set a new password (or when an admin sets a new password for them).
+   */
+  staffMustChangePassword?: boolean;
   /** Parent agency User._id for BD (`role === 'bd'` or legacy `agent`). */
   agencyId?: mongoose.Types.ObjectId;
   /** Staff earnings wallet (coins face units); separate from consumer `coins`. */
@@ -82,6 +87,8 @@ export interface IUser extends Document {
   bdApprovedAt?: Date | null;
   /** Optional label for agent management UI. */
   displayName?: string;
+  /** Agency portal: city/region label (staff-only usage). */
+  agencyPlace?: string;
   /** Fast Login: 'google' | 'fast'. Omitted for existing users (treated as Google). */
   authProvider?: 'google' | 'fast';
   /** Fast Login: device fingerprint for lookup (one account per device). */
@@ -260,6 +267,10 @@ const userSchema = new Schema<IUser>(
       type: Boolean,
       default: false,
     },
+    staffMustChangePassword: {
+      type: Boolean,
+      default: false,
+    },
     agencyId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
@@ -305,6 +316,12 @@ const userSchema = new Schema<IUser>(
       sparse: true,
       trim: true,
       maxlength: 120,
+    },
+    agencyPlace: {
+      type: String,
+      sparse: true,
+      trim: true,
+      maxlength: 200,
     },
     authProvider: {
       type: String,

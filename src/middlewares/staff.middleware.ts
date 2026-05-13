@@ -47,8 +47,15 @@ export async function assertAgent(req: Request, res: Response): Promise<boolean>
     return false;
   }
   if (u.agencyId) {
-    const parent = await User.findById(u.agencyId).select('agencyDisabled').lean();
-    if (parent?.agencyDisabled) {
+    const parent = await User.findById(u.agencyId).select('role agencyDisabled').lean();
+    if (!parent || parent.role !== 'agency') {
+      res.status(403).json({
+        success: false,
+        error: 'Agency no longer exists — BD portal access suspended',
+      });
+      return false;
+    }
+    if (parent.agencyDisabled) {
       res.status(403).json({
         success: false,
         error: 'Agency account is disabled — BD portal access suspended',

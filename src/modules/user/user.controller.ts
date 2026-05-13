@@ -33,7 +33,10 @@ import {
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
-import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
+import {
+  ensureCreatorPromotionBonusReversalEntry,
+  promoteUserToCreatorWithStarterProfile,
+} from '../creator/creator-starter.service';
 import { isBdRole, isNonConsumerCoinsRole, isSuperAdminRole } from '../../utils/staff-roles';
 import {
   commitImageAsset,
@@ -1273,10 +1276,10 @@ export const searchUsers = async (req: Request, res: Response): Promise<void> =>
 export const promoteToCreator = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { name, about, photo, categories, price, location } = req.body;
-    
+    const { name, about, photo, categories, price, location } = req.body ?? {};
+
     console.log(`🎭 [USER] Promote user to creator: ${id}`);
-    
+
     if (!req.auth) {
       res.status(401).json({
         success: false,
@@ -1295,33 +1298,11 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // Validate required fields
-    if (!name || !about || !photo || price === undefined) {
-      res.status(400).json({
-        success: false,
-        error: 'Missing required fields: name, about, photo, price',
-      });
-      return;
-    }
-
     if (categories !== undefined && (!Array.isArray(categories) || categories.some((c) => typeof c !== 'string'))) {
       res.status(400).json({
         success: false,
         error: 'Categories must be an array of strings',
       });
-      return;
-    }
-
-    const priceCheck = validateCreatorPriceForApi(price);
-    if (!priceCheck.ok) {
-      res.status(400).json({ success: false, error: priceCheck.error });
-      return;
-    }
-    const validatedPrice = priceCheck.price;
-
-    const locCreate = parseCreatorLocationForCreate(location);
-    if (!locCreate.ok) {
-      res.status(400).json({ success: false, error: locCreate.error });
       return;
     }
 
@@ -1357,27 +1338,40 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    const hasLegacyProfile =
+      typeof name === 'string' &&
+      name.trim().length >= 2 &&
+      typeof about === 'string' &&
+      about.trim().length >= 10 &&
+      typeof photo === 'string' &&
+      photo.trim().length > 0 &&
+      price !== undefined &&
+      price !== null;
+
+    let validatedPrice: number | undefined;
+    let legacyLocation: string | undefined;
+
+    if (hasLegacyProfile) {
+      const priceCheck = validateCreatorPriceForApi(price);
+      if (!priceCheck.ok) {
+        res.status(400).json({ success: false, error: priceCheck.error });
+        return;
+      }
+      validatedPrice = priceCheck.price;
+
+      const locParsed = parseCreatorLocationForCreate(location);
+      if (!locParsed.ok) {
+        res.status(400).json({ success: false, error: locParsed.error });
+        return;
+      }
+      legacyLocation = locParsed.value;
+    }
+
     // Atomic operation: Update role + Create creator profile (using transaction)
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
-      // Update user role within transaction
-      targetUser.role = 'creator';
-      
-      // 🔥 CRITICAL: Prevent welcome bonus claim and remove welcome bonus coins
-      // Creators don't need coins to receive calls/texts, so they shouldn't get the welcome bonus
-      // Set coins to 0 (creators don't need coins)
-      const previousCoins = targetUser.coins || 0;
-      targetUser.coins = 0; // Set coins to 0 - creators don't need coins
-      
-      if (previousCoins > 0) {
-        console.log(`💰 [USER] Removed ${previousCoins} coins from user ${targetUser._id} (promoted to creator, coins set to 0)`);
-      }
-      
-      await targetUser.save({ session });
-      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
-
       let assignedAgentId: mongoose.Types.ObjectId | undefined;
       if (targetUser.referredBy) {
         const refUser = await User.findById(targetUser.referredBy).select('role').session(session).lean();
@@ -1386,28 +1380,52 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
         }
       }
 
-      // Create creator profile within transaction
-      const creator = await Creator.create(
-        [
-          {
-            name,
-            about,
-            photo,
-            userId: targetUser._id,
-            ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
-            categories: Array.isArray(categories) ? categories : [],
-            price: validatedPrice,
-            ...(assignedAgentId ? { assignedAgentId } : {}),
-            ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
-          },
-        ],
-        { session }
-      );
+      let createdCreator;
+
+      if (hasLegacyProfile) {
+        // Update user role within transaction
+        targetUser.role = 'creator';
+
+        const previousCoins = targetUser.coins || 0;
+        targetUser.coins = 0;
+        targetUser.hostOnboardingStatus = 'none';
+
+        if (previousCoins > 0) {
+          console.log(
+            `💰 [USER] Removed ${previousCoins} coins from user ${targetUser._id} (promoted to creator, coins set to 0)`
+          );
+        }
+
+        await targetUser.save({ session });
+        await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+
+        const creator = await Creator.create(
+          [
+            {
+              name,
+              about,
+              photo,
+              userId: targetUser._id,
+              ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
+              categories: Array.isArray(categories) ? categories : [],
+              price: validatedPrice as number,
+              ...(assignedAgentId ? { assignedAgentId } : {}),
+              ...(legacyLocation !== undefined ? { location: legacyLocation } : {}),
+            },
+          ],
+          { session }
+        );
+        createdCreator = creator[0];
+      } else {
+        targetUser.hostOnboardingStatus = 'none';
+        createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
+          assignedAgentId,
+          session,
+        });
+      }
 
       // Commit transaction
       await session.commitTransaction();
-      
-      const createdCreator = creator[0];
       
       // Log promotion event (structured for future audit log)
       console.log(`📝 [AUDIT] ADMIN_PROMOTED_USER`);

@@ -580,8 +580,13 @@ export const agentLogin = async (req: Request, res: Response): Promise<void> => 
     }
 
     if (user.agencyId) {
-      const parentAgency = await User.findById(user.agencyId).select('agencyDisabled').lean();
-      if (parentAgency?.agencyDisabled) {
+      const parentAgency = await User.findById(user.agencyId).select('role agencyDisabled').lean();
+      if (!parentAgency || parentAgency.role !== 'agency') {
+        logInfo('Agent login blocked: parent agency missing', { email, ip: req.ip });
+        res.status(403).json({ success: false, error: 'Agency no longer exists' });
+        return;
+      }
+      if (parentAgency.agencyDisabled) {
         logInfo('Agent login blocked: parent agency disabled', { email, ip: req.ip });
         res.status(403).json({ success: false, error: 'Agency account is disabled' });
         return;
@@ -607,6 +612,7 @@ export const agentLogin = async (req: Request, res: Response): Promise<void> => 
           displayName: user.displayName ?? null,
           referralCode: user.referralCode ?? null,
           agencyId: user.agencyId?.toString() ?? null,
+          mustChangePassword: user.staffMustChangePassword === true,
         },
       },
     });
@@ -664,6 +670,7 @@ export const agencyLogin = async (req: Request, res: Response): Promise<void> =>
           email: user.email,
           role: user.role,
           displayName: user.displayName ?? null,
+          mustChangePassword: user.staffMustChangePassword === true,
         },
       },
     });
