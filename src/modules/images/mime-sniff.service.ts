@@ -16,11 +16,10 @@ import { downloadImageBytes } from './cloudflare.client';
 import { bumpImageCounter } from './image-metrics';
 
 // `file-type` is published as pure ESM (v17+). The backend is built as CJS,
-// so a static `import { fileTypeFromBuffer } from 'file-type'` is translated
-// to `require('file-type')` and crashes with ERR_PACKAGE_PATH_NOT_EXPORTED in
-// both `tsc --noEmit` (no, that doesn't bind) and `tsx --test` execution
-// environments. A dynamic `import()` keeps Node's ESM loader in charge for
-// this one package while the rest of the file stays CJS-friendly.
+// so a static or literal dynamic `import('file-type')` is translated to
+// `require('file-type')` and crashes with ERR_PACKAGE_PATH_NOT_EXPORTED.
+// Load it via a runtime `import()` (through `new Function`) so Node's ESM
+// loader handles the package while the rest of the file stays CJS-friendly.
 type FileTypeResult = { mime: string } | undefined;
 let fileTypeFromBufferImpl:
   | ((bytes: Uint8Array | ArrayBuffer | Buffer) => Promise<FileTypeResult>)
@@ -30,7 +29,13 @@ async function getFileTypeFromBuffer(): Promise<
   (bytes: Uint8Array | ArrayBuffer | Buffer) => Promise<FileTypeResult>
 > {
   if (fileTypeFromBufferImpl) return fileTypeFromBufferImpl;
-  const mod = await import('file-type');
+  // `module: commonjs` makes TS rewrite `import('file-type')` to `require()`.
+  // v17+ is ESM-only, so load through a runtime dynamic import instead.
+  const loadEsm = new Function(
+    'specifier',
+    'return import(specifier)',
+  ) as (specifier: string) => Promise<{ fileTypeFromBuffer?: typeof fileTypeFromBufferImpl }>;
+  const mod = await loadEsm('file-type');
   fileTypeFromBufferImpl = mod.fileTypeFromBuffer as typeof fileTypeFromBufferImpl &
     NonNullable<typeof fileTypeFromBufferImpl>;
   if (!fileTypeFromBufferImpl) {
