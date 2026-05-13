@@ -63,6 +63,23 @@ export function setDegradedHeader(res: Response): void {
   res.setHeader('X-Image-Service-Degraded', '1');
 }
 
+/**
+ * Short, client-safe copy for Cloudflare Images failures.
+ * Raw upstream bodies often include URLs / JSON — never return those verbatim.
+ */
+export function safeCloudflareImagesClientError(status: number): string {
+  if (status === 404) {
+    return 'The image service could not find or prepare that upload. Please pick the photo again and retry.';
+  }
+  if (status === 429) {
+    return 'Too many image uploads right now. Please wait a few minutes and try again.';
+  }
+  if (status >= 500) {
+    return 'Our image service is temporarily unavailable. Please try again shortly.';
+  }
+  return 'The image service could not process this upload. Please try a different photo or try again later.';
+}
+
 function handleDisabled(res: Response, error: CloudflareImagesDisabledError): void {
   bumpImageCounter('endpoint.disabled');
   setDegradedHeader(res);
@@ -86,10 +103,11 @@ function handleCloudflareError(res: Response, error: unknown): void {
   }
   if (error instanceof CloudflareImagesError) {
     bumpImageCounter('endpoint.upstream_error', { status: error.status });
+    logError('Cloudflare Images upstream error (redacted for client)', error);
     res.status(error.status >= 500 ? 502 : error.status).json({
       success: false,
       code: 'CLOUDFLARE_IMAGES_ERROR',
-      error: error.message,
+      error: safeCloudflareImagesClientError(error.status),
     });
     return;
   }

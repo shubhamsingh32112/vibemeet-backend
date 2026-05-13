@@ -9,7 +9,6 @@ import { assignReferralCodeToUser } from '../user/referral.service';
 import { checkDeletedStatus } from '../user/deleted-identity.service';
 import { assertAgency, loadStaffUserByAuth } from '../../middlewares/staff.middleware';
 import { invalidateAdminCaches } from '../../config/redis';
-import { emitToAdmin } from '../admin/admin.gateway';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { logError, logInfo } from '../../utils/logger';
 import { generateStaffPortalPassword } from '../../utils/staff-password';

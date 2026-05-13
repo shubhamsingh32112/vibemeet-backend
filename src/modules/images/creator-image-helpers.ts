@@ -18,6 +18,7 @@ import {
   serializeImageAsset,
   type AvatarSerialization,
   type ImageAssetView,
+  type SerializeOptions,
 } from './serialize-image-asset';
 
 export interface SerializedCreatorImages {
@@ -41,14 +42,17 @@ export function serializeCreatorImages(creator: ICreator): SerializedCreatorImag
   };
 }
 
-export function serializeCreatorGallery(items: ICreatorGalleryImage[]): SerializedGalleryItem[] {
+export function serializeCreatorGallery(
+  items: ICreatorGalleryImage[],
+  options: SerializeOptions = {},
+): SerializedGalleryItem[] {
   return [...items]
     .sort((a, b) => a.position - b.position || +new Date(a.createdAt) - +new Date(b.createdAt))
     .map((item, idx): SerializedGalleryItem => ({
       id: item.id,
       position: idx,
       createdAt: item.createdAt,
-      image: serializeImageAsset(item.asset ?? null),
+      image: serializeImageAsset(item.asset ?? null, options),
     }));
 }
 

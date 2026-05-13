@@ -144,18 +144,41 @@ app.use(
 
 // Rate limiting
 // FIX 3: More lenient limit for status endpoint (polling every 3s = 20/min)
+const isDev = process.env.NODE_ENV !== 'production';
+const rateLimitDisabledInDev =
+  isDev && process.env.DISABLE_RATE_LIMIT === 'true';
+
+function isLoopbackClient(req: Request): boolean {
+  const ip = req.ip ?? '';
+  return (
+    ip === '127.0.0.1' ||
+    ip === '::1' ||
+    ip === '::ffff:127.0.0.1' ||
+    ip.endsWith('127.0.0.1')
+  );
+}
+
+function shouldSkipGeneralRateLimit(req: Request): boolean {
+  if (rateLimitDisabledInDev) return true;
+  // Emulator + adb reverse share the host loopback IP; 100/15min is too low for dev.
+  if (isDev && isLoopbackClient(req)) return true;
+  return false;
+}
+
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: isDev ? 5000 : 100,
   message: 'Too many requests from this IP, please try again later.',
+  skip: shouldSkipGeneralRateLimit,
 });
 
 // Separate limiter for status endpoint (more lenient for polling)
 const statusLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 30, // 30 requests per minute (polling every 3s = 20/min, with buffer)
+  max: isDev ? 500 : 30,
   message: 'Too many status requests, please wait.',
   skip: (req) => {
+    if (shouldSkipGeneralRateLimit(req)) return true;
     // Only apply to status endpoint
     return !req.path.includes('/status');
   },

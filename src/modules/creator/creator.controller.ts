@@ -63,7 +63,10 @@ import {
   CloudflareImagesCircuitOpenError,
   CloudflareImagesError,
 } from '../images/cloudflare.client';
-import { setDegradedHeader } from '../images/images.controller';
+import {
+  safeCloudflareImagesClientError,
+  setDegradedHeader,
+} from '../images/images.controller';
 import { isCloudflareImagesEnabled } from '../../config/cloudflare';
 import {
   serializeCreatorImages,
@@ -1330,10 +1333,11 @@ export const updateMyCreatorProfile = async (req: Request, res: Response): Promi
           return;
         }
         if (commitError instanceof CloudflareImagesError) {
+          logError('Creator profile: Cloudflare Images error on avatar commit', commitError);
           res.status(commitError.status >= 500 ? 502 : commitError.status).json({
             success: false,
             code: 'CLOUDFLARE_IMAGES_ERROR',
-            error: commitError.message,
+            error: safeCloudflareImagesClientError(commitError.status),
           });
           return;
         }
@@ -1549,7 +1553,9 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const galleryImages = serializeCreatorGallery(creator.galleryImages);
+    const galleryImages = serializeCreatorGallery(creator.galleryImages, {
+      includePending: true,
+    });
 
     const images = serializeCreatorImages(creator);
     res.json({
@@ -1678,7 +1684,9 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
         success: true,
         data: {
           galleryItemId: newGalleryItemId,
-          galleryImages: serializeCreatorGallery(creator.galleryImages || []),
+          galleryImages: serializeCreatorGallery(creator.galleryImages || [], {
+            includePending: true,
+          }),
         },
       });
       return;
@@ -1701,10 +1709,11 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
         return;
       }
       if (commitError instanceof CloudflareImagesError) {
+        logError('Commit gallery image: Cloudflare Images upstream error', commitError);
         res.status(commitError.status >= 500 ? 502 : commitError.status).json({
           success: false,
           code: 'CLOUDFLARE_IMAGES_ERROR',
-          error: commitError.message,
+          error: safeCloudflareImagesClientError(commitError.status),
         });
         return;
       }

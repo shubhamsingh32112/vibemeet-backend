@@ -13,7 +13,6 @@ import {
   processWithdrawalMarkPaid,
 } from '../creator/withdrawal-processing.service';
 import { invalidateAdminCaches } from '../../config/redis';
-import { emitToAdmin } from '../admin/admin.gateway';
 import { CallHistory } from '../billing/call-history.model';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';

@@ -26,6 +26,7 @@ import {
 } from './referral.service';
 import { ReferralEdge } from './referral-edge.model';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
+import { logError } from '../../utils/logger';
 import {
   ADMIN_USER_SEARCH_QUERY_MAX_LEN,
   buildSafeMongoSubstringRegex,
@@ -46,11 +47,15 @@ import {
   CloudflareImagesCircuitOpenError,
   CloudflareImagesError,
 } from '../images/cloudflare.client';
-import { setDegradedHeader } from '../images/images.controller';
+import {
+  safeCloudflareImagesClientError,
+  setDegradedHeader,
+} from '../images/images.controller';
 import { isCloudflareImagesEnabled } from '../../config/cloudflare';
 import {
   serializeUserImages,
   serializeCreatorGallery,
+  serializeCreatorImages,
 } from '../images/creator-image-helpers';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
 import {
@@ -587,6 +592,8 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     // If creator exists, return creator details as primary data
     if (creator) {
+      const creatorImages = serializeCreatorImages(creator);
+      const userImages = serializeUserImages(user);
       res.json({
         success: true,
         data: {
@@ -610,6 +617,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           // Additional user fields that might be useful
           gender: user.gender,
           username: user.username,
+          avatarAsset: creatorImages.avatar ?? userImages.avatar,
           avatar: user.avatar,
           usernameChangeCount: user.usernameChangeCount,
           blockedCreatorCount: (user.blockedCreatorIds || []).length,
@@ -1131,17 +1139,20 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
     res.json({
       success: true,
       data: {
-        users: users.map((user) => ({
+        users: users.map((user) => {
+          const { avatar } = serializeUserImages(user);
+          return {
           id: user._id.toString(),
           username: user.username,
-          avatar: user.avatar,
+          avatar,
           gender: user.gender,
           categories: user.categories || [],
           firebaseUid: user.firebaseUid, // Include firebaseUid for video calls
           createdAt: user.createdAt,
           // 🔥 NEW: Include online status from Redis
           availability: user.firebaseUid ? (availabilityMap[user.firebaseUid] || 'offline') : 'offline',
-        })),
+        };
+        }),
         pagination: {
           page,
           limit,
@@ -1780,10 +1791,11 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
           return;
         }
         if (commitError instanceof CloudflareImagesError) {
+          logError('User profile: Cloudflare Images error on avatar commit', commitError);
           res.status(commitError.status >= 500 ? 502 : commitError.status).json({
             success: false,
             code: 'CLOUDFLARE_IMAGES_ERROR',
-            error: commitError.message,
+            error: safeCloudflareImagesClientError(commitError.status),
           });
           return;
         }
