@@ -17,6 +17,7 @@
  */
 
 import axios, { type AxiosError, type AxiosInstance } from 'axios';
+import FormData from 'form-data';
 import CircuitBreaker from 'opossum';
 import { getCloudflareConfig } from '../../config/cloudflare';
 import { logError, logWarning } from '../../utils/logger';
@@ -184,14 +185,14 @@ export async function createDirectUpload(args: {
   const startedAt = Date.now();
   try {
     return await callBreaker(operation, async () => {
-      const form = new URLSearchParams();
+      const form = new FormData();
       if (args.metadata) form.append('metadata', JSON.stringify(args.metadata));
       form.append('requireSignedURLs', String(Boolean(args.requireSignedURLs)));
 
       const { data } = await http.post<ApiEnvelope<DirectUploadResult & { id: string }>>(
         accountUrl('/images/v2/direct_upload'),
         form,
-        { timeout: 30_000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
+        { timeout: 30_000, headers: form.getHeaders() },
       );
       if (!data.success || !data.result) {
         throw new Error(`cloudflare error: ${JSON.stringify(data.errors)}`);

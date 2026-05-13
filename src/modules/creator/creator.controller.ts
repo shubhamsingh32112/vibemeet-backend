@@ -1553,7 +1553,9 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const galleryImages = serializeCreatorGallery(creator.galleryImages);
+    const galleryImages = serializeCreatorGallery(creator.galleryImages, {
+      includePending: true,
+    });
 
     const images = serializeCreatorImages(creator);
     res.json({
@@ -1682,7 +1684,9 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
         success: true,
         data: {
           galleryItemId: newGalleryItemId,
-          galleryImages: serializeCreatorGallery(creator.galleryImages || []),
+          galleryImages: serializeCreatorGallery(creator.galleryImages || [], {
+            includePending: true,
+          }),
         },
       });
       return;

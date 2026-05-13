@@ -52,6 +52,7 @@ import { isCloudflareImagesEnabled } from '../../config/cloudflare';
 import {
   serializeUserImages,
   serializeCreatorGallery,
+  serializeCreatorImages,
 } from '../images/creator-image-helpers';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
 import {
@@ -588,6 +589,8 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     // If creator exists, return creator details as primary data
     if (creator) {
+      const creatorImages = serializeCreatorImages(creator);
+      const userImages = serializeUserImages(user);
       res.json({
         success: true,
         data: {
@@ -611,6 +614,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           // Additional user fields that might be useful
           gender: user.gender,
           username: user.username,
+          avatarAsset: creatorImages.avatar ?? userImages.avatar,
           avatar: user.avatar,
           usernameChangeCount: user.usernameChangeCount,
           blockedCreatorCount: (user.blockedCreatorIds || []).length,
@@ -1132,17 +1136,20 @@ export const getAllUsers = async (req: Request, res: Response): Promise<void> =>
     res.json({
       success: true,
       data: {
-        users: users.map((user) => ({
+        users: users.map((user) => {
+          const { avatar } = serializeUserImages(user);
+          return {
           id: user._id.toString(),
           username: user.username,
-          avatar: user.avatar,
+          avatar,
           gender: user.gender,
           categories: user.categories || [],
           firebaseUid: user.firebaseUid, // Include firebaseUid for video calls
           createdAt: user.createdAt,
           // 🔥 NEW: Include online status from Redis
           availability: user.firebaseUid ? (availabilityMap[user.firebaseUid] || 'offline') : 'offline',
-        })),
+        };
+        }),
         pagination: {
           page,
           limit,

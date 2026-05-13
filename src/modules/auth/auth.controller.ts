@@ -18,7 +18,8 @@ import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-
 import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
 import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
-import { serializeCreatorGallery } from '../images/creator-image-helpers';
+import { serializeCreatorGallery, serializeUserImages } from '../images/creator-image-helpers';
+import { serializeAvatar } from '../images/serialize-image-asset';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
@@ -316,6 +317,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     // If creator exists, return creator details as primary data
     if (creator) {
+      const userImages = serializeUserImages(user);
       res.json({
         success: true,
         data: {
@@ -339,6 +341,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           // Additional user fields that might be useful
           gender: user.gender,
           username: user.username,
+          avatarAsset: serializeAvatar(creator.avatar) ?? userImages.avatar,
           avatar: user.avatar,
           usernameChangeCount: user.usernameChangeCount,
           createdAt: creator.createdAt,
