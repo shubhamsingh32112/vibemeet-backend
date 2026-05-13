@@ -48,7 +48,7 @@ async function main() {
       : [];
     const uidByUserId = new Map(users.map((u) => [u._id.toString(), u.firebaseUid || null] as const));
 
-    const ops: mongoose.mongo.AnyBulkWriteOperation[] = [];
+    const ops: Parameters<typeof Creator.bulkWrite>[0] = [];
     for (const c of creators) {
       const uid = c.userId ? uidByUserId.get(c.userId.toString()) : null;
       if (!uid || typeof uid !== 'string' || uid.trim() === '') {
