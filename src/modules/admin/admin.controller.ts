@@ -1894,6 +1894,15 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
       filter.status = statusFilter;
     }
     const hasAssignedAgent = String(req.query.hasAssignedAgent || '').toLowerCase();
+    const withdrawalType = String(req.query.type || 'all').toLowerCase();
+    if (withdrawalType === 'staff') {
+      filter.staffUserId = { $exists: true, $ne: null };
+    } else if (withdrawalType === 'creator') {
+      filter.$or = [
+        { staffUserId: null },
+        { staffUserId: { $exists: false } },
+      ];
+    }
     if (hasAssignedAgent === 'true') {
       filter.assignedAgentId = { $exists: true, $ne: null };
     } else if (hasAssignedAgent === 'false') {
@@ -1909,16 +1918,69 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
     ]);
 
     // Resolve creator info for each withdrawal (handles both creatorUserId and creatorFirebaseUid)
+    const staffIds = [
+      ...new Set(
+        withdrawals
+          .map((w) => (w as { staffUserId?: mongoose.Types.ObjectId }).staffUserId?.toString())
+          .filter(Boolean) as string[],
+      ),
+    ];
+    const staffUsers =
+      staffIds.length > 0
+        ? await User.find({ _id: { $in: staffIds.map((id) => new mongoose.Types.ObjectId(id)) } })
+            .select('email displayName role staffCoinsBalance')
+            .lean()
+        : [];
+    const staffById = new Map(staffUsers.map((u) => [u._id.toString(), u]));
+
     const enrichedWithdrawals = await Promise.all(
       withdrawals.map(async (w) => {
+        const staffId = (w as { staffUserId?: mongoose.Types.ObjectId }).staffUserId?.toString();
+        const staffUser = staffId ? staffById.get(staffId) : undefined;
+        if (staffUser) {
+          return {
+            id: w._id.toString(),
+            kind: 'staff' as const,
+            staffUserId: staffId,
+            staffRole: staffUser.role,
+            staffEmail: staffUser.email ?? null,
+            staffDisplayName: staffUser.displayName ?? null,
+            staffCurrentBalance: staffUser.staffCoinsBalance ?? 0,
+            creatorUserId: '',
+            creatorName: staffUser.displayName || staffUser.email || 'Staff',
+            creatorEmail: staffUser.email || null,
+            creatorPhone: null,
+            creatorCurrentBalance: staffUser.staffCoinsBalance ?? 0,
+            amount: w.amount,
+            status: w.status,
+            requestedAt: (w as any).requestedAt || w.createdAt,
+            processedAt: w.processedAt || null,
+            adminUserId: w.adminUserId?.toString() || null,
+            notes: w.notes || (w as any).note || null,
+            transactionId: w.transactionId || null,
+            createdAt: w.createdAt,
+            name: (w as any).name || null,
+            number: (w as any).number || null,
+            upi: (w as any).upi || null,
+            accountNumber: (w as any).accountNumber || null,
+            ifsc: (w as any).ifsc || null,
+            assignedAgentId: null,
+          };
+        }
+
         const resolved = await resolveWithdrawalCreator(w);
         return {
           id: w._id.toString(),
+          kind: 'creator' as const,
+          staffUserId: null,
+          staffRole: null,
+          staffEmail: null,
+          staffDisplayName: null,
+          staffCurrentBalance: null,
           creatorUserId: resolved.userId || '',
           creatorName: resolved.creator?.name || resolved.user?.username || 'Unknown',
           creatorEmail: resolved.user?.email || null,
           creatorPhone: resolved.user?.phone || null,
-          // Use User.coins as primary source (actual balance), fallback to Creator.earningsCoins if user not found
           creatorCurrentBalance: resolved.user?.coins ?? resolved.creator?.earningsCoins ?? 0,
           amount: w.amount,
           status: w.status,
@@ -1928,7 +1990,6 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           notes: w.notes || (w as any).note || null,
           transactionId: w.transactionId || null,
           createdAt: w.createdAt,
-          // Withdrawal details
           name: (w as any).name || null,
           number: (w as any).number || null,
           upi: (w as any).upi || null,
@@ -1936,7 +1997,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           ifsc: (w as any).ifsc || null,
           assignedAgentId: (w as any).assignedAgentId?.toString() || null,
         };
-      })
+      }),
     );
 
     // Summary stats
@@ -2150,21 +2211,25 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
     const priorityFilter = req.query.priority as string | undefined;
     const sourceFilter = req.query.source as string | undefined;
     const creatorReportsOnly = String(req.query.creatorReports || '').toLowerCase() === 'true';
+    const staffPortalOnly = String(req.query.staffPortal || '').toLowerCase() === 'true';
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
     const range = parseAdminDateRange(req);
 
     const filter: any = {};
-    if (roleFilter && ['user', 'creator'].includes(roleFilter)) filter.role = roleFilter;
+    if (roleFilter && ['user', 'creator', 'agency', 'bd'].includes(roleFilter)) filter.role = roleFilter;
     if (statusFilter && ['open', 'in_progress', 'resolved', 'closed'].includes(statusFilter)) filter.status = statusFilter;
     if (priorityFilter && ['low', 'medium', 'high', 'urgent'].includes(priorityFilter)) filter.priority = priorityFilter;
-    if (sourceFilter && ['chat', 'post_call', 'other'].includes(sourceFilter)) filter.source = sourceFilter;
+    if (sourceFilter && ['chat', 'post_call', 'other', 'staff_portal'].includes(sourceFilter)) filter.source = sourceFilter;
     if (creatorReportsOnly) {
       filter.$or = [
         { reportedCreatorUserId: { $exists: true } },
         { reportedCreatorFirebaseUid: { $exists: true, $ne: null } },
       ];
+    }
+    if (staffPortalOnly) {
+      filter.role = { $in: ['agency', 'bd'] };
     }
     if (range.hasRange) {
       filter.createdAt = { $gte: range.from, $lt: range.to };
@@ -2207,6 +2272,7 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
     const [
       openUserTickets,
       openCreatorTickets,
+      openStaffTickets,
       highPriorityOpen,
       unassigned,
       agingTickets,
@@ -2218,6 +2284,11 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
       }),
       SupportTicket.countDocuments({
         role: 'creator',
+        status: { $in: ['open', 'in_progress'] },
+        ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
+      }),
+      SupportTicket.countDocuments({
+        role: { $in: ['agency', 'bd'] },
         status: { $in: ['open', 'in_progress'] },
         ...(range.hasRange ? { createdAt: { $gte: range.from, $lt: range.to } } : {}),
       }),
@@ -2291,6 +2362,7 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
         summary: {
           openUserTickets,
           openCreatorTickets,
+          openStaffTickets,
           highPriorityOpen,
           unassigned,
           agingOver24h: agingTickets,

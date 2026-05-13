@@ -15,7 +15,22 @@ import {
   listAgencies,
   getAgencyDetail,
   patchAgency,
+  deleteAgency,
 } from './admin-agency.controller';
+import {
+  getDashboardAlerts,
+  getDashboardCallAnalytics,
+  getDashboardGeo,
+  getDashboardHeatmap,
+  getDashboardLiveCalls,
+  getDashboardOverview,
+  getDashboardPayouts,
+  getDashboardRealtime,
+  getDashboardRevenue,
+  getDashboardTopAgencies,
+  getDashboardTopBds,
+  getDashboardTopHosts,
+} from './admin-dashboard.controller';
 import {
   getOverview,
   getCreatorsPerformance,
@@ -96,11 +111,26 @@ router.get('/realtime-metrics', getRealtimeMetrics);
 router.get('/actions/log', getAdminActionLog);
 router.get('/audit-events', getAuditEvents);
 
+// ── Super Admin dashboard (BFF widgets) ───────────────────────────────────
+router.get('/dashboard/overview', getDashboardOverview);
+router.get('/dashboard/revenue', getDashboardRevenue);
+router.get('/dashboard/live-calls', getDashboardLiveCalls);
+router.get('/dashboard/realtime', getDashboardRealtime);
+router.get('/dashboard/top-hosts', getDashboardTopHosts);
+router.get('/dashboard/top-bds', getDashboardTopBds);
+router.get('/dashboard/top-agencies', getDashboardTopAgencies);
+router.get('/dashboard/alerts', getDashboardAlerts);
+router.get('/dashboard/heatmap', getDashboardHeatmap);
+router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
+router.get('/dashboard/payouts', getDashboardPayouts);
+router.get('/dashboard/geo', getDashboardGeo);
+
 // ── Agencies (super-admin) ───────────────────────────────────────────────
 router.post('/agencies', createAgency);
 router.get('/agencies', listAgencies);
 router.get('/agencies/:id', getAgencyDetail);
 router.patch('/agencies/:id', patchAgency);
+router.delete('/agencies/:id', deleteAgency);
 
 // ── BD / agents (super-admin) ─────────────────────────────────────────────
 router.post('/agents', createAgent);

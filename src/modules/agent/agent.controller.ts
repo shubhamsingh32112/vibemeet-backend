@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import mongoose from 'mongoose';
+import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { ReferralEdge } from '../user/referral-edge.model';
@@ -12,8 +13,8 @@ import {
   processWithdrawalMarkPaid,
 } from '../creator/withdrawal-processing.service';
 import { invalidateAdminCaches } from '../../config/redis';
-import { emitToAdmin } from '../admin/admin.gateway';
 import { CallHistory } from '../billing/call-history.model';
+import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
@@ -23,7 +24,12 @@ import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
 import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
 import { isDashboardStaffRole } from '../../utils/staff-roles';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
-import { ensureCreatorPromotionBonusReversalEntry } from '../creator/creator-starter.service';
+import {
+  ensureCreatorPromotionBonusReversalEntry,
+  promoteUserToCreatorWithStarterProfile,
+} from '../creator/creator-starter.service';
+
+const BCRYPT_ROUNDS = 12;
 
 function sinceDaysAgo(days: number): Date {
   const d = new Date();
@@ -342,6 +348,34 @@ async function aggregateCallStatsByUser(
   return m;
 }
 
+async function sumLedgerCredits(match: Record<string, unknown>): Promise<number> {
+  const agg = await StaffWalletLedger.aggregate([
+    { $match: match },
+    { $group: { _id: null, t: { $sum: '$amountCoins' } } },
+  ]);
+  return agg[0]?.t ?? 0;
+}
+
+async function sumHostsRevenueCoins(
+  userObjectIds: mongoose.Types.ObjectId[],
+  start: Date,
+  end: Date,
+): Promise<number> {
+  if (userObjectIds.length === 0) return 0;
+  const agg = await CallHistory.aggregate<{ total?: number }>([
+    {
+      $match: {
+        ownerUserId: { $in: userObjectIds },
+        ownerRole: 'creator',
+        durationSeconds: { $gt: 0 },
+        createdAt: { $gte: start, $lte: end },
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$coinsEarned' } } },
+  ]);
+  return agg[0]?.total ?? 0;
+}
+
 /** Users referred by this agent who do not yet have a Creator profile. */
 async function countReferredUsersAwaitingPromotion(
   agentId: mongoose.Types.ObjectId
@@ -387,6 +421,33 @@ export const getAgentDashboardSummary = async (req: Request, res: Response): Pro
 
     const totalCreators = creatorRows.length;
 
+    const now = new Date();
+    const todayStart = startOfLocalToday();
+    const weekStart = agentPeriodBounds('7d').start!;
+    const hostUserIds = userIdsForOnline;
+
+    const [
+      hostRevenueToday,
+      hostRevenueLast7d,
+      bdEarningsToday,
+      bdEarningsLast7d,
+    ] = await Promise.all([
+      sumHostsRevenueCoins(hostUserIds, todayStart, now),
+      sumHostsRevenueCoins(hostUserIds, weekStart, now),
+      sumLedgerCredits({
+        staffUserId: agent._id,
+        direction: 'credit',
+        sourceType: 'call_settlement',
+        createdAt: { $gte: todayStart, $lte: now },
+      }),
+      sumLedgerCredits({
+        staffUserId: agent._id,
+        direction: 'credit',
+        sourceType: 'call_settlement',
+        createdAt: { $gte: weekStart, $lte: now },
+      }),
+    ]);
+
     res.json({
       success: true,
       data: {
@@ -397,10 +458,102 @@ export const getAgentDashboardSummary = async (req: Request, res: Response): Pro
         activeCreators: totalCreators,
         totalCreators,
         onlineCreators,
+        mustChangePassword: agent.staffMustChangePassword === true,
+        hostRevenueCoins: {
+          today: hostRevenueToday,
+          last7d: hostRevenueLast7d,
+        },
+        bdEarningsCoins: {
+          today: bdEarningsToday,
+          last7d: bdEarningsLast7d,
+          totalBalance: agent.staffCoinsBalance ?? 0,
+        },
       },
     });
   } catch (error) {
     logError('getAgentDashboardSummary', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const patchAgentProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgent(req, res))) return;
+    const agent = await loadStaffUserByAuth(req);
+    if (!agent) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    if (typeof req.body.displayName !== 'string') {
+      res.status(400).json({ success: false, error: 'displayName is required' });
+      return;
+    }
+
+    const displayName = req.body.displayName.trim().slice(0, 120);
+    if (!displayName) {
+      res.status(400).json({ success: false, error: 'Display name cannot be empty' });
+      return;
+    }
+
+    agent.displayName = displayName;
+    await agent.save();
+
+    res.json({
+      success: true,
+      data: { displayName },
+    });
+  } catch (error) {
+    logError('patchAgentProfile', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const changeAgentPassword = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgent(req, res))) return;
+    if (!req.auth?.firebaseUid) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const staff = await User.findOne({ firebaseUid: req.auth.firebaseUid }).select('+passwordHash');
+    if (!staff || !staff.passwordHash) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const currentPassword = String(req.body.currentPassword ?? '');
+    const newPassword = String(req.body.newPassword ?? '');
+    if (!currentPassword || !newPassword || newPassword.length < 8) {
+      res.status(400).json({
+        success: false,
+        error: 'Current password and new password (at least 8 characters) are required',
+      });
+      return;
+    }
+
+    const match = await bcrypt.compare(currentPassword, staff.passwordHash);
+    if (!match) {
+      res.status(401).json({ success: false, error: 'Current password is incorrect' });
+      return;
+    }
+    if (currentPassword === newPassword) {
+      res.status(400).json({ success: false, error: 'Choose a password that is different from your current one' });
+      return;
+    }
+
+    staff.passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    staff.staffMustChangePassword = false;
+    await staff.save();
+
+    logInfo('BD/agent changed portal password', { userId: staff._id.toString() });
+
+    res.json({
+      success: true,
+      data: { mustChangePassword: false },
+    });
+  } catch (error) {
+    logError('changeAgentPassword', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -1022,31 +1175,35 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
 
     const { userId, name, about, photo, categories, age, location } = req.body ?? {};
 
-    if (!name || !about || !photo || !userId) {
+    if (!userId) {
       res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, about, photo, userId',
+        error: 'Missing required field: userId',
       });
       return;
     }
 
-    if (
-      categories !== undefined &&
-      (!Array.isArray(categories) || categories.some((c: unknown) => typeof c !== 'string'))
-    ) {
-      res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
-      return;
-    }
+    const hasLegacyProfile =
+      typeof name === 'string' &&
+      name.trim().length >= 2 &&
+      typeof about === 'string' &&
+      about.trim().length >= 10 &&
+      typeof photo === 'string' &&
+      photo.trim().length > 0;
 
-    if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
-      res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
-      return;
-    }
+    if (hasLegacyProfile) {
+      if (
+        categories !== undefined &&
+        (!Array.isArray(categories) || categories.some((c: unknown) => typeof c !== 'string'))
+      ) {
+        res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
+        return;
+      }
 
-    const locCreate = parseCreatorLocationForCreate(location);
-    if (!locCreate.ok) {
-      res.status(400).json({ success: false, error: locCreate.error });
-      return;
+      if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
+        res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
+        return;
+      }
     }
 
     const targetUser = await User.findById(userId);
@@ -1081,45 +1238,66 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
 
     const validatedPrice = getSystemDefaultHostPriceForNewHosts();
 
+    let legacyLoc: { ok: true; value?: string } | undefined;
+    if (hasLegacyProfile) {
+      const locParsed = parseCreatorLocationForCreate(location);
+      if (!locParsed.ok) {
+        res.status(400).json({ success: false, error: locParsed.error });
+        return;
+      }
+      legacyLoc = locParsed;
+    }
+
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
-      const previousCoins = targetUser.coins || 0;
-      targetUser.coins = 0;
-      targetUser.hostOnboardingStatus = 'none';
-      if (targetUser.role !== 'creator') {
-        targetUser.role = 'creator';
-      }
-      await targetUser.save({ session });
-      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+      let createdCreator;
 
-      if (previousCoins > 0) {
-        logInfo('Agent manual creator: cleared coins', {
-          userId: targetUser._id.toString(),
-          previousCoins,
+      if (hasLegacyProfile) {
+        const previousCoins = targetUser.coins || 0;
+        targetUser.coins = 0;
+        targetUser.hostOnboardingStatus = 'none';
+        if (targetUser.role !== 'creator') {
+          targetUser.role = 'creator';
+        }
+        await targetUser.save({ session });
+        await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+
+        if (previousCoins > 0) {
+          logInfo('Agent manual creator: cleared coins', {
+            userId: targetUser._id.toString(),
+            previousCoins,
+          });
+        }
+
+        const createdArr = await Creator.create(
+          [
+            {
+              name,
+              about,
+              photo: typeof photo === 'string' ? photo.trim() : String(photo),
+              galleryImages: [],
+              userId: targetUser._id,
+              ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
+              categories: Array.isArray(categories) ? categories : [],
+              price: validatedPrice,
+              age: age !== undefined ? age : undefined,
+              assignedAgentId: agent._id,
+              ...(legacyLoc && legacyLoc.value !== undefined ? { location: legacyLoc.value } : {}),
+            },
+          ],
+          { session },
+        );
+
+        createdCreator = createdArr[0];
+      } else {
+        targetUser.hostOnboardingStatus = 'none';
+        createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
+          assignedAgentId: agent._id,
+          session,
         });
       }
 
-      const createdArr = await Creator.create(
-        [
-          {
-            name,
-            about,
-            photo: typeof photo === 'string' ? photo.trim() : String(photo),
-            galleryImages: [],
-            userId: targetUser._id,
-            ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
-            categories: Array.isArray(categories) ? categories : [],
-            price: validatedPrice,
-            age: age !== undefined ? age : undefined,
-            assignedAgentId: agent._id,
-            ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
-          },
-        ],
-        { session },
-      );
-
-      const createdCreator = createdArr[0];
       await session.commitTransaction();
 
       if (targetUser.firebaseUid) {
@@ -1131,6 +1309,7 @@ export const postAgentCreateCreator = async (req: Request, res: Response): Promi
         agentId: agent._id.toString(),
         creatorId: createdCreator._id.toString(),
         userId: targetUser._id.toString(),
+        starterProfile: !hasLegacyProfile,
       });
 
       res.status(201).json({
@@ -1370,43 +1549,15 @@ export const postAgentStaffWithdrawalRequest = async (
     }
 
     const amount = Number(req.body?.amount);
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    const number = typeof req.body?.number === 'string' ? req.body.number.trim() : '';
-    const upi = typeof req.body?.upi === 'string' ? req.body.upi.trim() : '';
-    const accountNumber =
-      typeof req.body?.accountNumber === 'string' ? req.body.accountNumber.trim() : '';
-    const ifsc = typeof req.body?.ifsc === 'string' ? req.body.ifsc.trim() : '';
-
-    if (!Number.isFinite(amount) || amount < 1) {
-      res.status(400).json({ success: false, error: 'Invalid amount' });
+    const { createStaffWithdrawalRequest } = await import('../billing/staff-wallet-portal.service');
+    const data = await createStaffWithdrawalRequest(agent._id, amount);
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Internal server error';
+    if (msg !== 'Internal server error') {
+      res.status(400).json({ success: false, error: msg });
       return;
     }
-
-    const w = await Withdrawal.create({
-      staffUserId: agent._id,
-      amount: Math.floor(amount),
-      status: 'pending',
-      requestedAt: new Date(),
-      name: name || undefined,
-      number: number || undefined,
-      upi: upi || undefined,
-      accountNumber: accountNumber || undefined,
-      ifsc: ifsc || undefined,
-    });
-
-    emitToAdmin('withdrawal:requested', {
-      withdrawalId: w._id.toString(),
-      staffUserId: agent._id.toString(),
-      amount: w.amount,
-    });
-
-    invalidateAdminCaches('overview').catch(() => {});
-
-    res.status(201).json({
-      success: true,
-      data: { id: w._id.toString(), amount: w.amount, status: w.status },
-    });
-  } catch (error) {
     logError('postAgentStaffWithdrawalRequest', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }

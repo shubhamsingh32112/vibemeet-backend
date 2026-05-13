@@ -7,6 +7,7 @@ import { Creator } from '../creator/creator.model';
 import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assignReferralCodeToUser } from '../user/referral.service';
+import { checkDeletedStatus } from '../user/deleted-identity.service';
 import { assertAdmin } from '../../middlewares/staff.middleware';
 import { invalidateAdminCaches } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
@@ -31,6 +32,15 @@ export const createAgent = async (req: Request, res: Response): Promise<void> =>
       res.status(400).json({
         success: false,
         error: 'Valid email and password (min 8 characters) are required',
+      });
+      return;
+    }
+
+    const deletedStatus = await checkDeletedStatus({ email, phone: null });
+    if (deletedStatus.isDeleted) {
+      res.status(409).json({
+        success: false,
+        error: 'This email was previously removed and cannot be reused',
       });
       return;
     }
@@ -293,6 +303,7 @@ export const patchAgent = async (req: Request, res: Response): Promise<void> => 
     }
     if (typeof req.body.password === 'string' && req.body.password.length >= 8) {
       agent.passwordHash = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+      agent.staffMustChangePassword = false;
     }
     if (req.body.reassignCreatorsToAgentId) {
       const targetId = String(req.body.reassignCreatorsToAgentId).trim();

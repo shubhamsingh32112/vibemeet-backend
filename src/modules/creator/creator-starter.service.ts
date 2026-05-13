@@ -2,9 +2,11 @@ import type { ClientSession } from 'mongoose';
 import type { IUser } from '../user/user.model';
 import { Creator, type ICreator } from './creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
+import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
 
 export const STARTER_CREATOR_ABOUT =
   'Complete your creator profile in the app to start connecting with fans.';
+/** @deprecated Prefer `getSystemDefaultHostPriceForNewHosts()` for new host rows. */
 export const DEFAULT_CREATOR_STARTER_PRICE = 60;
 export const CREATOR_PROMOTION_BONUS_REVERSAL_COINS = 30;
 
@@ -78,7 +80,7 @@ export async function promoteUserToCreatorWithStarterProfile(
     userId: user._id,
     ...(user.firebaseUid ? { firebaseUid: user.firebaseUid.trim() } : {}),
     categories: [] as string[],
-    price: DEFAULT_CREATOR_STARTER_PRICE,
+    price: getSystemDefaultHostPriceForNewHosts(),
     ...(options.assignedAgentId
       ? { assignedAgentId: options.assignedAgentId }
       : {}),
