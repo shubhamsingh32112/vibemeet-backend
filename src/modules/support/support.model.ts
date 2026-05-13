@@ -10,11 +10,11 @@ import mongoose, { Schema, Document } from 'mongoose';
 export interface ISupportTicket extends Document {
   _id: mongoose.Types.ObjectId;
   userId: mongoose.Types.ObjectId;
-  role: 'user' | 'creator';
+  role: 'user' | 'creator' | 'agency' | 'bd';
   category: string;
   subject: string;
   message: string;
-  source?: 'chat' | 'post_call' | 'other';
+  source?: 'chat' | 'post_call' | 'other' | 'staff_portal';
   relatedCallId?: string;
   reportedCreatorUserId?: mongoose.Types.ObjectId;
   reportedCreatorFirebaseUid?: string;
@@ -37,7 +37,7 @@ const supportTicketSchema = new Schema<ISupportTicket>(
     },
     role: {
       type: String,
-      enum: ['user', 'creator'],
+      enum: ['user', 'creator', 'agency', 'bd'],
       required: true,
       index: true,
     },
@@ -56,7 +56,7 @@ const supportTicketSchema = new Schema<ISupportTicket>(
     },
     source: {
       type: String,
-      enum: ['chat', 'post_call', 'other'],
+      enum: ['chat', 'post_call', 'other', 'staff_portal'],
       default: 'other',
       index: true,
     },
