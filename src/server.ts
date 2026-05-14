@@ -9,6 +9,8 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 dotenv.config();
+import { createStaffGeneralLimiter } from './middlewares/rate-limit.middleware';
+import { attachStaffRateLimitIdentity } from './middlewares/staff-rate-limit.middleware';
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
 import { isRedisConfigured, getRedis, metricsKey } from './config/redis';
@@ -165,12 +167,7 @@ function shouldSkipGeneralRateLimit(req: Request): boolean {
   return false;
 }
 
-const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: isDev ? 5000 : 100,
-  message: 'Too many requests from this IP, please try again later.',
-  skip: shouldSkipGeneralRateLimit,
-});
+const generalLimiter = createStaffGeneralLimiter(isDev);
 
 // Separate limiter for status endpoint (more lenient for polling)
 const statusLimiter = rateLimit({
@@ -184,8 +181,14 @@ const statusLimiter = rateLimit({
   },
 });
 
+// Staff JWT identity for per-user rate buckets (decode only — full auth on routes)
+app.use('/api/', attachStaffRateLimitIdentity);
+
 // Apply general limiter to all API routes
-app.use('/api/', generalLimiter);
+app.use('/api/', (req, res, next) => {
+  if (shouldSkipGeneralRateLimit(req)) return next();
+  return generalLimiter(req, res, next);
+});
 // Apply stricter limiter specifically for status endpoints.
 app.use('/api/', statusLimiter);
 

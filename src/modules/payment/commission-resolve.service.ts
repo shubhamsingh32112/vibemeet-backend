@@ -47,7 +47,7 @@ function logAmbiguousSamePriority(
  */
 export async function resolveStaffCommissionBps(params: {
   bdUserId: mongoose.Types.ObjectId;
-  agencyId?: mongoose.Types.ObjectId | null;
+  bdId?: mongoose.Types.ObjectId | null;
 }): Promise<{ bdBps: number; agencyBps: number }> {
   const now = new Date();
 
@@ -63,9 +63,9 @@ export async function resolveStaffCommissionBps(params: {
     return { bdBps: bdProfile.bdBps, agencyBps: bdProfile.agencyBps };
   }
 
-  if (params.agencyId) {
+  if (params.bdId) {
     const agencyCandidates = await CommissionProfile.find(
-      activeProfileFilter(params.agencyId, 'agency', now)
+      activeProfileFilter(params.bdId, 'agency', now)
     )
       .sort(COMMISSION_PROFILE_RESOLUTION_SORT)
       .limit(5)
@@ -73,7 +73,7 @@ export async function resolveStaffCommissionBps(params: {
       .lean();
 
     if (agencyCandidates.length > 0) {
-      logAmbiguousSamePriority('agency', params.agencyId, agencyCandidates);
+      logAmbiguousSamePriority('agency', params.bdId, agencyCandidates);
       const agencyProfile = agencyCandidates[0];
       return { bdBps: agencyProfile.bdBps, agencyBps: agencyProfile.agencyBps };
     }

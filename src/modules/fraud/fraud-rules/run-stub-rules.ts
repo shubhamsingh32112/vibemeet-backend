@@ -16,7 +16,7 @@ export async function runStubFraudRulesScan(): Promise<{ created: number }> {
   }
 
   const suspiciousVelocity = await User.countDocuments({
-    role: { $in: ['agent', 'bd'] },
+    role: { $in: ['agency', 'bd'] },
     createdAt: { $gte: new Date(Date.now() - 86400000) },
   });
 

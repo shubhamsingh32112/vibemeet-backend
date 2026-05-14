@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
 import { ReferralEdge } from '../user/referral-edge.model';
-import { isBdRole } from '../../utils/staff-roles';
+import { isAgencyRole } from '../../utils/staff-roles';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { getReferralRewardCoins } from '../user/referral.service';
@@ -16,22 +16,20 @@ function isDuplicateKeyError(err: unknown): boolean {
   );
 }
 
-export type TransferCreatorToAgentResult =
+export type TransferCreatorToAgencyResult =
   | {
       ok: true;
       data: {
         creatorId: string;
         creatorUserId: string;
-        oldAssignedAgentId: string | null;
-        newAssignedAgentId: string;
+        oldAssignedAgencyId: string | null;
+        newAssignedAgencyId: string;
         oldReferredByUserId: string | null;
         newReferredByUserId: string;
         oldReferralCodeUsed: string | null;
         newReferralCodeUsed: string;
         rewardMoved: boolean;
-        /** UTC instant from payload or transfer completion time; forward attribution baseline. */
         assignmentEffectiveFrom: string;
-        /** True when caller explicitly opted into legacy reward coin moves (attempted; see rewardMoved). */
         moveGrantedReferralRewardsAttempted: boolean;
         pendingWithdrawalsReassigned: number;
       };
@@ -43,43 +41,36 @@ export type TransferCreatorToAgentResult =
     };
 
 type TransferOptions = {
-  /** Optional idempotency scope key (used in transactionId strings). */
   idempotencyKey?: string | null;
-  /**
-   * When true, moves already-granted referral reward coins between agents (legacy / dangerous).
-   * Default false: reassignment applies to attribution + future economics only; past ledger unchanged.
-   */
   moveGrantedReferralRewards?: boolean;
-  /** Optional instant for reporting; does not alter immutable past settlements. */
   assignmentEffectiveFrom?: Date | string;
 };
 
 /**
- * Admin transfer: moves creator to a target agent and re-attributes referral retroactively.
- * Single MongoDB transaction to keep Creator/User/ReferralEdge/referrer lists consistent.
+ * Admin transfer: moves creator to a target agency and re-attributes referral retroactively.
  */
-export async function transferCreatorToAgent(
+export async function transferCreatorToAgency(
   creatorIdRaw: string,
-  targetAgentIdRaw: string,
+  targetAgencyIdRaw: string,
   options?: TransferOptions
-): Promise<TransferCreatorToAgentResult> {
+): Promise<TransferCreatorToAgencyResult> {
   const creatorId = String(creatorIdRaw || '').trim();
-  const targetAgentId = String(targetAgentIdRaw || '').trim();
+  const targetAgencyId = String(targetAgencyIdRaw || '').trim();
   const idem = (options?.idempotencyKey || '').trim();
 
   if (!mongoose.Types.ObjectId.isValid(creatorId)) {
     return { ok: false, status: 400, error: 'Invalid creator id' };
   }
-  if (!mongoose.Types.ObjectId.isValid(targetAgentId)) {
-    return { ok: false, status: 400, error: 'Invalid targetAgentId' };
+  if (!mongoose.Types.ObjectId.isValid(targetAgencyId)) {
+    return { ok: false, status: 400, error: 'Invalid targetAgencyId' };
   }
 
   const creatorOid = new mongoose.Types.ObjectId(creatorId);
-  const targetAgentOid = new mongoose.Types.ObjectId(targetAgentId);
+  const targetAgencyOid = new mongoose.Types.ObjectId(targetAgencyId);
 
   const session = await mongoose.startSession();
   try {
-    let result: TransferCreatorToAgentResult | null = null;
+    let result: TransferCreatorToAgencyResult | null = null;
 
     await session.withTransaction(async () => {
       const effectiveFromRaw = options?.assignmentEffectiveFrom;
@@ -99,23 +90,23 @@ export async function transferCreatorToAgent(
         return;
       }
 
-      const targetAgent = await User.findOne({
-        _id: targetAgentOid,
-        role: { $in: ['agent', 'bd'] },
-        agentDisabled: { $ne: true },
+      const targetAgency = await User.findOne({
+        _id: targetAgencyOid,
+        role: 'agency',
+        agencyDisabled: { $ne: true },
       })
-        .select('_id role agentDisabled referralCode email displayName username')
+        .select('_id role agencyDisabled referralCode email displayName username')
         .session(session);
-      if (!targetAgent) {
-        result = { ok: false, status: 404, error: 'Target agent not found or disabled' };
+      if (!targetAgency) {
+        result = { ok: false, status: 404, error: 'Target agency not found or disabled' };
         return;
       }
-      const targetReferralCode = targetAgent.referralCode?.toUpperCase?.() || '';
+      const targetReferralCode = targetAgency.referralCode?.toUpperCase?.() || '';
       if (!targetReferralCode) {
         result = {
           ok: false,
           status: 409,
-          error: 'Target agent has no referralCode. Run backfill-referral-codes or recreate agent.',
+          error: 'Target agency has no referralCode. Run backfill-referral-codes or recreate agency.',
         };
         return;
       }
@@ -126,25 +117,23 @@ export async function transferCreatorToAgent(
         return;
       }
 
-      const oldAssignedAgentId = creator.assignedAgentId
-        ? (creator.assignedAgentId as mongoose.Types.ObjectId).toString()
+      const oldAssignedAgencyId = creator.assignedAgencyId
+        ? (creator.assignedAgencyId as mongoose.Types.ObjectId).toString()
         : null;
       const oldReferredBy = user.referredBy
         ? (user.referredBy as mongoose.Types.ObjectId).toString()
         : null;
 
-      // Upsert edge first (source-of-truth for referralCodeUsed snapshot)
       const existingEdge = await ReferralEdge.findOne({ referredUserId: creatorUserId })
         .select('_id referrerId referralCodeUsed rewardGranted')
         .session(session);
       const oldReferralCodeUsed = existingEdge?.referralCodeUsed ?? null;
       const rewardGranted = existingEdge?.rewardGranted ?? false;
 
-      // Pre-check reward move eligibility before mutating anything.
       const isReferrerChanging =
         !!oldReferredBy &&
         mongoose.Types.ObjectId.isValid(oldReferredBy) &&
-        oldReferredBy !== targetAgentOid.toString();
+        oldReferredBy !== targetAgencyOid.toString();
 
       let rewardMoveEligible = false;
       const allowRewardCoinMove = options?.moveGrantedReferralRewards === true;
@@ -156,15 +145,14 @@ export async function transferCreatorToAgent(
           result = { ok: false, status: 404, error: 'Previous referrer not found' };
           throw new Error('ABORT_TX');
         }
-        // Only move already-granted referral rewards between agents.
-        if (isBdRole(oldRef.role)) {
+        if (isAgencyRole(oldRef.role)) {
           const oldCoins = typeof oldRef.coins === 'number' ? oldRef.coins : 0;
           if (oldCoins < rewardCoins) {
             result = {
               ok: false,
               status: 409,
               error:
-                'Previous agent has insufficient coin balance to move an already-granted referral reward. Top up or handle manually, then retry.',
+                'Previous agency has insufficient coin balance to move an already-granted referral reward. Top up or handle manually, then retry.',
             };
             throw new Error('ABORT_TX');
           }
@@ -177,7 +165,7 @@ export async function transferCreatorToAgent(
           { _id: existingEdge._id },
           {
             $set: {
-              referrerId: targetAgentOid,
+              referrerId: targetAgencyOid,
               referralCodeUsed: targetReferralCode,
             },
           },
@@ -188,7 +176,7 @@ export async function transferCreatorToAgent(
           await ReferralEdge.create(
             [
               {
-                referrerId: targetAgentOid,
+                referrerId: targetAgencyOid,
                 referredUserId: creatorUserId,
                 referralCodeUsed: targetReferralCode,
                 rewardGranted: false,
@@ -198,12 +186,11 @@ export async function transferCreatorToAgent(
           );
         } catch (e) {
           if (!isDuplicateKeyError(e)) throw e;
-          // If another concurrent op inserted it, align it.
           await ReferralEdge.updateOne(
             { referredUserId: creatorUserId },
             {
               $set: {
-                referrerId: targetAgentOid,
+                referrerId: targetAgencyOid,
                 referralCodeUsed: targetReferralCode,
               },
             },
@@ -212,19 +199,16 @@ export async function transferCreatorToAgent(
         }
       }
 
-      // Creator assignment drives agent dashboard visibility
-      if (!creator.assignedAgentId || !(creator.assignedAgentId as mongoose.Types.ObjectId).equals(targetAgentOid)) {
-        creator.assignedAgentId = targetAgentOid;
+      if (!creator.assignedAgencyId || !(creator.assignedAgencyId as mongoose.Types.ObjectId).equals(targetAgencyOid)) {
+        creator.assignedAgencyId = targetAgencyOid;
         await creator.save({ session });
       }
 
-      // Referral attribution (retroactive): set referredBy to target agent
-      if (!user.referredBy || !(user.referredBy as mongoose.Types.ObjectId).equals(targetAgentOid)) {
-        user.referredBy = targetAgentOid;
+      if (!user.referredBy || !(user.referredBy as mongoose.Types.ObjectId).equals(targetAgencyOid)) {
+        user.referredBy = targetAgencyOid;
         await user.save({ session });
       }
 
-      // Keep referrer User.referrals[] lists consistent (best-effort, but in-transaction)
       const creatorUserOid = creatorUserId as mongoose.Types.ObjectId;
       if (oldReferredBy && mongoose.Types.ObjectId.isValid(oldReferredBy)) {
         const oldRefOid = new mongoose.Types.ObjectId(oldReferredBy);
@@ -235,14 +219,13 @@ export async function transferCreatorToAgent(
         );
       }
 
-      // Ensure a single entry for the new referrer
       await User.updateOne(
-        { _id: targetAgentOid },
+        { _id: targetAgencyOid },
         { $pull: { referrals: { user: creatorUserOid } } },
         { session }
       );
       await User.updateOne(
-        { _id: targetAgentOid },
+        { _id: targetAgencyOid },
         {
           $push: {
             referrals: {
@@ -255,7 +238,6 @@ export async function transferCreatorToAgent(
         { session }
       );
 
-      // Reward coin move (optional; default off — future settlements use new assignment via ledger)
       let rewardMoved = false;
       if (
         allowRewardCoinMove &&
@@ -263,12 +245,12 @@ export async function transferCreatorToAgent(
         rewardMoveEligible &&
         oldReferredBy &&
         mongoose.Types.ObjectId.isValid(oldReferredBy) &&
-        oldReferredBy !== targetAgentOid.toString()
+        oldReferredBy !== targetAgencyOid.toString()
       ) {
         const rewardCoins = getReferralRewardCoins();
         const oldRefOid = new mongoose.Types.ObjectId(oldReferredBy);
 
-        const suffix = `${creatorUserOid.toString()}_${oldRefOid.toString()}_${targetAgentOid.toString()}${
+        const suffix = `${creatorUserOid.toString()}_${oldRefOid.toString()}_${targetAgencyOid.toString()}${
           idem ? `_${idem}` : ''
         }`;
         const debitTxnId = `referral_reward_transfer_out_${suffix}`;
@@ -293,7 +275,7 @@ export async function transferCreatorToAgent(
               },
               {
                 transactionId: creditTxnId,
-                userId: targetAgentOid,
+                userId: targetAgencyOid,
                 type: 'credit',
                 coins: rewardCoins,
                 source: 'referral_reward',
@@ -306,7 +288,7 @@ export async function transferCreatorToAgent(
 
           await Promise.all([
             User.updateOne({ _id: oldRefOid }, { $inc: { coins: -rewardCoins } }, { session }),
-            User.updateOne({ _id: targetAgentOid }, { $inc: { coins: rewardCoins } }, { session }),
+            User.updateOne({ _id: targetAgencyOid }, { $inc: { coins: rewardCoins } }, { session }),
           ]);
 
           rewardMoved = true;
@@ -315,7 +297,7 @@ export async function transferCreatorToAgent(
 
       const wdUpdate = await Withdrawal.updateMany(
         { creatorUserId: creatorUserId, status: 'pending' },
-        { $set: { assignedAgentId: targetAgentOid } },
+        { $set: { assignedAgencyId: targetAgencyOid } },
         { session }
       );
 
@@ -324,10 +306,10 @@ export async function transferCreatorToAgent(
         data: {
           creatorId: creator._id.toString(),
           creatorUserId: creatorUserId.toString(),
-          oldAssignedAgentId,
-          newAssignedAgentId: targetAgentOid.toString(),
+          oldAssignedAgencyId,
+          newAssignedAgencyId: targetAgencyOid.toString(),
           oldReferredByUserId: oldReferredBy,
-          newReferredByUserId: targetAgentOid.toString(),
+          newReferredByUserId: targetAgencyOid.toString(),
           oldReferralCodeUsed,
           newReferralCodeUsed: targetReferralCode,
           rewardMoved,
@@ -349,4 +331,3 @@ export async function transferCreatorToAgent(
     await session.endSession();
   }
 }
-

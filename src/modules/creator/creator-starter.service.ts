@@ -55,7 +55,7 @@ export function starterCreatorDisplayName(user: IUser): string {
 export async function promoteUserToCreatorWithStarterProfile(
   user: IUser,
   options: {
-    assignedAgentId?: import('mongoose').Types.ObjectId | null;
+    assignedAgencyId?: import('mongoose').Types.ObjectId | null;
     session?: ClientSession;
   }
 ): Promise<ICreator> {
@@ -81,8 +81,8 @@ export async function promoteUserToCreatorWithStarterProfile(
     ...(user.firebaseUid ? { firebaseUid: user.firebaseUid.trim() } : {}),
     categories: [] as string[],
     price: getSystemDefaultHostPriceForNewHosts(),
-    ...(options.assignedAgentId
-      ? { assignedAgentId: options.assignedAgentId }
+    ...(options.assignedAgencyId
+      ? { assignedAgencyId: options.assignedAgencyId }
       : {}),
   };
 

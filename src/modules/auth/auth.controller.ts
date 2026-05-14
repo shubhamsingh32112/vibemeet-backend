@@ -14,12 +14,13 @@ import {
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug, logWarning } from '../../utils/logger';
-import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
+import { getCreatorApplicationFlagsForUser } from '../agency/creator-application-status.service';
 import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
 import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
 import { serializeCreatorGallery, serializeUserImages } from '../images/creator-image-helpers';
 import { serializeAvatar } from '../images/serialize-image-asset';
+import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
@@ -549,91 +550,14 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
 };
 
 /**
- * Agent dashboard login — email + bcrypt password on User (role agent).
- */
-export const agentLogin = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const email = String(req.body.email ?? '')
-      .trim()
-      .toLowerCase();
-    const password = String(req.body.password ?? '');
-
-    if (!email || !password) {
-      res.status(400).json({ success: false, error: 'Email and password are required' });
-      return;
-    }
-
-    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
-    const user = await User.findOne({
-      email,
-      role: { $in: ['agent', 'bd'] },
-    }).select('+passwordHash');
-
-    if (!user || !user.passwordHash || user.agentDisabled) {
-      logInfo('Agent login failed', { email, ip: req.ip });
-      res.status(401).json({ success: false, error: 'Invalid email or password' });
-      return;
-    }
-
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) {
-      logInfo('Agent login failed: bad password', { email, ip: req.ip });
-      res.status(401).json({ success: false, error: 'Invalid email or password' });
-      return;
-    }
-
-    if (user.agencyId) {
-      const parentAgency = await User.findById(user.agencyId).select('role agencyDisabled').lean();
-      if (!parentAgency || parentAgency.role !== 'agency') {
-        logInfo('Agent login blocked: parent agency missing', { email, ip: req.ip });
-        res.status(403).json({ success: false, error: 'Agency no longer exists' });
-        return;
-      }
-      if (parentAgency.agencyDisabled) {
-        logInfo('Agent login blocked: parent agency disabled', { email, ip: req.ip });
-        res.status(403).json({ success: false, error: 'Agency account is disabled' });
-        return;
-      }
-    }
-
-    const token = jwt.sign(
-      { userId: user._id.toString(), role: user.role, email: user.email },
-      jwtSecret,
-      { expiresIn: '7d' },
-    );
-
-    logInfo('Agent login successful', { userId: user._id.toString(), ip: req.ip });
-
-    res.json({
-      success: true,
-      data: {
-        token,
-        user: {
-          id: user._id.toString(),
-          email: user.email,
-          role: user.role,
-          displayName: user.displayName ?? null,
-          referralCode: user.referralCode ?? null,
-          agencyId: user.agencyId?.toString() ?? null,
-          mustChangePassword: user.staffMustChangePassword === true,
-        },
-      },
-    });
-  } catch (error) {
-    logError('Agent login error', error, { ip: req.ip });
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-/**
- * Agency dashboard login — email + bcrypt password on User (role agency).
+ * Middle-tier agency portal login — email + bcrypt password on User (role agency).
  */
 export const agencyLogin = async (req: Request, res: Response): Promise<void> => {
   try {
     const email = String(req.body.email ?? '')
       .trim()
       .toLowerCase();
-    const password = String(req.body.password ?? '');
+    const password = normalizeStaffPortalPassword(req.body.password);
 
     if (!email || !password) {
       res.status(400).json({ success: false, error: 'Email and password are required' });
@@ -641,19 +565,38 @@ export const agencyLogin = async (req: Request, res: Response): Promise<void> =>
     }
 
     const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
-    const user = await User.findOne({ email, role: 'agency' }).select('+passwordHash');
+    const candidates = await User.find({
+      email,
+      role: 'agency',
+      agencyDisabled: { $ne: true },
+    }).select('+passwordHash');
 
-    if (!user || !user.passwordHash || user.agencyDisabled) {
+    let user: (typeof candidates)[number] | null = null;
+    for (const c of candidates) {
+      if (c.passwordHash && (await bcrypt.compare(password, c.passwordHash))) {
+        user = c;
+        break;
+      }
+    }
+
+    if (!user) {
       logInfo('Agency login failed', { email, ip: req.ip });
       res.status(401).json({ success: false, error: 'Invalid email or password' });
       return;
     }
 
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) {
-      logInfo('Agency login failed: bad password', { email, ip: req.ip });
-      res.status(401).json({ success: false, error: 'Invalid email or password' });
-      return;
+    if (user.bdId) {
+      const parentBd = await User.findById(user.bdId).select('role bdDisabled').lean();
+      if (!parentBd || parentBd.role !== 'bd') {
+        logInfo('Agency login blocked: parent BD missing', { email, ip: req.ip });
+        res.status(403).json({ success: false, error: 'BD no longer exists' });
+        return;
+      }
+      if (parentBd.bdDisabled) {
+        logInfo('Agency login blocked: parent BD disabled', { email, ip: req.ip });
+        res.status(403).json({ success: false, error: 'BD account is disabled' });
+        return;
+      }
     }
 
     const token = jwt.sign(
@@ -673,12 +616,72 @@ export const agencyLogin = async (req: Request, res: Response): Promise<void> =>
           email: user.email,
           role: user.role,
           displayName: user.displayName ?? null,
+          referralCode: user.referralCode ?? null,
+          bdId: user.bdId?.toString() ?? null,
           mustChangePassword: user.staffMustChangePassword === true,
         },
       },
     });
   } catch (error) {
     logError('Agency login error', error, { ip: req.ip });
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * Top-tier BD portal login — email + bcrypt password on User (role bd).
+ */
+export const bdLogin = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const email = String(req.body.email ?? '')
+      .trim()
+      .toLowerCase();
+    const password = normalizeStaffPortalPassword(req.body.password);
+
+    if (!email || !password) {
+      res.status(400).json({ success: false, error: 'Email and password are required' });
+      return;
+    }
+
+    const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
+    const user = await User.findOne({ email, role: 'bd' }).select('+passwordHash');
+
+    if (!user || !user.passwordHash || user.bdDisabled) {
+      logInfo('BD login failed', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      logInfo('BD login failed: bad password', { email, ip: req.ip });
+      res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return;
+    }
+
+    const token = jwt.sign(
+      { userId: user._id.toString(), role: user.role, email: user.email },
+      jwtSecret,
+      { expiresIn: '7d' },
+    );
+
+    logInfo('BD login successful', { userId: user._id.toString(), ip: req.ip });
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+          role: user.role,
+          displayName: user.displayName ?? null,
+          mustChangePassword: user.staffMustChangePassword === true,
+        },
+      },
+    });
+  } catch (error) {
+    logError('BD login error', error, { ip: req.ip });
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

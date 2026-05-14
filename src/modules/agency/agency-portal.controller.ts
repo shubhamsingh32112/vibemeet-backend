@@ -1,41 +1,353 @@
 import type { Request, Response } from 'express';
-import { randomUUID } from 'crypto';
-import bcrypt from 'bcrypt';
 import mongoose from 'mongoose';
+import bcrypt from 'bcrypt';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
-import { CallHistory } from '../billing/call-history.model';
-import { assignReferralCodeToUser } from '../user/referral.service';
-import { checkDeletedStatus } from '../user/deleted-identity.service';
-import { assertAgency, loadStaffUserByAuth } from '../../middlewares/staff.middleware';
-import { invalidateAdminCaches } from '../../config/redis';
+import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
-import { logError, logInfo } from '../../utils/logger';
-import { generateStaffPortalPassword } from '../../utils/staff-password';
+import { assertAgency } from '../../middlewares/staff.middleware';
+import { loadStaffUserByAuth } from '../../middlewares/staff.middleware';
+import {
+  processWithdrawalApproval,
+  processWithdrawalRejection,
+  processWithdrawalMarkPaid,
+} from '../creator/withdrawal-processing.service';
+import { invalidateAdminCaches } from '../../config/redis';
+import { CallHistory } from '../billing/call-history.model';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
-import { AgencyRevenueDaily } from '../analytics/agency-revenue-daily.model';
-import { utcDateKey } from '../analytics/analytics-aggregation.service';
-import { buildAvatarUrls } from '../images/image-url';
-import type { IImageAsset } from '../images/image-asset.schema';
+import { logError, logInfo } from '../../utils/logger';
+import { getBatchAvailability } from '../availability/availability.service';
+import { countOnlineCreatorsForBd } from '../availability/presence-dashboard.service';
+import { serializeCreatorGallery } from '../images/creator-image-helpers';
+import { notifyCreatorProfileChannels } from '../creator/creator.controller';
+import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
+import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
+import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
+import { isDashboardStaffRole } from '../../utils/staff-roles';
+import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
+import {
+  ensureCreatorPromotionBonusReversalEntry,
+  promoteUserToCreatorWithStarterProfile,
+} from '../creator/creator-starter.service';
+import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 
 const BCRYPT_ROUNDS = 12;
 
-const BD_ROLE_QUERY = { $in: ['agent', 'bd'] as const };
-
-function staffAvatarSmUrl(avatar: IImageAsset | null | undefined): string | null {
-  const id = typeof avatar?.imageId === 'string' ? avatar.imageId.trim() : '';
-  if (!id) return null;
-  try {
-    return buildAvatarUrls(id).sm;
-  } catch {
-    return null;
-  }
+function sinceDaysAgo(days: number): Date {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  d.setHours(0, 0, 0, 0);
+  return d;
 }
 
-function utcStartOfDay(d: Date): Date {
-  const x = new Date(d);
-  x.setUTCHours(0, 0, 0, 0);
-  return x;
+async function earningsInWindow(userMongoId: mongoose.Types.ObjectId, since: Date): Promise<number> {
+  const agg = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerUserId: userMongoId,
+        ownerRole: 'creator',
+        durationSeconds: { $gt: 0 },
+        createdAt: { $gte: since },
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$coinsEarned' } } },
+  ]);
+  return agg[0]?.total ?? 0;
+}
+
+export const rejectAgencyReferredUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUserIdRaw = String(req.params.userId ?? '').trim();
+    if (!mongoose.isValidObjectId(targetUserIdRaw)) {
+      res.status(400).json({ success: false, error: 'Invalid userId' });
+      return;
+    }
+    const targetUserId = new mongoose.Types.ObjectId(targetUserIdRaw);
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length > 2000) {
+      res.status(400).json({ success: false, error: 'reason is too long (max 2000 chars)' });
+      return;
+    }
+
+    const targetUser = await User.findById(targetUserId).select('_id referredBy').lean();
+    if (!targetUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    if (!targetUser.referredBy || !targetUser.referredBy.equals(agency._id)) {
+      res.status(403).json({ success: false, error: 'User was not referred by this agency' });
+      return;
+    }
+
+    // If the user is already a creator, this is not a "referred user awaiting promotion".
+    const creator = await Creator.findOne({ userId: targetUserId }).select('_id').lean();
+    if (creator) {
+      res.status(409).json({
+        success: false,
+        error: 'Cannot reject: user already has a creator profile',
+      });
+      return;
+    }
+
+    const session = await mongoose.startSession();
+    let unlinkModified = 0;
+    let edgeDeleted = 0;
+    try {
+      await session.withTransaction(async () => {
+        const unlink = await User.updateOne(
+          { _id: targetUserId, referredBy: agency._id },
+          {
+            $set: {
+              referredBy: null,
+              hostOnboardingStatus: 'rejected',
+              hostOnboardingRejectedReason:
+                reason.length > 0 ? reason.slice(0, 2000) : undefined,
+            },
+          },
+          { session },
+        );
+        unlinkModified = unlink.modifiedCount ?? 0;
+
+        // Remove from agency's referrals array (best-effort; may not exist in legacy data).
+        await User.updateOne(
+          { _id: agency._id },
+          { $pull: { referrals: { user: targetUserId } } },
+          { session },
+        );
+
+        const del = await ReferralEdge.deleteOne(
+          { referredUserId: targetUserId, referrerId: agency._id },
+          { session },
+        );
+        edgeDeleted = del.deletedCount ?? 0;
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    logInfo('agent_referral_rejected', {
+      agencyId: agency._id.toString(),
+      targetUserId: targetUserId.toString(),
+      unlinkModified,
+      referralEdgeDeleted: edgeDeleted,
+      hasReason: reason.length > 0,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        userId: targetUserId.toString(),
+        unlinked: unlinkModified > 0,
+      },
+    });
+  } catch (error) {
+    logError('rejectAgencyReferredUser', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** BD approves referred host onboarding — host may then complete creator profile (mobile or BD-assisted). */
+export const approveAgencyReferredUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const targetUserIdRaw = String(req.params.userId ?? '').trim();
+    if (!mongoose.isValidObjectId(targetUserIdRaw)) {
+      res.status(400).json({ success: false, error: 'Invalid userId' });
+      return;
+    }
+    const targetUserId = new mongoose.Types.ObjectId(targetUserIdRaw);
+
+    const existingCreator = await Creator.findOne({ userId: targetUserId }).select('_id').lean();
+    if (existingCreator) {
+      res.status(409).json({
+        success: false,
+        error: 'User already has a creator profile',
+      });
+      return;
+    }
+
+    const updated = await User.updateOne(
+      {
+        _id: targetUserId,
+        referredBy: agency._id,
+        hostOnboardingStatus: 'pending_agency_approval',
+      },
+      {
+        $set: {
+          hostOnboardingStatus: 'approved',
+          agencyApprovedAt: new Date(),
+        },
+        $inc: { profileRevision: 1 },
+      },
+    );
+
+    if ((updated.modifiedCount ?? 0) < 1) {
+      const u = await User.findById(targetUserId).select('referredBy hostOnboardingStatus').lean();
+      if (!u) {
+        res.status(404).json({ success: false, error: 'User not found' });
+        return;
+      }
+      if (!u.referredBy?.equals(agency._id)) {
+        res.status(403).json({ success: false, error: 'User was not referred by this agency' });
+        return;
+      }
+      res.status(400).json({
+        success: false,
+        error: 'User is not awaiting BD approval',
+      });
+      return;
+    }
+
+    logInfo('agent_referral_approved', {
+      agencyId: agency._id.toString(),
+      targetUserId: targetUserId.toString(),
+    });
+
+    res.json({
+      success: true,
+      data: {
+        userId: targetUserId.toString(),
+        hostOnboardingStatus: 'approved',
+      },
+    });
+  } catch (error) {
+    logError('approveAgencyReferredUser', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Local calendar day 00:00 → now (agency dashboard "today"). */
+function startOfLocalToday(): Date {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/** Rolling windows for 7d/30d; `today` = calendar day; `all` = no start bound. */
+function agentPeriodBounds(period: string): { start: Date | null; end: Date } {
+  const now = new Date();
+  if (period === 'all') return { start: null, end: now };
+  if (period === '7d') return { start: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), end: now };
+  if (period === '30d') return { start: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000), end: now };
+  return { start: startOfLocalToday(), end: now };
+}
+
+type CallAggRow = { talkSeconds: number; periodCoinsEarned: number; callCount: number };
+
+type AgentWithdrawalDetails = {
+  id: string;
+  creatorUserId: string;
+  creatorName: string;
+  creatorEmail: string | null;
+  amount: number;
+  status: 'pending' | 'approved' | 'rejected' | 'paid';
+  requestedAt: Date;
+  processedAt: Date | null;
+  notes: string | null;
+  name: string | null;
+  number: string | null;
+  upi: string | null;
+  accountNumber: string | null;
+  ifsc: string | null;
+  createdAt: Date;
+};
+
+function normalizeNullableText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function mapAgentWithdrawalDto(
+  withdrawal: {
+    _id: mongoose.Types.ObjectId;
+    creatorUserId?: mongoose.Types.ObjectId;
+    amount: number;
+    status: 'pending' | 'approved' | 'rejected' | 'paid';
+    requestedAt: Date;
+    processedAt?: Date;
+    notes?: string;
+    name?: string;
+    number?: string;
+    upi?: string;
+    accountNumber?: string;
+    ifsc?: string;
+    createdAt: Date;
+  },
+  userById: Map<string, { email?: string; username?: string }>,
+  creatorByUserId: Map<string, { name?: string }>,
+): AgentWithdrawalDetails {
+  const creatorUserId = withdrawal.creatorUserId?.toString() ?? '';
+  const user = creatorUserId ? userById.get(creatorUserId) : undefined;
+  const creator = creatorUserId ? creatorByUserId.get(creatorUserId) : undefined;
+  return {
+    id: withdrawal._id.toString(),
+    creatorUserId,
+    creatorName: normalizeNullableText(creator?.name) ?? normalizeNullableText(user?.username) ?? 'Unknown',
+    creatorEmail: normalizeNullableText(user?.email),
+    amount: withdrawal.amount,
+    status: withdrawal.status,
+    requestedAt: withdrawal.requestedAt,
+    processedAt: withdrawal.processedAt ?? null,
+    notes: normalizeNullableText(withdrawal.notes),
+    name: normalizeNullableText(withdrawal.name),
+    number: normalizeNullableText(withdrawal.number),
+    upi: normalizeNullableText(withdrawal.upi),
+    accountNumber: normalizeNullableText(withdrawal.accountNumber),
+    ifsc: normalizeNullableText(withdrawal.ifsc),
+    createdAt: withdrawal.createdAt,
+  };
+}
+
+async function aggregateCallStatsByUser(
+  userObjectIds: mongoose.Types.ObjectId[],
+  start: Date | null,
+  end: Date,
+): Promise<Map<string, CallAggRow>> {
+  if (userObjectIds.length === 0) return new Map();
+  const match: Record<string, unknown> = {
+    ownerUserId: { $in: userObjectIds },
+    ownerRole: 'creator',
+    durationSeconds: { $gt: 0 },
+  };
+  if (start) {
+    match.createdAt = { $gte: start, $lte: end };
+  }
+
+  const rows = await CallHistory.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        talkSeconds: { $sum: '$durationSeconds' },
+        periodCoinsEarned: { $sum: '$coinsEarned' },
+        callCount: { $sum: 1 },
+      },
+    },
+  ]);
+  const m = new Map<string, CallAggRow>();
+  for (const r of rows) {
+    m.set(String(r._id), {
+      talkSeconds: r.talkSeconds ?? 0,
+      periodCoinsEarned: r.periodCoinsEarned ?? 0,
+      callCount: r.callCount ?? 0,
+    });
+  }
+  return m;
 }
 
 async function sumLedgerCredits(match: Record<string, unknown>): Promise<number> {
@@ -46,7 +358,40 @@ async function sumLedgerCredits(match: Record<string, unknown>): Promise<number>
   return agg[0]?.t ?? 0;
 }
 
-export const getAgencySummary = async (req: Request, res: Response): Promise<void> => {
+async function sumHostsRevenueCoins(
+  userObjectIds: mongoose.Types.ObjectId[],
+  start: Date,
+  end: Date,
+): Promise<number> {
+  if (userObjectIds.length === 0) return 0;
+  const agg = await CallHistory.aggregate<{ total?: number }>([
+    {
+      $match: {
+        ownerUserId: { $in: userObjectIds },
+        ownerRole: 'creator',
+        durationSeconds: { $gt: 0 },
+        createdAt: { $gte: start, $lte: end },
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$coinsEarned' } } },
+  ]);
+  return agg[0]?.total ?? 0;
+}
+
+/** Users referred by this agency who do not yet have a Creator profile. */
+async function countReferredUsersAwaitingPromotion(
+  agencyId: mongoose.Types.ObjectId
+): Promise<number> {
+  const agg = await User.aggregate<{ n?: number }>([
+    { $match: { referredBy: agencyId } },
+    { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+    { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+    { $count: 'n' },
+  ]);
+  return agg[0]?.n ?? 0;
+}
+
+export const getAgencyDashboardSummary = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgency(req, res))) return;
     const agency = await loadStaffUserByAuth(req);
@@ -55,537 +400,69 @@ export const getAgencySummary = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const agencyOid = agency._id;
-    const bdIds = await User.find({ agencyId: agencyOid, role: BD_ROLE_QUERY }).distinct('_id');
-    const [bdCount, hostCount] = await Promise.all([
-      Promise.resolve(bdIds.length),
-      bdIds.length === 0
-        ? Promise.resolve(0)
-        : Creator.countDocuments({ assignedAgentId: { $in: bdIds } }),
+    const [referredUsersAwaitingPromotion, pendingWd, creatorRows] = await Promise.all([
+      countReferredUsersAwaitingPromotion(agency._id),
+      Withdrawal.countDocuments({ assignedAgencyId: agency._id, status: 'pending' }),
+      Creator.find({ assignedAgencyId: agency._id }).select('userId').lean(),
     ]);
 
-    res.json({
-      success: true,
-      data: {
-        agencyId: agencyOid.toString(),
-        email: agency.email,
-        displayName: agency.displayName ?? null,
-        bdCount,
-        hostCount,
-        mustChangePassword: agency.staffMustChangePassword === true,
-      },
-    });
-  } catch (error) {
-    logError('getAgencySummary error', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
+    const onlineCreators = await countOnlineCreatorsForBd(agency._id.toString());
 
-export const listAgencyBds = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
+    const totalCreators = creatorRows.length;
 
-    const bds = await User.find({ agencyId: agency._id, role: BD_ROLE_QUERY })
-      .sort({ createdAt: -1 })
-      .select('email displayName referralCode agentDisabled createdAt')
-      .lean();
-
-    const bdIds = bds.map((b) => b._id);
-    const hostAgg =
-      bdIds.length === 0
-        ? []
-        : await Creator.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
-            { $match: { assignedAgentId: { $in: bdIds } } },
-            { $group: { _id: '$assignedAgentId', c: { $sum: 1 } } },
-          ]);
-    const hostMap = new Map(hostAgg.map((h) => [h._id.toString(), h.c]));
-
-    res.json({
-      success: true,
-      data: {
-        bds: bds.map((b) => ({
-          id: b._id.toString(),
-          email: b.email,
-          displayName: b.displayName ?? null,
-          referralCode: b.referralCode ?? null,
-          agentDisabled: b.agentDisabled ?? false,
-          hostCount: hostMap.get(b._id.toString()) ?? 0,
-          createdAt: b.createdAt,
-        })),
-      },
-    });
-  } catch (error) {
-    logError('listAgencyBds error', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-/** Ledger-backed dashboard: revenue windows, BD breakdown, withdrawals (agency wallet only). */
-export const getAgencyDashboard = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const agencyOid = agency._id;
     const now = new Date();
-    const todayStart = utcStartOfDay(now);
-    const d7 = new Date(now.getTime() - 7 * 86400000);
-    const d30 = new Date(now.getTime() - 30 * 86400000);
-
-    const bds = await User.find({ agencyId: agencyOid, role: BD_ROLE_QUERY })
-      .select('_id email displayName referralCode agentDisabled createdAt avatar')
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const bdIds = bds.map((b) => b._id);
-    const bdActive = bds.filter((b) => !b.agentDisabled).length;
-    const bdInactive = bds.length - bdActive;
-
-    const [totalHosts, onlineHosts] = await Promise.all([
-      bdIds.length === 0
-        ? Promise.resolve(0)
-        : Creator.countDocuments({ assignedAgentId: { $in: bdIds } }),
-      bdIds.length === 0
-        ? Promise.resolve(0)
-        : Creator.countDocuments({ assignedAgentId: { $in: bdIds }, isOnline: true }),
-    ]);
-
-    let revenueToday = 0;
-    let revenue7d = 0;
-    let revenue30d = 0;
-
-    const [rToday, r7, r30] = await Promise.all([
-      sumLedgerCredits({
-        staffUserId: agencyOid,
-        direction: 'credit',
-        sourceType: 'call_settlement',
-        createdAt: { $gte: todayStart },
-      }),
-      sumLedgerCredits({
-        staffUserId: agencyOid,
-        direction: 'credit',
-        sourceType: 'call_settlement',
-        createdAt: { $gte: d7 },
-      }),
-      sumLedgerCredits({
-        staffUserId: agencyOid,
-        direction: 'credit',
-        sourceType: 'call_settlement',
-        createdAt: { $gte: d30 },
-      }),
-    ]);
-    revenueToday = rToday;
-    revenue7d = r7;
-    revenue30d = r30;
-
-    if (process.env.USE_ANALYTICS_ROLLUPS === 'true') {
-      const todayK = utcDateKey(now);
-      const from7k = utcDateKey(d7);
-      const from30k = utcDateKey(d30);
-      const [tRow, roll7, roll30] = await Promise.all([
-        AgencyRevenueDaily.findOne({ agencyId: agencyOid, dateKey: todayK })
-          .select('totalSettlementCoins')
-          .lean(),
-        AgencyRevenueDaily.aggregate<{ t: number }>([
-          { $match: { agencyId: agencyOid, dateKey: { $gte: from7k } } },
-          { $group: { _id: null, t: { $sum: '$totalSettlementCoins' } } },
-        ]),
-        AgencyRevenueDaily.aggregate<{ t: number }>([
-          { $match: { agencyId: agencyOid, dateKey: { $gte: from30k } } },
-          { $group: { _id: null, t: { $sum: '$totalSettlementCoins' } } },
-        ]),
-      ]);
-      const rollupReady = Boolean(tRow) || roll7.length > 0 || roll30.length > 0;
-      if (rollupReady) {
-        if (tRow && typeof tRow.totalSettlementCoins === 'number') {
-          revenueToday = tRow.totalSettlementCoins;
-        }
-        if (roll7.length > 0) revenue7d = roll7[0].t;
-        if (roll30.length > 0) revenue30d = roll30[0].t;
-      }
-    }
-
-    const [pendingWithdrawals, completedWithdrawals, recentWithdrawals] = await Promise.all([
-      Withdrawal.countDocuments({ staffUserId: agencyOid, status: 'pending' }),
-      Withdrawal.countDocuments({
-        staffUserId: agencyOid,
-        status: { $in: ['paid', 'approved'] },
-      }),
-      Withdrawal.find({ staffUserId: agencyOid })
-        .sort({ createdAt: -1 })
-        .limit(40)
-        .select('amount status requestedAt processedAt createdAt')
-        .lean(),
-    ]);
-
-    const bdAnalytics = await Promise.all(
-      bds.map(async (b) => {
-        const bid = b._id;
-        const [hostCount, onlineHostCount, bdEarn7d, agencyFromBd7d, callIds7d] =
-          await Promise.all([
-            Creator.countDocuments({ assignedAgentId: bid }),
-            Creator.countDocuments({ assignedAgentId: bid, isOnline: true }),
-            sumLedgerCredits({
-              staffUserId: bid,
-              direction: 'credit',
-              sourceType: 'call_settlement',
-              createdAt: { $gte: d7 },
-            }),
-            sumLedgerCredits({
-              staffUserId: agencyOid,
-              direction: 'credit',
-              sourceType: 'call_settlement',
-              bdUserId: bid,
-              createdAt: { $gte: d7 },
-            }),
-            StaffWalletLedger.distinct('callId', {
-              bdUserId: bid,
-              direction: 'credit',
-              sourceType: 'call_settlement',
-              createdAt: { $gte: d7 },
-              callId: { $exists: true, $nin: [null, ''] },
-            }),
-          ]);
-
-        return {
-          id: bid.toString(),
-          email: b.email,
-          displayName: b.displayName ?? null,
-          referralCode: b.referralCode ?? null,
-          agentDisabled: b.agentDisabled ?? false,
-          avatarUrl: staffAvatarSmUrl(b.avatar as IImageAsset | null | undefined),
-          hostCount,
-          onlineHostCount,
-          callsLast7d: callIds7d.filter(Boolean).length,
-          bdEarningsCoinsLast7d: bdEarn7d,
-          agencyRevenueFromBdLast7d: agencyFromBd7d,
-        };
-      })
-    );
-
-    const sortedBds = [...bdAnalytics].sort(
-      (a, b) =>
-        b.bdEarningsCoinsLast7d - a.bdEarningsCoinsLast7d ||
-        b.hostCount - a.hostCount ||
-        b.agencyRevenueFromBdLast7d - a.agencyRevenueFromBdLast7d
-    );
-    const topBdsLeaderboard = sortedBds.slice(0, 5).map((row, i) => ({
-      rank: i + 1,
-      id: row.id,
-      displayLabel: row.displayName || row.email,
-      avatarUrl: row.avatarUrl ?? null,
-      hostCount: row.hostCount,
-      revenueGeneratedCoins: row.bdEarningsCoinsLast7d,
-      commission5PctCoins: Math.round(row.bdEarningsCoinsLast7d * 0.05),
-      activeHosts: row.onlineHostCount,
-    }));
-
-    const creatorsUnderAgency =
-      bdIds.length === 0
-        ? []
-        : await Creator.find({ assignedAgentId: { $in: bdIds } })
-            .select('name userId assignedAgentId avatar _id')
-            .lean();
-
-    const creatorByUserId = new Map(
-      creatorsUnderAgency
-        .filter((c) => c.userId)
-        .map((c) => [c.userId!.toString(), c] as [string, (typeof creatorsUnderAgency)[0]])
-    );
-    const creatorMongoIds = creatorsUnderAgency.map((c) => c._id);
-    const hostUserIds = creatorsUnderAgency
+    const todayStart = startOfLocalToday();
+    const weekStart = agentPeriodBounds('7d').start!;
+    const hostUserIds = creatorRows
       .map((c) => c.userId)
       .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
 
-    let topHostsLeaderboard: Array<{
-      rank: number;
-      hostName: string;
-      avatarUrl: string | null;
-      bdName: string;
-      minutes: number;
-      calls: number;
-      earningsCoins: number;
-      incentiveCoins: number;
-    }> = [];
-
-    if (hostUserIds.length > 0) {
-      const hostCallStats = await CallHistory.aggregate<{
-        _id: mongoose.Types.ObjectId;
-        minutes: number;
-        calls: number;
-        earnings: number;
-      }>([
-        {
-          $match: {
-            ownerRole: 'creator',
-            ownerUserId: { $in: hostUserIds },
-            createdAt: { $gte: d7 },
-          },
-        },
-        {
-          $group: {
-            _id: '$ownerUserId',
-            minutes: { $sum: { $divide: ['$durationSeconds', 60] } },
-            calls: { $sum: 1 },
-            earnings: { $sum: '$coinsEarned' },
-          },
-        },
-        { $sort: { earnings: -1 } },
-        { $limit: 5 },
-      ]);
-
-      const bdLabel = new Map(bds.map((b) => [b._id.toString(), b.displayName || b.email || 'BD']));
-
-      topHostsLeaderboard = hostCallStats.map((row, i) => {
-        const creator = creatorByUserId.get(row._id.toString());
-        const bid = creator?.assignedAgentId?.toString();
-        return {
-          rank: i + 1,
-          hostName: creator?.name ?? 'Host',
-          avatarUrl: staffAvatarSmUrl(creator?.avatar as IImageAsset | null | undefined),
-          bdName: bid ? bdLabel.get(bid) ?? '—' : '—',
-          minutes: Math.round((row.minutes ?? 0) * 100) / 100,
-          calls: row.calls ?? 0,
-          earningsCoins: row.earnings ?? 0,
-          incentiveCoins: 0,
-        };
-      });
-    }
-
-    const from14 = new Date(now);
-    from14.setUTCDate(from14.getUTCDate() - 13);
-    from14.setUTCHours(0, 0, 0, 0);
-    const ledgerDaily = await StaffWalletLedger.aggregate<{ _id: string; coins: number }>([
-      {
-        $match: {
-          staffUserId: agencyOid,
-          direction: 'credit',
-          sourceType: 'call_settlement',
-          createdAt: { $gte: from14 },
-        },
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
-          coins: { $sum: '$amountCoins' },
-        },
-      },
-      { $sort: { _id: 1 } },
+    const [
+      hostRevenueToday,
+      hostRevenueLast7d,
+      bdEarningsToday,
+      bdEarningsLast7d,
+    ] = await Promise.all([
+      sumHostsRevenueCoins(hostUserIds, todayStart, now),
+      sumHostsRevenueCoins(hostUserIds, weekStart, now),
+      sumLedgerCredits({
+        staffUserId: agency._id,
+        direction: 'credit',
+        sourceType: 'call_settlement',
+        createdAt: { $gte: todayStart, $lte: now },
+      }),
+      sumLedgerCredits({
+        staffUserId: agency._id,
+        direction: 'credit',
+        sourceType: 'call_settlement',
+        createdAt: { $gte: weekStart, $lte: now },
+      }),
     ]);
-    const seriesMap = new Map(ledgerDaily.map((x) => [x._id, x.coins]));
-    const revenueSeries14d: Array<{ date: string; coins: number }> = [];
-    for (let i = 0; i < 14; i++) {
-      const d = new Date(from14);
-      d.setUTCDate(from14.getUTCDate() + i);
-      const key = d.toISOString().slice(0, 10);
-      revenueSeries14d.push({ date: key, coins: seriesMap.get(key) ?? 0 });
-    }
-
-    let activitySeries7d: Array<{ date: string; calls: number; minutes: number }> = [];
-    if (creatorMongoIds.length > 0) {
-      const act = await CallHistory.aggregate<{
-        _id: string;
-        calls: number;
-        minutes: number;
-      }>([
-        {
-          $match: {
-            ownerRole: 'user',
-            otherCreatorId: { $in: creatorMongoIds },
-            createdAt: { $gte: d7 },
-          },
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
-            calls: { $sum: 1 },
-            minutes: { $sum: { $divide: ['$durationSeconds', 60] } },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]);
-      activitySeries7d = act.map((r) => ({
-        date: r._id,
-        calls: r.calls,
-        minutes: Math.round((r.minutes ?? 0) * 100) / 100,
-      }));
-    }
-
-    const [pendingWdAmount, processingWdAmount, paidWdAmount] = await Promise.all([
-      Withdrawal.aggregate<{ t: number }>([
-        { $match: { staffUserId: agencyOid, status: 'pending' } },
-        { $group: { _id: null, t: { $sum: '$amount' } } },
-      ]),
-      Withdrawal.aggregate<{ t: number }>([
-        { $match: { staffUserId: agencyOid, status: { $in: ['approved'] } } },
-        { $group: { _id: null, t: { $sum: '$amount' } } },
-      ]),
-      Withdrawal.aggregate<{ t: number }>([
-        { $match: { staffUserId: agencyOid, status: 'paid' } },
-        { $group: { _id: null, t: { $sum: '$amount' } } },
-      ]),
-    ]);
-
-    const recentActivity = recentWithdrawals.slice(0, 12).map((w) => ({
-      id: w._id.toString(),
-      type: 'withdrawal' as const,
-      message: `Withdrawal ${w.status}: ${w.amount.toLocaleString()} coins`,
-      at: (w.requestedAt ?? w.createdAt).toISOString(),
-    }));
 
     res.json({
       success: true,
       data: {
-        agencyId: agencyOid.toString(),
-        staffCoinsBalance: agency.staffCoinsBalance ?? 0,
-        bdTotal: bds.length,
-        bdActive,
-        bdInactive,
-        totalHosts,
-        onlineHosts,
-        revenueCoins: {
-          today: revenueToday,
-          last7d: revenue7d,
-          last30d: revenue30d,
+        referredUsersAwaitingPromotion,
+        /** @deprecated Use referredUsersAwaitingPromotion — same value, kept for older clients */
+        pendingApplications: referredUsersAwaitingPromotion,
+        pendingWithdrawals: pendingWd,
+        activeCreators: totalCreators,
+        totalCreators,
+        onlineCreators,
+        mustChangePassword: agency.staffMustChangePassword === true,
+        hostRevenueCoins: {
+          today: hostRevenueToday,
+          last7d: hostRevenueLast7d,
         },
-        withdrawals: {
-          pendingCount: pendingWithdrawals,
-          completedCount: completedWithdrawals,
-          recent: recentWithdrawals.map((w) => ({
-            id: w._id.toString(),
-            amount: w.amount,
-            status: w.status,
-            requestedAt: w.requestedAt,
-            processedAt: w.processedAt,
-            createdAt: w.createdAt,
-          })),
-        },
-        bdAnalytics,
-        topBdsLeaderboard,
-        topHostsLeaderboard,
-        revenueSeries14d,
-        activitySeries7d,
-        recentActivity,
-        payoutSummary: {
-          pendingCoins: pendingWdAmount[0]?.t ?? 0,
-          processingCoins: processingWdAmount[0]?.t ?? 0,
-          paidCoins: paidWdAmount[0]?.t ?? 0,
-          nextPayoutNote: 'Payout schedule is coordinated with platform finance.',
+        bdEarningsCoins: {
+          today: bdEarningsToday,
+          last7d: bdEarningsLast7d,
+          totalBalance: agency.staffCoinsBalance ?? 0,
         },
       },
     });
   } catch (error) {
-    logError('getAgencyDashboard error', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const postAgencyStaffWithdrawalRequest = async (
-  req: Request,
-  res: Response
-): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const amount = Number(req.body?.amount);
-    const { createStaffWithdrawalRequest } = await import('../billing/staff-wallet-portal.service');
-    const data = await createStaffWithdrawalRequest(agency._id, amount, {
-      blockIfAgencyDisabled: true,
-    });
-    res.status(201).json({ success: true, data });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Internal server error';
-    if (msg !== 'Internal server error') {
-      res.status(400).json({ success: false, error: msg });
-      return;
-    }
-    logError('postAgencyStaffWithdrawalRequest', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const createAgencyBd = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const email = String(req.body.email ?? '')
-      .trim()
-      .toLowerCase();
-    const displayName =
-      typeof req.body.displayName === 'string' ? req.body.displayName.trim().slice(0, 120) : undefined;
-
-    if (!email) {
-      res.status(400).json({ success: false, error: 'Email is required' });
-      return;
-    }
-
-    const deletedStatus = await checkDeletedStatus({ email, phone: null });
-    if (deletedStatus.isDeleted) {
-      res.status(409).json({
-        success: false,
-        error: 'This email was previously removed and cannot be reused',
-      });
-      return;
-    }
-
-    const existing = await User.findOne({ email }).select('_id').lean();
-    if (existing) {
-      res.status(409).json({ success: false, error: 'Email already in use' });
-      return;
-    }
-
-    const plainPassword = generateStaffPortalPassword(16);
-    const passwordHash = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
-
-    const bd = await User.create({
-      firebaseUid: `bd_${randomUUID().replace(/-/g, '')}`,
-      email,
-      role: 'bd',
-      passwordHash,
-      displayName: displayName || undefined,
-      coins: 0,
-      agentDisabled: false,
-      agencyId: agency._id,
-      staffMustChangePassword: true,
-    });
-
-    await assignReferralCodeToUser(bd);
-
-    logInfo('Agency created BD', { agencyId: agency._id.toString(), bdId: bd._id.toString(), email });
-
-    invalidateAdminCaches('overview', 'users_analytics').catch(() => {});
-
-    res.status(201).json({
-      success: true,
-      data: {
-        id: bd._id.toString(),
-        email: bd.email,
-        displayName: bd.displayName ?? null,
-        referralCode: bd.referralCode ?? null,
-        generatedPassword: plainPassword,
-      },
-    });
-  } catch (error) {
-    logError('createAgencyBd error', error as Error);
+    logError('getAgencyDashboardSummary', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -618,7 +495,7 @@ export const patchAgencyProfile = async (req: Request, res: Response): Promise<v
       data: { displayName },
     });
   } catch (error) {
-    logError('patchAgencyProfile error', error as Error);
+    logError('patchAgencyProfile', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -626,18 +503,19 @@ export const patchAgencyProfile = async (req: Request, res: Response): Promise<v
 export const changeAgencyPassword = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgency(req, res))) return;
-    if (!req.auth?.firebaseUid) {
+    const staff = await loadStaffUserByAuth(req);
+    if (!staff) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
-    const agency = await User.findOne({ firebaseUid: req.auth.firebaseUid }).select('+passwordHash');
-    if (!agency || !agency.passwordHash) {
+    const staffWithHash = await User.findById(staff._id).select('+passwordHash');
+    if (!staffWithHash?.passwordHash) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
 
-    const currentPassword = String(req.body.currentPassword ?? '');
-    const newPassword = String(req.body.newPassword ?? '');
+    const currentPassword = normalizeStaffPortalPassword(req.body.currentPassword);
+    const newPassword = normalizeStaffPortalPassword(req.body.newPassword);
     if (!currentPassword || !newPassword || newPassword.length < 8) {
       res.status(400).json({
         success: false,
@@ -646,9 +524,9 @@ export const changeAgencyPassword = async (req: Request, res: Response): Promise
       return;
     }
 
-    const match = await bcrypt.compare(currentPassword, agency.passwordHash);
+    const match = await bcrypt.compare(currentPassword, staffWithHash.passwordHash);
     if (!match) {
-      res.status(401).json({ success: false, error: 'Current password is incorrect' });
+      res.status(400).json({ success: false, error: 'Current password is incorrect' });
       return;
     }
     if (currentPassword === newPassword) {
@@ -656,18 +534,1024 @@ export const changeAgencyPassword = async (req: Request, res: Response): Promise
       return;
     }
 
-    agency.passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-    agency.staffMustChangePassword = false;
-    await agency.save();
+    staffWithHash.passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    staffWithHash.staffMustChangePassword = false;
+    staffWithHash.markModified('passwordHash');
+    await staffWithHash.save();
 
-    logInfo('Agency changed portal password', { agencyId: agency._id.toString() });
+    logInfo('BD/agency changed portal password', { userId: staffWithHash._id.toString() });
 
     res.json({
       success: true,
       data: { mustChangePassword: false },
     });
   } catch (error) {
-    logError('changeAgencyPassword error', error as Error);
+    logError('changeAgencyPassword', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Paginated users who signed up with this agency's referral (User.referredBy). */
+export const getAgencyReferredUsers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const skip = (page - 1) * limit;
+
+    const [rows, total] = await Promise.all([
+      User.find({ referredBy: agency._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select('username email phone avatar role createdAt hostOnboardingStatus')
+        .lean(),
+      User.countDocuments({ referredBy: agency._id }),
+    ]);
+
+    const userIds = rows.map((u) => u._id);
+    const [edges, creators] = await Promise.all([
+      ReferralEdge.find({ referredUserId: { $in: userIds } })
+        .select('referredUserId referralCodeUsed')
+        .lean(),
+      Creator.find({ userId: { $in: userIds } }).select('_id userId').lean(),
+    ]);
+    const edgeMap = new Map(edges.map((e) => [e.referredUserId.toString(), e.referralCodeUsed]));
+    const creatorByUser = new Map(creators.map((c) => [c.userId.toString(), c._id.toString()]));
+
+    const agentCode = agency.referralCode?.toUpperCase() ?? null;
+
+    res.json({
+      success: true,
+      data: {
+        users: rows.map((u) => {
+          const id = u._id.toString();
+          return {
+            id,
+            username: u.username,
+            email: u.email,
+            phone: u.phone,
+            avatar: u.avatar,
+            role: u.role,
+            createdAt: u.createdAt,
+            referralCodeUsed: edgeMap.get(id) ?? agentCode,
+            hasCreator: creatorByUser.has(id),
+            creatorId: creatorByUser.get(id) ?? null,
+            hostOnboardingStatus: u.hostOnboardingStatus ?? 'none',
+          };
+        }),
+        pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      },
+    });
+  } catch (error) {
+    logError('getAgencyReferredUsers', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+const DB_PAGINATED_AGENT_CREATOR_SORTS = new Set<string>([
+  'talkMinutesPeriod',
+  'earningsPeriod',
+  'callsPeriod',
+  'allTimeTalkMinutes',
+  'name',
+  'username',
+  'coins',
+  'earningsCoins',
+  'earnings',
+  'updatedAt',
+]);
+
+function normalizeAgentCreatorSortKey(raw: string): string {
+  if (DB_PAGINATED_AGENT_CREATOR_SORTS.has(raw)) return raw;
+  return 'talkMinutesPeriod';
+}
+
+function buildAgentCreatorSortSpec(sortKey: string, dirAsc: boolean): Record<string, 1 | -1> {
+  const d = dirAsc ? 1 : -1;
+  switch (sortKey) {
+    case 'name':
+      return { nameLower: d, _id: 1 };
+    case 'username':
+      return { usernameLower: d, _id: 1 };
+    case 'coins':
+      return { userCoins: d, _id: 1 };
+    case 'earningsCoins':
+    case 'earnings':
+      return { earningsCoins: d, _id: 1 };
+    case 'updatedAt':
+      return { updatedAt: d, _id: 1 };
+    case 'earningsPeriod':
+      return { periodCoinsEarned: d, _id: 1 };
+    case 'callsPeriod':
+      return { periodCallCount: d, _id: 1 };
+    case 'talkMinutesPeriod':
+      return { periodTalkSeconds: d, _id: 1 };
+    case 'allTimeTalkMinutes':
+      return { allTimeTalkSeconds: d, _id: 1 };
+    default:
+      return { periodTalkSeconds: d, _id: 1 };
+  }
+}
+
+type CreatorAggRow = {
+  _id: mongoose.Types.ObjectId;
+  userId: mongoose.Types.ObjectId;
+  name: string;
+  photo: string;
+  categories: string[];
+  price: number;
+  age?: number;
+  earningsCoins: number;
+  updatedAt: Date;
+  u?: {
+    username?: string;
+    email?: string;
+    phone?: string;
+    coins?: number;
+    firebaseUid?: string;
+  };
+  periodTalkSeconds: number;
+  periodCoinsEarned: number;
+  periodCallCount: number;
+  allTimeTalkSeconds: number;
+};
+
+function buildCreatorMetricsStages(
+  agencyId: mongoose.Types.ObjectId,
+  periodStart: Date | null,
+  periodEnd: Date,
+): mongoose.PipelineStage[] {
+  const userColl = User.collection.collectionName;
+  const callColl = CallHistory.collection.collectionName;
+
+  const periodExpr: Record<string, unknown> = {
+    $expr: {
+      $and: [
+        { $eq: ['$ownerUserId', '$$uid'] },
+        { $eq: ['$ownerRole', 'creator'] },
+        { $gt: ['$durationSeconds', 0] },
+        ...(periodStart
+          ? [
+              { $gte: ['$createdAt', periodStart] },
+              { $lte: ['$createdAt', periodEnd] },
+            ]
+          : []),
+      ],
+    },
+  };
+
+  const allTimeExpr: Record<string, unknown> = {
+    $expr: {
+      $and: [
+        { $eq: ['$ownerUserId', '$$uid'] },
+        { $eq: ['$ownerRole', 'creator'] },
+        { $gt: ['$durationSeconds', 0] },
+      ],
+    },
+  };
+
+  return [
+    { $match: { assignedAgencyId: agencyId } },
+    {
+      $lookup: {
+        from: userColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$uid'] } } },
+          { $project: { username: 1, email: 1, phone: 1, coins: 1, firebaseUid: 1 } },
+        ],
+        as: 'userArr',
+      },
+    },
+    { $addFields: { u: { $arrayElemAt: ['$userArr', 0] } } },
+    { $project: { userArr: 0 } },
+    {
+      $lookup: {
+        from: callColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: periodExpr },
+          {
+            $group: {
+              _id: null,
+              talkSeconds: { $sum: '$durationSeconds' },
+              periodCoinsEarned: { $sum: '$coinsEarned' },
+              callCount: { $sum: 1 },
+            },
+          },
+        ],
+        as: 'periodAgg',
+      },
+    },
+    {
+      $lookup: {
+        from: callColl,
+        let: { uid: '$userId' },
+        pipeline: [
+          { $match: allTimeExpr },
+          { $group: { _id: null, talkSeconds: { $sum: '$durationSeconds' } } },
+        ],
+        as: 'allTimeAgg',
+      },
+    },
+    {
+      $addFields: {
+        periodTalkSeconds: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.talkSeconds', 0] },
+          },
+        },
+        periodCoinsEarned: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.periodCoinsEarned', 0] },
+          },
+        },
+        periodCallCount: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$periodAgg', 0] } },
+            in: { $ifNull: ['$$row.callCount', 0] },
+          },
+        },
+        allTimeTalkSeconds: {
+          $let: {
+            vars: { row: { $arrayElemAt: ['$allTimeAgg', 0] } },
+            in: { $ifNull: ['$$row.talkSeconds', 0] },
+          },
+        },
+        nameLower: { $toLower: { $ifNull: ['$name', ''] } },
+        usernameLower: { $toLower: { $ifNull: ['$u.username', ''] } },
+        userCoins: { $ifNull: ['$u.coins', 0] },
+      },
+    },
+    { $project: { periodAgg: 0, allTimeAgg: 0 } },
+  ];
+}
+
+function buildPendingWithdrawalMap(
+  pendingList: {
+    creatorUserId?: mongoose.Types.ObjectId;
+    _id: mongoose.Types.ObjectId;
+    amount: number;
+    requestedAt: Date;
+  }[],
+): Map<string, { id: string; amount: number; requestedAt: Date }> {
+  const pendingByUserId = new Map<string, { id: string; amount: number; requestedAt: Date }>();
+  for (const w of pendingList) {
+    const uid = w.creatorUserId?.toString();
+    if (uid && !pendingByUserId.has(uid)) {
+      pendingByUserId.set(uid, {
+        id: w._id.toString(),
+        amount: w.amount,
+        requestedAt: w.requestedAt,
+      });
+    }
+  }
+  return pendingByUserId;
+}
+
+function mapAggDocToAgentCreatorJson(
+  c: CreatorAggRow,
+  availabilityMap: Record<string, string>,
+  pendingByUserId: Map<string, { id: string; amount: number; requestedAt: Date }>,
+) {
+  const uid = c.userId.toString();
+  const u = c.u;
+  const fUid = u?.firebaseUid || '';
+  const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+    | 'online'
+    | 'busy';
+  const pw = pendingByUserId.get(uid);
+  const pts = c.periodTalkSeconds;
+  const ats = c.allTimeTalkSeconds;
+  return {
+    id: c._id.toString(),
+    userId: uid,
+    name: c.name,
+    photo: c.photo,
+    categories: c.categories,
+    price: c.price,
+    age: c.age,
+    earningsCoins: c.earningsCoins,
+    updatedAt: c.updatedAt,
+    username: u?.username,
+    email: u?.email,
+    phone: u?.phone,
+    coins: u?.coins,
+    availability: avail,
+    pendingWithdrawal: pw
+      ? { id: pw.id, amount: pw.amount, requestedAt: pw.requestedAt.toISOString() }
+      : null,
+    periodTalkMinutes: Math.round((pts / 60) * 100) / 100,
+    periodCoinsEarned: c.periodCoinsEarned,
+    periodCallCount: c.periodCallCount,
+    allTimeTalkMinutes: Math.round((ats / 60) * 100) / 100,
+  };
+}
+
+export const getAgencyCreators = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const periodRaw = (req.query.period as string) || 'today';
+    const period = ['today', '7d', '30d', 'all'].includes(periodRaw) ? periodRaw : 'today';
+    const { start: periodStart, end: periodEnd } = agentPeriodBounds(period);
+
+    const sortKeyRaw = ((req.query.sort as string) || 'talkMinutesPeriod').trim();
+    const sortKey =
+      sortKeyRaw === 'online' ? 'online' : normalizeAgentCreatorSortKey(sortKeyRaw);
+    const dirAsc = (req.query.dir as string) === 'asc';
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const skip = (page - 1) * limit;
+
+    const total = await Creator.countDocuments({ assignedAgencyId: agency._id });
+    if (total === 0) {
+      res.json({
+        success: true,
+        data: {
+          creators: [],
+          meta: { period },
+          pagination: { page, limit, total: 0, totalPages: 0 },
+        },
+      });
+      return;
+    }
+
+    if (sortKey === 'online') {
+      const minimal = await Creator.find({ assignedAgencyId: agency._id }).select('_id userId').lean();
+      const userObjectIds = minimal.map((c) => c.userId as mongoose.Types.ObjectId);
+      const users = await User.find({ _id: { $in: userObjectIds } })
+        .select('_id firebaseUid')
+        .lean();
+      const firebaseByUser = new Map(users.map((u) => [u._id.toString(), u.firebaseUid || '']));
+      const firebaseUids = users.map((u) => u.firebaseUid).filter(Boolean) as string[];
+      const availabilityMap =
+        firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
+
+      type MRow = {
+        creatorId: mongoose.Types.ObjectId;
+        userId: string;
+        onlineRank: number;
+        tie: string;
+      };
+      const rows: MRow[] = minimal.map((c) => {
+        const uid = c.userId.toString();
+        const f = firebaseByUser.get(uid) || '';
+        const onlineRank = f && availabilityMap[f] === 'online' ? 1 : 0;
+        return { creatorId: c._id, userId: uid, onlineRank, tie: uid };
+      });
+      rows.sort((a, b) => {
+        const v = a.onlineRank - b.onlineRank;
+        if (v !== 0) return dirAsc ? v : -v;
+        return a.tie.localeCompare(b.tie);
+      });
+
+      const sliced = rows.slice(skip, skip + limit);
+      const pageCreatorIds = sliced.map((r) => r.creatorId);
+      const pageUserIds = sliced.map((r) => new mongoose.Types.ObjectId(r.userId));
+
+      const [creators, fullUsers, periodStats, allTimeStats, pendingList] = await Promise.all([
+        Creator.find({ _id: { $in: pageCreatorIds } }).lean(),
+        User.find({ _id: { $in: pageUserIds } })
+          .select('username email phone coins firebaseUid')
+          .lean(),
+        aggregateCallStatsByUser(pageUserIds, periodStart, periodEnd),
+        aggregateCallStatsByUser(pageUserIds, null, periodEnd),
+        Withdrawal.find({
+          creatorUserId: { $in: pageUserIds },
+          status: 'pending',
+        })
+          .select('creatorUserId amount requestedAt _id')
+          .lean(),
+      ]);
+
+      const order = new Map(pageCreatorIds.map((id, i) => [id.toString(), i]));
+      creators.sort(
+        (a, b) => (order.get(a._id.toString()) ?? 0) - (order.get(b._id.toString()) ?? 0),
+      );
+      const userMap = new Map(fullUsers.map((u) => [u._id.toString(), u]));
+      const pendingByUserId = buildPendingWithdrawalMap(pendingList);
+
+      const pageRows = creators.map((c) => {
+        const uid = c.userId.toString();
+        const u = userMap.get(uid);
+        const fUid = u?.firebaseUid || '';
+        const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+          | 'online'
+          | 'busy';
+        const p = periodStats.get(uid) ?? {
+          talkSeconds: 0,
+          periodCoinsEarned: 0,
+          callCount: 0,
+        };
+        const a = allTimeStats.get(uid) ?? {
+          talkSeconds: 0,
+          periodCoinsEarned: 0,
+          callCount: 0,
+        };
+        const pw = pendingByUserId.get(uid);
+        return {
+          id: c._id.toString(),
+          userId: uid,
+          name: c.name,
+          categories: c.categories,
+          price: c.price,
+          age: c.age,
+          earningsCoins: c.earningsCoins,
+          updatedAt: c.updatedAt,
+          username: u?.username,
+          email: u?.email,
+          phone: u?.phone,
+          coins: u?.coins,
+          availability: avail,
+          pendingWithdrawal: pw
+            ? { id: pw.id, amount: pw.amount, requestedAt: pw.requestedAt.toISOString() }
+            : null,
+          periodTalkMinutes: Math.round((p.talkSeconds / 60) * 100) / 100,
+          periodCoinsEarned: p.periodCoinsEarned,
+          periodCallCount: p.callCount,
+          allTimeTalkMinutes: Math.round((a.talkSeconds / 60) * 100) / 100,
+        };
+      });
+
+      res.json({
+        success: true,
+        data: {
+          creators: pageRows,
+          meta: { period },
+          pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+        },
+      });
+      return;
+    }
+
+    const pipeline: mongoose.PipelineStage[] = [
+      ...buildCreatorMetricsStages(agency._id, periodStart, periodEnd),
+      { $sort: buildAgentCreatorSortSpec(sortKey, dirAsc) },
+      { $skip: skip },
+      { $limit: limit },
+    ];
+
+    const pageDocs = (await Creator.aggregate(pipeline)) as CreatorAggRow[];
+
+    const pageUserIds = pageDocs.map((d) => d.userId as mongoose.Types.ObjectId);
+    const firebaseUids = pageDocs.map((d) => d.u?.firebaseUid).filter(Boolean) as string[];
+    const availabilityMap =
+      firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
+
+    const pendingList =
+      pageUserIds.length > 0
+        ? await Withdrawal.find({
+            creatorUserId: { $in: pageUserIds },
+            status: 'pending',
+          })
+            .select('creatorUserId amount requestedAt _id')
+            .lean()
+        : [];
+
+    const pendingByUserId = buildPendingWithdrawalMap(pendingList);
+
+    const pageRows = pageDocs.map((doc) =>
+      mapAggDocToAgentCreatorJson(doc, availabilityMap, pendingByUserId),
+    );
+
+    res.json({
+      success: true,
+      data: {
+        creators: pageRows,
+        meta: { period },
+        pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      },
+    });
+  } catch (error) {
+    logError('getAgencyCreators', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getAgencyCreatorDetail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const periodRaw = (req.query.period as string) || 'today';
+    const period = ['today', '7d', '30d', 'all'].includes(periodRaw) ? periodRaw : 'today';
+    const { start: periodStart, end: periodEnd } = agentPeriodBounds(period);
+
+    const { creatorId } = req.params;
+    const creatorDoc = await Creator.findById(creatorId);
+    if (!creatorDoc || !creatorDoc.assignedAgencyId?.equals(agency._id)) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    // Cloudflare-Images: URLs are derived from imageId at serialize time.
+    const galleryImages = serializeCreatorGallery(creatorDoc.galleryImages);
+
+    const creator = creatorDoc.toObject();
+    creator.galleryImages = galleryImages;
+
+    const user = await User.findById(creator.userId).lean();
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const uid = user._id;
+    const [e1d, e7d, e30d, periodMap, allTimeMap, pendingWd] = await Promise.all([
+      earningsInWindow(uid, sinceDaysAgo(1)),
+      earningsInWindow(uid, sinceDaysAgo(7)),
+      earningsInWindow(uid, sinceDaysAgo(30)),
+      aggregateCallStatsByUser([uid], periodStart, periodEnd),
+      aggregateCallStatsByUser([uid], null, periodEnd),
+      Withdrawal.findOne({ creatorUserId: uid, status: 'pending' })
+        .select('_id amount requestedAt')
+        .lean(),
+    ]);
+
+    const p = periodMap.get(uid.toString()) ?? {
+      talkSeconds: 0,
+      periodCoinsEarned: 0,
+      callCount: 0,
+    };
+    const a = allTimeMap.get(uid.toString()) ?? {
+      talkSeconds: 0,
+      periodCoinsEarned: 0,
+      callCount: 0,
+    };
+
+    const fUid = user.firebaseUid || '';
+    const availabilityMap = fUid ? await getBatchAvailability([fUid]) : {};
+    const availability = fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy';
+
+    res.json({
+      success: true,
+      data: {
+        meta: { period },
+        creator: {
+          id: creator._id.toString(),
+          userId: creator.userId.toString(),
+          name: creator.name,
+          about: creator.about,
+          galleryImages,
+          categories: creator.categories,
+          price: creator.price,
+          age: creator.age,
+          location: creator.location,
+          earningsCoins: creator.earningsCoins,
+          isOnline: creator.isOnline,
+          createdAt: creator.createdAt,
+          updatedAt: creator.updatedAt,
+        },
+        user: {
+          id: user._id.toString(),
+          username: user.username,
+          email: user.email,
+          phone: user.phone,
+          coins: user.coins,
+          avatar: user.avatar,
+          profileRevision: user.profileRevision,
+        },
+        availability,
+        earningsSummaryCoins: { last1d: e1d, last7d: e7d, last30d: e30d },
+        callStats: {
+          periodTalkMinutes: Math.round((p.talkSeconds / 60) * 100) / 100,
+          periodCoinsEarned: p.periodCoinsEarned,
+          periodCallCount: p.callCount,
+          allTimeTalkMinutes: Math.round((a.talkSeconds / 60) * 100) / 100,
+          allTimeCoinsEarned: a.periodCoinsEarned,
+          allTimeCallCount: a.callCount,
+        },
+        pendingWithdrawal: pendingWd
+          ? {
+              id: pendingWd._id.toString(),
+              amount: pendingWd.amount,
+              requestedAt: pendingWd.requestedAt.toISOString(),
+            }
+          : null,
+      },
+    });
+  } catch (error) {
+    logError('getAgencyCreatorDetail', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Manual add creator — same economics as admin promote (coins cleared); assigns to calling agency. */
+export const postAgencyCreateCreator = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { userId, name, about, photo, categories, age, location } = req.body ?? {};
+
+    if (!userId) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required field: userId',
+      });
+      return;
+    }
+
+    const hasLegacyProfile =
+      typeof name === 'string' &&
+      name.trim().length >= 2 &&
+      typeof about === 'string' &&
+      about.trim().length >= 10 &&
+      typeof photo === 'string' &&
+      photo.trim().length > 0;
+
+    if (hasLegacyProfile) {
+      if (
+        categories !== undefined &&
+        (!Array.isArray(categories) || categories.some((c: unknown) => typeof c !== 'string'))
+      ) {
+        res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
+        return;
+      }
+
+      if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
+        res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
+        return;
+      }
+    }
+
+    const targetUser = await User.findById(userId);
+    if (!targetUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (!targetUser.referredBy?.equals(agency._id)) {
+      res.status(403).json({ success: false, error: 'User was not referred by this agency' });
+      return;
+    }
+
+    if (isDashboardStaffRole(targetUser.role)) {
+      res.status(400).json({ success: false, error: 'Invalid user for creator profile' });
+      return;
+    }
+
+    const existingCreator = await Creator.findOne({ userId: targetUser._id });
+    if (existingCreator) {
+      res.status(409).json({ success: false, error: 'Creator profile already exists for this user' });
+      return;
+    }
+
+    if (targetUser.hostOnboardingStatus !== 'approved') {
+      res.status(403).json({
+        success: false,
+        error: 'BD must approve this host before creating a creator profile',
+      });
+      return;
+    }
+
+    const validatedPrice = getSystemDefaultHostPriceForNewHosts();
+
+    let legacyLoc: { ok: true; value?: string } | undefined;
+    if (hasLegacyProfile) {
+      const locParsed = parseCreatorLocationForCreate(location);
+      if (!locParsed.ok) {
+        res.status(400).json({ success: false, error: locParsed.error });
+        return;
+      }
+      legacyLoc = locParsed;
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      let createdCreator;
+
+      if (hasLegacyProfile) {
+        const previousCoins = targetUser.coins || 0;
+        targetUser.coins = 0;
+        targetUser.hostOnboardingStatus = 'none';
+        if (targetUser.role !== 'creator') {
+          targetUser.role = 'creator';
+        }
+        await targetUser.save({ session });
+        await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+
+        if (previousCoins > 0) {
+          logInfo('agency manual creator: cleared coins', {
+            userId: targetUser._id.toString(),
+            previousCoins,
+          });
+        }
+
+        const createdArr = await Creator.create(
+          [
+            {
+              name,
+              about,
+              photo: typeof photo === 'string' ? photo.trim() : String(photo),
+              galleryImages: [],
+              userId: targetUser._id,
+              ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
+              categories: Array.isArray(categories) ? categories : [],
+              price: validatedPrice,
+              age: age !== undefined ? age : undefined,
+              assignedAgencyId: agency._id,
+              ...(legacyLoc && legacyLoc.value !== undefined ? { location: legacyLoc.value } : {}),
+            },
+          ],
+          { session },
+        );
+
+        createdCreator = createdArr[0];
+      } else {
+        targetUser.hostOnboardingStatus = 'none';
+        createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
+          assignedAgencyId: agency._id,
+          session,
+        });
+      }
+
+      await session.commitTransaction();
+
+      if (targetUser.firebaseUid) {
+        await notifyCreatorProfileChannels(targetUser._id, targetUser.firebaseUid);
+      }
+      await invalidateAdminCaches('overview', 'creators_performance', 'users_analytics');
+
+      logInfo('agency created creator manually', {
+        agencyId: agency._id.toString(),
+        creatorId: createdCreator._id.toString(),
+        userId: targetUser._id.toString(),
+        starterProfile: !hasLegacyProfile,
+      });
+
+      res.status(201).json({
+        success: true,
+        data: {
+          creator: {
+            id: createdCreator._id.toString(),
+            userId: createdCreator.userId.toString(),
+            name: createdCreator.name,
+            about: createdCreator.about,
+            categories: createdCreator.categories,
+            price: createdCreator.price,
+            age: createdCreator.age,
+            location: createdCreator.location,
+            createdAt: createdCreator.createdAt,
+            updatedAt: createdCreator.updatedAt,
+          },
+        },
+      });
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
+  } catch (error) {
+    logError('postAgencyCreateCreator', error as Error);
+    if (error instanceof Error && error.name === 'ValidationError') {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Pick referred users without a creator profile (for manual add). */
+export const searchUsersForAgency = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.min(30, Math.max(1, parseInt(req.query.limit as string, 10) || 30));
+
+    const excludeIds = await getCachedCreatorUserObjectIds();
+
+    const filter: Record<string, unknown> = {
+      _id: { $nin: excludeIds },
+      role: { $nin: ['admin', 'super_admin', 'agency', 'bd'] },
+      referredBy: agency._id,
+    };
+
+    if (q.length > 0) {
+      const searchRegex = buildSafeMongoSubstringRegex(q);
+      filter.$or = [{ username: searchRegex }, { email: searchRegex }, { phone: searchRegex }];
+    }
+
+    const users = await User.find(filter)
+      .select('username email phone role avatar createdAt')
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        users: users.map((u) => ({
+          id: u._id.toString(),
+          username: u.username,
+          email: u.email,
+          phone: u.phone,
+          role: u.role,
+          avatar: u.avatar,
+          createdAt: u.createdAt,
+          isCreator: false,
+        })),
+      },
+    });
+  } catch (error) {
+    logError('searchUsersForAgency', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getAgencyWithdrawals = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const statusFilter = req.query.status as string | undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const skip = (page - 1) * limit;
+
+    const filter: Record<string, unknown> = { assignedAgencyId: agency._id };
+    if (statusFilter && ['pending', 'approved', 'rejected', 'paid'].includes(statusFilter)) {
+      filter.status = statusFilter;
+    }
+
+    const [withdrawals, total] = await Promise.all([
+      Withdrawal.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Withdrawal.countDocuments(filter),
+    ]);
+
+    const creatorUserIds = [...new Set(withdrawals.map((w) => w.creatorUserId?.toString()).filter(Boolean))].map(
+      (id) => new mongoose.Types.ObjectId(id),
+    );
+    const [users, creators] = await Promise.all([
+      creatorUserIds.length > 0
+        ? User.find({ _id: { $in: creatorUserIds } }).select('_id username email').lean()
+        : [],
+      creatorUserIds.length > 0
+        ? Creator.find({ userId: { $in: creatorUserIds } }).select('userId name').lean()
+        : [],
+    ]);
+
+    const userById = new Map(users.map((u) => [u._id.toString(), u]));
+    const creatorByUserId = new Map(creators.map((c) => [c.userId.toString(), c]));
+    const enriched = withdrawals.map((w) => mapAgentWithdrawalDto(w, userById, creatorByUserId));
+    const missingAssignmentCount = await Withdrawal.countDocuments({
+      assignedAgencyId: { $exists: false },
+      status: statusFilter && ['pending', 'approved', 'rejected', 'paid'].includes(statusFilter)
+        ? statusFilter
+        : 'pending',
+    });
+    const missingPayoutDetailsCount = enriched.filter(
+      (row) => !row.upi && (!row.accountNumber || !row.ifsc),
+    ).length;
+    logInfo('agent_withdrawal_visibility_metrics', {
+      agencyId: agency._id.toString(),
+      agent_withdrawal_rows_returned: enriched.length,
+      agent_withdrawal_rows_missing_assignment: missingAssignmentCount,
+      agent_withdrawal_rows_missing_payout_details: missingPayoutDetailsCount,
+      statusFilter: statusFilter ?? null,
+      page,
+      limit,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        withdrawals: enriched,
+        pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      },
+    });
+  } catch (error) {
+    logError('getAgencyWithdrawals', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const agencyApproveWithdrawal = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+    const result = await processWithdrawalApproval(id, agency, { notes, isAdmin: false });
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
+      return;
+    }
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    logError('agencyApproveWithdrawal', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const agencyRejectWithdrawal = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes : '';
+    const result = await processWithdrawalRejection(id, agency, { notes, isAdmin: false });
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
+      return;
+    }
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    logError('agencyRejectWithdrawal', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const agencyMarkWithdrawalPaid = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const { id } = req.params;
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+    const result = await processWithdrawalMarkPaid(id, agency, { notes, isAdmin: false });
+    if (!result.ok) {
+      res.status(result.status).json({ success: false, error: result.error });
+      return;
+    }
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    logError('agencyMarkWithdrawalPaid', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** BD requests payout from `staffCoinsBalance` (super admin approves in withdrawals queue). */
+export const postAgencyStaffWithdrawalRequest = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!(await assertAgency(req, res))) return;
+    const agency = await loadStaffUserByAuth(req);
+    if (!agency) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const amount = Number(req.body?.amount);
+    const { createStaffWithdrawalRequest } = await import('../billing/staff-wallet-portal.service');
+    const data = await createStaffWithdrawalRequest(agency._id, amount);
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Internal server error';
+    if (msg !== 'Internal server error') {
+      res.status(400).json({ success: false, error: msg });
+      return;
+    }
+    logError('postAgencyStaffWithdrawalRequest', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

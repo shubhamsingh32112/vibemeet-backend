@@ -4,19 +4,19 @@ import {
   appUpdatePublishLimiter,
 } from '../../middlewares/rate-limit.middleware';
 import {
-  createAgent,
-  listAgents,
-  listAgentsBrief,
-  getAgentDetail,
-  patchAgent,
-} from './admin-agent.controller';
-import {
   createAgency,
   listAgencies,
+  listAgenciesBrief,
   getAgencyDetail,
   patchAgency,
-  deleteAgency,
 } from './admin-agency.controller';
+import {
+  createBd,
+  listBds,
+  getBdDetail,
+  patchBd,
+  deleteBd,
+} from './admin-bd.controller';
 import {
   getDashboardAlerts,
   getDashboardCallAnalytics,
@@ -60,7 +60,7 @@ import {
   getPlatformRevenueConfigAdmin,
   updatePlatformRevenueConfigAdmin,
   patchCreatorLinkedUser,
-  postAdminTransferCreatorToAgent,
+  postAdminTransferCreatorToAgency,
   adminCreatorGalleryCommit,
   adminCreatorGalleryDelete,
   adminCreatorGalleryReorder,
@@ -125,19 +125,19 @@ router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
 router.get('/dashboard/payouts', getDashboardPayouts);
 router.get('/dashboard/geo', getDashboardGeo);
 
-// ── Agencies (super-admin) ───────────────────────────────────────────────
+// ── Top-tier BDs (super-admin) ─────────────────────────────────────────────
+router.post('/bds', createBd);
+router.get('/bds', listBds);
+router.get('/bds/:id', getBdDetail);
+router.patch('/bds/:id', patchBd);
+router.delete('/bds/:id', deleteBd);
+
+// ── Middle-tier agencies (super-admin) ───────────────────────────────────
 router.post('/agencies', createAgency);
+router.get('/agencies/brief', listAgenciesBrief);
 router.get('/agencies', listAgencies);
 router.get('/agencies/:id', getAgencyDetail);
 router.patch('/agencies/:id', patchAgency);
-router.delete('/agencies/:id', deleteAgency);
-
-// ── BD / agents (super-admin) ─────────────────────────────────────────────
-router.post('/agents', createAgent);
-router.get('/agents/brief', listAgentsBrief);
-router.get('/agents', listAgents);
-router.get('/agents/:id', getAgentDetail);
-router.patch('/agents/:id', patchAgent);
 
 // ── Withdrawal Management ────────────────────────────────────────────────
 router.get('/withdrawals', getWithdrawals);
@@ -154,7 +154,7 @@ router.patch('/support/:id/assign', assignTicket);
 router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/force-offline', forceCreatorOffline);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
-router.post('/creators/:id/transfer-agent', postAdminTransferCreatorToAgent);
+router.post('/creators/:id/transfer-agency', postAdminTransferCreatorToAgency);
 router.post('/creators/:id/gallery/commit', adminCreatorGalleryCommit);
 router.delete('/creators/:id/gallery/:imageId', adminCreatorGalleryDelete);
 router.patch('/creators/:id/gallery/reorder', adminCreatorGalleryReorder);

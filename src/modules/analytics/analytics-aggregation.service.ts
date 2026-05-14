@@ -20,7 +20,7 @@ function utcDayBounds(dateKey: string): { start: Date; end: Date } {
 /**
  * Rebuild pre-aggregates for a single UTC calendar day. Idempotent (upsert by natural keys).
  *
- * Index intent: rollups read by `{ agencyId, dateKey }` / `{ bdId, dateKey }` / `{ dateKey }` — see schema index comments.
+ * Index intent: rollups read by `{ bdId, dateKey }` / `{ bdId, dateKey }` / `{ dateKey }` — see schema index comments.
  */
 export async function rebuildAnalyticsUtcDay(dateKey: string): Promise<void> {
   const { start, end } = utcDayBounds(dateKey);
@@ -65,46 +65,36 @@ export async function rebuildAnalyticsUtcDay(dateKey: string): Promise<void> {
     { upsert: true, new: true }
   );
 
-  const agencies = await User.find({ role: 'agency' }).select('_id').lean();
+  const agencies = await User.find({ role: 'agency' }).select('_id bdId').lean();
   for (const a of agencies) {
     const aid = a._id as mongoose.Types.ObjectId;
+    const parentBdId = (a as { bdId?: mongoose.Types.ObjectId }).bdId ?? null;
     const [ag] = await StaffWalletLedger.aggregate<{ t: number }>([
       { $match: { ...ledgerMatch, staffUserId: aid } },
       { $group: { _id: null, t: { $sum: '$amountCoins' } } },
     ]);
-    const calls = await StaffWalletLedger.distinct('callId', {
+    const agencyCalls = await StaffWalletLedger.distinct('callId', {
       ...ledgerMatch,
       staffUserId: aid,
       callId: { $exists: true, $nin: [null, ''] },
     });
-    const wdAg = await Withdrawal.aggregate<{ t: number }>([
-      {
-        $match: {
-          staffUserId: aid,
-          status: { $in: ['approved', 'paid'] },
-          processedAt: { $gte: start, $lt: end },
-        },
-      },
-      { $group: { _id: null, t: { $sum: '$amount' } } },
-    ]);
 
-    await AgencyRevenueDaily.findOneAndUpdate(
-      { agencyId: aid, dateKey },
+    await BdRevenueDaily.findOneAndUpdate(
+      { bdId: parentBdId ?? aid, agencyId: aid, dateKey },
       {
         $set: {
+          bdId: parentBdId ?? aid,
+          agencyId: aid,
           totalSettlementCoins: ag?.t ?? 0,
-          totalWithdrawalsCoins: wdAg[0]?.t ?? 0,
-          totalCalls: calls.filter(Boolean).length,
+          totalCalls: agencyCalls.filter(Boolean).length,
         },
       },
       { upsert: true, new: true }
     );
   }
 
-  const bds = await User.find({ role: { $in: ['agent', 'bd'] } })
-    .select('_id agencyId')
-    .lean();
-  for (const b of bds) {
+  const topBds = await User.find({ role: 'bd' }).select('_id').lean();
+  for (const b of topBds) {
     const bid = b._id as mongoose.Types.ObjectId;
     const [bdAgg] = await StaffWalletLedger.aggregate<{ t: number }>([
       { $match: { ...ledgerMatch, staffUserId: bid } },
@@ -115,13 +105,23 @@ export async function rebuildAnalyticsUtcDay(dateKey: string): Promise<void> {
       staffUserId: bid,
       callId: { $exists: true, $nin: [null, ''] },
     });
+    const wdBd = await Withdrawal.aggregate<{ t: number }>([
+      {
+        $match: {
+          staffUserId: bid,
+          status: { $in: ['approved', 'paid'] },
+          processedAt: { $gte: start, $lt: end },
+        },
+      },
+      { $group: { _id: null, t: { $sum: '$amount' } } },
+    ]);
 
-    await BdRevenueDaily.findOneAndUpdate(
+    await AgencyRevenueDaily.findOneAndUpdate(
       { bdId: bid, dateKey },
       {
         $set: {
-          agencyId: (b.agencyId as mongoose.Types.ObjectId | undefined) ?? null,
           totalSettlementCoins: bdAgg?.t ?? 0,
+          totalWithdrawalsCoins: wdBd[0]?.t ?? 0,
           totalCalls: bdCalls.filter(Boolean).length,
         },
       },

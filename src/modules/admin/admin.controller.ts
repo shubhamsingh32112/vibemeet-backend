@@ -49,7 +49,7 @@ import {
   assertAdminOrOwningAgentForCreator,
   assertSuperAdminStaffCapability,
 } from '../../middlewares/staff.middleware';
-import { transferCreatorToAgent } from './creator-transfer.service';
+import { transferCreatorToAgency } from './creator-transfer.service';
 import {
   processWithdrawalApproval,
   processWithdrawalRejection,
@@ -70,7 +70,7 @@ import {
   getOrCreatePlatformRevenueConfig,
 } from '../payment/platform-revenue-config.model';
 import { parseAdminDateRange } from './admin-date-range';
-import { isBdRole, isSuperAdminRole } from '../../utils/staff-roles';
+import { isAgencyRole, isSuperAdminRole } from '../../utils/staff-roles';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -411,23 +411,23 @@ async function computeCreatorsPerformance() {
   const users = await User.find({ _id: { $in: userIds } }).lean();
   const userMap = new Map(users.map((u) => [u._id.toString(), u]));
 
-  const assignedAgentIds = [
+  const assignedAgencyIds = [
     ...new Set(
       creators
-        .map((c) => c.assignedAgentId?.toString())
+        .map((c) => c.assignedAgencyId?.toString())
         .filter((id): id is string => !!id)
     ),
   ].map((id) => new mongoose.Types.ObjectId(id));
 
-  const assignedAgents =
-    assignedAgentIds.length > 0
-      ? await User.find({ _id: { $in: assignedAgentIds } })
-          .select('_id email displayName username referralCode role agentDisabled')
+  const assignedAgencies =
+    assignedAgencyIds.length > 0
+      ? await User.find({ _id: { $in: assignedAgencyIds } })
+          .select('_id email displayName username referralCode role agencyDisabled')
           .lean()
       : [];
 
-  const agentLabelById = new Map(
-    assignedAgents.map((a) => {
+  const agencyLabelById = new Map(
+    assignedAgencies.map((a) => {
       const label =
         (a.displayName && a.displayName.trim()) ||
         a.email ||
@@ -567,9 +567,9 @@ async function computeCreatorsPerformance() {
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
-      assignedAgentId: creator.assignedAgentId?.toString() ?? null,
-      assignedAgentLabel: creator.assignedAgentId
-        ? agentLabelById.get(creator.assignedAgentId.toString()) ?? null
+      assignedAgencyId: creator.assignedAgencyId?.toString() ?? null,
+      assignedAgencyLabel: creator.assignedAgencyId
+        ? agencyLabelById.get(creator.assignedAgencyId.toString()) ?? null
         : null,
       email: user?.email || null,
       phone: user?.phone || null,
@@ -617,7 +617,7 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const { query, role, sort, referrerAgentId } = req.query;
+    const { query, role, sort, referrerAgencyId } = req.query;
     const searchQuery = firstQueryString(query);
     const roleFilter = firstQueryString(role);
     const sortField = firstQueryString(sort);
@@ -631,13 +631,13 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    const rawReferrer = firstQueryString(referrerAgentId);
+    const rawReferrer = firstQueryString(referrerAgencyId);
     const referrerTrimmed = rawReferrer?.trim() ?? '';
     if (referrerTrimmed.length > 0 && !mongoose.Types.ObjectId.isValid(referrerTrimmed)) {
-      res.status(400).json({ success: false, error: 'Invalid referrerAgentId' });
+      res.status(400).json({ success: false, error: 'Invalid referrerAgencyId' });
       return;
     }
-    const referrerAgentOid =
+    const referrerAgencyOid =
       referrerTrimmed.length > 0 ? new mongoose.Types.ObjectId(referrerTrimmed) : undefined;
 
     // Only cache the unfiltered default view
@@ -645,7 +645,7 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
       (searchQuery && searchQuery.trim()) ||
       (roleFilter && roleFilter !== 'all') ||
       sortField ||
-      !!referrerAgentOid ||
+      !!referrerAgencyOid ||
       range.hasRange;
 
     const data = hasFilters
@@ -653,7 +653,7 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
           searchQuery,
           roleFilter,
           sortField,
-          referrerAgentOid,
+          referrerAgencyOid,
           range.hasRange ? range.from : undefined,
           range.hasRange ? range.to : undefined
         )
@@ -672,7 +672,7 @@ async function computeUsersAnalytics(
   searchQuery?: string,
   roleFilter?: string,
   sortField?: string,
-  referrerAgentId?: mongoose.Types.ObjectId,
+  referrerAgencyId?: mongoose.Types.ObjectId,
   from?: Date,
   to?: Date
 ) {
@@ -682,8 +682,8 @@ async function computeUsersAnalytics(
     const regex = buildSafeMongoSubstringRegex(searchQuery.trim());
     filter.$or = [{ username: regex }, { email: regex }, { phone: regex }];
   }
-  if (referrerAgentId) {
-    filter.referredBy = referrerAgentId;
+  if (referrerAgencyId) {
+    filter.referredBy = referrerAgencyId;
   }
   if (from && to) {
     filter.createdAt = { $gte: from, $lt: to };
@@ -816,7 +816,7 @@ async function computeUsersAnalytics(
       referredByUserId: refId ?? null,
       referralCodeUsed: edgeCodeByUser.get(uid) ?? null,
       referrerLabel: refInfo?.label ?? null,
-      referrerIsAgent: refInfo ? isBdRole(refInfo.role) : false,
+      referrerIsAgency: refInfo ? isAgencyRole(refInfo.role) : false,
     };
   });
 
@@ -1904,9 +1904,9 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
       ];
     }
     if (hasAssignedAgent === 'true') {
-      filter.assignedAgentId = { $exists: true, $ne: null };
+      filter.assignedAgencyId = { $exists: true, $ne: null };
     } else if (hasAssignedAgent === 'false') {
-      filter.$or = [{ assignedAgentId: null }, { assignedAgentId: { $exists: false } }];
+      filter.$or = [{ assignedAgencyId: null }, { assignedAgencyId: { $exists: false } }];
     }
     if (range.hasRange) {
       filter.createdAt = { $gte: range.from, $lt: range.to };
@@ -1964,7 +1964,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
             upi: (w as any).upi || null,
             accountNumber: (w as any).accountNumber || null,
             ifsc: (w as any).ifsc || null,
-            assignedAgentId: null,
+            assignedAgencyId: null,
           };
         }
 
@@ -1995,7 +1995,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
           upi: (w as any).upi || null,
           accountNumber: (w as any).accountNumber || null,
           ifsc: (w as any).ifsc || null,
-          assignedAgentId: (w as any).assignedAgentId?.toString() || null,
+          assignedAgencyId: (w as any).assignedAgencyId?.toString() || null,
         };
       }),
     );
@@ -2860,7 +2860,7 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export const postAdminTransferCreatorToAgent = async (
+export const postAdminTransferCreatorToAgency = async (
   req: Request,
   res: Response
 ): Promise<void> => {
@@ -2874,13 +2874,13 @@ export const postAdminTransferCreatorToAgent = async (
       return;
     }
 
-    const targetAgentId = String(req.body?.targetAgentId ?? '').trim();
+    const targetAgencyId = String(req.body?.targetAgencyId ?? '').trim();
     const reason = String(req.body?.reason ?? '').trim();
     const idempotencyKey =
       String(req.header('x-idempotency-key') ?? req.body?.idempotencyKey ?? '').trim() || null;
 
-    if (!targetAgentId) {
-      res.status(400).json({ success: false, error: 'targetAgentId is required' });
+    if (!targetAgencyId) {
+      res.status(400).json({ success: false, error: 'targetAgencyId is required' });
       return;
     }
     if (!reason || reason.length < 3) {
@@ -2896,7 +2896,7 @@ export const postAdminTransferCreatorToAgent = async (
 
     const moveGrantedReferralRewards = req.body?.moveGrantedReferralRewards === true;
     const assignmentEffectiveFromRaw = req.body?.assignmentEffectiveFrom;
-    const transfer = await transferCreatorToAgent(creatorId, targetAgentId, {
+    const transfer = await transferCreatorToAgency(creatorId, targetAgencyId, {
       idempotencyKey,
       moveGrantedReferralRewards,
       assignmentEffectiveFrom:
@@ -2913,7 +2913,7 @@ export const postAdminTransferCreatorToAgent = async (
 
     await logAdminAction(
       adminUser,
-      'CREATOR_TRANSFER_AGENT',
+      'CREATOR_TRANSFER_AGENCY',
       'creator',
       creatorId,
       reason,
@@ -2933,7 +2933,7 @@ export const postAdminTransferCreatorToAgent = async (
 
     res.json({ success: true, data: transfer.data });
   } catch (error) {
-    console.error('❌ [ADMIN] postAdminTransferCreatorToAgent error:', error);
+    console.error('❌ [ADMIN] postAdminTransferCreatorToAgency error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

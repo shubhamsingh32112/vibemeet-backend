@@ -7,16 +7,16 @@ import { logError, logInfo, logDebug, logWarning } from '../utils/logger';
 import {
   isAgencyRole,
   isBdRole,
-  isStaffRecruiterDisabled,
-  isSuperAdminRole,
   isAgencyStaffDisabled,
+  isBdStaffDisabled,
+  isSuperAdminRole,
 } from '../utils/staff-roles';
 
 function jwtRoleMatchesMongoStaff(tokenRole: string, mongoRole: string): boolean {
   if (tokenRole === 'admin' || tokenRole === 'super_admin') {
     return isSuperAdminRole(mongoRole);
   }
-  if (tokenRole === 'agent' || tokenRole === 'bd') {
+  if (tokenRole === 'bd') {
     return isBdRole(mongoRole);
   }
   if (tokenRole === 'agency') {
@@ -36,7 +36,7 @@ export const verifyFirebaseToken = async (
 ): Promise<void> => {
   try {
     logDebug('Verifying token', { path: req.path, ip: req.ip });
-    
+
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -51,7 +51,6 @@ export const verifyFirebaseToken = async (
     const token = authHeader.split('Bearer ')[1];
     logDebug('Auth token received', { path: req.path });
 
-    // --- Try Admin JWT first (short tokens, ~236 chars) ---
     const jwtSecret = (process.env.JWT_SECRET || 'admin-secret-change-me').trim();
     if (jwtSecret) {
       try {
@@ -67,14 +66,14 @@ export const verifyFirebaseToken = async (
             staffUser &&
             jwtRoleMatchesMongoStaff(decoded.role, staffUser.role) &&
             (isSuperAdminRole(staffUser.role) ||
-              (isBdRole(staffUser.role) && !isStaffRecruiterDisabled(staffUser)) ||
-              (isAgencyRole(staffUser.role) && !isAgencyStaffDisabled(staffUser)))
+              (isAgencyRole(staffUser.role) && !isAgencyStaffDisabled(staffUser)) ||
+              (isBdRole(staffUser.role) && !isBdStaffDisabled(staffUser)))
           ) {
             const kind = isSuperAdminRole(staffUser.role)
               ? 'Admin'
-              : isAgencyRole(staffUser.role)
-                ? 'Agency'
-                : 'Agent';
+              : isBdRole(staffUser.role)
+                ? 'BD'
+                : 'Agency';
             logInfo(`${kind} JWT verified`, {
               staffId: staffUser._id.toString(),
               path: req.path,
@@ -92,9 +91,8 @@ export const verifyFirebaseToken = async (
       }
     }
 
-    // --- Firebase ID token verification (Flutter app) ---
     const admin = getFirebaseAdmin();
-    
+
     logDebug('Verifying token with Firebase Admin', { path: req.path });
     const decodedToken = await admin.auth().verifyIdToken(token);
     logInfo('Firebase token verified', {

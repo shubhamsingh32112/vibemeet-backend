@@ -18,9 +18,9 @@ async function main() {
 
   const pendingUnassigned = await Withdrawal.find({
     status: 'pending',
-    $or: [{ assignedAgentId: { $exists: false } }, { assignedAgentId: null }],
+    $or: [{ assignedAgencyId: { $exists: false } }, { assignedAgencyId: null }],
   })
-    .select('_id creatorUserId assignedAgentId')
+    .select('_id creatorUserId assignedAgencyId')
     .lean();
 
   console.log(`Pending unassigned withdrawals: ${pendingUnassigned.length}`);
@@ -34,7 +34,7 @@ async function main() {
   ].map((id) => new mongoose.Types.ObjectId(id));
 
   const creators = await Creator.find({ userId: { $in: creatorUserIds } })
-    .select('userId assignedAgentId')
+    .select('userId assignedAgencyId')
     .lean();
   const creatorByUserId = new Map(creators.map((c) => [c.userId.toString(), c]));
 
@@ -49,16 +49,16 @@ async function main() {
       continue;
     }
     const creator = creatorByUserId.get(creatorUserId);
-    const assignedAgentId = creator?.assignedAgentId;
-    if (!assignedAgentId) {
+    const assignedAgencyId = creator?.assignedAgencyId;
+    if (!assignedAgencyId) {
       skipped += 1;
       continue;
     }
     eligibleForAssign += 1;
     if (!dryRun) {
       const result = await Withdrawal.updateOne(
-        { _id: wd._id, status: 'pending', $or: [{ assignedAgentId: { $exists: false } }, { assignedAgentId: null }] },
-        { $set: { assignedAgentId } },
+        { _id: wd._id, status: 'pending', $or: [{ assignedAgencyId: { $exists: false } }, { assignedAgencyId: null }] },
+        { $set: { assignedAgencyId } },
       );
       if (result.modifiedCount > 0) updated += 1;
     }

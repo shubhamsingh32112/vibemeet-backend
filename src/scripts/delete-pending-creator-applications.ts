@@ -10,7 +10,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import mongoose from 'mongoose';
-import { CreatorApplication } from '../modules/agent/creator-application.model';
+import { CreatorApplication } from '../modules/agency/creator-application.model';
 
 async function main() {
   const dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';

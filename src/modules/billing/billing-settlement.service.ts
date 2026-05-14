@@ -27,7 +27,7 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from './call-history.model';
 import { emitCreatorDataUpdated } from '../creator/creator.controller';
 import { verifyUserBalance } from '../../utils/balance-integrity';
-import { emitToAdmin } from '../admin/admin.gateway';
+import { emitStaffDomainEvent, setCreatorStaffScope } from '../staff/staff-dashboard-invalidation.service';
 import { getStreamClient } from '../../config/stream';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
@@ -41,7 +41,7 @@ import {
 import { billingService, finalFlushMarkerKey } from './billing.service';
 import { getBillingCheckpoint } from './billing-checkpoint.service';
 import { featureFlags } from '../../config/feature-flags';
-import { isBdRole } from '../../utils/staff-roles';
+import { isAgencyRole } from '../../utils/staff-roles';
 import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { resolveStaffCommissionBps } from '../payment/commission-resolve.service';
 import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
@@ -405,6 +405,8 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
   dbSession.startTransaction();
 
   let mongoTransactionCommitted = false;
+  let settlementBdId: string | undefined;
+  let settlementAgencyId: string | undefined;
 
   try {
     const user = await User.findById(session.userMongoId).session(dbSession);
@@ -557,29 +559,36 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
               );
 
               // Staff revenue: BD/agency % of host-earned coins (gross). Snapshots stored on ledger rows.
-              const bdOid = creator.assignedAgentId;
-              if (bdOid && totalEarnedCreator > 0) {
-                const bdUser = await User.findById(bdOid)
-                  .select('role agencyId')
+              const agencyOid = creator.assignedAgencyId;
+              if (agencyOid && totalEarnedCreator > 0) {
+                const agencyUser = await User.findById(agencyOid)
+                  .select('role bdId')
                   .session(dbSession)
                   .lean();
-                if (bdUser && isBdRole(bdUser.role)) {
+                if (agencyUser && isAgencyRole(agencyUser.role)) {
+                  settlementAgencyId = agencyOid.toString();
+                  const bdOid = agencyUser.bdId;
+                  if (bdOid) {
+                    settlementBdId = bdOid.toString();
+                  }
+                  void setCreatorStaffScope(session.creatorFirebaseUid, {
+                    bdId: settlementBdId,
+                    agencyId: settlementAgencyId,
+                  });
                   const rates = await resolveStaffCommissionBps({
-                    bdUserId: bdOid as mongoose.Types.ObjectId,
-                    agencyId: bdUser.agencyId ?? null,
+                    bdUserId: (bdOid ?? agencyOid) as mongoose.Types.ObjectId,
+                    bdId: agencyOid,
                   });
                   const bdBpsSnap = rates.bdBps;
                   const agencyBpsSnap = rates.agencyBps;
-                  const bdCut = Math.floor((totalEarnedCreator * bdBpsSnap) / 10000);
-                  const agencyCut =
-                    bdUser.agencyId != null
-                      ? Math.floor((totalEarnedCreator * agencyBpsSnap) / 10000)
-                      : 0;
+                  const bdCut =
+                    bdOid != null ? Math.floor((totalEarnedCreator * bdBpsSnap) / 10000) : 0;
+                  const agencyCut = Math.floor((totalEarnedCreator * agencyBpsSnap) / 10000);
 
                   const bdKey = `staff_ledger_call_${callId}_bd_credit`;
                   const agKey = `staff_ledger_call_${callId}_agency_credit`;
 
-                  if (bdCut > 0) {
+                  if (bdCut > 0 && bdOid) {
                     const existingBdLine = await StaffWalletLedger.findOne({ idempotencyKey: bdKey })
                       .session(dbSession)
                       .select('_id')
@@ -604,9 +613,7 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
                             hostUserId: creator.userId as mongoose.Types.ObjectId,
                             creatorMongoId: creator._id,
                             bdUserId: bdOid,
-                            ...(bdUser.agencyId
-                              ? { agencyUserId: bdUser.agencyId as mongoose.Types.ObjectId }
-                              : {}),
+                            agencyUserId: agencyOid,
                             bdBpsSnapshot: bdBpsSnap,
                             agencyBpsSnapshot: agencyBpsSnap,
                             description: `BD share from call`,
@@ -618,15 +625,14 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
                     }
                   }
 
-                  if (agencyCut > 0 && bdUser.agencyId) {
-                    const agOid = bdUser.agencyId;
+                  if (agencyCut > 0) {
                     const existingAgLine = await StaffWalletLedger.findOne({ idempotencyKey: agKey })
                       .session(dbSession)
                       .select('_id')
                       .lean();
                     if (!existingAgLine) {
                       const agAfterDoc = await User.findByIdAndUpdate(
-                        agOid,
+                        agencyOid,
                         { $inc: { staffCoinsBalance: agencyCut } },
                         { new: true, session: dbSession }
                       )
@@ -635,16 +641,15 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
                       await StaffWalletLedger.create(
                         [
                           {
-                            staffUserId: agOid,
+                            staffUserId: agencyOid,
                             direction: 'credit',
                             amountCoins: agencyCut,
                             balanceAfter: agAfterDoc?.staffCoinsBalance,
                             sourceType: 'call_settlement',
-                            callId,
                             hostUserId: creator.userId as mongoose.Types.ObjectId,
                             creatorMongoId: creator._id,
-                            bdUserId: bdOid,
-                            agencyUserId: agOid,
+                            bdUserId: bdOid ?? agencyOid,
+                            agencyUserId: agencyOid,
                             bdBpsSnapshot: bdBpsSnap,
                             agencyBpsSnapshot: agencyBpsSnap,
                             description: `Agency share from call`,
@@ -848,13 +853,17 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     }
     recordBillingMetric('settlement_post_commit_ms', Date.now() - postCommitStartedAt, { callId });
 
-    emitToAdmin('billing:settled', {
-      callId,
-      userFirebaseUid: session.userFirebaseUid,
-      creatorFirebaseUid: session.creatorFirebaseUid,
-      durationSeconds,
-      coinsDeducted: totalDeducted,
-      creatorEarned: totalEarnedCreator,
+    emitStaffDomainEvent({
+      type: 'billing:settled',
+      scope: { bdId: settlementBdId, agencyId: settlementAgencyId },
+      entityId: callId,
+      meta: {
+        userFirebaseUid: session.userFirebaseUid,
+        creatorFirebaseUid: session.creatorFirebaseUid,
+        durationSeconds,
+        coinsDeducted: totalDeducted,
+        creatorEarned: totalEarnedCreator,
+      },
     });
 
     logInfo('Settlement complete', { callId });

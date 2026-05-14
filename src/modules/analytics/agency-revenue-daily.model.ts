@@ -1,9 +1,9 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-/** Pre-aggregated agency wallet metrics per UTC day (idempotent upserts). */
+/** Pre-aggregated top-tier BD wallet metrics per UTC day (idempotent upserts). */
 export interface IAgencyRevenueDaily extends Document {
   dateKey: string;
-  agencyId: mongoose.Types.ObjectId;
+  bdId: mongoose.Types.ObjectId;
   totalSettlementCoins: number;
   totalWithdrawalsCoins: number;
   totalCalls: number;
@@ -15,7 +15,7 @@ export interface IAgencyRevenueDaily extends Document {
 const agencyRevenueDailySchema = new Schema<IAgencyRevenueDaily>(
   {
     dateKey: { type: String, required: true, index: true },
-    agencyId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    bdId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     totalSettlementCoins: { type: Number, default: 0 },
     totalWithdrawalsCoins: { type: Number, default: 0 },
     totalCalls: { type: Number, default: 0 },
@@ -24,7 +24,7 @@ const agencyRevenueDailySchema = new Schema<IAgencyRevenueDaily>(
   { timestamps: true }
 );
 
-agencyRevenueDailySchema.index({ agencyId: 1, dateKey: 1 }, { unique: true });
+agencyRevenueDailySchema.index({ bdId: 1, dateKey: 1 }, { unique: true });
 
 export const AgencyRevenueDaily = mongoose.model<IAgencyRevenueDaily>(
   'AgencyRevenueDaily',

@@ -18,7 +18,7 @@ import {
   resolveChatPresentationFromDocs,
 } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
-import { getCreatorApplicationFlagsForUser } from '../agent/creator-application-status.service';
+import { getCreatorApplicationFlagsForUser } from '../agency/creator-application-status.service';
 import {
   applyReferralCode,
   assignReferralCodeToUser,
@@ -38,7 +38,7 @@ import {
   ensureCreatorPromotionBonusReversalEntry,
   promoteUserToCreatorWithStarterProfile,
 } from '../creator/creator-starter.service';
-import { isBdRole, isNonConsumerCoinsRole, isSuperAdminRole } from '../../utils/staff-roles';
+import { isAgencyRole, isNonConsumerCoinsRole, isSuperAdminRole } from '../../utils/staff-roles';
 import {
   commitImageAsset,
   CommitImageAssetError,
@@ -1383,11 +1383,11 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
     session.startTransaction();
 
     try {
-      let assignedAgentId: mongoose.Types.ObjectId | undefined;
+      let assignedAgencyId: mongoose.Types.ObjectId | undefined;
       if (targetUser.referredBy) {
         const refUser = await User.findById(targetUser.referredBy).select('role').session(session).lean();
-        if (refUser && isBdRole(refUser.role)) {
-          assignedAgentId = targetUser.referredBy as mongoose.Types.ObjectId;
+        if (refUser && isAgencyRole(refUser.role)) {
+          assignedAgencyId = targetUser.referredBy as mongoose.Types.ObjectId;
         }
       }
 
@@ -1420,7 +1420,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
               ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
               categories: Array.isArray(categories) ? categories : [],
               price: validatedPrice as number,
-              ...(assignedAgentId ? { assignedAgentId } : {}),
+              ...(assignedAgencyId ? { assignedAgencyId } : {}),
               ...(legacyLocation !== undefined ? { location: legacyLocation } : {}),
             },
           ],
@@ -1430,7 +1430,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
       } else {
         targetUser.hostOnboardingStatus = 'none';
         createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
-          assignedAgentId,
+          assignedAgencyId,
           session,
         });
       }
@@ -1531,7 +1531,7 @@ export const completeHostProfileAfterBdApproval = async (
     }
 
     const refUser = await User.findById(targetUser.referredBy).select('role').lean();
-    if (!refUser || !isBdRole(refUser.role)) {
+    if (!refUser || !isAgencyRole(refUser.role)) {
       res.status(403).json({ success: false, error: 'Invalid referrer for host onboarding' });
       return;
     }
@@ -1569,7 +1569,7 @@ export const completeHostProfileAfterBdApproval = async (
 
     const validatedPrice = getSystemDefaultHostPriceForNewHosts();
 
-    const assignedAgentId = targetUser.referredBy as mongoose.Types.ObjectId;
+    const assignedAgencyId = targetUser.referredBy as mongoose.Types.ObjectId;
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1599,7 +1599,7 @@ export const completeHostProfileAfterBdApproval = async (
             ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
             categories: Array.isArray(categories) ? categories : [],
             price: validatedPrice,
-            assignedAgentId,
+            assignedAgencyId,
             ...(locCreate.value !== undefined ? { location: locCreate.value } : {}),
           },
         ],

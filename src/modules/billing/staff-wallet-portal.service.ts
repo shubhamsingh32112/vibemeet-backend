@@ -252,16 +252,16 @@ export async function upsertStaffPayoutAccount(
 export async function createStaffWithdrawalRequest(
   staffUserId: mongoose.Types.ObjectId,
   amountRaw: number,
-  opts?: { blockIfAgencyDisabled?: boolean },
+  opts?: { blockIfbdDisabled?: boolean },
 ) {
   const amount = Math.floor(amountRaw);
   if (!Number.isFinite(amount) || amount < MIN_STAFF_WITHDRAWAL_COINS) {
     throw new Error(`Minimum withdrawal amount is ${MIN_STAFF_WITHDRAWAL_COINS} coins`);
   }
 
-  const user = await User.findById(staffUserId).select('staffCoinsBalance agencyDisabled role').lean();
+  const user = await User.findById(staffUserId).select('staffCoinsBalance bdDisabled role').lean();
   if (!user) throw new Error('Unauthorized');
-  if (opts?.blockIfAgencyDisabled && user.agencyDisabled) {
+  if (opts?.blockIfbdDisabled && user.bdDisabled) {
     throw new Error('Account is disabled — new payout requests are blocked');
   }
 

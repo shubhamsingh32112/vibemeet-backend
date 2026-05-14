@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
+/** Pre-aggregated middle-tier agency metrics per UTC day. */
 export interface IBdRevenueDaily extends Document {
   dateKey: string;
   bdId: mongoose.Types.ObjectId;
@@ -21,6 +22,6 @@ const bdRevenueDailySchema = new Schema<IBdRevenueDaily>(
   { timestamps: true }
 );
 
-bdRevenueDailySchema.index({ bdId: 1, dateKey: 1 }, { unique: true });
+bdRevenueDailySchema.index({ bdId: 1, agencyId: 1, dateKey: 1 }, { unique: true });
 
 export const BdRevenueDaily = mongoose.model<IBdRevenueDaily>('BdRevenueDaily', bdRevenueDailySchema);

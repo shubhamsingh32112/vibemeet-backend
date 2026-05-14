@@ -25,7 +25,7 @@ import {
   getReferralMinPurchaseInr,
   getReferralRewardCoins,
 } from './referral-config';
-import { isBdRole } from '../../utils/staff-roles';
+import { isAgencyRole, isBdRole } from '../../utils/staff-roles';
 
 export {
   getReferralAttachWindowMs,
@@ -224,10 +224,10 @@ export async function previewReferralCode(
   if (applicant && referrer._id.equals(applicant._id)) {
     return { ok: false, code: 'SELF' };
   }
-  if (isBdRole(referrer.role) && referrer.agentDisabled) {
+  if (isAgencyRole(referrer.role) && referrer.agencyDisabled) {
     return { ok: false, code: 'AGENT_DISABLED' };
   }
-  if (!isBdRole(referrer.role)) {
+  if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
       .lean();
@@ -283,7 +283,7 @@ export async function applyReferralCode(
     return { ok: false, code: 'SELF' };
   }
 
-  if (isBdRole(referrer.role) && referrer.agentDisabled) {
+  if (isAgencyRole(referrer.role) && referrer.agencyDisabled) {
     logInfo('Referral skipped: agent account disabled', {
       code,
       referrerId: referrer._id.toString(),
@@ -291,8 +291,8 @@ export async function applyReferralCode(
     return { ok: false, code: 'AGENT_DISABLED' };
   }
 
-  // Creators cannot refer (non-BD). BD/agents may refer even if they have a creator profile.
-  if (!isBdRole(referrer.role)) {
+  // Creators cannot refer (non-staff). Agency/BD staff may refer even if they have a creator profile.
+  if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
       .lean();
@@ -306,8 +306,8 @@ export async function applyReferralCode(
   }
 
   const referredByUpdate: Record<string, unknown> = { referredBy: referrer._id };
-  if (isBdRole(referrer.role)) {
-    referredByUpdate.hostOnboardingStatus = 'pending_bd_approval';
+  if (isAgencyRole(referrer.role)) {
+    referredByUpdate.hostOnboardingStatus = 'pending_agency_approval';
   }
 
   const claimed = await User.findOneAndUpdate(
@@ -355,10 +355,10 @@ export async function applyReferralCode(
     mode,
   });
 
-  if (isBdRole(referrer.role)) {
-    logInfo('Agent referral: user linked; promotion via agent or admin dashboard', {
+  if (isAgencyRole(referrer.role)) {
+    logInfo('Agency referral: user linked; promotion via agency or admin dashboard', {
       newUserId: applicant._id.toString(),
-      agentUserId: referrer._id.toString(),
+      agencyUserId: referrer._id.toString(),
     });
     return { ok: true };
   }

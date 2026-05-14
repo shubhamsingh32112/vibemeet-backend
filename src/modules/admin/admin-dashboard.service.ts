@@ -11,8 +11,10 @@ import { FraudSignal } from '../fraud/fraud-signal.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
+import { countOnlineCreatorsPlatform } from '../availability/presence-dashboard.service';
 
-const BD_ROLE = { $in: ['agent', 'bd'] as const };
+const TOP_BD_ROLE = { role: 'bd' as const };
+const MIDDLE_AGENCY_ROLE = { role: 'agency' as const };
 const MAX = 100;
 
 function utcStartOfDay(d = new Date()): Date {
@@ -50,9 +52,9 @@ export async function dashboardOverviewPayload() {
     recentCalls5m,
     activeZeroDuration,
   ] = await Promise.all([
-    Creator.countDocuments({ isOnline: true }),
+    countOnlineCreatorsPlatform(),
     User.countDocuments({ role: 'agency' }),
-    User.countDocuments({ role: BD_ROLE }),
+    User.countDocuments(TOP_BD_ROLE),
     Withdrawal.countDocuments({ status: 'pending' }),
     CallHistory.aggregate([
       { $match: { createdAt: { $gte: today }, ownerRole: 'user' } },
@@ -156,7 +158,7 @@ export async function dashboardRealtimePayload() {
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
   const [onlineCreators, pendingWithdrawals, openSupportTickets, recentCalls5m, activeBillingSessions] =
     await Promise.all([
-      Creator.countDocuments({ isOnline: true }),
+      countOnlineCreatorsPlatform(),
       Withdrawal.countDocuments({ status: 'pending' }),
       SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } }),
       CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
@@ -214,68 +216,69 @@ export async function dashboardTopHosts(limit: number) {
 
 export async function dashboardTopBds(limit: number) {
   const lim = clampDashboardLimit(limit, 10);
-  const bds = await User.find({ role: BD_ROLE })
+  const bds = await User.find(TOP_BD_ROLE)
     .sort({ staffCoinsBalance: -1 })
     .limit(lim)
-    .select('displayName email staffCoinsBalance referralCode')
+    .select('displayName email staffCoinsBalance')
     .lean();
-  const ids = bds.map((b) => b._id);
+  const bdIds = bds.map((b) => b._id);
+  const agencyIds =
+    bdIds.length === 0
+      ? []
+      : await User.find({ bdId: { $in: bdIds }, ...MIDDLE_AGENCY_ROLE }).distinct('_id');
   const hosts = await Creator.aggregate<{ _id: import('mongoose').Types.ObjectId; c: number }>([
-    { $match: { assignedAgentId: { $in: ids } } },
-    { $group: { _id: '$assignedAgentId', c: { $sum: 1 } } },
+    { $match: { assignedAgencyId: { $in: agencyIds } } },
+    { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
   ]);
-  const hostMap = new Map(hosts.map((h) => [h._id.toString(), h.c]));
+  const hostsByAgency = new Map(hosts.map((h) => [h._id.toString(), h.c]));
+  const agenciesByBd = await User.find({ bdId: { $in: bdIds }, ...MIDDLE_AGENCY_ROLE })
+    .select('_id bdId')
+    .lean();
 
   return {
-    rows: bds.map((b, i) => ({
-      rank: i + 1,
-      bdName: b.displayName || b.email || b.referralCode || b._id.toString(),
-      hosts: hostMap.get(b._id.toString()) ?? 0,
-      revenueCoins: b.staffCoinsBalance ?? 0,
-      commissionCoins: 0,
-    })),
+    rows: bds.map((b, i) => {
+      const childAgencies = agenciesByBd.filter((a) => a.bdId?.toString() === b._id.toString());
+      const hostTotal = childAgencies.reduce(
+        (sum, a) => sum + (hostsByAgency.get(a._id.toString()) ?? 0),
+        0
+      );
+      return {
+        rank: i + 1,
+        bdName: b.displayName || b.email || b._id.toString(),
+        agencies: childAgencies.length,
+        hosts: hostTotal,
+        revenueCoins: b.staffCoinsBalance ?? 0,
+        commissionCoins: 0,
+      };
+    }),
   };
 }
 
 export async function dashboardTopAgencies(limit: number) {
   const lim = clampDashboardLimit(limit, 10);
-  const agencies = await User.find({ role: 'agency' })
-    .sort({ createdAt: -1 })
+  const agencies = await User.find(MIDDLE_AGENCY_ROLE)
+    .sort({ staffCoinsBalance: -1 })
     .limit(lim)
-    .select('_id email displayName agencyPlace')
+    .select('_id email displayName staffCoinsBalance bdId')
     .lean();
   const ids = agencies.map((a) => a._id);
-  const bdCounts = await User.aggregate<{ _id: import('mongoose').Types.ObjectId; c: number }>([
-    { $match: { agencyId: { $in: ids }, role: BD_ROLE } },
-    { $group: { _id: '$agencyId', c: { $sum: 1 } } },
-  ]);
-  const bdMap = new Map(bdCounts.map((b) => [b._id.toString(), b.c]));
-  const bdIds = await User.find({ agencyId: { $in: ids }, role: BD_ROLE }).distinct('_id');
   const hostCounts =
-    bdIds.length === 0
+    ids.length === 0
       ? []
       : await Creator.aggregate<{ _id: import('mongoose').Types.ObjectId; c: number }>([
-          { $match: { assignedAgentId: { $in: bdIds } } },
-          { $group: { _id: '$assignedAgentId', c: { $sum: 1 } } },
+          { $match: { assignedAgencyId: { $in: ids } } },
+          { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
         ]);
-  const hostsPerBd = new Map(hostCounts.map((h) => [h._id.toString(), h.c]));
-  const hostsPerAgency = new Map<string, number>();
-  const bdsByAgency = await User.find({ agencyId: { $in: ids }, role: BD_ROLE }).select('_id agencyId').lean();
-  for (const bd of bdsByAgency) {
-    const aid = bd.agencyId?.toString();
-    if (!aid) continue;
-    hostsPerAgency.set(aid, (hostsPerAgency.get(aid) ?? 0) + (hostsPerBd.get(bd._id.toString()) ?? 0));
-  }
+  const hostsPerAgency = new Map(hostCounts.map((h) => [h._id.toString(), h.c]));
 
   return {
     rows: agencies.map((a, i) => ({
       rank: i + 1,
-      agencyName: a.displayName || a.email || a.agencyPlace || a._id.toString(),
-      bds: bdMap.get(a._id.toString()) ?? 0,
+      agencyName: a.displayName || a.email || a._id.toString(),
       hosts: hostsPerAgency.get(a._id.toString()) ?? 0,
-      revenueCoins: 0,
+      revenueCoins: a.staffCoinsBalance ?? 0,
+      parentBdId: a.bdId?.toString() ?? null,
     })),
-    note: 'Agency revenue rollup requires staff ledger join; hosts/BD counts are live.',
   };
 }
 

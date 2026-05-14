@@ -63,14 +63,14 @@ export async function withdrawalManagedByAgent(
   withdrawal: IWithdrawal,
   agentUserId: Types.ObjectId
 ): Promise<boolean> {
-  if (withdrawal.assignedAgentId && withdrawal.assignedAgentId.equals(agentUserId)) {
+  if (withdrawal.assignedAgencyId && withdrawal.assignedAgencyId.equals(agentUserId)) {
     return true;
   }
   if (!withdrawal.creatorUserId) return false;
   const c = await Creator.findOne({ userId: withdrawal.creatorUserId })
-    .select('assignedAgentId')
+    .select('assignedAgencyId')
     .lean();
-  return !!(c?.assignedAgentId && c.assignedAgentId.equals(agentUserId));
+  return !!(c?.assignedAgencyId && c.assignedAgencyId.equals(agentUserId));
 }
 
 export type WithdrawalActionResult =

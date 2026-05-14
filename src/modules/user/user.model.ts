@@ -49,30 +49,29 @@ export interface IUser extends Document {
     | 'user'
     | 'creator'
     | 'admin'
-    | 'agent'
     | 'super_admin'
     | 'agency'
     | 'bd';
-  /** Bcrypt hash for agent/bd/agency dashboard login (never store plaintext). */
+  /** Bcrypt hash for staff dashboard login (never store plaintext). */
   passwordHash?: string;
-  /** When true, BD/agent JWT login is blocked (super-admin toggle). */
-  agentDisabled?: boolean;
-  /** When true, agency JWT login is blocked (super-admin toggle). */
+  /** When true, middle-tier agency JWT login is blocked (super-admin toggle). */
   agencyDisabled?: boolean;
+  /** When true, top-tier BD JWT login is blocked (super-admin toggle). */
+  bdDisabled?: boolean;
   /**
-   * Agency / BD portal: user should change password after first login with an auto-generated password.
+   * Staff portal: user should change password after first login with an auto-generated password.
    * Cleared when they set a new password (or when an admin sets a new password for them).
    */
   staffMustChangePassword?: boolean;
-  /** Parent agency User._id for BD (`role === 'bd'` or legacy `agent`). */
-  agencyId?: mongoose.Types.ObjectId;
+  /** Parent BD User._id for middle-tier agency (`role === 'agency'`). */
+  bdId?: mongoose.Types.ObjectId;
   /** Staff earnings wallet (coins face units); separate from consumer `coins`. */
   staffCoinsBalance?: number;
-  /** Host onboarding under BD referral — Flutter reads via creatorApplication* flags. */
+  /** Host onboarding under agency referral — Flutter reads via creatorApplication* flags. */
   hostOnboardingStatus?:
     | 'none'
     | 'draft'
-    | 'pending_bd_approval'
+    | 'pending_agency_approval'
     | 'approved'
     | 'rejected'
     | 'suspended'
@@ -84,7 +83,7 @@ export interface IUser extends Document {
     managePlatformRevenue?: boolean;
   };
   hostOnboardingRejectedReason?: string;
-  bdApprovedAt?: Date | null;
+  agencyApprovedAt?: Date | null;
   /** Optional label for agent management UI. */
   displayName?: string;
   /** Agency portal: city/region label (staff-only usage). */
@@ -251,7 +250,7 @@ const userSchema = new Schema<IUser>(
     },
     role: {
       type: String,
-      enum: ['user', 'creator', 'admin', 'agent', 'super_admin', 'agency', 'bd'],
+      enum: ['user', 'creator', 'admin', 'super_admin', 'agency', 'bd'],
       default: 'user',
     },
     passwordHash: {
@@ -259,11 +258,11 @@ const userSchema = new Schema<IUser>(
       select: false,
       sparse: true,
     },
-    agentDisabled: {
+    agencyDisabled: {
       type: Boolean,
       default: false,
     },
-    agencyDisabled: {
+    bdDisabled: {
       type: Boolean,
       default: false,
     },
@@ -271,7 +270,7 @@ const userSchema = new Schema<IUser>(
       type: Boolean,
       default: false,
     },
-    agencyId: {
+    bdId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
       sparse: true,
@@ -287,7 +286,7 @@ const userSchema = new Schema<IUser>(
       enum: [
         'none',
         'draft',
-        'pending_bd_approval',
+        'pending_agency_approval',
         'approved',
         'rejected',
         'suspended',
@@ -307,7 +306,7 @@ const userSchema = new Schema<IUser>(
       maxlength: 2000,
       default: undefined,
     },
-    bdApprovedAt: {
+    agencyApprovedAt: {
       type: Date,
       default: null,
     },
@@ -395,7 +394,7 @@ userSchema.index({ deviceFingerprint: 1 }, { sparse: true });
 userSchema.index({ installId: 1 }, { unique: true, sparse: true });
 // Index for Fast Login migration (find by installId when fingerprint format changed)
 userSchema.index({ installId: 1, authProvider: 1 }, { sparse: true });
-userSchema.index({ agencyId: 1, role: 1 }, { sparse: true });
+userSchema.index({ bdId: 1, role: 1 }, { sparse: true });
 userSchema.index({ hostOnboardingStatus: 1, referredBy: 1 }, { sparse: true });
 
 export const User = mongoose.model<IUser>('User', userSchema);

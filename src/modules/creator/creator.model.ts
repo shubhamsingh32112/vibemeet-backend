@@ -40,7 +40,7 @@ export interface ICreator extends Document {
   isOnline: boolean;
   currentCallId?: string;
   earningsCoins: number;
-  assignedAgentId?: mongoose.Types.ObjectId;
+  assignedAgencyId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -153,7 +153,7 @@ const creatorSchema = new Schema<ICreator>(
       default: 0,
       min: 0,
     },
-    assignedAgentId: {
+    assignedAgencyId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
       sparse: true,
@@ -165,7 +165,7 @@ const creatorSchema = new Schema<ICreator>(
   }
 );
 
-creatorSchema.index({ assignedAgentId: 1, updatedAt: -1 });
+creatorSchema.index({ assignedAgencyId: 1, updatedAt: -1 });
 creatorSchema.index({ createdAt: -1 });
 creatorSchema.index({ isOnline: 1, createdAt: -1 });
 // Cloudflare-Images indexes (Phase 2 §2 — orphan-cleanup, moderation lookups, ownership scans).

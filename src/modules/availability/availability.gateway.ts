@@ -1,7 +1,10 @@
 import { Server, Socket } from 'socket.io';
 import { getRedis, availabilityKey, activeCallByUserKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
-import { emitToAdmin } from '../admin/admin.gateway';
+import { emitStaffDomainEvent, getCreatorStaffScope } from '../staff/staff-dashboard-invalidation.service';
+import {
+  updateOnlinePresenceSets,
+} from './presence-dashboard.service';
 import { User } from '../user/user.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
@@ -672,6 +675,13 @@ export async function setCreatorAvailability(
     await redis.del(key);
   }
 
+  const scope = await getCreatorStaffScope(creatorFirebaseUid);
+  await updateOnlinePresenceSets(
+    creatorFirebaseUid,
+    status === 'online' ? 'online' : 'offline',
+    scope
+  );
+
   // Fanout to user-facing consumers and creators without a global broadcast.
   const payload = {
     creatorId: creatorFirebaseUid,
@@ -689,10 +699,11 @@ export async function setCreatorAvailability(
     creatorsRoomSize: io.sockets.adapter.rooms.get('creators')?.size ?? 0,
   });
 
-  // Emit to admin dashboard
-  emitToAdmin('creator:status', {
-    creatorFirebaseUid,
-    status,
+  emitStaffDomainEvent({
+    type: 'creator:status_changed',
+    scope: { bdId: scope.bdId, agencyId: scope.agencyId },
+    entityId: creatorFirebaseUid,
+    meta: { status },
   });
 
   logDebug('Broadcast creator status', {

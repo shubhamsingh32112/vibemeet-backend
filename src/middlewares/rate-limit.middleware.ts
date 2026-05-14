@@ -321,3 +321,37 @@ export const referralApplyLimiter = createLimiter(
   },
   'rl:referral-apply:'
 );
+
+export type StaffRateLimitIdentity = { userId: string; role: string };
+
+export function staffGeneralRateLimitMaxForRole(role: string | undefined, isDev: boolean): number {
+  if (isDev) return 5000;
+  if (role === 'admin' || role === 'super_admin') return 2000;
+  if (role === 'bd') return 400;
+  if (role === 'agency') return 800;
+  return 100;
+}
+
+/** Staff-aware general API limiter — key by JWT identity when present, else IP. */
+export function createStaffGeneralLimiter(isDev: boolean) {
+  return createLimiter(
+    {
+      windowMs: 15 * 60 * 1000,
+      max: (req: Request) => {
+        const staff = (req as Request & { staffRateLimit?: StaffRateLimitIdentity }).staffRateLimit;
+        return staffGeneralRateLimitMaxForRole(staff?.role, isDev);
+      },
+      message: 'Too many requests, please try again later.',
+      standardHeaders: true,
+      legacyHeaders: false,
+      keyGenerator: (req: Request): string => {
+        const staff = (req as Request & { staffRateLimit?: StaffRateLimitIdentity }).staffRateLimit;
+        if (staff?.userId) {
+          return `staff:${staff.userId}:${staff.role}`;
+        }
+        return `ip:${req.ip ?? 'unknown'}`;
+      },
+    },
+    'rl:staff-general:'
+  );
+}

@@ -31,11 +31,11 @@ test('admin promotion flow must call bonus reversal ledger helper', () => {
   );
 });
 
-test('agent promotion flow must call bonus reversal ledger helper', () => {
-  const src = readFileSync(join(__dirname, '../agent/agent.controller.ts'), 'utf8');
+test('agency promotion flow must call bonus reversal ledger helper', () => {
+  const src = readFileSync(join(__dirname, '../agency/agency-portal.controller.ts'), 'utf8');
   assert.ok(
     src.includes('ensureCreatorPromotionBonusReversalEntry(targetUser, session)'),
-    'expected agent create-creator flow to write bonus reversal transaction entry'
+    'expected agency create-creator flow to write bonus reversal transaction entry'
   );
 });
 

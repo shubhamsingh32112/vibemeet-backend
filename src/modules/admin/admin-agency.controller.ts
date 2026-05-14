@@ -4,27 +4,18 @@ import bcrypt from 'bcrypt';
 import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
+import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
+import { assignReferralCodeToUser } from '../user/referral.service';
+import { checkDeletedStatus } from '../user/deleted-identity.service';
 import { assertAdmin } from '../../middlewares/staff.middleware';
 import { invalidateAdminCaches } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
-import { generateStaffPortalPassword } from '../../utils/staff-password';
-import { appendAuditEvent, extractAuditContext } from '../audit/audit-event.service';
-import {
-  checkDeletedStatus,
-  normalizePhone,
-  upsertDeletedIdentities,
-} from '../user/deleted-identity.service';
 
 const BCRYPT_ROUNDS = 12;
 
-const BD_ROLE_QUERY = { $in: ['agent', 'bd'] as const };
-
-const PHONE_MAX_LEN = 32;
-
-function normalizeAgencyPhone(raw: string): string {
-  return normalizePhone(raw);
-}
+/** Legacy Mongo stored `agent`; new rows use `bd`. */
+const AGENCY_ROLE_QUERY = { role: 'agency' as const };
 
 export const createAgency = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -33,40 +24,23 @@ export const createAgency = async (req: Request, res: Response): Promise<void> =
     const email = String(req.body.email ?? '')
       .trim()
       .toLowerCase();
+    const password = String(req.body.password ?? '');
     const displayName =
       typeof req.body.displayName === 'string' ? req.body.displayName.trim().slice(0, 120) : undefined;
-    const phoneRaw = String(req.body.phone ?? '').trim();
-    const phone = phoneRaw ? normalizeAgencyPhone(phoneRaw) : '';
-    const placeRaw =
-      typeof req.body.agencyPlace === 'string'
-        ? req.body.agencyPlace.trim()
-        : typeof req.body.place === 'string'
-          ? req.body.place.trim()
-          : '';
-    const agencyPlace = placeRaw ? placeRaw.slice(0, 200) : undefined;
 
-    if (!email) {
-      res.status(400).json({ success: false, error: 'Valid email is required' });
-      return;
-    }
-    if (!phone) {
-      res.status(400).json({ success: false, error: 'Phone number is required' });
-      return;
-    }
-    if (!agencyPlace) {
-      res.status(400).json({ success: false, error: 'Place is required' });
-      return;
-    }
-    if (phone.length > PHONE_MAX_LEN) {
-      res.status(400).json({ success: false, error: 'Phone number is too long' });
+    if (!email || !password || password.length < 8) {
+      res.status(400).json({
+        success: false,
+        error: 'Valid email and password (min 8 characters) are required',
+      });
       return;
     }
 
-    const deletedStatus = await checkDeletedStatus({ email, phone });
+    const deletedStatus = await checkDeletedStatus({ email, phone: null });
     if (deletedStatus.isDeleted) {
       res.status(409).json({
         success: false,
-        error: 'This email or phone was previously removed and cannot be reused',
+        error: 'This email was previously removed and cannot be reused',
       });
       return;
     }
@@ -77,43 +51,43 @@ export const createAgency = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const phoneTaken = await User.findOne({ phone }).select('_id').lean();
-    if (phoneTaken) {
-      res.status(409).json({ success: false, error: 'Phone number already in use' });
-      return;
+    let bdId: mongoose.Types.ObjectId | undefined;
+    const rawbdId = req.body.bdId;
+    if (typeof rawbdId === 'string' && mongoose.Types.ObjectId.isValid(rawbdId)) {
+      const ag = await User.findById(rawbdId).select('role').lean();
+      if (ag?.role === 'bd') {
+        bdId = new mongoose.Types.ObjectId(rawbdId);
+      }
     }
 
-    const plainPassword = generateStaffPortalPassword(16);
-    const passwordHash = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
     const firebaseUid = `agency_${randomUUID().replace(/-/g, '')}`;
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    const agency = await User.create({
+    const agent = await User.create({
       firebaseUid,
       email,
-      phone,
       role: 'agency',
       passwordHash,
       displayName: displayName || undefined,
-      agencyPlace,
       coins: 0,
       agencyDisabled: false,
-      staffMustChangePassword: true,
+      ...(bdId ? { bdId } : {}),
     });
 
-    logInfo('Admin created agency', { agencyId: agency._id.toString(), email });
+    await assignReferralCodeToUser(agent);
+
+    logInfo('Admin created agent', { agentId: agent._id.toString(), email });
 
     invalidateAdminCaches('overview', 'users_analytics').catch(() => {});
 
     res.status(201).json({
       success: true,
       data: {
-        id: agency._id.toString(),
-        email: agency.email,
-        phone: agency.phone ?? null,
-        agencyPlace: agency.agencyPlace ?? null,
-        displayName: agency.displayName ?? null,
-        agencyDisabled: agency.agencyDisabled ?? false,
-        generatedPassword: plainPassword,
+        id: agent._id.toString(),
+        email: agent.email,
+        displayName: agent.displayName ?? null,
+        referralCode: agent.referralCode ?? null,
+        agencyDisabled: agent.agencyDisabled ?? false,
       },
     });
   } catch (error) {
@@ -130,35 +104,58 @@ export const listAgencies = async (req: Request, res: Response): Promise<void> =
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 30));
     const skip = (page - 1) * limit;
 
-    const [agencies, total] = await Promise.all([
-      User.find({ role: 'agency' })
+    const [agents, total] = await Promise.all([
+      User.find({ role: AGENCY_ROLE_QUERY })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('email phone agencyPlace displayName agencyDisabled createdAt')
+        .select('email displayName referralCode agencyDisabled bdId createdAt')
         .lean(),
-      User.countDocuments({ role: 'agency' }),
+      User.countDocuments({ role: AGENCY_ROLE_QUERY }),
     ]);
 
-    const ids = agencies.map((a) => a._id);
-    const bdCounts = await User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
-      { $match: { agencyId: { $in: ids }, role: BD_ROLE_QUERY } },
-      { $group: { _id: '$agencyId', c: { $sum: 1 } } },
+    const ids = agents.map((a) => a._id);
+    const [awaitingCounts, creatorCounts, pendingWithdrawals] = await Promise.all([
+      User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
+        { $match: { referredBy: { $in: ids } } },
+        { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+        { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+        { $group: { _id: '$referredBy', c: { $sum: 1 } } },
+      ]),
+      Creator.aggregate([
+        { $match: { assignedAgencyId: { $in: ids } } },
+        { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
+      ]),
+      Withdrawal.aggregate([
+        {
+          $match: {
+            assignedAgencyId: { $in: ids },
+            status: 'pending',
+          },
+        },
+        { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
+      ]),
     ]);
-    const bdMap = new Map(bdCounts.map((r) => [r._id.toString(), r.c]));
+
+    const pendingMap = new Map(awaitingCounts.map((p) => [p._id.toString(), p.c]));
+    const creatorMap = new Map(creatorCounts.map((p: { _id: mongoose.Types.ObjectId; c: number }) => [p._id.toString(), p.c]));
+    const wdMap = new Map(pendingWithdrawals.map((p: { _id: mongoose.Types.ObjectId; c: number }) => [p._id.toString(), p.c]));
 
     res.json({
       success: true,
       data: {
-        agencies: agencies.map((a) => ({
+        agencies: agents.map((a) => ({
           id: a._id.toString(),
           email: a.email,
-          phone: a.phone ?? null,
-          agencyPlace: a.agencyPlace ?? null,
           displayName: a.displayName ?? null,
+          referralCode: a.referralCode ?? null,
           agencyDisabled: a.agencyDisabled ?? false,
-          bdCount: bdMap.get(a._id.toString()) ?? 0,
+          bdId: (a as { bdId?: mongoose.Types.ObjectId }).bdId?.toString() ?? null,
           createdAt: a.createdAt,
+          /** Referred users not yet promoted to creator (legacy field name). */
+          pendingApplications: pendingMap.get(a._id.toString()) ?? 0,
+          activeCreators: creatorMap.get(a._id.toString()) ?? 0,
+          pendingWithdrawals: wdMap.get(a._id.toString()) ?? 0,
         })),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
       },
@@ -169,57 +166,115 @@ export const listAgencies = async (req: Request, res: Response): Promise<void> =
   }
 };
 
+/** Minimal agent list for filters (e.g. user analytics referrer dropdown) — no aggregates. */
+export const listAgenciesBrief = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const agents = await User.find({ role: AGENCY_ROLE_QUERY })
+      .sort({ email: 1 })
+      .select('_id email displayName')
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        agencies: agents.map((a) => ({
+          id: a._id.toString(),
+          email: a.email,
+          displayName: a.displayName ?? null,
+        })),
+      },
+    });
+  } catch (error) {
+    logError('listAgenciesBrief error', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 export const getAgencyDetail = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agency = await User.findOne({ _id: id, role: 'agency' })
-      .select('email phone agencyPlace displayName agencyDisabled createdAt updatedAt')
+    const agent = await User.findOne({ _id: id, role: AGENCY_ROLE_QUERY })
+      .select('email displayName referralCode agencyDisabled bdId createdAt updatedAt')
       .lean();
-    if (!agency) {
-      res.status(404).json({ success: false, error: 'Agency not found' });
+    if (!agent) {
+      res.status(404).json({ success: false, error: 'Agent not found' });
       return;
     }
 
-    const agencyOid = new mongoose.Types.ObjectId(id);
-    const bds = await User.find({ agencyId: agencyOid, role: BD_ROLE_QUERY })
-      .select('email displayName referralCode agentDisabled createdAt')
-      .sort({ createdAt: -1 })
-      .lean();
+    const agentOid = new mongoose.Types.ObjectId(id);
 
-    const bdIds = bds.map((b) => b._id);
-    const hostCounts =
-      bdIds.length === 0
-        ? []
-        : await Creator.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
-            { $match: { assignedAgentId: { $in: bdIds } } },
-            { $group: { _id: '$assignedAgentId', c: { $sum: 1 } } },
-          ]);
-    const hostMap = new Map(hostCounts.map((h) => [h._id.toString(), h.c]));
+    const awaitingRaw = await User.aggregate<{
+      _id: mongoose.Types.ObjectId;
+      email?: string;
+      phone?: string;
+      username?: string;
+      firebaseUid?: string;
+      createdAt: Date;
+    }>([
+      { $match: { referredBy: agentOid } },
+      { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
+      { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+      { $sort: { createdAt: -1 } },
+      { $limit: 200 },
+      { $project: { email: 1, phone: 1, username: 1, firebaseUid: 1, createdAt: 1 } },
+    ]);
+
+    const awaitingIds = awaitingRaw.map((u) => u._id);
+    const edges = await ReferralEdge.find({ referredUserId: { $in: awaitingIds } })
+      .select('referredUserId referralCodeUsed')
+      .lean();
+    const codeByUser = new Map(edges.map((e) => [e.referredUserId.toString(), e.referralCodeUsed]));
+
+    const [creators, pendingWd] = await Promise.all([
+      Creator.find({ assignedAgencyId: agentOid })
+        .select('name photo userId earningsCoins createdAt')
+        .sort({ updatedAt: -1 })
+        .limit(500)
+        .lean(),
+      Withdrawal.countDocuments({ assignedAgencyId: agentOid, status: 'pending' }),
+    ]);
 
     res.json({
       success: true,
       data: {
-        agency: {
-          id: agency._id.toString(),
-          email: agency.email,
-          phone: agency.phone ?? null,
-          agencyPlace: agency.agencyPlace ?? null,
-          displayName: agency.displayName ?? null,
-          agencyDisabled: agency.agencyDisabled ?? false,
-          createdAt: agency.createdAt,
-          updatedAt: agency.updatedAt,
+        agent: {
+          id: agent._id.toString(),
+          email: agent.email,
+          displayName: agent.displayName ?? null,
+          referralCode: agent.referralCode ?? null,
+          agencyDisabled: agent.agencyDisabled ?? false,
+          bdId: (agent as { bdId?: mongoose.Types.ObjectId }).bdId?.toString() ?? null,
+          createdAt: agent.createdAt,
+          updatedAt: agent.updatedAt,
         },
-        bds: bds.map((b) => ({
-          id: b._id.toString(),
-          email: b.email,
-          displayName: b.displayName ?? null,
-          referralCode: b.referralCode ?? null,
-          agentDisabled: b.agentDisabled ?? false,
-          hostCount: hostMap.get(b._id.toString()) ?? 0,
-          createdAt: b.createdAt,
+        pendingApplications: awaitingRaw.map((u) => {
+          const uid = u._id.toString();
+          return {
+            id: uid,
+            applicantUserId: uid,
+            applicant: {
+              _id: u._id,
+              email: u.email,
+              phone: u.phone,
+              username: u.username,
+              firebaseUid: u.firebaseUid,
+            },
+            referralCodeUsed: codeByUser.get(uid) ?? agent.referralCode ?? '',
+            createdAt: u.createdAt,
+          };
+        }),
+        creators: creators.map((c) => ({
+          id: c._id.toString(),
+          userId: c.userId.toString(),
+          name: c.name,
+          earningsCoins: c.earningsCoins,
+          createdAt: c.createdAt,
         })),
+        pendingWithdrawalsCount: pendingWd,
       },
     });
   } catch (error) {
@@ -233,171 +288,63 @@ export const patchAgency = async (req: Request, res: Response): Promise<void> =>
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agency = await User.findOne({ _id: id, role: 'agency' });
-    if (!agency) {
-      res.status(404).json({ success: false, error: 'Agency not found' });
+    const agent = await User.findOne({ _id: id, role: AGENCY_ROLE_QUERY });
+    if (!agent) {
+      res.status(404).json({ success: false, error: 'Agent not found' });
       return;
     }
 
     if (typeof req.body.agencyDisabled === 'boolean') {
-      agency.agencyDisabled = req.body.agencyDisabled;
+      agent.agencyDisabled = req.body.agencyDisabled;
     }
     if (typeof req.body.displayName === 'string') {
       const d = req.body.displayName.trim().slice(0, 120);
-      agency.displayName = d || undefined;
+      agent.displayName = d || undefined;
     }
     if (typeof req.body.password === 'string' && req.body.password.length >= 8) {
-      agency.passwordHash = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
-      agency.staffMustChangePassword = false;
+      agent.passwordHash = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+      agent.staffMustChangePassword = false;
     }
-    if (typeof req.body.phone === 'string') {
-      const p = normalizeAgencyPhone(req.body.phone);
-      if (p.length > PHONE_MAX_LEN) {
-        res.status(400).json({ success: false, error: 'Phone number is too long' });
+    if (req.body.reassignCreatorsToAgentId) {
+      const targetId = String(req.body.reassignCreatorsToAgentId).trim();
+      if (!mongoose.Types.ObjectId.isValid(targetId)) {
+        res.status(400).json({ success: false, error: 'Invalid reassignCreatorsToAgentId' });
         return;
       }
-      if (p) {
-        const taken = await User.findOne({ phone: p, _id: { $ne: agency._id } })
-          .select('_id')
-          .lean();
-        if (taken) {
-          res.status(409).json({ success: false, error: 'Phone number already in use' });
-          return;
-        }
+      const target = await User.findOne({
+        _id: targetId,
+        role: AGENCY_ROLE_QUERY,
+        agencyDisabled: false,
+      });
+      if (!target) {
+        res.status(404).json({ success: false, error: 'Target agent not found or disabled' });
+        return;
       }
-      agency.phone = p || undefined;
-    }
-    const placeBody =
-      typeof req.body.agencyPlace === 'string'
-        ? req.body.agencyPlace
-        : typeof req.body.place === 'string'
-          ? req.body.place
-          : undefined;
-    if (typeof placeBody === 'string') {
-      const pl = placeBody.trim().slice(0, 200);
-      agency.agencyPlace = pl || undefined;
+      await Creator.updateMany(
+        { assignedAgencyId: agent._id },
+        { $set: { assignedAgencyId: target._id } },
+      );
+      await Withdrawal.updateMany(
+        { assignedAgencyId: agent._id, status: 'pending' },
+        { $set: { assignedAgencyId: target._id } },
+      );
     }
 
-    await agency.save();
+    await agent.save();
 
-    invalidateAdminCaches('overview', 'users_analytics').catch(() => {});
-
-    const actor = await User.findOne({ firebaseUid: req.auth?.firebaseUid })
-      .select('_id role')
-      .lean();
-    const ctx = extractAuditContext(req);
-    void appendAuditEvent({
-      actorUserId: actor?._id ?? null,
-      actorRole: actor?.role,
-      eventType: 'agency_patched',
-      targetType: 'agency',
-      targetId: id,
-      metadata: {
-        agencyDisabled: agency.agencyDisabled ?? false,
-        email: agency.email,
-      },
-      ...ctx,
-    });
+    invalidateAdminCaches('overview', 'users_analytics', 'creators_performance').catch(() => {});
 
     res.json({
       success: true,
       data: {
-        id: agency._id.toString(),
-        email: agency.email,
-        phone: agency.phone ?? null,
-        agencyPlace: agency.agencyPlace ?? null,
-        displayName: agency.displayName ?? null,
-        agencyDisabled: agency.agencyDisabled ?? false,
+        id: agent._id.toString(),
+        email: agent.email,
+        displayName: agent.displayName ?? null,
+        agencyDisabled: agent.agencyDisabled ?? false,
       },
     });
   } catch (error) {
     logError('patchAgency error', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-/**
- * Permanently removes the agency User row. Staff JWT verification uses `User.findById`,
- * so tokens become unusable once the document is gone (invalid JWT falls through to Firebase and fails).
- */
-export const deleteAgency = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAdmin(req, res))) return;
-
-    const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      res.status(400).json({ success: false, error: 'Invalid agency id' });
-      return;
-    }
-
-    const agency = await User.findOne({ _id: id, role: 'agency' })
-      .select('email phone staffCoinsBalance')
-      .lean();
-    if (!agency) {
-      res.status(404).json({ success: false, error: 'Agency not found' });
-      return;
-    }
-
-    const agencyOid = agency._id;
-
-    const [bdCount, pendingPayouts, balance] = await Promise.all([
-      User.countDocuments({ agencyId: agencyOid, role: BD_ROLE_QUERY }),
-      Withdrawal.countDocuments({ staffUserId: agencyOid, status: 'pending' }),
-      Promise.resolve(Number(agency.staffCoinsBalance) || 0),
-    ]);
-
-    if (bdCount > 0) {
-      res.status(409).json({
-        success: false,
-        error: `Cannot remove agency: ${bdCount} BD account(s) still exist under this agency. Remove or re-home them first.`,
-      });
-      return;
-    }
-    if (pendingPayouts > 0) {
-      res.status(409).json({
-        success: false,
-        error: 'Cannot remove agency: pending staff withdrawal(s) exist for this agency.',
-      });
-      return;
-    }
-    if (balance > 0) {
-      res.status(409).json({
-        success: false,
-        error: 'Cannot remove agency: staff wallet balance must be zero first.',
-      });
-      return;
-    }
-
-    await upsertDeletedIdentities({
-      email: agency.email ?? null,
-      phone: agency.phone ?? null,
-    });
-
-    await User.deleteOne({ _id: agencyOid });
-
-    logInfo('Admin deleted agency', { agencyId: agencyOid.toString(), email: agency.email });
-
-    invalidateAdminCaches('overview', 'users_analytics').catch(() => {});
-
-    const actor = await User.findOne({ firebaseUid: req.auth?.firebaseUid })
-      .select('_id role')
-      .lean();
-    const ctx = extractAuditContext(req);
-    void appendAuditEvent({
-      actorUserId: actor?._id ?? null,
-      actorRole: actor?.role,
-      eventType: 'agency_deleted',
-      targetType: 'agency',
-      targetId: id,
-      metadata: {
-        email: agency.email,
-      },
-      ...ctx,
-    });
-
-    res.json({ success: true, data: { id: agencyOid.toString(), deleted: true } });
-  } catch (error) {
-    logError('deleteAgency error', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

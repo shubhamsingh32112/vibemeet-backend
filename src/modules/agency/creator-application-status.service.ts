@@ -23,7 +23,7 @@ export async function getCreatorApplicationFlagsForUser(
     };
   }
   const st = u.hostOnboardingStatus ?? 'none';
-  const pending = st === 'pending_bd_approval' || st === 'under_review';
+  const pending = st === 'pending_agency_approval' || st === 'under_review';
   const rejected =
     st === 'rejected' || st === 'suspended' || st === 'blocked';
   return {

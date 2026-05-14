@@ -125,7 +125,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     if (isBdRole(currentUser?.role)) {
       res.status(403).json({
         success: false,
-        error: 'Forbidden: Use GET /agent/creators for your assigned creators.',
+        error: 'Forbidden: Use GET /agency/creators for your assigned creators.',
       });
       return;
     }
@@ -1047,7 +1047,7 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
     let allowed = false;
     if (isSuperAdminRole(staffUser.role)) {
       allowed = true;
-    } else if (isBdRole(staffUser.role) && !staffUser.agentDisabled && creator.assignedAgentId?.equals(staffUser._id)) {
+    } else if (isAgencyRole(staffUser.role) && !staffUser.agencyDisabled && creator.assignedAgencyId?.equals(staffUser._id)) {
       allowed = true;
     }
     if (!allowed) {
@@ -2829,15 +2829,15 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
     }
 
     const creatorProfile = await Creator.findOne({ userId: currentUser._id })
-      .select('_id assignedAgentId')
+      .select('_id assignedAgencyId')
       .lean();
     if (!creatorProfile) {
       res.status(404).json({ success: false, error: 'Creator profile not found' });
       return;
     }
 
-    const assignedAgentId = creatorProfile.assignedAgentId ?? undefined;
-    if (!assignedAgentId) {
+    const assignedAgencyId = creatorProfile.assignedAgencyId ?? undefined;
+    if (!assignedAgencyId) {
       logInfo('withdrawal_created_without_assignment', {
         creatorUserId: currentUser._id.toString(),
         creatorId: creatorProfile._id.toString(),
@@ -2855,7 +2855,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       upi: upi?.trim() || undefined,
       accountNumber: accountNumber?.trim() || undefined,
       ifsc: ifsc?.trim() || undefined,
-      assignedAgentId,
+      assignedAgencyId,
     });
 
     console.log(`✅ [CREATOR] Withdrawal requested: ${withdrawal._id} for ${amount} coins by user ${currentUser._id}`);
@@ -2881,7 +2881,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
         upi: withdrawal.upi ?? null,
         accountNumber: withdrawal.accountNumber ?? null,
         ifsc: withdrawal.ifsc ?? null,
-        assignedAgentId: withdrawal.assignedAgentId?.toString() ?? null,
+        assignedAgencyId: withdrawal.assignedAgencyId?.toString() ?? null,
         message: 'Withdrawal request submitted. Coins will be deducted upon admin approval.',
       },
     });
