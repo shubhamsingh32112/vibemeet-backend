@@ -52,3 +52,39 @@ test('redis config defines creator feed and uids cache keys', () => {
   assert.ok(src.includes('CREATOR_UIDS_CACHE_KEY'));
   assert.ok(src.includes('invalidateCreatorCatalogCaches'));
 });
+
+test('getCreatorFeed serves unscoped consumer catalog (not agency-filtered)', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes('Creator.find({})'));
+  assert.ok(!block.includes('assignedAgencyId'));
+  assert.ok(!block.includes('assignedAgentId'));
+});
+
+test('getCreatorFeed blocks portal roles but not regular users', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes("currentUser?.role === 'creator'"));
+  assert.ok(block.includes('isBdRole(currentUser?.role)'));
+  assert.ok(block.includes('isAgencyRole(currentUser?.role)'));
+  assert.ok(block.includes("currentUser.role === 'user'"));
+});
+
+test('getCreatorFeed response includes fields required by mobile CreatorModel', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes('id: creator._id.toString()'));
+  assert.ok(block.includes('name: creator.name'));
+  assert.ok(block.includes('price: creator.price'));
+  assert.ok(block.includes('creators: creatorsOut'));
+  assert.ok(block.includes('pagination:'));
+});
