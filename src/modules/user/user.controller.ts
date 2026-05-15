@@ -1520,7 +1520,7 @@ export const completeHostProfileAfterBdApproval = async (
     if (targetUser.hostOnboardingStatus !== 'approved') {
       res.status(403).json({
         success: false,
-        error: 'BD approval required before completing host profile',
+        error: 'Agency approval required before completing host profile',
       });
       return;
     }

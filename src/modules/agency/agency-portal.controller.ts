@@ -154,7 +154,7 @@ export const rejectAgencyReferredUser = async (req: Request, res: Response): Pro
   }
 };
 
-/** BD approves referred host onboarding — host may then complete creator profile (mobile or BD-assisted). */
+/** Agency approves referred host onboarding — host may then be promoted or complete profile on mobile. */
 export const approveAgencyReferredUser = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgency(req, res))) return;
@@ -184,7 +184,7 @@ export const approveAgencyReferredUser = async (req: Request, res: Response): Pr
       {
         _id: targetUserId,
         referredBy: agency._id,
-        hostOnboardingStatus: 'pending_agency_approval',
+        hostOnboardingStatus: { $in: ['pending_agency_approval', 'pending_bd_approval'] },
       },
       {
         $set: {
@@ -207,7 +207,7 @@ export const approveAgencyReferredUser = async (req: Request, res: Response): Pr
       }
       res.status(400).json({
         success: false,
-        error: 'User is not awaiting BD approval',
+        error: 'User is not awaiting agency approval',
       });
       return;
     }
@@ -1224,7 +1224,7 @@ export const postAgencyCreateCreator = async (req: Request, res: Response): Prom
     if (targetUser.hostOnboardingStatus !== 'approved') {
       res.status(403).json({
         success: false,
-        error: 'BD must approve this host before creating a creator profile',
+        error: 'Agency must approve this host before creating a creator profile',
       });
       return;
     }
