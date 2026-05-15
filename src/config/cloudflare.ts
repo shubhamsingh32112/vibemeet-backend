@@ -29,8 +29,8 @@ export interface ImageQuotaConfig {
 
 const DEFAULT_DELIVERY_HOST = 'imagedelivery.net';
 const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const DEFAULT_AVATAR_QUOTA = 5;
-const DEFAULT_GALLERY_QUOTA = 20;
+const DEFAULT_AVATAR_QUOTA = 15;
+const DEFAULT_GALLERY_QUOTA = 60;
 
 let cachedConfig: CloudflareConfig | null = null;
 

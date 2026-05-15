@@ -2,8 +2,8 @@
  * Redis-backed anti-abuse counters for image uploads.
  *
  * Quotas are read from `getImageQuotaConfig()`:
- *   - avatar uploads:  IMAGE_QUOTA_AVATAR_PER_DAY (default 5/day)
- *   - gallery uploads: IMAGE_QUOTA_GALLERY_PER_HOUR (default 20/hour)
+ *   - avatar uploads:  IMAGE_QUOTA_AVATAR_PER_DAY (default 15/day)
+ *   - gallery uploads: IMAGE_QUOTA_GALLERY_PER_HOUR (default 60/hour)
  *
  * Counters use bucketed Redis keys with a TTL matching the window so they
  * are automatically reaped. We check-then-bump in two RTTs (`get` + `incr`)

@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 dotenv.config();
 import { createStaffGeneralLimiter } from './middlewares/rate-limit.middleware';
+import { attachFirebaseRateLimitIdentity } from './middlewares/firebase-rate-limit.middleware';
 import { attachStaffRateLimitIdentity } from './middlewares/staff-rate-limit.middleware';
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
@@ -181,8 +182,9 @@ const statusLimiter = rateLimit({
   },
 });
 
-// Staff JWT identity for per-user rate buckets (decode only — full auth on routes)
+// Staff JWT + Firebase UID identity for per-user rate buckets (before route auth)
 app.use('/api/', attachStaffRateLimitIdentity);
+app.use('/api/', attachFirebaseRateLimitIdentity);
 
 // Apply general limiter to all API routes
 app.use('/api/', (req, res, next) => {

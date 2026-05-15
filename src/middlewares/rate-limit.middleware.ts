@@ -1,9 +1,12 @@
 import rateLimit from 'express-rate-limit';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import RedisStore from 'rate-limit-redis';
 import type { RedisReply } from 'rate-limit-redis';
 import { getRedis } from '../config/redis';
 import { logWarning } from '../utils/logger';
+
+/** Per-Firebase-UID general API cap (15 min) for mobile app users. */
+export const MOBILE_FIREBASE_GENERAL_RATE_LIMIT_MAX = 600;
 function createLimiter(
   config: Parameters<typeof rateLimit>[0],
   prefix: string
@@ -332,24 +335,60 @@ export function staffGeneralRateLimitMaxForRole(role: string | undefined, isDev:
   return 100;
 }
 
-/** Staff-aware general API limiter — key by JWT identity when present, else IP. */
+function generalRateLimitMaxForRequest(req: Request, isDev: boolean): number {
+  const staff = req.staffRateLimit;
+  if (staff?.userId) {
+    return staffGeneralRateLimitMaxForRole(staff.role, isDev);
+  }
+  if (req.firebaseRateLimitUid) {
+    return isDev ? 5000 : MOBILE_FIREBASE_GENERAL_RATE_LIMIT_MAX;
+  }
+  return staffGeneralRateLimitMaxForRole(undefined, isDev);
+}
+
+function generalRateLimitKey(req: Request): string {
+  const staff = req.staffRateLimit;
+  if (staff?.userId) {
+    return `staff:${staff.userId}:${staff.role}`;
+  }
+  if (req.firebaseRateLimitUid) {
+    return `firebase:${req.firebaseRateLimitUid}`;
+  }
+  return `ip:${req.ip ?? 'unknown'}`;
+}
+
+function generalRateLimitBucketKind(req: Request): 'staff' | 'firebase' | 'ip' {
+  if (req.staffRateLimit?.userId) return 'staff';
+  if (req.firebaseRateLimitUid) return 'firebase';
+  return 'ip';
+}
+
+/** Staff- and Firebase-aware general API limiter; unauthenticated traffic uses IP. */
 export function createStaffGeneralLimiter(isDev: boolean) {
   return createLimiter(
     {
       windowMs: 15 * 60 * 1000,
-      max: (req: Request) => {
-        const staff = (req as Request & { staffRateLimit?: StaffRateLimitIdentity }).staffRateLimit;
-        return staffGeneralRateLimitMaxForRole(staff?.role, isDev);
-      },
-      message: 'Too many requests, please try again later.',
+      max: (req: Request) => generalRateLimitMaxForRequest(req, isDev),
       standardHeaders: true,
       legacyHeaders: false,
-      keyGenerator: (req: Request): string => {
-        const staff = (req as Request & { staffRateLimit?: StaffRateLimitIdentity }).staffRateLimit;
-        if (staff?.userId) {
-          return `staff:${staff.userId}:${staff.role}`;
-        }
-        return `ip:${req.ip ?? 'unknown'}`;
+      keyGenerator: (req: Request): string => generalRateLimitKey(req),
+      handler: (req: Request, res: Response) => {
+        const resetTime = req.rateLimit?.resetTime instanceof Date
+          ? req.rateLimit.resetTime.getTime()
+          : Date.now() + 15 * 60 * 1000;
+        const retryAfter = Math.max(1, Math.ceil((resetTime - Date.now()) / 1000));
+        logWarning('general API rate limit exceeded', {
+          bucket: generalRateLimitBucketKind(req),
+          key: generalRateLimitKey(req),
+          path: req.path,
+          requestId: req.headers['x-request-id'],
+          retryAfterSeconds: retryAfter,
+        });
+        res.status(429).json({
+          success: false,
+          error: 'too_many_requests',
+          retry_after: retryAfter,
+        });
       },
     },
     'rl:staff-general:'

@@ -12,6 +12,9 @@ import { markStreamCallEnded } from './billing-termination.stream';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { isBullmqBillingEnabled } from './billing-driver';
+import { terminateCallJobId } from './billing-termination.job-id';
+
+export { terminateCallJobId } from './billing-termination.job-id';
 
 const QUEUE_NAME = 'billing-termination-retry';
 const DEFAULT_ATTEMPTS = 6;
@@ -88,7 +91,7 @@ export async function enqueueTerminationRetryJob(data: TerminationRetryJobData):
   }
 
   const q = getQueue();
-  const jobId = `terminate:${data.callId}`;
+  const jobId = terminateCallJobId(data.callId);
 
   const existing = await q.getJob(jobId);
   if (existing) {

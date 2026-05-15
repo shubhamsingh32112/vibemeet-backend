@@ -53,6 +53,8 @@ export interface CommitImageAssetInput {
   quotaScope: QuotaScope;
   blurhashTarget: BlurhashJobData['target'];
   requestId?: string;
+  /** When true, skip Redis upload quota increment (e.g. gallery slot replace). */
+  skipQuotaRecord?: boolean;
 }
 
 export interface CommitImageAssetResult {
@@ -116,7 +118,9 @@ export async function commitImageAsset(
     throw error;
   }
 
-  await recordUpload(input.userId, input.quotaScope);
+  if (!input.skipQuotaRecord) {
+    await recordUpload(input.userId, input.quotaScope);
+  }
 
   const width = typeof (metadata as { width?: unknown }).width === 'number'
     ? Number((metadata as { width?: number }).width)

@@ -15,8 +15,11 @@
 
 import { Queue, type JobsOptions } from 'bullmq';
 import { duplicateImageWorkerConnection } from './image-workers.connection';
+import { blurhashJobId } from './blurhash.job-id';
 import { logInfo, logWarning } from '../../utils/logger';
 import { bumpImageCounter } from './image-metrics';
+
+export { blurhashJobId } from './blurhash.job-id';
 
 export const BLURHASH_QUEUE_NAME = 'image-blurhash';
 
@@ -54,7 +57,7 @@ export async function enqueueBlurhashJob(data: BlurhashJobData): Promise<void> {
     const q = getBlurhashQueue();
     await q.add('generate-blurhash', data, {
       ...DEFAULT_JOB_OPTIONS,
-      jobId: `blurhash:${data.imageId}`,
+      jobId: blurhashJobId(data.imageId),
     });
     bumpImageCounter('blurhash.enqueued', { kind: data.target.kind });
   } catch (error) {

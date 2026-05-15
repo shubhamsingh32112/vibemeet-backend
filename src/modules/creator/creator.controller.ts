@@ -1637,12 +1637,13 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
         ? galleryItemId.trim()
         : new mongoose.Types.ObjectId().toString();
 
+    const isGallerySlotReplace = (creator.galleryImages || []).some(
+      (img) => img.id === newGalleryItemId,
+    );
+
     if ((creator.galleryImages?.length ?? 0) >= CREATOR_GALLERY_MAX_IMAGES) {
       // Allow updating an existing slot; reject only when adding net-new images.
-      const existingSlot = (creator.galleryImages || []).some(
-        (img) => img.id === newGalleryItemId,
-      );
-      if (!existingSlot) {
+      if (!isGallerySlotReplace) {
         res.status(409).json({
           success: false,
           error: `Maximum ${CREATOR_GALLERY_MAX_IMAGES} gallery images allowed`,
@@ -1658,6 +1659,7 @@ export const commitGalleryImage = async (req: Request, res: Response): Promise<v
         userObjectId: currentUser._id,
         purpose: 'creator-gallery',
         quotaScope: 'gallery',
+        skipQuotaRecord: isGallerySlotReplace,
         blurhashTarget: {
           kind: 'creator-gallery',
           creatorId: creator._id.toString(),

@@ -106,7 +106,7 @@ export async function scheduleNextBillingCycleAfterTickOk(
 }
 
 export function billingCycleJobId(callId: string): string {
-  return `billing-cycle:${callId}`;
+  return `billing-cycle-${callId}`;
 }
 
 /**
