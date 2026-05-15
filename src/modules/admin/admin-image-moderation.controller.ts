@@ -24,6 +24,7 @@ import {
   serializeImageAsset,
   serializeAvatar,
 } from '../images/serialize-image-asset';
+import { assertAdmin } from '../../middlewares/staff.middleware';
 import { logError, logInfo } from '../../utils/logger';
 import { bumpImageCounter } from '../images/image-metrics';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
@@ -69,8 +70,9 @@ interface PendingItem {
   image: ReturnType<typeof serializeImageAsset>;
 }
 
-export const listPendingImages = async (_req: Request, res: Response): Promise<void> => {
+export const listPendingImages = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (!(await assertAdmin(req, res))) return;
     const creators = await Creator.find({
       $or: [
         { 'avatar.moderationStatus': 'pending' },
@@ -135,6 +137,7 @@ export const listPendingImages = async (_req: Request, res: Response): Promise<v
 };
 
 export const approveImage = async (req: Request, res: Response): Promise<void> => {
+  if (!(await assertAdmin(req, res))) return;
   const { kind, ownerId, imageId, galleryItemId } = req.body as {
     kind?: PendingItem['kind'];
     ownerId?: string;
@@ -196,6 +199,7 @@ export const approveImage = async (req: Request, res: Response): Promise<void> =
 };
 
 export const rejectImage = async (req: Request, res: Response): Promise<void> => {
+  if (!(await assertAdmin(req, res))) return;
   const { kind, ownerId, imageId, galleryItemId } = req.body as {
     kind?: PendingItem['kind'];
     ownerId?: string;
@@ -280,7 +284,8 @@ export const rejectImage = async (req: Request, res: Response): Promise<void> =>
 };
 
 /** Read-only: surface the breaker state for ops dashboards. */
-export const getImagePipelineHealth = async (_req: Request, res: Response): Promise<void> => {
+export const getImagePipelineHealth = async (req: Request, res: Response): Promise<void> => {
+  if (!(await assertAdmin(req, res))) return;
   res.json({
     success: true,
     data: {
