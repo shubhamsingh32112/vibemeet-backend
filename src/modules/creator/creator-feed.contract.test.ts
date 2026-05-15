@@ -87,4 +87,5 @@ test('getCreatorFeed response includes fields required by mobile CreatorModel', 
   assert.ok(block.includes('price: creator.price'));
   assert.ok(block.includes('creators: creatorsOut'));
   assert.ok(block.includes('pagination:'));
+  assert.ok(block.includes('CREATOR_FEED_CACHE_VERSION'));
 });

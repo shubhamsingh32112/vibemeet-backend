@@ -1,10 +1,8 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
 /**
- * Tracks phone numbers from deleted accounts to prevent welcome bonus abuse.
- * When a user deletes their account, we store their phone number here.
- * When they log in again with the same phone number, we check this collection
- * to prevent them from claiming the welcome bonus again.
+ * Legacy phone record for deleted accounts (identity / anti-abuse bookkeeping).
+ * New flows prefer `deleted-identity` data; this collection remains for back-compat.
  */
 export interface IDeletedUserPhone extends Document {
   phone: string; // Phone number (indexed for fast lookup)

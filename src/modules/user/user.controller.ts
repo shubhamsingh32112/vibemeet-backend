@@ -2133,6 +2133,39 @@ export const getUserTransactions = async (req: Request, res: Response): Promise<
 // CALL HISTORY
 // ══════════════════════════════════════════════════════════════════════════
 
+function callHistoryOidString(v: unknown): string {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  return String(v);
+}
+
+function callHistoryToIsoString(v: unknown): string | undefined {
+  if (v == null) return undefined;
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === 'string') return v;
+  return undefined;
+}
+
+/** Stable wire shape for mobile: string IDs and ISO date strings only. */
+function serializeCallHistoryForApi(entry: Record<string, unknown>): Record<string, unknown> {
+  const e: Record<string, unknown> = { ...entry };
+  if (e._id != null) e._id = callHistoryOidString(e._id);
+  if (e.ownerUserId != null) e.ownerUserId = callHistoryOidString(e.ownerUserId);
+  if (e.otherUserId != null) e.otherUserId = callHistoryOidString(e.otherUserId);
+  if (e.otherCreatorId != null && e.otherCreatorId !== undefined) {
+    e.otherCreatorId = callHistoryOidString(e.otherCreatorId);
+  }
+  e.createdAt = callHistoryToIsoString(e.createdAt) ?? new Date().toISOString();
+  const updatedAt = callHistoryToIsoString(e.updatedAt);
+  if (updatedAt !== undefined) e.updatedAt = updatedAt;
+  const ratedAt = callHistoryToIsoString(e.ratedAt);
+  if (ratedAt !== undefined) e.ratedAt = ratedAt;
+  if (e.otherAvatar != null && typeof e.otherAvatar !== 'string') {
+    delete e.otherAvatar;
+  }
+  return e;
+}
+
 /**
  * GET /user/call-history
  *
@@ -2228,7 +2261,7 @@ export const getCallHistory = async (req: Request, res: Response): Promise<void>
     res.json({
       success: true,
       data: {
-        calls: enrichedCalls,
+        calls: enrichedCalls.map((c) => serializeCallHistoryForApi(c as Record<string, unknown>)),
         pagination: {
           page,
           limit,

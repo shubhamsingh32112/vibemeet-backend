@@ -74,6 +74,9 @@ import {
 } from '../images/creator-image-helpers';
 import { isAgencyRole, isBdRole, isSuperAdminRole } from '../../utils/staff-roles';
 
+/** Bump when feed Redis JSON shape changes so stale entries are ignored. */
+const CREATOR_FEED_CACHE_VERSION = 2;
+
 /** Legacy root catalog removed — clients must use GET /creator/feed. */
 export const getCreatorCatalogGone = async (_req: Request, res: Response): Promise<void> => {
   res.status(410).json({
@@ -154,7 +157,11 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
       const cached = await safeRedisGet<{ v: number; creators: CreatorFeedBaseRow[]; total: number }>(
         cacheKey,
       );
-      if (cached?.creators && typeof cached.total === 'number') {
+      if (
+        cached?.creators &&
+        typeof cached.total === 'number' &&
+        cached.v === CREATOR_FEED_CACHE_VERSION
+      ) {
         cacheHit = true;
         baseRows = cached.creators;
         total = cached.total;
@@ -239,7 +246,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
 
       if (isRedisConfigured()) {
         const payload = JSON.stringify({
-          v: 1,
+          v: CREATOR_FEED_CACHE_VERSION,
           creators: baseRows,
           total,
         });

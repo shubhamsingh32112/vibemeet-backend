@@ -296,6 +296,96 @@ export function normalizeV4SessionFields(session: CallSession): void {
   session.totalWalletDeductedMicros = session.totalWalletDeductedMicros ?? 0;
 }
 
+/**
+ * When `call:started` races or retries after Redis already has the session, the first
+ * `billing:started` may have been missed (socket reconnect). Replay the same event shape
+ * from live Redis balances so clients do not sit in "billing sync" until the stuck watchdog.
+ */
+async function replayBillingStartedFromRedisSession(
+  io: Server,
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  session: CallSession,
+  source: BillingSessionStartSource
+): Promise<void> {
+  const userFirebaseUid = session.userFirebaseUid;
+  const creatorFirebaseUid = session.creatorFirebaseUid;
+
+  const [introR, walletR, legacyMerged, earningsRaw] = await Promise.all([
+    redis.get(callUserIntroMicrosKey(callId)),
+    redis.get(callUserWalletMicrosKey(callId)),
+    redis.get(callUserCoinsKey(callId)),
+    redis.get(callCreatorEarningsKey(callId)),
+  ]);
+
+  let introMicros = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
+  let walletMicros = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
+  if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
+    walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
+    introMicros = 0;
+  }
+
+  const balanceMicros = introMicros + walletMicros;
+  const pps =
+    session.billingPricePerSecondMicros ??
+    session.pricePerSecondMicros ??
+    Math.max(0, Math.round((session.pricePerSecond ?? 0) * COIN_MICROS));
+  const pricePerSecondMicros = Number(pps) || 0;
+  const remainingSeconds = pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
+
+  const earnRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
+  let earningsMicros = earnRaw;
+  if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION) {
+    earningsMicros = Math.round((earnRaw * COIN_MICROS) / 10000);
+  }
+  const creatorEpsMicros =
+    session.creatorEarningsPerSecondMicros ??
+    Math.max(0, Math.round((session.creatorEarningsPerSecond ?? 0) * COIN_MICROS));
+
+  const serverTimestamp = Date.now();
+  const introPromo = session.introPromoActive === true;
+
+  io.to(`user:${userFirebaseUid}`).emit('billing:started', {
+    callId,
+    coins: microsToWholeCoinsFloor(balanceMicros),
+    introCreditsRemainingApprox: introPromo ? microsToWholeCoinsFloor(introMicros) : 0,
+    introPromoActive: introPromo,
+    pricePerSecond: pricePerSecondMicros / COIN_MICROS,
+    pricePerSecondMicros,
+    maxSeconds: session.effectiveDurationLimitSeconds,
+    elapsedSeconds: session.elapsedSeconds ?? 0,
+    remainingSeconds,
+    serverTimestamp,
+    callStartTime: session.startTime,
+    durationLimit: session.effectiveDurationLimitSeconds,
+  });
+
+  const earningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
+
+  io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
+    callId,
+    earnings: earningsDisplay,
+    pricePerSecond: creatorEpsMicros / COIN_MICROS,
+    pricePerSecondMicros: creatorEpsMicros,
+    creatorEarningsPerSecond: creatorEpsMicros / COIN_MICROS,
+    creatorSharePercentage: session.creatorShareAtCallTime,
+    elapsedSeconds: session.elapsedSeconds ?? 0,
+    serverTimestamp,
+    callStartTime: session.startTime,
+  });
+
+  logInfo('Replayed billing:started for existing Redis session', {
+    callId,
+    source,
+    elapsedSeconds: session.elapsedSeconds,
+    remainingSeconds,
+  });
+  recordBillingMetric('session_start_idempotent_replay', 1, {
+    callIdPrefix: callId.length > 16 ? callId.slice(0, 16) : callId,
+    source,
+  });
+}
+
 function migrateSession(
   raw: Record<string, unknown>,
   coinsRaw: string | null,
@@ -477,6 +567,20 @@ export class BillingService {
         callId,
         attemptedSource: source,
       });
+      const sessionDuringLock = await redis.get(callSessionKey(callId));
+      if (sessionDuringLock) {
+        try {
+          const parsed = JSON.parse(sessionDuringLock) as CallSession;
+          normalizeV4SessionFields(parsed);
+          await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+        } catch (replayErr) {
+          logError(
+            'Failed to replay billing:started after start lock busy',
+            replayErr,
+            { callId }
+          );
+        }
+      }
       recordBillingMetric('session_start_duplicate', 1, {
         source,
         callIdPrefix,
@@ -497,7 +601,7 @@ export class BillingService {
 
     const existingSession = await redis.get(callSessionKey(callId));
     if (existingSession) {
-      logInfo('Billing session already exists (idempotent)', {
+      logInfo('Billing session already exists (idempotent) — replaying billing:started', {
         callId,
         attemptedSource: source,
       });
@@ -505,6 +609,13 @@ export class BillingService {
         source,
         callIdPrefix,
       });
+      try {
+        const parsed = JSON.parse(existingSession) as CallSession;
+        normalizeV4SessionFields(parsed);
+        await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+      } catch (replayErr) {
+        logError('Failed to replay billing:started for existing session', replayErr, { callId });
+      }
       return;
     }
 
