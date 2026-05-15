@@ -11,11 +11,9 @@ import { checkDeletedStatus } from '../user/deleted-identity.service';
 import { assertAdmin } from '../../middlewares/staff.middleware';
 import { invalidateAdminCaches } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
+import { AGENCY_ROLE_QUERY } from '../../utils/staff-roles';
 
 const BCRYPT_ROUNDS = 12;
-
-/** Legacy Mongo stored `agent`; new rows use `bd`. */
-const AGENCY_ROLE_QUERY = { role: 'agency' as const };
 
 export const createAgency = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -105,13 +103,13 @@ export const listAgencies = async (req: Request, res: Response): Promise<void> =
     const skip = (page - 1) * limit;
 
     const [agents, total] = await Promise.all([
-      User.find({ role: AGENCY_ROLE_QUERY })
+      User.find(AGENCY_ROLE_QUERY)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .select('email displayName referralCode agencyDisabled bdId createdAt')
         .lean(),
-      User.countDocuments({ role: AGENCY_ROLE_QUERY }),
+      User.countDocuments(AGENCY_ROLE_QUERY),
     ]);
 
     const ids = agents.map((a) => a._id);
@@ -171,7 +169,7 @@ export const listAgenciesBrief = async (req: Request, res: Response): Promise<vo
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const agents = await User.find({ role: AGENCY_ROLE_QUERY })
+    const agents = await User.find(AGENCY_ROLE_QUERY)
       .sort({ email: 1 })
       .select('_id email displayName')
       .lean();
@@ -197,7 +195,7 @@ export const getAgencyDetail = async (req: Request, res: Response): Promise<void
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agent = await User.findOne({ _id: id, role: AGENCY_ROLE_QUERY })
+    const agent = await User.findOne({ _id: id, ...AGENCY_ROLE_QUERY })
       .select('email displayName referralCode agencyDisabled bdId createdAt updatedAt')
       .lean();
     if (!agent) {
@@ -288,7 +286,7 @@ export const patchAgency = async (req: Request, res: Response): Promise<void> =>
     if (!(await assertAdmin(req, res))) return;
 
     const { id } = req.params;
-    const agent = await User.findOne({ _id: id, role: AGENCY_ROLE_QUERY });
+    const agent = await User.findOne({ _id: id, ...AGENCY_ROLE_QUERY });
     if (!agent) {
       res.status(404).json({ success: false, error: 'Agent not found' });
       return;
@@ -313,7 +311,7 @@ export const patchAgency = async (req: Request, res: Response): Promise<void> =>
       }
       const target = await User.findOne({
         _id: targetId,
-        role: AGENCY_ROLE_QUERY,
+        ...AGENCY_ROLE_QUERY,
         agencyDisabled: false,
       });
       if (!target) {

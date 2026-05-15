@@ -60,7 +60,7 @@ export const getBdSummary = async (req: Request, res: Response): Promise<void> =
     }
 
     const bdOid = bd._id;
-    const bdIds = await User.find({ bdId: bdOid, role: AGENCY_ROLE_QUERY }).distinct('_id');
+    const bdIds = await User.find({ bdId: bdOid, ...AGENCY_ROLE_QUERY }).distinct('_id');
     const [agencyCount, hostCount] = await Promise.all([
       Promise.resolve(bdIds.length),
       bdIds.length === 0
@@ -94,7 +94,7 @@ export const listBdAgencies = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const agencies = await User.find({ bdId: bd._id, role: AGENCY_ROLE_QUERY })
+    const agencies = await User.find({ bdId: bd._id, ...AGENCY_ROLE_QUERY })
       .sort({ createdAt: -1 })
       .select('email displayName referralCode agencyDisabled staffMustChangePassword createdAt')
       .lean();
@@ -146,7 +146,7 @@ export const getBdDashboard = async (req: Request, res: Response): Promise<void>
     const d7 = new Date(now.getTime() - 7 * 86400000);
     const d30 = new Date(now.getTime() - 30 * 86400000);
 
-    const agencies = await User.find({ bdId: bdOid, role: AGENCY_ROLE_QUERY })
+    const agencies = await User.find({ bdId: bdOid, ...AGENCY_ROLE_QUERY })
       .select('_id email displayName referralCode agencyDisabled createdAt avatar')
       .sort({ createdAt: -1 })
       .lean();

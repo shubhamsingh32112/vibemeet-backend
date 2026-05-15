@@ -61,3 +61,22 @@ test('createAgency (admin) must check deleted email status', () => {
     'expected createAgency deleted-identity check'
   );
 });
+
+test('admin-agency queries must spread AGENCY_ROLE_QUERY, not nest under role', () => {
+  const src = readFileSync(join(__dirname, 'admin-agency.controller.ts'), 'utf8');
+  assert.ok(
+    src.includes("from '../../utils/staff-roles'"),
+    'expected AGENCY_ROLE_QUERY import from staff-roles'
+  );
+  assert.ok(!src.includes('role: AGENCY_ROLE_QUERY'), 'must not use role: AGENCY_ROLE_QUERY (causes CastError)');
+  assert.ok(
+    src.includes('User.find(AGENCY_ROLE_QUERY)') || src.includes('...AGENCY_ROLE_QUERY'),
+    'expected spread or direct AGENCY_ROLE_QUERY filter'
+  );
+});
+
+test('bd-portal agency queries must spread AGENCY_ROLE_QUERY', () => {
+  const src = readFileSync(join(__dirname, '../bd/bd-portal.controller.ts'), 'utf8');
+  assert.ok(!src.includes('role: AGENCY_ROLE_QUERY'), 'must not use role: AGENCY_ROLE_QUERY');
+  assert.ok(src.includes('...AGENCY_ROLE_QUERY'), 'expected ...AGENCY_ROLE_QUERY spread in filters');
+});
