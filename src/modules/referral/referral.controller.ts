@@ -12,24 +12,38 @@ function previewHttpStatus(code: ApplyReferralCodeErrorCode): number {
 /**
  * GET /referral/preview?code= — public, rate-limited; validates code before login.
  */
+async function loadApplicantFromBearer(req: Request) {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = authHeader.slice('Bearer '.length).trim();
+  if (!token) return null;
+  try {
+    const decoded = await getFirebaseAdmin().auth().verifyIdToken(token);
+    return await User.findOne({ firebaseUid: decoded.uid });
+  } catch {
+    return null;
+  }
+}
+
 export const getReferralPreview = async (req: Request, res: Response): Promise<void> => {
   try {
     const raw = typeof req.query.code === 'string' ? req.query.code.trim() : '';
-    const mode = req.query.mode === 'late_attach' ? 'late_attach' : 'signup';
+    const modeParam = req.query.mode;
+    const mode =
+      modeParam === 'late_attach'
+        ? 'late_attach'
+        : modeParam === 'agency_host'
+          ? 'agency_host'
+          : 'signup';
     let applicant = null;
 
-    if (mode === 'late_attach') {
-      const authHeader = req.headers.authorization;
-      if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.slice('Bearer '.length).trim();
-        if (token) {
-          try {
-            const decoded = await getFirebaseAdmin().auth().verifyIdToken(token);
-            applicant = await User.findOne({ firebaseUid: decoded.uid });
-          } catch {
-            applicant = null;
-          }
-        }
+    if (mode === 'late_attach' || mode === 'agency_host') {
+      applicant = await loadApplicantFromBearer(req);
+      if (mode === 'agency_host' && !applicant) {
+        res.status(401).json({ success: false, error: 'Unauthorized' });
+        return;
       }
     }
 
@@ -44,7 +58,10 @@ export const getReferralPreview = async (req: Request, res: Response): Promise<v
     }
     res.json({
       success: true,
-      data: { code: result.code },
+      data: {
+        code: result.code,
+        ...(result.agencyDisplayName ? { agencyDisplayName: result.agencyDisplayName } : {}),
+      },
     });
   } catch (error) {
     logError('getReferralPreview failed', error instanceof Error ? error : new Error(String(error)));

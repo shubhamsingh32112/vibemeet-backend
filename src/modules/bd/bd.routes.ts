@@ -8,6 +8,8 @@ import {
   changeBdPassword,
   patchBdProfile,
   postBdStaffWithdrawalRequest,
+  listBdCreators,
+  patchBdCreatorPrice,
 } from './bd-portal.controller';
 import {
   getBdWallet,
@@ -24,6 +26,8 @@ router.get('/summary', getBdSummary);
 router.get('/dashboard', getBdDashboard);
 router.get('/agencies', listBdAgencies);
 router.post('/agencies', createBdAgency);
+router.get('/creators', listBdCreators);
+router.patch('/creators/:creatorId/price', patchBdCreatorPrice);
 router.post('/change-password', changeBdPassword);
 router.patch('/profile', patchBdProfile);
 router.get('/wallet', getBdWallet);

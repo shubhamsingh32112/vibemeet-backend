@@ -3,6 +3,7 @@ import {
   getMe,
   getReferrals,
   applyReferralPost,
+  applyReferralAgencyPost,
   updateProfile,
   getAllUsers,
   searchUsers,
@@ -29,6 +30,12 @@ const router = Router();
 router.get('/me', verifyFirebaseToken, getMe);
 router.get('/referrals', verifyFirebaseToken, getReferrals);
 router.post('/referral/apply', verifyFirebaseToken, referralApplyLimiter, applyReferralPost);
+router.post(
+  '/referral/apply-agency',
+  verifyFirebaseToken,
+  referralApplyLimiter,
+  applyReferralAgencyPost
+);
 router.get('/list', verifyFirebaseToken, getAllUsers);
 router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search users
 router.put('/profile', verifyFirebaseToken, updateProfile);

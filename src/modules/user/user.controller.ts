@@ -589,6 +589,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     const creator = await Creator.findOne({ userId: user._id });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
     const onboarding = buildOnboardingPayload(user);
+    const hasAgencyAssignment = !!(creator?.assignedAgencyId);
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -631,6 +632,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
+          hasAgencyAssignment,
         },
       });
     } else {
@@ -665,6 +667,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
               : {}),
           },
           creator: null,
+          hasAgencyAssignment: false,
         },
       });
     }
@@ -996,9 +999,72 @@ export const reconcileOnboardingPermissionsStatus = async (
 };
 
 /**
- * POST /user/referral/apply
- * One-time referral attach after signup (window + before first coin purchase).
+ * POST /user/referral/apply-agency
+ * Apply an agency host referral (logged-in users/creators without agency assignment).
  */
+export const applyReferralAgencyPost = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const raw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : '';
+    if (!raw) {
+      res.status(400).json({
+        success: false,
+        error: 'referralCode is required',
+        errorCode: 'INVALID_FORMAT',
+      });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (!user.referralCode) {
+      await assignReferralCodeToUser(user);
+    }
+
+    const ar = await applyReferralCode(user, raw, { mode: 'agency_host' });
+    if (!ar.ok) {
+      res.status(referralErrorHttpStatus(ar.code)).json({
+        success: false,
+        error: referralUserFacingMessage(ar.code),
+        errorCode: ar.code,
+      });
+      return;
+    }
+
+    const refreshed = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!refreshed) {
+      res.status(500).json({ success: false, error: 'Internal server error' });
+      return;
+    }
+
+    const appFlags = await getCreatorApplicationFlagsForUser(refreshed._id);
+
+    res.json({
+      success: true,
+      data: {
+        applied: true,
+        role: refreshed.role,
+        creatorApplicationPending: appFlags.creatorApplicationPending,
+        creatorApplicationRejected: appFlags.creatorApplicationRejected,
+        ...(appFlags.creatorApplicationRejectionReason
+          ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
+          : {}),
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] applyReferralAgencyPost error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 export const applyReferralPost = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.auth) {
@@ -1558,8 +1624,17 @@ export const completeHostProfileAfterBdApproval = async (
       return;
     }
 
-    const existingCreator = await Creator.findOne({ userId: targetUser._id });
+    const existingCreator = await Creator.findOne({ userId: targetUser._id })
+      .select('assignedAgencyId')
+      .lean();
     if (existingCreator) {
+      if (existingCreator.assignedAgencyId) {
+        res.status(409).json({
+          success: false,
+          error: 'You are already linked to an agency',
+        });
+        return;
+      }
       res.status(409).json({
         success: false,
         error: 'Creator profile already exists',

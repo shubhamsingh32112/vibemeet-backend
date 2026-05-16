@@ -895,10 +895,10 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
       const actor = await User.findOne({ firebaseUid: req.auth?.firebaseUid })
         .select('role staffCapabilities')
         .lean();
-      if (!actor || !isSuperAdminRole(actor.role)) {
+      if (!actor) {
         res.status(403).json({
           success: false,
-          error: 'Only super admin can change host per-minute price',
+          error: 'Only super admin or BD can change host per-minute price',
         });
         return;
       }
@@ -908,6 +908,34 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
           error: 'Insufficient permission to edit host pricing',
         });
         return;
+      }
+      const isAdmin = isSuperAdminRole(actor.role);
+      const isBd = isBdRole(actor.role);
+      if (!isAdmin && !isBd) {
+        res.status(403).json({
+          success: false,
+          error: 'Only super admin or BD can change host per-minute price',
+        });
+        return;
+      }
+      if (isBd) {
+        if (!creator.assignedAgencyId) {
+          res.status(403).json({
+            success: false,
+            error: 'Host is not assigned to an agency under your BD account',
+          });
+          return;
+        }
+        const agency = await User.findById(creator.assignedAgencyId)
+          .select('bdId role')
+          .lean();
+        if (!agency?.bdId?.equals(actor._id)) {
+          res.status(403).json({
+            success: false,
+            error: 'Forbidden: Host is not under your agencies',
+          });
+          return;
+        }
       }
     }
 

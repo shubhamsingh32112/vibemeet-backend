@@ -21,6 +21,10 @@ export function referralUserFacingMessage(code: ApplyReferralCodeErrorCode): str
       return 'Referral codes cannot be applied after your first coin purchase';
     case 'NOT_ELIGIBLE_ROLE':
       return 'Referral codes cannot be applied for this account type';
+    case 'AGENCY_REFERRAL_ONLY':
+      return 'This link is for joining an agency; use a valid agency referral code';
+    case 'ALREADY_LINKED_TO_AGENCY':
+      return 'You are already linked to an agency';
     default:
       return 'Unable to apply referral code';
   }

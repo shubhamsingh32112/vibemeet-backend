@@ -21,6 +21,8 @@ import {
   countOnlineCreatorsForAgency,
   countOnlineByAgencyIds,
 } from '../availability/presence-dashboard.service';
+import { validateCreatorPriceForApi } from '../../config/creator-price.config';
+import { invalidateCreatorPricingCache } from '../video/pricing.service';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -715,6 +717,131 @@ export const changeBdPassword = async (req: Request, res: Response): Promise<voi
     });
   } catch (error) {
     logError('changeBdPassword error', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Hosts under this BD's agencies — for per-minute price management. */
+export const listBdCreators = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertBd(req, res))) return;
+    const bd = await loadStaffUserByAuth(req);
+    if (!bd) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const agencies = await User.find({ bdId: bd._id, role: AGENCY_ROLE_QUERY })
+      .select('_id email displayName')
+      .lean();
+    const agencyIds = agencies.map((a) => a._id);
+    const agencyById = new Map(agencies.map((a) => [a._id.toString(), a]));
+
+    if (agencyIds.length === 0) {
+      res.json({ success: true, data: { creators: [] } });
+      return;
+    }
+
+    const creators = await Creator.find({ assignedAgencyId: { $in: agencyIds } })
+      .select('name price userId assignedAgencyId createdAt')
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    const userIds = creators.map((c) => c.userId).filter(Boolean) as mongoose.Types.ObjectId[];
+    const users = await User.find({ _id: { $in: userIds } })
+      .select('username email phone')
+      .lean();
+    const userById = new Map(users.map((u) => [u._id.toString(), u]));
+
+    res.json({
+      success: true,
+      data: {
+        creators: creators.map((c) => {
+          const agency = c.assignedAgencyId
+            ? agencyById.get(c.assignedAgencyId.toString())
+            : undefined;
+          const u = c.userId ? userById.get(c.userId.toString()) : undefined;
+          return {
+            id: c._id.toString(),
+            name: c.name,
+            price: c.price,
+            userId: c.userId?.toString() ?? null,
+            agencyId: c.assignedAgencyId?.toString() ?? null,
+            agencyLabel: agency?.displayName || agency?.email || null,
+            userLabel: u?.username || u?.email || u?.phone || null,
+          };
+        }),
+      },
+    });
+  } catch (error) {
+    logError('listBdCreators', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const patchBdCreatorPrice = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertBd(req, res))) return;
+    const bd = await loadStaffUserByAuth(req);
+    if (!bd) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const creatorId = String(req.params.creatorId ?? '').trim();
+    if (!mongoose.isValidObjectId(creatorId)) {
+      res.status(400).json({ success: false, error: 'Invalid creator id' });
+      return;
+    }
+
+    const priceRaw = req.body?.price;
+    const priceCheck = validateCreatorPriceForApi(priceRaw);
+    if (!priceCheck.ok) {
+      res.status(400).json({ success: false, error: priceCheck.error });
+      return;
+    }
+
+    const creator = await Creator.findById(creatorId).select('price assignedAgencyId').lean();
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+    if (!creator.assignedAgencyId) {
+      res.status(403).json({ success: false, error: 'Host is not under an agency' });
+      return;
+    }
+
+    const agency = await User.findById(creator.assignedAgencyId).select('bdId').lean();
+    if (!agency?.bdId?.equals(bd._id)) {
+      res.status(403).json({ success: false, error: 'Forbidden: Host is not under your agencies' });
+      return;
+    }
+
+    if (creator.price === priceCheck.price) {
+      res.json({
+        success: true,
+        data: { id: creatorId, price: creator.price },
+      });
+      return;
+    }
+
+    await Creator.updateOne({ _id: creatorId }, { $set: { price: priceCheck.price } });
+    await invalidateCreatorPricingCache(creatorId);
+    await invalidateAdminCaches('overview', 'creators_performance');
+
+    logInfo('BD updated host per-minute price', {
+      bdId: bd._id.toString(),
+      creatorId,
+      price: priceCheck.price,
+    });
+
+    res.json({
+      success: true,
+      data: { id: creatorId, price: priceCheck.price },
+    });
+  } catch (error) {
+    logError('patchBdCreatorPrice', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

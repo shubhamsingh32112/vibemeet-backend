@@ -9,6 +9,7 @@ import { checkDeletedStatus } from '../user/deleted-identity.service';
 import {
   assignReferralCodeToUser,
   applyReferralCode,
+  resolveReferralApplyModeForExistingUser,
   type ApplyReferralCodeErrorCode,
 } from '../user/referral.service';
 import { isValidReferralCodeFormat } from '../../utils/referral-code';
@@ -156,17 +157,37 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         });
 
         // Referral: assign unique code and apply referral if provided
-        await assignReferralCodeToUser(user);
+        try {
+          await assignReferralCodeToUser(user);
+        } catch (assignErr) {
+          logError('assignReferralCodeToUser failed on signup', assignErr as Error, {
+            firebaseUid,
+            userId: user._id.toString(),
+          });
+        }
         const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
         if (referralCodeRaw) {
           if (!isValidReferralCodeFormat(referralCodeRaw)) {
             referralApply = referralApplyFailure('INVALID_FORMAT');
           } else {
-            const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
-            referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
+            try {
+              const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
+              referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
+            } catch (applyErr) {
+              logError('applyReferralCode failed on signup', applyErr as Error, {
+                firebaseUid,
+                userId: user._id.toString(),
+              });
+              referralApply = referralApplyFailure('NOT_FOUND');
+            }
           }
         }
-        user = (await User.findOne({ firebaseUid }))!;
+        const reloaded = await User.findOne({ firebaseUid });
+        if (!reloaded) {
+          res.status(500).json({ success: false, error: 'User creation failed' });
+          return;
+        }
+        user = reloaded;
 
         logInfo('New user created', {
           userId: user._id.toString(),
@@ -257,7 +278,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           referralApply = referralApplyFailure('ALREADY_REFERRED');
         } else {
           if (!user.referralCode) {
-            await assignReferralCodeToUser(user);
+            try {
+              await assignReferralCodeToUser(user);
+            } catch (assignErr) {
+              logError('assignReferralCodeToUser failed on late attach', assignErr as Error, {
+                firebaseUid,
+                userId: user._id.toString(),
+              });
+            }
           }
           const working = await User.findOne({ firebaseUid });
           if (working) user = working;
@@ -265,8 +293,20 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           if (!isValidReferralCodeFormat(existingReferralRaw)) {
             referralApply = referralApplyFailure('INVALID_FORMAT');
           } else {
-            const ar = await applyReferralCode(user, existingReferralRaw, { mode: 'late_attach' });
-            referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
+            try {
+              const existingApplyMode =
+                await resolveReferralApplyModeForExistingUser(existingReferralRaw);
+              const ar = await applyReferralCode(user, existingReferralRaw, {
+                mode: existingApplyMode,
+              });
+              referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
+            } catch (applyErr) {
+              logError('applyReferralCode failed on existing-user attach', applyErr as Error, {
+                firebaseUid,
+                userId: user._id.toString(),
+              });
+              referralApply = referralApplyFailure('NOT_FOUND');
+            }
             const latest = await User.findOne({ firebaseUid });
             if (latest) user = latest;
           }
@@ -315,6 +355,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       showWelcomeBackDialog,
     });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
+    const hasAgencyAssignment = !!(creator?.assignedAgencyId);
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -357,6 +398,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
+          hasAgencyAssignment,
           ...(referralApply !== undefined ? { referralApply } : {}),
           meta: {
             showWelcomeBackDialog,
@@ -394,6 +436,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           creator: null,
           needsOnboarding,
           createdNow,
+          hasAgencyAssignment: false,
           ...(referralApply !== undefined ? { referralApply } : {}),
           meta: {
             showWelcomeBackDialog,

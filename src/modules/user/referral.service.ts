@@ -25,7 +25,24 @@ import {
   getReferralMinPurchaseInr,
   getReferralRewardCoins,
 } from './referral-config';
-import { isAgencyRole, isBdRole } from '../../utils/staff-roles';
+import { isAgencyRole, isBdRole, isBdStaffDisabled } from '../../utils/staff-roles';
+
+/**
+ * Existing-account login: agency join links use agency_host; consumer codes use late_attach.
+ */
+export async function resolveReferralApplyModeForExistingUser(
+  referralCodeRaw: string
+): Promise<'agency_host' | 'late_attach'> {
+  if (!isValidReferralCodeFormat(referralCodeRaw)) {
+    return 'late_attach';
+  }
+  const code = normalizeReferralCode(referralCodeRaw);
+  const referrer = await User.findOne({ referralCode: code }).select('role').lean();
+  if (referrer && isAgencyRole(referrer.role)) {
+    return 'agency_host';
+  }
+  return 'late_attach';
+}
 
 export {
   getReferralAttachWindowMs,
@@ -37,7 +54,7 @@ export {
 export const REFERRAL_REWARD_COINS = 60;
 export const REFERRAL_MIN_PURCHASE_INR = 100;
 
-export type ApplyReferralCodeMode = 'signup' | 'late_attach';
+export type ApplyReferralCodeMode = 'signup' | 'late_attach' | 'agency_host';
 
 export type ApplyReferralCodeErrorCode =
   | 'INVALID_FORMAT'
@@ -48,7 +65,9 @@ export type ApplyReferralCodeErrorCode =
   | 'CREATOR_CANNOT_REFER'
   | 'WINDOW_EXPIRED'
   | 'PURCHASE_ALREADY'
-  | 'NOT_ELIGIBLE_ROLE';
+  | 'NOT_ELIGIBLE_ROLE'
+  | 'AGENCY_REFERRAL_ONLY'
+  | 'ALREADY_LINKED_TO_AGENCY';
 
 export type ApplyReferralCodeResult =
   | { ok: true }
@@ -146,24 +165,81 @@ function getDisplayNameForCode(user: {
  * Generate and assign a unique referral code to a new user.
  * Call this when creating a User (login or fast-login).
  */
+async function rollbackReferralClaim(
+  applicantId: Types.ObjectId,
+  referrerId: Types.ObjectId
+): Promise<void> {
+  await User.updateOne(
+    { _id: applicantId },
+    { $unset: { referredBy: 1, hostOnboardingStatus: 1 } }
+  );
+  await User.updateOne(
+    { _id: referrerId },
+    { $pull: { referrals: { user: applicantId } } }
+  );
+}
+
 export async function assignReferralCodeToUser(user: IUser): Promise<string> {
   if (user.referralCode) return user.referralCode;
 
   const name = getDisplayNameForCode(user);
-  const code = await generateUniqueReferralCode(name, async (c) => {
-    const hit = await User.findOne({ referralCode: c });
-    return !!hit;
-  });
-
-  user.referralCode = code;
-  await user.save();
-  logDebug('Referral code assigned', { userId: user._id.toString(), referralCode: code });
-  return code;
+  const maxAttempts = 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const code = await generateUniqueReferralCode(name, async (c) => {
+      const hit = await User.findOne({ referralCode: c }).select('_id').lean();
+      return !!hit;
+    });
+    user.referralCode = code;
+    try {
+      await user.save();
+      logDebug('Referral code assigned', { userId: user._id.toString(), referralCode: code });
+      return code;
+    } catch (err) {
+      if (isDuplicateKeyError(err)) {
+        user.referralCode = undefined;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Unable to assign unique referral code after retries');
 }
 
 export type PreviewReferralCodeResult =
-  | { ok: true; code: string }
+  | { ok: true; code: string; agencyDisplayName?: string }
   | { ok: false; code: ApplyReferralCodeErrorCode };
+
+/** Label for agency host referral dialog (username, email local, or fallback). */
+export function agencyDisplayNameFromUser(user: {
+  username?: string | null;
+  email?: string | null;
+}): string {
+  if (user.username && user.username.trim().length >= 2) {
+    return user.username.trim();
+  }
+  if (user.email) {
+    const local = user.email.split('@')[0]?.trim();
+    if (local && local.length >= 2) return local;
+  }
+  return 'Agency';
+}
+
+async function applicantHasAgencyAssignment(userId: Types.ObjectId): Promise<boolean> {
+  const creator = await Creator.findOne({ userId }).select('assignedAgencyId').lean();
+  return !!(creator?.assignedAgencyId);
+}
+
+async function previewAgencyHostApplicantEligibility(
+  applicant: IUser
+): Promise<ApplyReferralCodeErrorCode | null> {
+  if (applicant.referredBy) {
+    return 'ALREADY_REFERRED';
+  }
+  if (await applicantHasAgencyAssignment(applicant._id)) {
+    return 'ALREADY_LINKED_TO_AGENCY';
+  }
+  return null;
+}
 
 type PreviewReferralOptions = {
   mode?: ApplyReferralCodeMode;
@@ -174,6 +250,9 @@ async function previewApplicantEligibility(
   applicant: IUser,
   mode: ApplyReferralCodeMode
 ): Promise<ApplyReferralCodeErrorCode | null> {
+  if (mode === 'agency_host') {
+    return previewAgencyHostApplicantEligibility(applicant);
+  }
   if (applicant.referredBy) {
     return 'ALREADY_REFERRED';
   }
@@ -227,6 +306,19 @@ export async function previewReferralCode(
   if (isAgencyRole(referrer.role) && referrer.agencyDisabled) {
     return { ok: false, code: 'AGENT_DISABLED' };
   }
+  if (isBdRole(referrer.role) && isBdStaffDisabled(referrer)) {
+    return { ok: false, code: 'AGENT_DISABLED' };
+  }
+  if (mode === 'agency_host') {
+    if (!isAgencyRole(referrer.role)) {
+      return { ok: false, code: 'AGENCY_REFERRAL_ONLY' };
+    }
+    return {
+      ok: true,
+      code,
+      agencyDisplayName: agencyDisplayNameFromUser(referrer),
+    };
+  }
   if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
@@ -252,7 +344,12 @@ export async function applyReferralCode(
     return { ok: false, code: 'INVALID_FORMAT' };
   }
 
-  if (applicant.referredBy) {
+  if (mode === 'agency_host') {
+    const agencyHostError = await previewAgencyHostApplicantEligibility(applicant);
+    if (agencyHostError) {
+      return { ok: false, code: agencyHostError };
+    }
+  } else if (applicant.referredBy) {
     return { ok: false, code: 'ALREADY_REFERRED' };
   }
 
@@ -290,6 +387,19 @@ export async function applyReferralCode(
     });
     return { ok: false, code: 'AGENT_DISABLED' };
   }
+  if (isBdRole(referrer.role) && isBdStaffDisabled(referrer)) {
+    logInfo('Referral skipped: BD account disabled', {
+      code,
+      referrerId: referrer._id.toString(),
+    });
+    return { ok: false, code: 'AGENT_DISABLED' };
+  }
+
+  if (mode === 'agency_host') {
+    if (!isAgencyRole(referrer.role)) {
+      return { ok: false, code: 'AGENCY_REFERRAL_ONLY' };
+    }
+  }
 
   // Creators cannot refer (non-staff). Agency/BD staff may refer even if they have a creator profile.
   if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
@@ -308,6 +418,7 @@ export async function applyReferralCode(
   const referredByUpdate: Record<string, unknown> = { referredBy: referrer._id };
   if (isAgencyRole(referrer.role)) {
     referredByUpdate.hostOnboardingStatus = 'pending_agency_approval';
+    referredByUpdate.hostOnboardingRejectedReason = null;
   }
 
   const claimed = await User.findOneAndUpdate(
@@ -319,7 +430,7 @@ export async function applyReferralCode(
     return { ok: false, code: 'ALREADY_REFERRED' };
   }
 
-  await User.updateOne(
+  const pushResult = await User.updateOne(
     { _id: referrer._id },
     {
       $push: {
@@ -331,6 +442,10 @@ export async function applyReferralCode(
       },
     }
   );
+  if ((pushResult.matchedCount ?? 0) === 0) {
+    await rollbackReferralClaim(applicant._id, referrer._id);
+    return { ok: false, code: 'NOT_FOUND' };
+  }
 
   try {
     await ReferralEdge.create({
@@ -340,12 +455,15 @@ export async function applyReferralCode(
       rewardGranted: false,
     });
   } catch (err) {
+    await rollbackReferralClaim(applicant._id, referrer._id);
     if (isDuplicateKeyError(err)) {
-      await User.updateOne({ _id: applicant._id }, { $unset: { referredBy: 1 } });
-      await User.updateOne({ _id: referrer._id }, { $pull: { referrals: { user: applicant._id } } });
       return { ok: false, code: 'ALREADY_REFERRED' };
     }
-    throw err;
+    logError('ReferralEdge.create failed after claim', err as Error, {
+      applicantId: applicant._id.toString(),
+      referrerId: referrer._id.toString(),
+    });
+    return { ok: false, code: 'NOT_FOUND' };
   }
 
   logInfo('Referral applied', {

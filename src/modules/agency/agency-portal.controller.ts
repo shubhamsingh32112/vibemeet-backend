@@ -1215,16 +1215,29 @@ export const postAgencyCreateCreator = async (req: Request, res: Response): Prom
       return;
     }
 
-    const existingCreator = await Creator.findOne({ userId: targetUser._id });
+    const existingCreator = await Creator.findOne({ userId: targetUser._id })
+      .select('assignedAgencyId')
+      .lean();
     if (existingCreator) {
-      res.status(409).json({ success: false, error: 'Creator profile already exists for this user' });
+      if (existingCreator.assignedAgencyId) {
+        res.status(409).json({
+          success: false,
+          error: 'User is already linked to an agency',
+        });
+        return;
+      }
+      res.status(409).json({
+        success: false,
+        error: 'Creator profile already exists for this user',
+      });
       return;
     }
 
-    if (targetUser.hostOnboardingStatus !== 'approved') {
+    const onboarding = targetUser.hostOnboardingStatus ?? 'none';
+    if (onboarding === 'rejected') {
       res.status(403).json({
         success: false,
-        error: 'Agency must approve this host before creating a creator profile',
+        error: 'This referral was rejected and cannot be promoted',
       });
       return;
     }
@@ -1250,6 +1263,9 @@ export const postAgencyCreateCreator = async (req: Request, res: Response): Prom
         const previousCoins = targetUser.coins || 0;
         targetUser.coins = 0;
         targetUser.hostOnboardingStatus = 'none';
+        if (!targetUser.agencyApprovedAt) {
+          targetUser.agencyApprovedAt = new Date();
+        }
         if (targetUser.role !== 'creator') {
           targetUser.role = 'creator';
         }
