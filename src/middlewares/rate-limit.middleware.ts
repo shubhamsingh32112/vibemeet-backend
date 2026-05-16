@@ -280,37 +280,6 @@ export const loginLimiter = createLimiter({
   },
 }, 'rl:login:');
 
-/**
- * Rate limiter for phone auth precheck endpoint.
- * Returns explicit retry_after to support client-enforced cooldown UX.
- */
-export const phonePrecheckLimiter = createLimiter({
-  windowMs: 60 * 1000, // 1 minute
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req: Request): string => {
-    const phone = typeof req.body?.phoneNumber === 'string'
-      ? req.body.phoneNumber.trim()
-      : 'unknown';
-    return `phone_precheck:${req.ip}:${phone}`;
-  },
-  handler: (req, res) => {
-    const resetTime = req.rateLimit?.resetTime instanceof Date
-      ? req.rateLimit.resetTime.getTime()
-      : Date.now() + 60 * 1000;
-    const retryAfter = Math.max(1, Math.ceil((resetTime - Date.now()) / 1000));
-    res.status(429).json({
-      success: false,
-      error: 'too_many_requests',
-      retry_after: retryAfter,
-    });
-  },
-  skip: (_req: Request): boolean => {
-    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
-  },
-}, 'rl:phone-precheck:');
-
 export const referralApplyLimiter = createLimiter(
   {
     windowMs: 15 * 60 * 1000,
