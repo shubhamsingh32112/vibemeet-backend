@@ -8,7 +8,6 @@ import {
   getAllUsers,
   searchUsers,
   promoteToCreator,
-  completeHostProfileAfterBdApproval,
   addCoins,
   advanceOnboardingStage,
   submitOnboardingPermissionsDecision,
@@ -60,6 +59,5 @@ router.post('/block-creator', verifyFirebaseToken, toggleBlockCreator); // Toggl
 router.get('/blocked-creators/count', verifyFirebaseToken, getBlockedCreatorsCount); // Get blocked creators count (user account settings)
 router.post('/delete-account', verifyFirebaseToken, deleteAccount); // Delete user account permanently
 router.post('/:id/promote-to-creator', verifyFirebaseToken, promoteToCreator); // Admin only - promote user to creator
-router.post('/host-profile/complete', verifyFirebaseToken, completeHostProfileAfterBdApproval);
 
 export default router;

@@ -23,7 +23,8 @@
     "backfill:referral-edges": "tsx src/scripts/backfill-referral-edges.ts",
     "reconcile:withdrawal-assignment": "tsx src/scripts/reconcile-unassigned-withdrawals.ts",
     "resync:stream-images": "tsx src/scripts/resync-stream-user-images.ts",
-    "check:phone-login-users": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/with-dev-env.ps1 node ./node_modules/tsx/dist/cli.mjs src/scripts/check-phone-login-users.ts"
+    "check:phone-login-users": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/with-dev-env.ps1 node ./node_modules/tsx/dist/cli.mjs src/scripts/check-phone-login-users.ts",
+    "backfill:agency-approved-creators": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/with-dev-env.ps1 tsx src/scripts/backfill-agency-approved-to-creators.ts"
   },
   "keywords": [],
   "author": "",

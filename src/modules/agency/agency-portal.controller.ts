@@ -19,6 +19,7 @@ import { getBatchAvailability } from '../availability/availability.service';
 import { countOnlineCreatorsForBd } from '../availability/presence-dashboard.service';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
+import { promoteUserToCreatorWithStarterProfile } from '../creator/creator-starter.service';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -143,7 +144,7 @@ export const rejectAgencyReferredUser = async (req: Request, res: Response): Pro
   }
 };
 
-/** Agency approves referred host — user completes profile on mobile; does not create Creator doc. */
+/** Agency approves referred host — promotes to creator with starter profile (details via app Edit Profile). */
 export const approveAgencyReferredUser = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgency(req, res))) return;
@@ -169,31 +170,26 @@ export const approveAgencyReferredUser = async (req: Request, res: Response): Pr
       return;
     }
 
-    const updated = await User.updateOne(
-      {
-        _id: targetUserId,
-        referredBy: agency._id,
-        hostOnboardingStatus: { $in: ['pending_agency_approval', 'pending_bd_approval'] },
-      },
-      {
-        $set: {
-          hostOnboardingStatus: 'approved',
-          agencyApprovedAt: new Date(),
-        },
-        $inc: { profileRevision: 1 },
-      },
-    );
-
-    if ((updated.modifiedCount ?? 0) < 1) {
-      const u = await User.findById(targetUserId).select('referredBy hostOnboardingStatus').lean();
+    const targetUser = await User.findOne({
+      _id: targetUserId,
+      referredBy: agency._id,
+    });
+    if (!targetUser) {
+      const u = await User.findById(targetUserId).select('referredBy').lean();
       if (!u) {
         res.status(404).json({ success: false, error: 'User not found' });
         return;
       }
-      if (!u.referredBy?.equals(agency._id)) {
-        res.status(403).json({ success: false, error: 'User was not referred by this agency' });
-        return;
-      }
+      res.status(403).json({ success: false, error: 'User was not referred by this agency' });
+      return;
+    }
+
+    const st = String(targetUser.hostOnboardingStatus ?? 'none');
+    const canPromote =
+      st === 'pending_agency_approval' ||
+      st === 'pending_bd_approval' ||
+      st === 'approved';
+    if (!canPromote) {
       res.status(400).json({
         success: false,
         error: 'User is not awaiting agency approval',
@@ -201,16 +197,35 @@ export const approveAgencyReferredUser = async (req: Request, res: Response): Pr
       return;
     }
 
+    const session = await mongoose.startSession();
+    let createdCreator: Awaited<ReturnType<typeof promoteUserToCreatorWithStarterProfile>>;
+    try {
+      await session.withTransaction(async () => {
+        targetUser.hostOnboardingStatus = 'none';
+        targetUser.agencyApprovedAt = new Date();
+        targetUser.profileRevision = (targetUser.profileRevision ?? 0) + 1;
+        createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
+          assignedAgencyId: agency._id,
+          session,
+        });
+      });
+    } finally {
+      await session.endSession();
+    }
+
     logInfo('agent_referral_approved', {
       agencyId: agency._id.toString(),
       targetUserId: targetUserId.toString(),
+      creatorId: createdCreator!._id.toString(),
     });
 
-    res.json({
+    res.status(201).json({
       success: true,
       data: {
         userId: targetUserId.toString(),
-        hostOnboardingStatus: 'approved',
+        creatorId: createdCreator!._id.toString(),
+        role: 'creator',
+        hostOnboardingStatus: 'none',
       },
     });
   } catch (error) {

@@ -1,13 +1,10 @@
 import type { Types } from 'mongoose';
 import { User } from '../user/user.model';
-import { Creator } from '../creator/creator.model';
-import { isAgencyRole } from '../../utils/staff-roles';
-
 export type CreatorApplicationFlags = {
   creatorApplicationPending: boolean;
   creatorApplicationRejected: boolean;
   creatorApplicationRejectionReason?: string;
-  /** Approved agency referral — user must complete host profile in the app. */
+  /** Deprecated — always false; agency approval promotes directly to creator. */
   hostProfileSetupRequired: boolean;
 };
 
@@ -18,7 +15,7 @@ export async function getCreatorApplicationFlagsForUser(
   userId: Types.ObjectId
 ): Promise<CreatorApplicationFlags> {
   const u = await User.findById(userId)
-    .select('hostOnboardingStatus hostOnboardingRejectedReason referredBy')
+    .select('hostOnboardingStatus hostOnboardingRejectedReason')
     .lean();
   if (!u) {
     return {
@@ -36,19 +33,10 @@ export async function getCreatorApplicationFlagsForUser(
   const rejected =
     st === 'rejected' || st === 'suspended' || st === 'blocked';
 
-  let hostProfileSetupRequired = false;
-  if (st === 'approved' && u.referredBy) {
-    const refUser = await User.findById(u.referredBy).select('role').lean();
-    if (refUser && isAgencyRole(refUser.role)) {
-      const existingCreator = await Creator.findOne({ userId }).select('_id').lean();
-      hostProfileSetupRequired = !existingCreator;
-    }
-  }
-
   return {
     creatorApplicationPending: pending,
     creatorApplicationRejected: rejected,
-    hostProfileSetupRequired,
+    hostProfileSetupRequired: false,
     ...(rejected && u.hostOnboardingRejectedReason
       ? { creatorApplicationRejectionReason: u.hostOnboardingRejectedReason }
       : {}),
