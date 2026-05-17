@@ -7,8 +7,6 @@ import {
   getAgencyReferredUsers,
   getAgencyCreators,
   getAgencyCreatorDetail,
-  postAgencyCreateCreator,
-  searchUsersForAgency,
   getAgencyWithdrawals,
   agencyApproveWithdrawal,
   agencyRejectWithdrawal,
@@ -39,8 +37,6 @@ router.post('/wallet/withdrawals', postAgencyWalletWithdrawal);
 router.get('/referred-users', getAgencyReferredUsers);
 router.post('/referred-users/:userId/approve', approveAgencyReferredUser);
 router.post('/referred-users/:userId/reject', rejectAgencyReferredUser);
-router.get('/search-users', searchUsersForAgency);
-router.post('/creators', postAgencyCreateCreator);
 router.get('/creators', getAgencyCreators);
 router.get('/creators/:creatorId', getAgencyCreatorDetail);
 router.get('/withdrawals', getAgencyWithdrawals);

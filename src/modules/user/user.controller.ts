@@ -628,6 +628,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           referralCode: user.referralCode ?? undefined,
           creatorApplicationPending: appFlags.creatorApplicationPending,
           creatorApplicationRejected: appFlags.creatorApplicationRejected,
+          hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
           onboarding,
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
@@ -661,6 +662,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             referralCode: user.referralCode ?? undefined,
             creatorApplicationPending: appFlags.creatorApplicationPending,
             creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
             onboarding,
             ...(appFlags.creatorApplicationRejectionReason
               ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
@@ -1054,6 +1056,7 @@ export const applyReferralAgencyPost = async (req: Request, res: Response): Prom
         role: refreshed.role,
         creatorApplicationPending: appFlags.creatorApplicationPending,
         creatorApplicationRejected: appFlags.creatorApplicationRejected,
+        hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
         ...(appFlags.creatorApplicationRejectionReason
           ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
           : {}),
@@ -1117,6 +1120,7 @@ export const applyReferralPost = async (req: Request, res: Response): Promise<vo
         role: refreshed.role,
         creatorApplicationPending: appFlags.creatorApplicationPending,
         creatorApplicationRejected: appFlags.creatorApplicationRejected,
+        hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
         ...(appFlags.creatorApplicationRejectionReason
           ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
           : {}),
@@ -1563,14 +1567,14 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
 };
 
 /**
- * POST /user/host-profile/complete — Firebase user completes creator profile after BD approval (default 60 coins/min).
+ * POST /user/host-profile/complete — Firebase user completes creator profile after agency approval (default price from config).
  */
 export const completeHostProfileAfterBdApproval = async (
   req: Request,
   res: Response
 ): Promise<void> => {
   try {
-    const { name, about, photo, categories, location } = req.body ?? {};
+    const { name, about, categories, location, avatarUploadSessionId } = req.body ?? {};
 
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -1602,10 +1606,37 @@ export const completeHostProfileAfterBdApproval = async (
       return;
     }
 
-    if (!name || !about || !photo) {
+    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 100) {
       res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, about, photo',
+        error: 'Name must be between 2 and 100 characters',
+      });
+      return;
+    }
+
+    if (typeof about !== 'string' || about.trim().length < 10 || about.trim().length > 1000) {
+      res.status(400).json({
+        success: false,
+        error: 'About must be between 10 and 1000 characters',
+      });
+      return;
+    }
+
+    const sessionId =
+      typeof avatarUploadSessionId === 'string' ? avatarUploadSessionId.trim() : '';
+    if (!sessionId) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required field: avatarUploadSessionId',
+      });
+      return;
+    }
+
+    if (!isCloudflareImagesEnabled()) {
+      res.status(503).json({
+        success: false,
+        code: 'IMAGES_DISABLED',
+        error: 'Cloudflare Images is not enabled on this deployment',
       });
       return;
     }
@@ -1643,8 +1674,53 @@ export const completeHostProfileAfterBdApproval = async (
     }
 
     const validatedPrice = getSystemDefaultHostPriceForNewHosts();
-
     const assignedAgencyId = targetUser.referredBy as mongoose.Types.ObjectId;
+    const trimmedName = name.trim();
+    const trimmedAbout = about.trim();
+
+    let avatarAsset;
+    try {
+      const committed = await commitImageAsset({
+        sessionId,
+        userId: targetUser._id.toString(),
+        userObjectId: targetUser._id,
+        purpose: 'creator-avatar',
+        quotaScope: 'avatar',
+        blurhashTarget: {
+          kind: 'user-avatar',
+          userId: targetUser._id.toString(),
+        },
+      });
+      avatarAsset = committed.asset;
+    } catch (commitError) {
+      if (commitError instanceof CommitImageAssetError) {
+        res.status(commitError.status).json({
+          success: false,
+          code: commitError.code,
+          error: commitError.message,
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesCircuitOpenError) {
+        setDegradedHeader(res);
+        res.status(503).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+          error: 'image service is temporarily unavailable; please retry',
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesError) {
+        logError('host-profile complete: Cloudflare Images error on avatar commit', commitError);
+        res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_ERROR',
+          error: safeCloudflareImagesClientError(commitError.status),
+        });
+        return;
+      }
+      throw commitError;
+    }
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1654,6 +1730,10 @@ export const completeHostProfileAfterBdApproval = async (
       const previousCoins = targetUser.coins || 0;
       targetUser.coins = 0;
       targetUser.hostOnboardingStatus = 'none';
+      if (targetUser.avatar) {
+        targetUser.previousAvatar = targetUser.avatar;
+      }
+      targetUser.avatar = avatarAsset;
 
       if (previousCoins > 0) {
         console.log(
@@ -1667,9 +1747,9 @@ export const completeHostProfileAfterBdApproval = async (
       const creator = await Creator.create(
         [
           {
-            name,
-            about,
-            photo,
+            name: trimmedName,
+            about: trimmedAbout,
+            avatar: avatarAsset,
             userId: targetUser._id,
             ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
             categories: Array.isArray(categories) ? categories : [],

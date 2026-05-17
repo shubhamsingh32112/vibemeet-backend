@@ -115,9 +115,12 @@ export const listAgencies = async (req: Request, res: Response): Promise<void> =
     const ids = agents.map((a) => a._id);
     const [awaitingCounts, creatorCounts, pendingWithdrawals] = await Promise.all([
       User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
-        { $match: { referredBy: { $in: ids } } },
-        { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
-        { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
+        {
+          $match: {
+            referredBy: { $in: ids },
+            hostOnboardingStatus: { $in: ['pending_agency_approval', 'pending_bd_approval'] },
+          },
+        },
         { $group: { _id: '$referredBy', c: { $sum: 1 } } },
       ]),
       Creator.aggregate([
@@ -150,7 +153,7 @@ export const listAgencies = async (req: Request, res: Response): Promise<void> =
           agencyDisabled: a.agencyDisabled ?? false,
           bdId: (a as { bdId?: mongoose.Types.ObjectId }).bdId?.toString() ?? null,
           createdAt: a.createdAt,
-          /** Referred users not yet promoted to creator (legacy field name). */
+          /** Referred users pending agency approval. */
           pendingApplications: pendingMap.get(a._id.toString()) ?? 0,
           activeCreators: creatorMap.get(a._id.toString()) ?? 0,
           pendingWithdrawals: wdMap.get(a._id.toString()) ?? 0,
@@ -205,21 +208,14 @@ export const getAgencyDetail = async (req: Request, res: Response): Promise<void
 
     const agentOid = new mongoose.Types.ObjectId(id);
 
-    const awaitingRaw = await User.aggregate<{
-      _id: mongoose.Types.ObjectId;
-      email?: string;
-      phone?: string;
-      username?: string;
-      firebaseUid?: string;
-      createdAt: Date;
-    }>([
-      { $match: { referredBy: agentOid } },
-      { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
-      { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
-      { $sort: { createdAt: -1 } },
-      { $limit: 200 },
-      { $project: { email: 1, phone: 1, username: 1, firebaseUid: 1, createdAt: 1 } },
-    ]);
+    const awaitingRaw = await User.find({
+      referredBy: agentOid,
+      hostOnboardingStatus: { $in: ['pending_agency_approval', 'pending_bd_approval'] },
+    })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .select('email phone username firebaseUid createdAt')
+      .lean();
 
     const awaitingIds = awaitingRaw.map((u) => u._id);
     const edges = await ReferralEdge.find({ referredUserId: { $in: awaitingIds } })

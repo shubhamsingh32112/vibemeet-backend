@@ -395,6 +395,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           profileRevision: user.profileRevision ?? 0,
           creatorApplicationPending: appFlags.creatorApplicationPending,
           creatorApplicationRejected: appFlags.creatorApplicationRejected,
+          hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
           ...(appFlags.creatorApplicationRejectionReason
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
@@ -428,6 +429,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             profileRevision: user.profileRevision ?? 0,
             creatorApplicationPending: appFlags.creatorApplicationPending,
             creatorApplicationRejected: appFlags.creatorApplicationRejected,
+            hostProfileSetupRequired: appFlags.hostProfileSetupRequired,
             onboarding: onboardingState,
             ...(appFlags.creatorApplicationRejectionReason
               ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }

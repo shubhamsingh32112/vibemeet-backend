@@ -12,23 +12,12 @@ import {
   processWithdrawalRejection,
   processWithdrawalMarkPaid,
 } from '../creator/withdrawal-processing.service';
-import { invalidateAdminCaches } from '../../config/redis';
 import { CallHistory } from '../billing/call-history.model';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
 import { countOnlineCreatorsForBd } from '../availability/presence-dashboard.service';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
-import { notifyCreatorProfileChannels } from '../creator/creator.controller';
-import { getCachedCreatorUserObjectIds } from './creator-user-ids-cache';
-import { buildSafeMongoSubstringRegex } from '../../utils/mongo-regex';
-import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.config';
-import { isDashboardStaffRole } from '../../utils/staff-roles';
-import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
-import {
-  ensureCreatorPromotionBonusReversalEntry,
-  promoteUserToCreatorWithStarterProfile,
-} from '../creator/creator-starter.service';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 
 const BCRYPT_ROUNDS = 12;
@@ -154,7 +143,7 @@ export const rejectAgencyReferredUser = async (req: Request, res: Response): Pro
   }
 };
 
-/** Agency approves referred host onboarding — host may then be promoted or complete profile on mobile. */
+/** Agency approves referred host — user completes profile on mobile; does not create Creator doc. */
 export const approveAgencyReferredUser = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAgency(req, res))) return;
@@ -378,17 +367,14 @@ async function sumHostsRevenueCoins(
   return agg[0]?.total ?? 0;
 }
 
-/** Users referred by this agency who do not yet have a Creator profile. */
-async function countReferredUsersAwaitingPromotion(
+/** Referred users awaiting agency approval (pending only). */
+async function countReferredUsersPendingApproval(
   agencyId: mongoose.Types.ObjectId
 ): Promise<number> {
-  const agg = await User.aggregate<{ n?: number }>([
-    { $match: { referredBy: agencyId } },
-    { $lookup: { from: 'creators', localField: '_id', foreignField: 'userId', as: 'cr' } },
-    { $match: { $expr: { $eq: [{ $size: '$cr' }, 0] } } },
-    { $count: 'n' },
-  ]);
-  return agg[0]?.n ?? 0;
+  return User.countDocuments({
+    referredBy: agencyId,
+    hostOnboardingStatus: { $in: ['pending_agency_approval', 'pending_bd_approval'] },
+  });
 }
 
 export const getAgencyDashboardSummary = async (req: Request, res: Response): Promise<void> => {
@@ -400,8 +386,8 @@ export const getAgencyDashboardSummary = async (req: Request, res: Response): Pr
       return;
     }
 
-    const [referredUsersAwaitingPromotion, pendingWd, creatorRows] = await Promise.all([
-      countReferredUsersAwaitingPromotion(agency._id),
+    const [referredUsersPendingApproval, pendingWd, creatorRows] = await Promise.all([
+      countReferredUsersPendingApproval(agency._id),
       Withdrawal.countDocuments({ assignedAgencyId: agency._id, status: 'pending' }),
       Creator.find({ assignedAgencyId: agency._id }).select('userId').lean(),
     ]);
@@ -442,9 +428,11 @@ export const getAgencyDashboardSummary = async (req: Request, res: Response): Pr
     res.json({
       success: true,
       data: {
-        referredUsersAwaitingPromotion,
-        /** @deprecated Use referredUsersAwaitingPromotion — same value, kept for older clients */
-        pendingApplications: referredUsersAwaitingPromotion,
+        referredUsersPendingApproval,
+        /** @deprecated Use referredUsersPendingApproval */
+        referredUsersAwaitingPromotion: referredUsersPendingApproval,
+        /** @deprecated Use referredUsersPendingApproval */
+        pendingApplications: referredUsersPendingApproval,
         pendingWithdrawals: pendingWd,
         activeCreators: totalCreators,
         totalCreators,
@@ -1156,256 +1144,6 @@ export const getAgencyCreatorDetail = async (req: Request, res: Response): Promi
   }
 };
 
-/** Manual add creator — same economics as admin promote (coins cleared); assigns to calling agency. */
-export const postAgencyCreateCreator = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const { userId, name, about, photo, categories, age, location } = req.body ?? {};
-
-    if (!userId) {
-      res.status(400).json({
-        success: false,
-        error: 'Missing required field: userId',
-      });
-      return;
-    }
-
-    const hasLegacyProfile =
-      typeof name === 'string' &&
-      name.trim().length >= 2 &&
-      typeof about === 'string' &&
-      about.trim().length >= 10 &&
-      typeof photo === 'string' &&
-      photo.trim().length > 0;
-
-    if (hasLegacyProfile) {
-      if (
-        categories !== undefined &&
-        (!Array.isArray(categories) || categories.some((c: unknown) => typeof c !== 'string'))
-      ) {
-        res.status(400).json({ success: false, error: 'Categories must be an array of strings' });
-        return;
-      }
-
-      if (age !== undefined && (typeof age !== 'number' || age < 18 || age > 100)) {
-        res.status(400).json({ success: false, error: 'Age must be a number between 18 and 100' });
-        return;
-      }
-    }
-
-    const targetUser = await User.findById(userId);
-    if (!targetUser) {
-      res.status(404).json({ success: false, error: 'User not found' });
-      return;
-    }
-
-    if (!targetUser.referredBy?.equals(agency._id)) {
-      res.status(403).json({ success: false, error: 'User was not referred by this agency' });
-      return;
-    }
-
-    if (isDashboardStaffRole(targetUser.role)) {
-      res.status(400).json({ success: false, error: 'Invalid user for creator profile' });
-      return;
-    }
-
-    const existingCreator = await Creator.findOne({ userId: targetUser._id })
-      .select('assignedAgencyId')
-      .lean();
-    if (existingCreator) {
-      if (existingCreator.assignedAgencyId) {
-        res.status(409).json({
-          success: false,
-          error: 'User is already linked to an agency',
-        });
-        return;
-      }
-      res.status(409).json({
-        success: false,
-        error: 'Creator profile already exists for this user',
-      });
-      return;
-    }
-
-    const onboarding = targetUser.hostOnboardingStatus ?? 'none';
-    if (onboarding === 'rejected') {
-      res.status(403).json({
-        success: false,
-        error: 'This referral was rejected and cannot be promoted',
-      });
-      return;
-    }
-
-    const validatedPrice = getSystemDefaultHostPriceForNewHosts();
-
-    let legacyLoc: { ok: true; value?: string } | undefined;
-    if (hasLegacyProfile) {
-      const locParsed = parseCreatorLocationForCreate(location);
-      if (!locParsed.ok) {
-        res.status(400).json({ success: false, error: locParsed.error });
-        return;
-      }
-      legacyLoc = locParsed;
-    }
-
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    try {
-      let createdCreator;
-
-      if (hasLegacyProfile) {
-        const previousCoins = targetUser.coins || 0;
-        targetUser.coins = 0;
-        targetUser.hostOnboardingStatus = 'none';
-        if (!targetUser.agencyApprovedAt) {
-          targetUser.agencyApprovedAt = new Date();
-        }
-        if (targetUser.role !== 'creator') {
-          targetUser.role = 'creator';
-        }
-        await targetUser.save({ session });
-        await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
-
-        if (previousCoins > 0) {
-          logInfo('agency manual creator: cleared coins', {
-            userId: targetUser._id.toString(),
-            previousCoins,
-          });
-        }
-
-        const createdArr = await Creator.create(
-          [
-            {
-              name,
-              about,
-              photo: typeof photo === 'string' ? photo.trim() : String(photo),
-              galleryImages: [],
-              userId: targetUser._id,
-              ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
-              categories: Array.isArray(categories) ? categories : [],
-              price: validatedPrice,
-              age: age !== undefined ? age : undefined,
-              assignedAgencyId: agency._id,
-              ...(legacyLoc && legacyLoc.value !== undefined ? { location: legacyLoc.value } : {}),
-            },
-          ],
-          { session },
-        );
-
-        createdCreator = createdArr[0];
-      } else {
-        targetUser.hostOnboardingStatus = 'none';
-        createdCreator = await promoteUserToCreatorWithStarterProfile(targetUser, {
-          assignedAgencyId: agency._id,
-          session,
-        });
-      }
-
-      await session.commitTransaction();
-
-      if (targetUser.firebaseUid) {
-        await notifyCreatorProfileChannels(targetUser._id, targetUser.firebaseUid);
-      }
-      await invalidateAdminCaches('overview', 'creators_performance', 'users_analytics');
-
-      logInfo('agency created creator manually', {
-        agencyId: agency._id.toString(),
-        creatorId: createdCreator._id.toString(),
-        userId: targetUser._id.toString(),
-        starterProfile: !hasLegacyProfile,
-      });
-
-      res.status(201).json({
-        success: true,
-        data: {
-          creator: {
-            id: createdCreator._id.toString(),
-            userId: createdCreator.userId.toString(),
-            name: createdCreator.name,
-            about: createdCreator.about,
-            categories: createdCreator.categories,
-            price: createdCreator.price,
-            age: createdCreator.age,
-            location: createdCreator.location,
-            createdAt: createdCreator.createdAt,
-            updatedAt: createdCreator.updatedAt,
-          },
-        },
-      });
-    } catch (e) {
-      await session.abortTransaction();
-      throw e;
-    } finally {
-      session.endSession();
-    }
-  } catch (error) {
-    logError('postAgencyCreateCreator', error as Error);
-    if (error instanceof Error && error.name === 'ValidationError') {
-      res.status(400).json({ success: false, error: error.message });
-      return;
-    }
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-/** Pick referred users without a creator profile (for manual add). */
-export const searchUsersForAgency = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    const limit = Math.min(30, Math.max(1, parseInt(req.query.limit as string, 10) || 30));
-
-    const excludeIds = await getCachedCreatorUserObjectIds();
-
-    const filter: Record<string, unknown> = {
-      _id: { $nin: excludeIds },
-      role: { $nin: ['admin', 'super_admin', 'agency', 'bd'] },
-      referredBy: agency._id,
-    };
-
-    if (q.length > 0) {
-      const searchRegex = buildSafeMongoSubstringRegex(q);
-      filter.$or = [{ username: searchRegex }, { email: searchRegex }, { phone: searchRegex }];
-    }
-
-    const users = await User.find(filter)
-      .select('username email phone role avatar createdAt')
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .lean();
-
-    res.json({
-      success: true,
-      data: {
-        users: users.map((u) => ({
-          id: u._id.toString(),
-          username: u.username,
-          email: u.email,
-          phone: u.phone,
-          role: u.role,
-          avatar: u.avatar,
-          createdAt: u.createdAt,
-          isCreator: false,
-        })),
-      },
-    });
-  } catch (error) {
-    logError('searchUsersForAgency', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
 
 export const getAgencyWithdrawals = async (req: Request, res: Response): Promise<void> => {
   try {
