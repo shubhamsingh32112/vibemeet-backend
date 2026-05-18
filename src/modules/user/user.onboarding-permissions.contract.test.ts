@@ -22,6 +22,9 @@ test('onboarding stage handler uses transition service and strict invalid code',
   assert.ok(src.includes('INVALID_ONBOARDING_TRANSITION'));
   assert.ok(src.includes('status(409)'));
   assert.ok(src.includes("req.headers['x-idempotency-key']"));
+  assert.ok(src.includes("req.headers['x-client-mutation-id']"));
+  assert.ok(src.includes("req.headers['x-onboarding-flow-version']"));
+  assert.ok(src.includes('invalidTransition && !transition.ignored'));
   assert.ok(src.includes('invalid_transition_rate'));
   assert.ok(src.includes('atomic_conflict_replay_rate'));
 });

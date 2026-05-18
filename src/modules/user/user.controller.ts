@@ -93,9 +93,11 @@ function buildOnboardingPayload(user: {
   cameraMicPermissionStatus?: PermissionStatus;
   notificationPermissionStatus?: PermissionStatus;
   permissionsLastCheckedAt?: Date | null;
+  onboardingFlowVersion?: number | null;
 }) {
   return {
     stage: stageForClient(user.onboardingStage),
+    flowVersion: user.onboardingFlowVersion === 2 ? 2 : 1,
     welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
     bonusSeenAt: user.onboardingBonusSeenAt ?? null,
     permissionSeenAt: user.onboardingPermissionSeenAt ?? null,
@@ -106,6 +108,38 @@ function buildOnboardingPayload(user: {
     notificationStatus: user.notificationPermissionStatus ?? 'unknown',
     permissionsLastCheckedAt: user.permissionsLastCheckedAt ?? null,
   };
+}
+
+function parseOnboardingFlowVersionHeader(req: Request): number | null {
+  const raw =
+    typeof req.headers['x-onboarding-flow-version'] === 'string'
+      ? req.headers['x-onboarding-flow-version'].trim()
+      : '';
+  if (raw === '2') return 2;
+  if (raw === '1') return 1;
+  return null;
+}
+
+function parseClientMutationId(req: Request): string | undefined {
+  const header =
+    typeof req.headers['x-client-mutation-id'] === 'string'
+      ? req.headers['x-client-mutation-id'].trim()
+      : '';
+  const body =
+    typeof req.body?.clientMutationId === 'string' ? req.body.clientMutationId.trim() : '';
+  const value = header || body;
+  if (value.length === 0 || value.length > 160) return undefined;
+  return value;
+}
+
+function parseClientAppVersion(req: Request): string | undefined {
+  const raw =
+    typeof req.headers['x-app-version'] === 'string'
+      ? req.headers['x-app-version'].trim()
+      : typeof req.headers['x-client-version'] === 'string'
+        ? req.headers['x-client-version'].trim()
+        : '';
+  return raw.length > 0 ? raw : undefined;
 }
 
 export const getFavoriteCreators = async (req: Request, res: Response): Promise<void> => {
@@ -783,6 +817,9 @@ export const advanceOnboardingStage = async (req: Request, res: Response): Promi
         typeof req.headers['x-idempotency-key'] === 'string'
           ? req.headers['x-idempotency-key']
           : undefined,
+      clientMutationId: parseClientMutationId(req),
+      requestFlowVersion: parseOnboardingFlowVersionHeader(req),
+      clientAppVersion: parseClientAppVersion(req),
     });
     const onboardingSessionId =
       typeof req.headers['x-onboarding-session-id'] === 'string'
@@ -891,12 +928,20 @@ export const submitOnboardingPermissionsDecision = async (
       requestId,
       cameraMicStatus,
       notificationStatus,
+      clientMutationId: parseClientMutationId(req),
+      requestFlowVersion: parseOnboardingFlowVersionHeader(req),
+      clientAppVersion: parseClientAppVersion(req),
     });
     const onboardingSessionId =
       typeof req.headers['x-onboarding-session-id'] === 'string'
         ? req.headers['x-onboarding-session-id']
         : undefined;
-    if (transition.invalidTransition) {
+    if (transition.rolloutFastForward) {
+      console.log(
+        `📊 [ONBOARDING METRIC] rollout_fast_forward_used userId=${transition.user._id.toString()} sessionId=${onboardingSessionId ?? 'none'}`
+      );
+    }
+    if (transition.invalidTransition && !transition.ignored) {
       res.status(409).json({
         success: false,
         error: 'Invalid onboarding transition',

@@ -44,6 +44,10 @@ export interface IUser extends Document {
   permissionsLastCheckedAt?: Date | null;
   lastPermissionsDecisionRequestId?: string | null;
   lastOnboardingStageIdempotencyKey?: string | null;
+  /** Latest onboarding mutation id (stage or permissions) for cross-endpoint dedup. */
+  lastOnboardingTransitionRequestId?: string | null;
+  /** 1 = legacy welcome→bonus→permissions→completed; 2 = strict welcome→permissions→completed. */
+  onboardingFlowVersion?: 1 | 2;
   permissionOnboardingStatus?: 'accepted' | 'skipped' | 'unknown';
   role:
     | 'user'
@@ -242,6 +246,17 @@ const userSchema = new Schema<IUser>(
       default: null,
       trim: true,
       maxlength: 160,
+    },
+    lastOnboardingTransitionRequestId: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 160,
+    },
+    onboardingFlowVersion: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
     },
     permissionOnboardingStatus: {
       type: String,

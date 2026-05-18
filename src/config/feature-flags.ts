@@ -19,5 +19,9 @@ export const featureFlags = {
    * - hard-enforce: reject invalid transitions (HTTP 409)
    */
   onboardingStrictMode: process.env.ONBOARDING_STRICT_MODE ?? 'log-only',
+  /** ISO date; after this, rollout fast-forward (welcome/bonus→completed) is disabled. */
+  onboardingFastForwardUntil: process.env.ONBOARDING_FAST_FORWARD_UNTIL ?? '',
+  /** First mobile semver that sends strict v2 onboarding (legacy clients below may use rollout fast-forward). */
+  onboardingMinFixedClientVersion: process.env.MIN_FIXED_CLIENT_VERSION ?? '',
 };
 

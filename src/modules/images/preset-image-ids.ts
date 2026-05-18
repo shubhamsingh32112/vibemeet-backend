@@ -31,7 +31,10 @@ const EMPTY_MANIFEST: PresetManifest = { male: {}, female: {}, default: '' };
 let cached: PresetManifest | null = null;
 
 function manifestPath(): string {
-  return path.resolve(__dirname, '..', '..', 'data', 'preset-image-ids.json');
+  const distPath = path.resolve(__dirname, '..', '..', 'data', 'preset-image-ids.json');
+  if (fs.existsSync(distPath)) return distPath;
+  const srcPath = path.resolve(__dirname, '..', '..', '..', 'src', 'data', 'preset-image-ids.json');
+  return fs.existsSync(srcPath) ? srcPath : distPath;
 }
 
 function load(): PresetManifest {

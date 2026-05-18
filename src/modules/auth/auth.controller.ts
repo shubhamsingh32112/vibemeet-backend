@@ -153,6 +153,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           permissionsLastCheckedAt: null,
           lastPermissionsDecisionRequestId: null,
           lastOnboardingStageIdempotencyKey: null,
+          lastOnboardingTransitionRequestId: null,
+          onboardingFlowVersion: 2,
           permissionOnboardingStatus: 'unknown',
         });
 
@@ -245,6 +247,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           user.lastOnboardingStageIdempotencyKey = null;
           profileBackfilled = true;
         }
+        if (typeof user.lastOnboardingTransitionRequestId === 'undefined') {
+          user.lastOnboardingTransitionRequestId = null;
+          profileBackfilled = true;
+        }
+        if (typeof user.onboardingFlowVersion === 'undefined') {
+          user.onboardingFlowVersion = 1;
+          profileBackfilled = true;
+        }
         if (!user.permissionOnboardingStatus) {
           user.permissionOnboardingStatus = 'unknown';
           profileBackfilled = true;
@@ -329,6 +339,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const needsOnboarding = (user.categories ?? []).length === 0;
     const onboardingState = {
       stage: user.onboardingStage === 'permissions' ? 'permission' : (user.onboardingStage ?? 'welcome'),
+      flowVersion: user.onboardingFlowVersion === 2 ? 2 : 1,
       welcomeSeenAt: user.onboardingWelcomeSeenAt ?? null,
       bonusSeenAt: user.onboardingBonusSeenAt ?? null,
       permissionSeenAt: user.onboardingPermissionSeenAt ?? null,

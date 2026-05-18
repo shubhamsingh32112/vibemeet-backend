@@ -658,13 +658,27 @@ app.get('/ready', async (_req, res) => {
 app.use('/api/v1', routes);
 
 // 404 handler
+const QUIET_404_PATHS = new Set([
+  '/',
+  '/favicon.ico',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/.well-known/security.txt',
+]);
+
 app.use((req, res) => {
-  logWarning('Route not found', {
-    method: req.method,
-    path: req.path,
-    fullUrl: `${req.protocol}://${req.get('host') ?? 'unknown-host'}${req.originalUrl}`,
-    ip: req.ip,
-  });
+  const quietProbe =
+    QUIET_404_PATHS.has(req.path) ||
+    req.path.startsWith('/.well-known/') ||
+    req.path.startsWith('/api/v1') === false && req.method === 'GET' && req.path.endsWith('.php');
+  if (!quietProbe) {
+    logWarning('Route not found', {
+      method: req.method,
+      path: req.path,
+      fullUrl: `${req.protocol}://${req.get('host') ?? 'unknown-host'}${req.originalUrl}`,
+      ip: req.ip,
+    });
+  }
   res.status(404).json({
     success: false,
     error: 'Route not found',

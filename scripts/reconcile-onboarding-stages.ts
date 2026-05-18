@@ -13,7 +13,8 @@ const BATCH_SIZE = 500;
 function normalizeStage(stage?: string | null): 'welcome' | 'bonus' | 'permissions' | 'completed' {
   if (stage === 'completed') return 'completed';
   if (stage === 'permission' || stage === 'permissions') return 'permissions';
-  if (stage === 'bonus') return 'bonus';
+  // v2: legacy bonus stage maps to permissions
+  if (stage === 'bonus') return 'permissions';
   return 'welcome';
 }
 
@@ -74,12 +75,17 @@ async function main(): Promise<void> {
   await mongoose.connect(uri);
   console.log(`[RECONCILE] connected dryRun=${dryRun}`);
 
-  const cursor = User.find({}, '_id onboardingStage onboardingWelcomeSeenAt onboardingBonusSeenAt onboardingPermissionSeenAt onboardingCompletedAt')
+  const cursor = User.find(
+    {},
+    '_id onboardingStage onboardingFlowVersion onboardingWelcomeSeenAt onboardingBonusSeenAt onboardingPermissionSeenAt onboardingCompletedAt'
+  )
     .lean()
     .cursor();
 
   let scanned = 0;
   let stageNormalized = 0;
+  let bonusToPermissions = 0;
+  let flowVersionUpgraded = 0;
   let timestampsReconciled = 0;
   let chronologyClamped = 0;
   const sampleFixes: string[] = [];
@@ -87,27 +93,32 @@ async function main(): Promise<void> {
 
   for await (const user of cursor) {
     scanned += 1;
-    const normalizedStage = normalizeStage(user.onboardingStage);
+    const rawStage = user.onboardingStage ?? null;
+    const normalizedStage = normalizeStage(rawStage);
     const reconciled = reconcileTimestamps(user);
     const { orderCorrections, ...reconciledTimestamps } = reconciled;
-    const stageChanged = normalizedStage !== normalizeStage(user.onboardingStage ?? null) || user.onboardingStage === 'permission';
+    const stageChanged =
+      normalizedStage !== normalizeStage(rawStage) || rawStage === 'permission';
+    const needsFlowV2 = user.onboardingFlowVersion !== 2;
     const timestampChanged =
-      String(user.onboardingWelcomeSeenAt ?? null) !== String(reconciled.onboardingWelcomeSeenAt) ||
+      String(user.onboardingWelcomeSeenAt ?? null) !==
+        String(reconciled.onboardingWelcomeSeenAt) ||
       String(user.onboardingBonusSeenAt ?? null) !== String(reconciled.onboardingBonusSeenAt) ||
-      String(user.onboardingPermissionSeenAt ?? null) !== String(reconciled.onboardingPermissionSeenAt);
+      String(user.onboardingPermissionSeenAt ?? null) !==
+        String(reconciled.onboardingPermissionSeenAt);
 
-    if (!stageChanged && !timestampChanged) {
+    if (!stageChanged && !timestampChanged && !needsFlowV2) {
       continue;
     }
 
     if (stageChanged) stageNormalized += 1;
+    if (rawStage === 'bonus' && normalizedStage === 'permissions') bonusToPermissions += 1;
+    if (needsFlowV2) flowVersionUpgraded += 1;
     if (timestampChanged) timestampsReconciled += 1;
     if (orderCorrections > 0) {
       chronologyClamped += orderCorrections;
       if (sampleFixes.length < 10) {
-        sampleFixes.push(
-          `${String(user._id).slice(-6)}: corrections=${orderCorrections}`
-        );
+        sampleFixes.push(`${String(user._id).slice(-6)}: corrections=${orderCorrections}`);
       }
     }
 
@@ -117,6 +128,7 @@ async function main(): Promise<void> {
         update: {
           $set: {
             onboardingStage: normalizedStage,
+            onboardingFlowVersion: 2,
             ...reconciledTimestamps,
           },
         },
@@ -136,7 +148,7 @@ async function main(): Promise<void> {
   }
 
   console.log(
-    `[RECONCILE] scanned=${scanned} stageNormalized=${stageNormalized} timestampsReconciled=${timestampsReconciled} chronologyClamped=${chronologyClamped} dryRun=${dryRun}`
+    `[RECONCILE] scanned=${scanned} stageNormalized=${stageNormalized} bonusToPermissions=${bonusToPermissions} flowVersionUpgraded=${flowVersionUpgraded} timestampsReconciled=${timestampsReconciled} chronologyClamped=${chronologyClamped} dryRun=${dryRun}`
   );
   if (sampleFixes.length > 0) {
     console.log(`[RECONCILE] sampleFixes=${sampleFixes.join(', ')}`);
