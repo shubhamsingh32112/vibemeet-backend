@@ -144,7 +144,7 @@ function formatDurationLabel(totalSeconds: number): string {
   return `${hours} hour${hours === 1 ? '' : 's'} ${remainingMins} minute${remainingMins === 1 ? '' : 's'}`;
 }
 
-async function removeCallFromBilling(callId: string): Promise<void> {
+export async function removeCallFromBilling(callId: string): Promise<void> {
   const redis = getRedis();
   await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
   logDebug('Removed call from active billing', { callId });
@@ -169,7 +169,7 @@ function callpairKey(uid1: string, uid2: string): string {
 }
 
 /** Remove live billing keys only after Mongo commit (or idempotent cleanup). */
-async function deleteBillingSessionRedisKeys(
+export async function deleteBillingSessionRedisKeys(
   redis: ReturnType<typeof getRedis>,
   callId: string,
   userFirebaseUid: string,
@@ -190,43 +190,72 @@ async function deleteBillingSessionRedisKeys(
   ]);
 }
 
-export async function settleCall(io: Server, callId: string): Promise<void> {
+export interface SettleCallFromFinalizerOptions {
+  _fromFinalizer: true;
+  lockToken: string;
+  settleLockRedisKey: string;
+}
+
+export interface SettlePersistResult {
+  totalDeducted: number;
+  totalEarnedCreator: number;
+  durationSeconds: number;
+  userFirebaseUid: string;
+  creatorFirebaseUid: string;
+  userMongoId: string;
+}
+
+/**
+ * Financial persistence for a billed call. When invoked by finalizeCallSession, orchestration
+ * (flush, locks, ZSET removal, Redis cleanup) is handled by the finalizer.
+ */
+export async function settleCall(
+  io: Server,
+  callId: string,
+  opts?: SettleCallFromFinalizerOptions
+): Promise<SettlePersistResult | void> {
+  const fromFinalizer = opts?._fromFinalizer === true;
   const redis = getRedis();
   const settleStartedAt = Date.now();
 
   const settledKey = settledCallKey(callId);
-  if (await redis.get(settledKey)) {
-    logWarning('Call already settled (Redis) — skipping', { callId });
-    return;
+  if (!fromFinalizer) {
+    if (await redis.get(settledKey)) {
+      logWarning('Call already settled (Redis) — skipping', { callId });
+      return;
+    }
+
+    await billingService.flushBillingToQuiescence(io, callId);
+    const flushMarkerRaw = await redis.get(finalFlushMarkerKey(callId));
+    if (!flushMarkerRaw) {
+      recordBillingMetric('settlement_final_flush_marker_missing', 1, { callId });
+      logWarning('Settlement proceeding without final flush marker', { callId });
+    } else {
+      recordBillingMetric('settlement_final_flush_marker_present', 1, { callId });
+    }
+
+    if (await redis.get(settledKey)) {
+      logWarning('Call already settled (Redis) — skipping', { callId });
+      return;
+    }
   }
 
-  await billingService.flushBillingToQuiescence(io, callId);
-  const flushMarkerRaw = await redis.get(finalFlushMarkerKey(callId));
-  if (!flushMarkerRaw) {
-    recordBillingMetric('settlement_final_flush_marker_missing', 1, { callId });
-    logWarning('Settlement proceeding without final flush marker', { callId });
-  } else {
-    recordBillingMetric('settlement_final_flush_marker_present', 1, { callId });
+  const lockToken = fromFinalizer ? opts!.lockToken : crypto.randomUUID();
+  const settleLockRedisKey = fromFinalizer ? opts!.settleLockRedisKey : settleLockKey(callId);
+  let lockHeartbeat: ReturnType<typeof setInterval> | undefined;
+  if (!fromFinalizer) {
+    const lockResult = await redis.set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'NX');
+    const lockAcquired = lockResult === 'OK';
+    if (!lockAcquired) {
+      logWarning('Settlement already in progress / completed — skipping', { callId });
+      return;
+    }
+    lockHeartbeat = setInterval(() => {
+      redis
+        .set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'XX')
+        .catch(() => {});
+    }, SETTLE_LOCK_HEARTBEAT_MS);
   }
-
-  if (await redis.get(settledKey)) {
-    logWarning('Call already settled (Redis) — skipping', { callId });
-    return;
-  }
-
-  const lockToken = crypto.randomUUID();
-  const settleLockRedisKey = settleLockKey(callId);
-  const lockResult = await redis.set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'NX');
-  const lockAcquired = lockResult === 'OK';
-  if (!lockAcquired) {
-    logWarning('Settlement already in progress / completed — skipping', { callId });
-    return;
-  }
-  const lockHeartbeat = setInterval(() => {
-    redis
-      .set(settleLockRedisKey, lockToken, 'EX', SETTLE_LOCK_TTL_SECONDS, 'XX')
-      .catch(() => {});
-  }, SETTLE_LOCK_HEARTBEAT_MS);
 
   logInfo('Settling call - reading from Redis', {
     callId,
@@ -238,7 +267,9 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     },
   });
 
-  await removeCallFromBilling(callId);
+  if (!fromFinalizer) {
+    await removeCallFromBilling(callId);
+  }
 
   let sessionRaw: string | null;
   try {
@@ -752,21 +783,32 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
       })
     );
 
-    try {
-      await deleteBillingSessionRedisKeys(
-        redis,
-        callId,
-        session.userFirebaseUid,
-        session.creatorFirebaseUid
-      );
-      await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
-    } catch (redisAfterCommitErr) {
-      logError(
-        'CRITICAL: Redis cleanup after successful Mongo settlement — balances are committed; clear keys via ops/reconciliation',
-        redisAfterCommitErr,
-        { callId, alert: true }
-      );
+    if (!fromFinalizer) {
+      try {
+        await deleteBillingSessionRedisKeys(
+          redis,
+          callId,
+          session.userFirebaseUid,
+          session.creatorFirebaseUid
+        );
+        await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
+      } catch (redisAfterCommitErr) {
+        logError(
+          'CRITICAL: Redis cleanup after successful Mongo settlement — balances are committed; clear keys via ops/reconciliation',
+          redisAfterCommitErr,
+          { callId, alert: true }
+        );
+      }
     }
+
+    const persistResult: SettlePersistResult = {
+      totalDeducted,
+      totalEarnedCreator,
+      durationSeconds,
+      userFirebaseUid: session.userFirebaseUid,
+      creatorFirebaseUid: session.creatorFirebaseUid,
+      userMongoId: session.userMongoId,
+    };
 
     io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
       userId: user._id.toString(),
@@ -868,6 +910,10 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
 
     logInfo('Settlement complete', { callId });
     recordBillingMetric('settlement_total_ms', Date.now() - settleStartedAt, { callId });
+
+    if (fromFinalizer) {
+      return persistResult;
+    }
   } catch (err) {
     try {
       await dbSession.abortTransaction();
@@ -885,8 +931,15 @@ export async function settleCall(io: Server, callId: string): Promise<void> {
     }
     throw err;
   } finally {
-    clearInterval(lockHeartbeat);
+    if (lockHeartbeat) {
+      clearInterval(lockHeartbeat);
+    }
     await dbSession.endSession();
-    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
+    if (!fromFinalizer) {
+      await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
+    }
   }
 }
+
+/** @deprecated Use finalizeCallSession — persistence-only alias for the finalizer. */
+export const persistCallSettlement = settleCall;

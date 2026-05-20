@@ -1,7 +1,7 @@
 import { Server } from 'socket.io';
 import { Call } from './call.model';
 import { getRedis } from '../../config/redis';
-import { settleCall } from '../billing/billing-settlement.service';
+import { finalizeCallSession } from '../billing/billing-session-finalization.service';
 import { finalizeCreatorAvailabilityForCall, releaseCreatorCallLock } from './creator-call-lock.service';
 import { transitionCallStatus } from './call-state.service';
 import { logError, logInfo } from '../../utils/logger';
@@ -59,12 +59,29 @@ export async function finalizeCallEnd(
         call.isSettled = true;
       }
 
-      // Billing settlement can be slow; run after availability restoration.
-      await settleCall(io, callId);
+      const settlementSource =
+        source === 'http_settle_call'
+          ? 'http_call_ended'
+          : source === 'socket_call_ended'
+            ? 'socket_call_ended'
+            : source.startsWith('reconciliation')
+              ? 'reconciliation_worker'
+              : source.startsWith('webhook')
+                ? 'webhook'
+                : 'webhook';
+
+      await finalizeCallSession(io, {
+        callId,
+        reason: 'explicit_end',
+        source: settlementSource,
+      });
       await call.save();
     } else {
-      // No Call record yet — still settle so billing keys are flushed.
-      await settleCall(io, callId);
+      await finalizeCallSession(io, {
+        callId,
+        reason: 'explicit_end',
+        source: 'webhook',
+      });
     }
 
     await redis.set(doneKey, source, 'EX', FINALIZE_DONE_TTL_SECONDS);

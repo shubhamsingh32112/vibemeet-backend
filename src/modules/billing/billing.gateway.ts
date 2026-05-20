@@ -6,7 +6,7 @@ import {
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
 import { billingService, type BillingSessionStartSource } from './billing.service';
-import { settleCall } from './billing-settlement.service';
+import { finalizeCallSession } from './billing-session-finalization.service';
 import { logInfo, logDebug } from '../../utils/logger';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
 import { closeTerminationRetryQueue } from './billing-termination.queue';
@@ -71,7 +71,11 @@ export async function handleCallStartedHttp(
   if (hasPendingEnd) {
     await redis.del(pendingEndKey);
     logInfo('Deferred settlement (HTTP)', { callId: data.callId });
-    await settleCall(io, data.callId);
+    await finalizeCallSession(io, {
+      callId: data.callId,
+      reason: 'explicit_end',
+      source: 'deferred_pending_end',
+    });
   }
 }
 

@@ -266,8 +266,12 @@ export function startBillingBullWorker(): Worker {
           logError('BullMQ schedule next failed', e, { callId })
         );
       } else if (result === 'stop_needs_settlement') {
-        const { settleCall } = await import('./billing-settlement.service');
-        await settleCall(io, callId).catch((e) => logError('settleCall failed', e, { callId }));
+        const { finalizeCallSession } = await import('./billing-session-finalization.service');
+        await finalizeCallSession(io, {
+          callId,
+          reason: 'insufficient_coins',
+          source: 'billing_tick',
+        }).catch((e) => logError('finalizeCallSession failed', e, { callId }));
       }
       return result;
     },

@@ -27,6 +27,26 @@ export interface ICall extends Document {
   isForceEnded: boolean; // True if call ended due to insufficient coins
   isSettled?: boolean; // Whether billing has been processed
 
+  settlement?: {
+    status: 'pending' | 'settling' | 'settled' | 'failed';
+    source?: string;
+    reason?: string;
+    settledAt?: Date;
+    version?: number;
+    updatedAt?: Date;
+    ownerToken?: string;
+    ownerInstanceId?: string;
+  };
+  settlementAttempts?: Array<{
+    source: string;
+    reason: string;
+    timestamp: Date;
+    result: 'success' | 'duplicate' | 'retry' | 'failed' | 'stale_takeover';
+    error?: string;
+    ownerToken?: string;
+    settlementVersion?: number;
+  }>;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -117,6 +137,33 @@ const callSchema = new Schema<ICall>(
       default: false,
       index: true,
     },
+    settlement: {
+      status: {
+        type: String,
+        enum: ['pending', 'settling', 'settled', 'failed'],
+      },
+      source: { type: String },
+      reason: { type: String },
+      settledAt: { type: Date },
+      version: { type: Number, default: 0 },
+      updatedAt: { type: Date },
+      ownerToken: { type: String },
+      ownerInstanceId: { type: String },
+    },
+    settlementAttempts: [
+      {
+        source: { type: String },
+        reason: { type: String },
+        timestamp: { type: Date },
+        result: {
+          type: String,
+          enum: ['success', 'duplicate', 'retry', 'failed', 'stale_takeover'],
+        },
+        error: { type: String },
+        ownerToken: { type: String },
+        settlementVersion: { type: Number },
+      },
+    ],
   },
   {
     timestamps: true,
