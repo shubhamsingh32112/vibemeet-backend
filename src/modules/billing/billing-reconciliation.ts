@@ -20,7 +20,13 @@ import {
   CALL_SESSION_PREFIX,
 } from '../../config/redis';
 import { billingService } from './billing.service';
-import { settleCall } from './billing-settlement.service';
+import {
+  finalizeCallSession,
+  processSettlementRetryQueue,
+} from './billing-session-finalization.service';
+import { CallHistory } from './call-history.model';
+import { Call } from '../video/call.model';
+import { BILLING_MAX_SETTLING_MS, BILLING_SETTLEMENT_PENDING_MAX_MS } from './billing.constants';
 import {
   isBullmqBillingEnabled,
   scheduleNextBillingCycleAfterTickOk,
@@ -167,6 +173,8 @@ export function startReconciliationJob(io: Server): void {
   const run = (): void => {
     withBillingReconciliationLock(async () => {
       const startedAt = Date.now();
+      await processSettlementRetryQueue(io, 40);
+      await runSettlementOrphanRepair(io, startedAt);
       await processDLQ(io, startedAt);
       await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
       await runBullmqBillingWatchdog(startedAt);
@@ -247,6 +255,89 @@ async function runBullmqBillingWatchdog(startedAt: number): Promise<void> {
   }
 }
 
+/** Repair calls with deductions but no CallHistory, stale settling, or long-pending settlement. */
+async function runSettlementOrphanRepair(io: Server, startedAt: number): Promise<void> {
+  const redis = getRedis();
+  const now = Date.now();
+
+  const staleSettling = await Call.find({
+    'settlement.status': 'settling',
+    'settlement.updatedAt': { $lt: new Date(now - BILLING_MAX_SETTLING_MS) },
+  })
+    .select('callId')
+    .limit(30)
+    .lean();
+
+  for (const row of staleSettling) {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) break;
+    const callId = row.callId;
+    recordBillingMetric('billing_orphaned_sessions_total', 1, { callId, type: 'stale_settling' });
+    logInfo('billing_reconciliation_repair', { callId, orphanType: 'stale_settling' });
+    await finalizeCallSession(io, {
+      callId,
+      reason: 'reconciliation',
+      source: 'reconciliation_worker',
+    }).catch((e) => logError('Stale settling repair failed', e, { callId }));
+  }
+
+  const pendingTooLong = await Call.find({
+    'settlement.status': 'pending',
+    updatedAt: { $lt: new Date(now - BILLING_SETTLEMENT_PENDING_MAX_MS) },
+  })
+    .select('callId')
+    .limit(20)
+    .lean();
+
+  for (const row of pendingTooLong) {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) break;
+    const callId = row.callId;
+    recordBillingMetric('billing_orphaned_sessions_total', 1, { callId, type: 'pending_timeout' });
+    await finalizeCallSession(io, {
+      callId,
+      reason: 'timeout',
+      source: 'reconciliation_worker',
+    }).catch((e) => logError('Pending settlement repair failed', e, { callId }));
+  }
+
+  let cursor = '0';
+  let scanned = 0;
+  const maxScan = 80;
+  do {
+    if (Date.now() - startedAt > RUN_BUDGET_MS || scanned >= maxScan) break;
+    const [next, keys] = await redis.scan(
+      cursor,
+      'MATCH',
+      `${CALL_SESSION_PREFIX}*`,
+      'COUNT',
+      40
+    );
+    cursor = next;
+    for (const key of keys) {
+      if (Date.now() - startedAt > RUN_BUDGET_MS) break;
+      const callId = key.replace(CALL_SESSION_PREFIX, '');
+      if (!callId) continue;
+      scanned++;
+      const hasHistory = await CallHistory.findOne({ callId, ownerRole: 'user' }).lean();
+      if (hasHistory) continue;
+      const sessionRaw = await redis.get(callSessionKey(callId));
+      if (!sessionRaw) continue;
+      try {
+        const sess = JSON.parse(sessionRaw) as { totalDeductedMicros?: number };
+        if ((sess.totalDeductedMicros ?? 0) <= 0) continue;
+      } catch {
+        continue;
+      }
+      recordBillingMetric('billing_reconciliation_repairs_total', 1, { callId, type: 'session_no_history' });
+      logInfo('billing_reconciliation_repair', { callId, orphanType: 'session_no_history' });
+      await finalizeCallSession(io, {
+        callId,
+        reason: 'reconciliation',
+        source: 'reconciliation_worker',
+      }).catch((e) => logError('Orphan session repair failed', e, { callId }));
+    }
+  } while (cursor !== '0');
+}
+
 /** ZSET-only: recover calls whose next-process score is far in the past (stuck scheduler). */
 async function runStaleBillingWatchdog(io: Server, startedAt: number): Promise<void> {
   if (isBullmqBillingEnabled()) {
@@ -288,7 +379,11 @@ async function runStaleBillingWatchdog(io: Server, startedAt: number): Promise<v
         }
       }
       if (r === 'stop_needs_settlement') {
-        await settleCall(io, callId).catch((e) => logError('Watchdog settleCall failed', e, { callId }));
+        await finalizeCallSession(io, {
+          callId,
+          reason: 'timeout',
+          source: 'reconciliation_worker',
+        }).catch((e) => logError('Watchdog finalizeCallSession failed', e, { callId }));
       }
       recordBillingMetric('billing_stale_recovered', 1, { callId });
     } catch (e) {
@@ -426,9 +521,11 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
           processed++;
           logInfo('Successfully retried billing tick from DLQ', { callId });
         } else if (tickResult === 'stop_needs_settlement') {
-          await settleCall(io, callId).catch((e) =>
-            logError('DLQ settleCall failed', e, { callId })
-          );
+          await finalizeCallSession(io, {
+            callId,
+            reason: 'reconciliation',
+            source: 'reconciliation_worker',
+          }).catch((e) => logError('DLQ finalizeCallSession failed', e, { callId }));
           await Promise.all([
             redis.del(dlqKey),
             redis.srem(dlqSetKey, dlqKey),

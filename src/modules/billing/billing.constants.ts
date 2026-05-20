@@ -239,3 +239,24 @@ export function pricePerMinuteToCreatorMicrosPerSecond(
 ): number {
   return Math.floor((Math.round(pricePerMinute * creatorShare * COIN_MICROS)) / 60);
 }
+
+/** Settlement orchestration (finalizeCallSession). */
+export const BILLING_MAX_SETTLING_MS = Math.min(
+  600_000,
+  Math.max(30_000, parseInt(process.env.BILLING_MAX_SETTLING_MS || '180000', 10) || 180_000)
+);
+export const BILLING_SETTLEMENT_POLL_MS = Math.min(
+  60_000,
+  Math.max(1000, parseInt(process.env.BILLING_SETTLEMENT_POLL_MS || '25000', 10) || 25_000)
+);
+export const BILLING_SETTLEMENT_PENDING_MAX_MS = Math.min(
+  600_000,
+  Math.max(60_000, parseInt(process.env.BILLING_SETTLEMENT_PENDING_MAX_MS || '300000', 10) || 300_000)
+);
+export const BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS = Math.min(
+  20,
+  Math.max(1, parseInt(process.env.BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS || '8', 10) || 8)
+);
+export function isUnifiedBillingFinalizerEnabled(): boolean {
+  return process.env.BILLING_UNIFIED_FINALIZER_ENABLED !== 'false';
+}

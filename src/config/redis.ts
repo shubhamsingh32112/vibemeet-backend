@@ -178,6 +178,17 @@ export const ACTIVE_CALL_BY_USER_TTL = 7200; // 2 hours (same as call session)
 export const PENDING_CALL_END_TTL = 60; // 60 seconds
 export const SETTLED_CALL_TTL = 300; // 5 minutes
 
+// Settlement orchestration (finalizeCallSession)
+export const SETTLEMENT_CLAIM_PREFIX = 'settlement:claim:';
+export const settlementClaimKey = (callId: string): string =>
+  `${SETTLEMENT_CLAIM_PREFIX}${callId}`;
+export const SETTLEMENT_CLAIM_TTL_SECONDS = Math.min(
+  600,
+  Math.max(60, parseInt(process.env.BILLING_SETTLEMENT_CLAIM_TTL_SECONDS || '180', 10) || 180)
+);
+
+export const BILLING_SETTLEMENT_RETRY_KEY = 'billing:settlement-retry';
+
 // 🔥 FIX 3: Distributed lock for batch processor
 export const BATCH_PROCESSOR_LOCK_KEY = 'lock:billing:batch_processor';
 export const BATCH_PROCESSOR_LOCK_TTL = 2; // 2 seconds (renewed each tick)

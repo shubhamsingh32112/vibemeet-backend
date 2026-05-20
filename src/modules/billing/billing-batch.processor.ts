@@ -6,7 +6,7 @@ import {
 } from '../../config/redis';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService } from './billing.service';
-import { settleCall } from './billing-settlement.service';
+import { finalizeCallSession } from './billing-session-finalization.service';
 import { logError, logWarning, logInfo, logDebug } from '../../utils/logger';
 import {
   isBullmqBillingEnabled,
@@ -160,8 +160,12 @@ export async function processBillingBatch(io: Server): Promise<void> {
           await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
           logDebug('Removed call from active billing', { callId, tickResult });
           if (tickResult === 'stop_needs_settlement') {
-            await settleCall(io, callId).catch((settleErr) =>
-              logError('settleCall after billing tick stop', settleErr, { callId })
+            await finalizeCallSession(io, {
+              callId,
+              reason: 'insufficient_coins',
+              source: 'billing_tick',
+            }).catch((settleErr) =>
+              logError('finalizeCallSession after billing tick stop', settleErr, { callId })
             );
           }
         }

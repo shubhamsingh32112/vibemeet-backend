@@ -77,16 +77,28 @@ export async function forceTerminateCall(
     return;
   }
 
+  const { finalizeCallSession } = await import('./billing-session-finalization.service');
+  const settlementReason =
+    reason === 'duration_limit_reached'
+      ? 'duration_limit'
+      : reason === 'insufficient_coins' || reason === 'intro_promo_exhausted'
+        ? 'insufficient_coins'
+        : 'unknown';
+
+  void finalizeCallSession(io, {
+    callId,
+    reason: settlementReason,
+    source: 'force_end',
+  }).catch((settleError) => {
+    logError('forceTerminateCall settlement trigger failed', settleError, { callId, reason });
+  });
+  recordBillingMetric('force_terminate_settlement_triggered', 1, { callId, reason });
+
   try {
     await markStreamCallEnded(callId, reason);
     await setCallEndedMarker(callId);
     await releaseMarkEndedLease(callId);
     recordBillingMetric('force_terminate_stream_success', 1, { callId, reason });
-    const { settleCall } = await import('./billing-settlement.service');
-    void settleCall(io, callId).catch((settleError) => {
-      logError('forceTerminateCall settlement trigger failed', settleError, { callId, reason });
-    });
-    recordBillingMetric('force_terminate_settlement_triggered', 1, { callId, reason });
     logInfo('Server-side Stream mark_ended sent', { callId, reason });
   } catch (error) {
     await releaseMarkEndedLease(callId);

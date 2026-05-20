@@ -12,7 +12,7 @@ import {
 } from '../../config/redis';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService } from './billing.service';
-import { settleCall } from './billing-settlement.service';
+import { finalizeCallSession } from './billing-session-finalization.service';
 import { isBullmqBillingEnabled } from './billing.queue';
 import { isCallActive } from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
@@ -123,7 +123,11 @@ export function setupBillingGateway(io: Server): void {
           if (hasPendingEnd) {
             await redis.del(pendingEndKey);
             logInfo('Deferred settlement for call', { callId: data.callId });
-            await settleCall(io, data.callId);
+            await finalizeCallSession(io, {
+              callId: data.callId,
+              reason: 'explicit_end',
+              source: 'deferred_pending_end',
+            });
           }
         } catch (err) {
           logError('Error in call:started', err, { callId: data.callId, firebaseUid });
