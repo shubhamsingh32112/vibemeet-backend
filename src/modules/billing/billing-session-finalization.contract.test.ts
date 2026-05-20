@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const here = dirname(fileURLToPath(import.meta.url));
+import { join } from 'node:path';
 
 test('finalizeCallSession module exports canonical orchestration API', async () => {
   const mod = await import('./billing-session-finalization.service');
@@ -14,7 +11,7 @@ test('finalizeCallSession module exports canonical orchestration API', async () 
 });
 
 test('settleCall legacy path flushes only when not from finalizer', () => {
-  const src = readFileSync(join(here, 'billing-settlement.service.ts'), 'utf8');
+  const src = readFileSync(join(__dirname, 'billing-settlement.service.ts'), 'utf8');
   assert.ok(src.includes('export async function settleCall'));
   assert.ok(src.includes('_fromFinalizer'));
   assert.ok(src.includes('if (!fromFinalizer)'));
@@ -25,7 +22,7 @@ test('settleCall legacy path flushes only when not from finalizer', () => {
 
 test('finalizer owns flush orchestration', () => {
   const finalization = readFileSync(
-    join(here, 'billing-session-finalization.service.ts'),
+    join(__dirname, 'billing-session-finalization.service.ts'),
     'utf8'
   );
   assert.ok(finalization.includes('flushBillingToQuiescence'));
@@ -34,7 +31,7 @@ test('finalizer owns flush orchestration', () => {
 });
 
 test('forceTerminateCall triggers finalizeCallSession before Stream mark_ended', () => {
-  const src = readFileSync(join(here, 'billing-termination.service.ts'), 'utf8');
+  const src = readFileSync(join(__dirname, 'billing-termination.service.ts'), 'utf8');
   const finalizeIdx = src.indexOf('void finalizeCallSession');
   const streamIdx = src.indexOf('await markStreamCallEnded');
   assert.ok(finalizeIdx >= 0 && streamIdx >= 0);
@@ -42,7 +39,7 @@ test('forceTerminateCall triggers finalizeCallSession before Stream mark_ended',
 });
 
 test('batch processor uses finalizeCallSession on stop_needs_settlement', () => {
-  const src = readFileSync(join(here, 'billing-batch.processor.ts'), 'utf8');
+  const src = readFileSync(join(__dirname, 'billing-batch.processor.ts'), 'utf8');
   assert.ok(src.includes('finalizeCallSession'));
   assert.ok(!src.includes("from './billing-settlement.service'"));
 });

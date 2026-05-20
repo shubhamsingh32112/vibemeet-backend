@@ -446,6 +446,7 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
 
     const availabilityMap = await getBatchAvailability([uidRaw]);
     const availability = availabilityMap[uidRaw] ?? 'busy';
+    const images = serializeCreatorImages(creator as unknown as ICreator);
 
     logInfo('creator.by_uid.timing', { totalMs: Date.now() - t0 });
     res.json({
@@ -456,6 +457,7 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
           userId: creator.userId ? creator.userId.toString() : null,
           firebaseUid: creator.firebaseUid ? String(creator.firebaseUid) : uidRaw,
           name: creator.name,
+          avatar: images.avatar,
           availability,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
