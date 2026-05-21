@@ -3,6 +3,7 @@ import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { billingLimiter } from '../../middlewares/rate-limit.middleware';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp, settleCallHttp } from './billing.gateway';
+import { getBillingStartedUserPayloadForCall } from './billing.service';
 import { logError, logDebug } from '../../utils/logger';
 import {
   assertBillingRestCallEndedAccess,
@@ -79,7 +80,13 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
       { source: 'client_http', requestReceivedAtMs: callStartedRequestAt }
     );
 
-    res.json({ success: true, message: 'Billing started' });
+    const billing = await getBillingStartedUserPayloadForCall(callId);
+
+    res.json({
+      success: true,
+      message: 'Billing started',
+      billing: billing ?? undefined,
+    });
   } catch (err: any) {
     logError('Billing REST: call-started error', err, {
       firebaseUid: req.auth?.firebaseUid,

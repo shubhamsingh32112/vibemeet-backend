@@ -296,6 +296,93 @@ export function normalizeV4SessionFields(session: CallSession): void {
   session.totalWalletDeductedMicros = session.totalWalletDeductedMicros ?? 0;
 }
 
+export type BillingStartedUserPayload = {
+  callId: string;
+  coins: number;
+  introCreditsRemainingApprox: number;
+  introPromoActive: boolean;
+  pricePerSecond: number;
+  pricePerSecondMicros: number;
+  maxSeconds: number | undefined;
+  elapsedSeconds: number;
+  remainingSeconds: number;
+  serverTimestamp: number;
+  callStartTime: number;
+  durationLimit: number | undefined;
+};
+
+async function readLiveUserSpendBalancesMicros(
+  redis: ReturnType<typeof getRedis>,
+  callId: string
+): Promise<{ introMicros: number; walletMicros: number; balanceMicros: number }> {
+  const [introR, walletR, legacyMerged] = await Promise.all([
+    redis.get(callUserIntroMicrosKey(callId)),
+    redis.get(callUserWalletMicrosKey(callId)),
+    redis.get(callUserCoinsKey(callId)),
+  ]);
+
+  let introMicros = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
+  let walletMicros = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
+  if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
+    walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
+    introMicros = 0;
+  }
+
+  return {
+    introMicros,
+    walletMicros,
+    balanceMicros: introMicros + walletMicros,
+  };
+}
+
+export async function buildBillingStartedUserPayload(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  session: CallSession
+): Promise<BillingStartedUserPayload> {
+  const { introMicros, balanceMicros } = await readLiveUserSpendBalancesMicros(redis, callId);
+  const pps =
+    session.billingPricePerSecondMicros ??
+    session.pricePerSecondMicros ??
+    Math.max(0, Math.round((session.pricePerSecond ?? 0) * COIN_MICROS));
+  const pricePerSecondMicros = Number(pps) || 0;
+  const remainingSeconds =
+    pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
+  const introPromo = session.introPromoActive === true;
+  const serverTimestamp = Date.now();
+
+  return {
+    callId,
+    coins: microsToWholeCoinsFloor(balanceMicros),
+    introCreditsRemainingApprox: introPromo ? microsToWholeCoinsFloor(introMicros) : 0,
+    introPromoActive: introPromo,
+    pricePerSecond: pricePerSecondMicros / COIN_MICROS,
+    pricePerSecondMicros,
+    maxSeconds: session.effectiveDurationLimitSeconds,
+    elapsedSeconds: session.elapsedSeconds ?? 0,
+    remainingSeconds,
+    serverTimestamp,
+    callStartTime: session.startTime,
+    durationLimit: session.effectiveDurationLimitSeconds,
+  };
+}
+
+/** REST fallback: return the same shape as `billing:started` when the socket missed the emit. */
+export async function getBillingStartedUserPayloadForCall(
+  callId: string
+): Promise<BillingStartedUserPayload | null> {
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) return null;
+  try {
+    const session = JSON.parse(sessionRaw) as CallSession;
+    normalizeV4SessionFields(session);
+    return await buildBillingStartedUserPayload(redis, callId, session);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * When `call:started` races or retries after Redis already has the session, the first
  * `billing:started` may have been missed (socket reconnect). Replay the same event shape
@@ -311,28 +398,9 @@ async function replayBillingStartedFromRedisSession(
   const userFirebaseUid = session.userFirebaseUid;
   const creatorFirebaseUid = session.creatorFirebaseUid;
 
-  const [introR, walletR, legacyMerged, earningsRaw] = await Promise.all([
-    redis.get(callUserIntroMicrosKey(callId)),
-    redis.get(callUserWalletMicrosKey(callId)),
-    redis.get(callUserCoinsKey(callId)),
-    redis.get(callCreatorEarningsKey(callId)),
-  ]);
+  const userPayload = await buildBillingStartedUserPayload(redis, callId, session);
 
-  let introMicros = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
-  let walletMicros = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
-  if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
-    walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
-    introMicros = 0;
-  }
-
-  const balanceMicros = introMicros + walletMicros;
-  const pps =
-    session.billingPricePerSecondMicros ??
-    session.pricePerSecondMicros ??
-    Math.max(0, Math.round((session.pricePerSecond ?? 0) * COIN_MICROS));
-  const pricePerSecondMicros = Number(pps) || 0;
-  const remainingSeconds = pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
-
+  const earningsRaw = await redis.get(callCreatorEarningsKey(callId));
   const earnRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
   let earningsMicros = earnRaw;
   if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION) {
@@ -341,26 +409,9 @@ async function replayBillingStartedFromRedisSession(
   const creatorEpsMicros =
     session.creatorEarningsPerSecondMicros ??
     Math.max(0, Math.round((session.creatorEarningsPerSecond ?? 0) * COIN_MICROS));
-
-  const serverTimestamp = Date.now();
-  const introPromo = session.introPromoActive === true;
-
-  io.to(`user:${userFirebaseUid}`).emit('billing:started', {
-    callId,
-    coins: microsToWholeCoinsFloor(balanceMicros),
-    introCreditsRemainingApprox: introPromo ? microsToWholeCoinsFloor(introMicros) : 0,
-    introPromoActive: introPromo,
-    pricePerSecond: pricePerSecondMicros / COIN_MICROS,
-    pricePerSecondMicros,
-    maxSeconds: session.effectiveDurationLimitSeconds,
-    elapsedSeconds: session.elapsedSeconds ?? 0,
-    remainingSeconds,
-    serverTimestamp,
-    callStartTime: session.startTime,
-    durationLimit: session.effectiveDurationLimitSeconds,
-  });
-
   const earningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
+
+  io.to(`user:${userFirebaseUid}`).emit('billing:started', userPayload);
 
   io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
     callId,
@@ -370,7 +421,7 @@ async function replayBillingStartedFromRedisSession(
     creatorEarningsPerSecond: creatorEpsMicros / COIN_MICROS,
     creatorSharePercentage: session.creatorShareAtCallTime,
     elapsedSeconds: session.elapsedSeconds ?? 0,
-    serverTimestamp,
+    serverTimestamp: userPayload.serverTimestamp,
     callStartTime: session.startTime,
   });
 
@@ -378,7 +429,7 @@ async function replayBillingStartedFromRedisSession(
     callId,
     source,
     elapsedSeconds: session.elapsedSeconds,
-    remainingSeconds,
+    remainingSeconds: userPayload.remainingSeconds,
   });
   recordBillingMetric('session_start_idempotent_replay', 1, {
     callIdPrefix: callId.length > 16 ? callId.slice(0, 16) : callId,
@@ -840,9 +891,9 @@ export class BillingService {
       pricePerSecondMicros > 0 ? Math.floor(spendableMicros / pricePerSecondMicros) : 0;
     const serverTimestamp = Date.now();
 
-    io.to(`user:${userFirebaseUid}`).emit('billing:started', {
+    const userBillingStartedPayload: BillingStartedUserPayload = {
       callId,
-      coins: user.coins,
+      coins: microsToWholeCoinsFloor(spendableMicros),
       introCreditsRemainingApprox: introPromoActive
         ? microsToWholeCoinsFloor(initialIntroMicros)
         : 0,
@@ -855,7 +906,9 @@ export class BillingService {
       serverTimestamp,
       callStartTime: session.startTime,
       durationLimit: effectiveDurationLimitSeconds,
-    });
+    };
+
+    io.to(`user:${userFirebaseUid}`).emit('billing:started', userBillingStartedPayload);
 
     io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
       callId,
