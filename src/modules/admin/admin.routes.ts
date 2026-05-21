@@ -34,6 +34,7 @@ import {
 import {
   getOverview,
   getCreatorsPerformance,
+  getAdminCreatorDetail,
   getUsersAnalytics,
   getUserLedger,
   getCoinEconomy,
@@ -88,6 +89,9 @@ import {
   postFraudInvestigationNote,
   postFraudRulesRun,
 } from '../fraud/fraud.controller';
+import { getBlockedHosts } from './admin-blocked-hosts.controller';
+import { getRevenueSplitSummary } from './admin-revenue-split.controller';
+import { getLeaderboardHosts, getLeaderboardUsers } from './admin-leaderboards.controller';
 
 const router = Router();
 
@@ -97,7 +101,12 @@ router.use(verifyFirebaseToken);
 // ── Read-Only Endpoints ─────────────────────────────────────────────────
 router.get('/overview', getOverview);
 router.get('/creators/performance', getCreatorsPerformance);
+router.get('/creators/:id/detail', getAdminCreatorDetail);
 router.get('/users/analytics', getUsersAnalytics);
+router.get('/blocked-hosts', getBlockedHosts);
+router.get('/revenue-split/summary', getRevenueSplitSummary);
+router.get('/leaderboards/hosts', getLeaderboardHosts);
+router.get('/leaderboards/users', getLeaderboardUsers);
 router.get('/users/:id/ledger', getUserLedger);
 router.get('/coins', getCoinEconomy);
 router.get('/wallet-pricing', getWalletPricing);

@@ -17,7 +17,9 @@ import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
 import { countOnlineCreatorsForBd } from '../availability/presence-dashboard.service';
-import { serializeCreatorGallery } from '../images/creator-image-helpers';
+import { buildAvatarUrls } from '../images/image-url';
+import type { IImageAsset } from '../images/image-asset.schema';
+import { buildCreatorMediaPayload, buildUserMediaPayload } from '../creator/creator-staff-portal.payload';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 import { promoteUserToCreatorWithStarterProfile } from '../creator/creator-starter.service';
 
@@ -663,11 +665,21 @@ function buildAgentCreatorSortSpec(sortKey: string, dirAsc: boolean): Record<str
   }
 }
 
+function creatorListAvatarUrl(avatar: IImageAsset | null | undefined): string | null {
+  const id = typeof avatar?.imageId === 'string' ? avatar.imageId.trim() : '';
+  if (!id) return null;
+  try {
+    return buildAvatarUrls(id).sm;
+  } catch {
+    return null;
+  }
+}
+
 type CreatorAggRow = {
   _id: mongoose.Types.ObjectId;
   userId: mongoose.Types.ObjectId;
   name: string;
-  photo: string;
+  avatar?: IImageAsset | null;
   categories: string[];
   price: number;
   age?: number;
@@ -835,11 +847,13 @@ function mapAggDocToAgentCreatorJson(
   const pw = pendingByUserId.get(uid);
   const pts = c.periodTalkSeconds;
   const ats = c.allTimeTalkSeconds;
+  const avatarUrl = creatorListAvatarUrl(c.avatar);
   return {
     id: c._id.toString(),
     userId: uid,
     name: c.name,
-    photo: c.photo,
+    photo: avatarUrl,
+    avatarUrl,
     categories: c.categories,
     price: c.price,
     age: c.age,
@@ -1067,13 +1081,8 @@ export const getAgencyCreatorDetail = async (req: Request, res: Response): Promi
       return;
     }
 
-    // Cloudflare-Images: URLs are derived from imageId at serialize time.
-    const galleryImages = serializeCreatorGallery(creatorDoc.galleryImages);
-
-    const creator = creatorDoc.toObject();
-    creator.galleryImages = galleryImages;
-
-    const user = await User.findById(creator.userId).lean();
+    const media = buildCreatorMediaPayload(creatorDoc);
+    const user = await User.findById(creatorDoc.userId).lean();
     if (!user) {
       res.status(404).json({ success: false, error: 'User not found' });
       return;
@@ -1111,19 +1120,19 @@ export const getAgencyCreatorDetail = async (req: Request, res: Response): Promi
       data: {
         meta: { period },
         creator: {
-          id: creator._id.toString(),
-          userId: creator.userId.toString(),
-          name: creator.name,
-          about: creator.about,
-          galleryImages,
-          categories: creator.categories,
-          price: creator.price,
-          age: creator.age,
-          location: creator.location,
-          earningsCoins: creator.earningsCoins,
-          isOnline: creator.isOnline,
-          createdAt: creator.createdAt,
-          updatedAt: creator.updatedAt,
+          id: creatorDoc._id.toString(),
+          userId: creatorDoc.userId.toString(),
+          name: creatorDoc.name,
+          about: creatorDoc.about ?? '',
+          categories: creatorDoc.categories ?? [],
+          price: creatorDoc.price,
+          age: creatorDoc.age,
+          location: creatorDoc.location,
+          earningsCoins: creatorDoc.earningsCoins ?? 0,
+          isOnline: creatorDoc.isOnline ?? false,
+          createdAt: creatorDoc.createdAt,
+          updatedAt: creatorDoc.updatedAt,
+          ...media,
         },
         user: {
           id: user._id.toString(),
@@ -1131,8 +1140,8 @@ export const getAgencyCreatorDetail = async (req: Request, res: Response): Promi
           email: user.email,
           phone: user.phone,
           coins: user.coins,
-          avatar: user.avatar,
           profileRevision: user.profileRevision,
+          ...buildUserMediaPayload(user as unknown as import('../user/user.model').IUser),
         },
         availability,
         earningsSummaryCoins: { last1d: e1d, last7d: e7d, last30d: e30d },

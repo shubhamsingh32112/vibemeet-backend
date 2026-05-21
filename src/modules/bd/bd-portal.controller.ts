@@ -23,6 +23,7 @@ import {
 } from '../availability/presence-dashboard.service';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { invalidateCreatorPricingCache } from '../video/pricing.service';
+import { loadStaffCreatorDetailById } from '../creator/creator-staff-portal.detail';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -743,7 +744,7 @@ export const listBdCreators = async (req: Request, res: Response): Promise<void>
     }
 
     const creators = await Creator.find({ assignedAgencyId: { $in: agencyIds } })
-      .select('name price userId assignedAgencyId createdAt')
+      .select('name price userId assignedAgencyId avatar galleryImages createdAt')
       .sort({ createdAt: -1 })
       .limit(500)
       .lean();
@@ -762,6 +763,8 @@ export const listBdCreators = async (req: Request, res: Response): Promise<void>
             ? agencyById.get(c.assignedAgencyId.toString())
             : undefined;
           const u = c.userId ? userById.get(c.userId.toString()) : undefined;
+          const avatarUrl = staffAvatarSmUrl(c.avatar as IImageAsset | null | undefined);
+          const galleryCount = Array.isArray(c.galleryImages) ? c.galleryImages.length : 0;
           return {
             id: c._id.toString(),
             name: c.name,
@@ -770,12 +773,64 @@ export const listBdCreators = async (req: Request, res: Response): Promise<void>
             agencyId: c.assignedAgencyId?.toString() ?? null,
             agencyLabel: agency?.displayName || agency?.email || null,
             userLabel: u?.username || u?.email || u?.phone || null,
+            avatarUrl,
+            galleryCount,
           };
         }),
       },
     });
   } catch (error) {
     logError('listBdCreators', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Host profile (avatar + gallery) for a creator under this BD's agencies. */
+export const getBdCreatorDetail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertBd(req, res))) return;
+    const bd = await loadStaffUserByAuth(req);
+    if (!bd) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const creatorId = String(req.params.creatorId ?? '').trim();
+    if (!mongoose.isValidObjectId(creatorId)) {
+      res.status(400).json({ success: false, error: 'Invalid creator id' });
+      return;
+    }
+
+    const loaded = await loadStaffCreatorDetailById(creatorId);
+    if (!loaded) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const creator = await Creator.findById(creatorId).select('assignedAgencyId').lean();
+    if (!creator?.assignedAgencyId) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const agency = await User.findById(creator.assignedAgencyId).select('bdId displayName email').lean();
+    if (!agency?.bdId?.equals(bd._id)) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...loaded.doc,
+        agency: {
+          id: agency._id.toString(),
+          label: agency.displayName || agency.email || agency._id.toString(),
+        },
+      },
+    });
+  } catch (error) {
+    logError('getBdCreatorDetail', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

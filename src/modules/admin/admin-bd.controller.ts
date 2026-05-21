@@ -140,11 +140,31 @@ export const listBds = async (req: Request, res: Response): Promise<void> => {
     ]);
 
     const ids = agencies.map((a) => a._id);
-    const bdCounts = await User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
-      { $match: { bdId: { $in: ids }, ...AGENCY_ROLE_QUERY } },
-      { $group: { _id: '$bdId', c: { $sum: 1 } } },
+    const [bdCounts, childAgencies] = await Promise.all([
+      User.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
+        { $match: { bdId: { $in: ids }, ...AGENCY_ROLE_QUERY } },
+        { $group: { _id: '$bdId', c: { $sum: 1 } } },
+      ]),
+      User.find({ bdId: { $in: ids }, ...AGENCY_ROLE_QUERY }).select('_id bdId').lean(),
     ]);
     const bdMap = new Map(bdCounts.map((r) => [r._id.toString(), r.c]));
+
+    const agencyIds = childAgencies.map((a) => a._id);
+    const hostCountsByAgency =
+      agencyIds.length === 0
+        ? []
+        : await Creator.aggregate<{ _id: mongoose.Types.ObjectId; c: number }>([
+            { $match: { assignedAgencyId: { $in: agencyIds } } },
+            { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
+          ]);
+    const hostsPerAgency = new Map(hostCountsByAgency.map((h) => [h._id.toString(), h.c]));
+    const totalHostsPerBd = new Map<string, number>();
+    for (const ag of childAgencies) {
+      const bdKey = ag.bdId?.toString();
+      if (!bdKey) continue;
+      const c = hostsPerAgency.get(ag._id.toString()) ?? 0;
+      totalHostsPerBd.set(bdKey, (totalHostsPerBd.get(bdKey) ?? 0) + c);
+    }
 
     res.json({
       success: true,
@@ -157,6 +177,7 @@ export const listBds = async (req: Request, res: Response): Promise<void> => {
           displayName: a.displayName ?? null,
           bdDisabled: a.bdDisabled ?? false,
           agencyCount: bdMap.get(a._id.toString()) ?? 0,
+          totalHostCount: totalHostsPerBd.get(a._id.toString()) ?? 0,
           createdAt: a.createdAt,
         })),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
@@ -196,6 +217,10 @@ export const getBdDetail = async (req: Request, res: Response): Promise<void> =>
             { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
           ]);
     const hostMap = new Map(hostCounts.map((h) => [h._id.toString(), h.c]));
+    const totalHostCount = bds.reduce(
+      (sum, b) => sum + (hostMap.get(b._id.toString()) ?? 0),
+      0
+    );
 
     res.json({
       success: true,
@@ -207,6 +232,8 @@ export const getBdDetail = async (req: Request, res: Response): Promise<void> =>
           agencyPlace: agency.agencyPlace ?? null,
           displayName: agency.displayName ?? null,
           bdDisabled: agency.bdDisabled ?? false,
+          agencyCount: bds.length,
+          totalHostCount,
           createdAt: agency.createdAt,
           updatedAt: agency.updatedAt,
         },

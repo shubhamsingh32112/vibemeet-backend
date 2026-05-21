@@ -26,6 +26,8 @@ import { setCreatorAvailability } from '../availability/availability.gateway';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
+import { loadStaffCreatorDetailById } from '../creator/creator-staff-portal.detail';
+import { buildCreatorMediaPayload } from '../creator/creator-staff-portal.payload';
 import { CreatorDailyOnline } from '../availability/creator-daily-online.model';
 import {
   CREATOR_GALLERY_MAX_IMAGES,
@@ -71,6 +73,7 @@ import {
 } from '../payment/platform-revenue-config.model';
 import { parseAdminDateRange } from './admin-date-range';
 import { isAgencyRole, isSuperAdminRole } from '../../utils/staff-roles';
+import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -403,6 +406,48 @@ export const getCreatorsPerformance = async (req: Request, res: Response): Promi
   }
 };
 
+/** GET /admin/creators/:id/detail — Host profile with avatar + gallery for super admin. */
+export const getAdminCreatorDetail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const creatorId = String(req.params.id ?? '').trim();
+    const loaded = await loadStaffCreatorDetailById(creatorId);
+    if (!loaded) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const creator = loaded.creator;
+    let assignedAgencyLabel: string | null = null;
+    if (creator.assignedAgencyId) {
+      const agency = await User.findById(creator.assignedAgencyId)
+        .select('displayName email username referralCode')
+        .lean();
+      if (agency) {
+        assignedAgencyLabel =
+          (agency.displayName && agency.displayName.trim()) ||
+          agency.email ||
+          agency.username ||
+          agency.referralCode ||
+          agency._id.toString();
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...loaded.doc,
+        assignedAgencyId: creator.assignedAgencyId?.toString() ?? null,
+        assignedAgencyLabel,
+      },
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] Creator detail error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
 async function computeCreatorsPerformance() {
   const thirtyDaysAgo = daysAgo(30);
 
@@ -558,12 +603,17 @@ async function computeCreatorsPerformance() {
       (shortCallPct > 30 && refundCount > 0) ||
       (abuse.total >= 5 && shortCallPct > 50);
 
+    const media = buildCreatorMediaPayload(creator);
+
     return {
       creatorId: creator._id.toString(),
       userId,
       name: creator.name,
       username: user?.username ?? null,
-      avatar: user?.avatar ?? null,
+      avatar: media.avatar,
+      avatarUrl: media.avatarUrl,
+      photo: media.photo,
+      galleryCount: media.galleryCount,
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
@@ -948,7 +998,20 @@ export const getPlatformRevenueConfigAdmin = async (
   try {
     if (!(await assertAdmin(req, res))) return;
     const cfg = await getOrCreatePlatformRevenueConfig();
-    res.json({ success: true, data: cfg });
+    const hostSharePct = Math.round(CREATOR_SHARE_PERCENTAGE * 1000) / 10;
+
+    res.json({
+      success: true,
+      data: {
+        ...cfg,
+        hostSharePct,
+        bdPctOfGross: cfg.bdBps / 100,
+        agencyPctOfGross: cfg.agencyBps / 100,
+        note:
+          'Staff BD/agency wallet credits are computed as basis points of the host earnings pool at settlement. ' +
+          'If a host has no agency (or agency has no BD), those shares are not paid out and remain with the platform.',
+      },
+    });
   } catch (error) {
     console.error('❌ [ADMIN] Get platform revenue config error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
