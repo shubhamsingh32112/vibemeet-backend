@@ -23,12 +23,12 @@ export const CREATOR_EARNINGS_PER_SECOND: number = parseFloat(
 
 /**
  * Creator share percentage (as decimal)
- * Default: 0.30 (30%)
- * 
+ * Default: 0.25 (25%)
+ *
  * Environment variable: CREATOR_SHARE_PERCENTAGE
  */
 export const CREATOR_SHARE_PERCENTAGE: number = parseFloat(
-  process.env.CREATOR_SHARE_PERCENTAGE || '0.30'
+  process.env.CREATOR_SHARE_PERCENTAGE || '0.25'
 );
 
 /**

@@ -44,6 +44,7 @@ import { featureFlags } from '../../config/feature-flags';
 import { isAgencyRole } from '../../utils/staff-roles';
 import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { resolveStaffCommissionBps } from '../payment/commission-resolve.service';
+import { computeStaffCutsFromHostEarnings } from './staff-revenue-share';
 import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
 
 interface CallSession {
@@ -612,9 +613,12 @@ export async function settleCall(
                   });
                   const bdBpsSnap = rates.bdBps;
                   const agencyBpsSnap = rates.agencyBps;
-                  const bdCut =
-                    bdOid != null ? Math.floor((totalEarnedCreator * bdBpsSnap) / 10000) : 0;
-                  const agencyCut = Math.floor((totalEarnedCreator * agencyBpsSnap) / 10000);
+                  const { bdCut, agencyCut } = computeStaffCutsFromHostEarnings(
+                    totalEarnedCreator,
+                    bdBpsSnap,
+                    agencyBpsSnap,
+                    bdOid != null
+                  );
 
                   const bdKey = `staff_ledger_call_${callId}_bd_credit`;
                   const agKey = `staff_ledger_call_${callId}_agency_credit`;

@@ -36,13 +36,13 @@ From [`pricing.service.ts`](../src/modules/video/pricing.service.ts) + [`billing
   `creatorEarningsPerSecondMicros = floor((round(pricePerMinute * CREATOR_SHARE_PERCENTAGE * COIN_MICROS)) / 60)`  
   ([`pricePerMinuteToCreatorMicrosPerSecond`](../src/modules/billing/billing.constants.ts))
 
-Default `CREATOR_SHARE_PERCENTAGE = 0.30` ([`pricing.config.ts`](../src/config/pricing.config.ts)).
+Default `CREATOR_SHARE_PERCENTAGE = 0.25` ([`pricing.config.ts`](../src/config/pricing.config.ts)).
 
 ### Scenario baseline numbers (creator `price` = 60 coins/min)
 
 - `pricePerMinute = 60`
 - `pricePerSecondMicros = floor(60 * 1_000_000 / 60) = 1_000_000` micros per second of **billed** time (≈ 1 coin/s).
-- `creatorEarningsPerSecondMicros = floor(60 * 0.30 * 1_000_000 / 60) = 300_000` micros per second of **billed** time (≈ 0.3 coin/s).
+- `creatorEarningsPerSecondMicros = floor(60 * 0.25 * 1_000_000 / 60) = 250_000` micros per second of **billed** time (≈ 0.25 coin/s).
 
 User wallet at session start: Mongo `user.coins = 60` → `balanceMicros = 60 * COIN_MICROS = 60_000_000`.
 

@@ -3,6 +3,7 @@ import { assertAgency, assertBd, loadStaffUserByAuth } from '../../middlewares/s
 import { logError } from '../../utils/logger';
 import {
   createStaffWithdrawalRequest,
+  getStaffWalletCommissionMeta,
   getStaffWalletSummary,
   listStaffWalletTransactions,
   listStaffWalletWithdrawals,
@@ -34,8 +35,11 @@ export const getBdWallet = async (req: Request, res: Response): Promise<void> =>
   try {
     const staff = await resolveStaff(req, res, 'bd');
     if (!staff) return;
-    const data = await getStaffWalletSummary(staff._id);
-    res.json({ success: true, data });
+    const [data, commission] = await Promise.all([
+      getStaffWalletSummary(staff._id),
+      getStaffWalletCommissionMeta(staff),
+    ]);
+    res.json({ success: true, data: { ...data, ...commission } });
   } catch (error) {
     logError('getBdWallet', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -46,8 +50,11 @@ export const getAgencyWallet = async (req: Request, res: Response): Promise<void
   try {
     const staff = await resolveStaff(req, res, 'agency');
     if (!staff) return;
-    const data = await getStaffWalletSummary(staff._id);
-    res.json({ success: true, data });
+    const [data, commission] = await Promise.all([
+      getStaffWalletSummary(staff._id),
+      getStaffWalletCommissionMeta(staff),
+    ]);
+    res.json({ success: true, data: { ...data, ...commission } });
   } catch (error) {
     logError('getAgentWallet', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });

@@ -7,8 +7,8 @@ import { assertAdmin } from '../../middlewares/staff.middleware';
 import { logError } from '../../utils/logger';
 import { isBdRole, isAgencyRole } from '../../utils/staff-roles';
 import {
-  SPLIT_INDEPENDENT_HOST_PCT,
-  SPLIT_WITH_STAFF_PCT,
+  getSplitIndependentHostPct,
+  getSplitWithStaffPct,
 } from './admin-revenue-split.constants';
 
 function utcStartOfDaysAgo(days: number): Date {
@@ -77,27 +77,32 @@ export const getRevenueSplitSummary = async (req: Request, res: Response): Promi
 
     const pctCoins = (pct: number) => Math.floor((totalCallRevenue * pct) / 100);
 
+    const [splitWithStaffPct, splitIndependentPct] = await Promise.all([
+      getSplitWithStaffPct(),
+      getSplitIndependentHostPct(),
+    ]);
+
     const scenarioWithStaff = {
       key: 'with_agency_and_bd',
       label: 'Host with agency & BD (policy %)',
-      slices: SPLIT_WITH_STAFF_PCT.map((s) => ({
+      slices: splitWithStaffPct.map((s) => ({
         ...s,
         coins: pctCoins(s.pct),
       })),
       platformCoins: pctCoins(
-        SPLIT_WITH_STAFF_PCT.find((s) => s.key === 'platform')?.pct ?? 55
+        splitWithStaffPct.find((s) => s.key === 'platform')?.pct ?? 0
       ),
     };
 
     const scenarioIndependent = {
       key: 'independent_host',
       label: 'Host without agency or BD (policy %)',
-      slices: SPLIT_INDEPENDENT_HOST_PCT.map((s) => ({
+      slices: splitIndependentPct.map((s) => ({
         ...s,
         coins: pctCoins(s.pct),
       })),
       platformCoins: pctCoins(
-        SPLIT_INDEPENDENT_HOST_PCT.find((s) => s.key === 'platform')?.pct ?? 75
+        splitIndependentPct.find((s) => s.key === 'platform')?.pct ?? 0
       ),
     };
 

@@ -62,6 +62,7 @@ import {
   updatePlatformRevenueConfigAdmin,
   patchCreatorLinkedUser,
   postAdminTransferCreatorToAgency,
+  adminCreatorAvatarCommit,
   adminCreatorGalleryCommit,
   adminCreatorGalleryDelete,
   adminCreatorGalleryReorder,
@@ -164,6 +165,7 @@ router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/force-offline', forceCreatorOffline);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
 router.post('/creators/:id/transfer-agency', postAdminTransferCreatorToAgency);
+router.post('/creators/:id/avatar/commit', adminCreatorAvatarCommit);
 router.post('/creators/:id/gallery/commit', adminCreatorGalleryCommit);
 router.delete('/creators/:id/gallery/:imageId', adminCreatorGalleryDelete);
 router.patch('/creators/:id/gallery/reorder', adminCreatorGalleryReorder);

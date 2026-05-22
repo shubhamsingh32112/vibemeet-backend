@@ -11,7 +11,7 @@ export interface ICall extends Document {
 
   // Price snapshots (aligned with pricingService + billing session)
   priceAtCallTime?: number; // Creator's price per minute at call start
-  creatorShareAtCallTime?: number; // Creator's share percentage (e.g., 0.30 for 30%)
+  creatorShareAtCallTime?: number; // Creator's share percentage (e.g., 0.25 for 25%)
 
   // Call lifecycle timestamps
   startedAt?: Date; // When call session actually started (from Stream webhook)

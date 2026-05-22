@@ -1,12 +1,24 @@
-/** Policy % of call spend (display / scenario coins). */
-export const SPLIT_WITH_STAFF_PCT = [
-  { key: 'host', label: 'Host', pct: 25 },
-  { key: 'bd', label: 'BD', pct: 5 },
-  { key: 'agency', label: 'Agency', pct: 15 },
-  { key: 'platform', label: 'Platform', pct: 55 },
-] as const;
+import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
+import { getOrCreatePlatformRevenueConfig } from '../payment/platform-revenue-config.model';
+import {
+  computeIndependentHostDisplayPercents,
+  computeRevenueSplitDisplayPercents,
+} from '../billing/staff-revenue-share';
 
-export const SPLIT_INDEPENDENT_HOST_PCT = [
-  { key: 'host', label: 'Host', pct: 25 },
-  { key: 'platform', label: 'Platform', pct: 75 },
-] as const;
+export function hostSharePctFromConfig(): number {
+  return Math.round(CREATOR_SHARE_PERCENTAGE * 1000) / 10;
+}
+
+/** Policy % of call spend for charts (derived from host share × staff bps). */
+export async function getSplitWithStaffPct(): Promise<
+  ReturnType<typeof computeRevenueSplitDisplayPercents>
+> {
+  const cfg = await getOrCreatePlatformRevenueConfig();
+  return computeRevenueSplitDisplayPercents(hostSharePctFromConfig(), cfg.bdBps, cfg.agencyBps);
+}
+
+export async function getSplitIndependentHostPct(): Promise<
+  ReturnType<typeof computeIndependentHostDisplayPercents>
+> {
+  return computeIndependentHostDisplayPercents(hostSharePctFromConfig());
+}

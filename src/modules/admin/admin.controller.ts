@@ -27,7 +27,28 @@ import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
 import { loadStaffCreatorDetailById } from '../creator/creator-staff-portal.detail';
-import { buildCreatorMediaPayload } from '../creator/creator-staff-portal.payload';
+import {
+  buildCreatorMediaPayload,
+  buildUserMediaPayload,
+} from '../creator/creator-staff-portal.payload';
+import {
+  assertCloudflareEnabled,
+  CloudflareImagesDisabledError,
+  isCloudflareImagesEnabled,
+} from '../../config/cloudflare';
+import {
+  invalidateCreatorCatalogCaches,
+  invalidateCreatorDashboard,
+  invalidateCreatorDetailCache,
+} from '../../config/redis';
+import { ensureStreamUser } from '../../config/stream';
+import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
+import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
+import { emitCreatorDataUpdated } from '../creator/creator-notify';
+import {
+  safeCloudflareImagesClientError,
+  setDegradedHeader,
+} from '../images/images.controller';
 import { CreatorDailyOnline } from '../availability/creator-daily-online.model';
 import {
   CREATOR_GALLERY_MAX_IMAGES,
@@ -1005,8 +1026,8 @@ export const getPlatformRevenueConfigAdmin = async (
       data: {
         ...cfg,
         hostSharePct,
-        bdPctOfGross: cfg.bdBps / 100,
-        agencyPctOfGross: cfg.agencyBps / 100,
+        bdPctOfHostEarnings: cfg.bdBps / 100,
+        agencyPctOfHostEarnings: cfg.agencyBps / 100,
         note:
           'Staff BD/agency wallet credits are computed as basis points of the host earnings pool at settlement. ' +
           'If a host has no agency (or agency has no BD), those shares are not paid out and remain with the platform.',
@@ -3101,6 +3122,159 @@ export const patchCreatorLinkedUser = async (req: Request, res: Response): Promi
     });
   } catch (error) {
     console.error('❌ [ADMIN] patchCreatorLinkedUser error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * Cloudflare-Images admin creator avatar commit.
+ *
+ * Flow:
+ *   1. `POST /images/direct-upload { purpose: 'creator-avatar', ... }`
+ *   2. Client uploads bytes to `uploadUrl`
+ *   3. `POST` here with `{ sessionId }` — commits to creator.avatar and syncs User.avatar
+ */
+export const adminCreatorAvatarCommit = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id: creatorId } = req.params;
+
+    if (!isCloudflareImagesEnabled()) {
+      res.status(503).json({
+        success: false,
+        code: 'IMAGES_DISABLED',
+        error: 'Cloudflare Images is not enabled. Set USE_CLOUDFLARE_IMAGES=true on the API.',
+      });
+      return;
+    }
+
+    if (!(await assertAdminOrOwningAgentForCreator(req, res, creatorId))) return;
+
+    const creator = await Creator.findById(creatorId);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const adminUser = await User.findOne({ firebaseUid: req.auth?.firebaseUid });
+    if (!adminUser) {
+      res.status(401).json({ success: false, error: 'admin user not found' });
+      return;
+    }
+
+    const { sessionId } = req.body ?? {};
+    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'sessionId is required' });
+      return;
+    }
+
+    try {
+      assertCloudflareEnabled();
+    } catch (error) {
+      if (error instanceof CloudflareImagesDisabledError) {
+        setDegradedHeader(res);
+        res.status(503).json({
+          success: false,
+          code: 'IMAGES_DISABLED',
+          error: error.message,
+        });
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      const { asset } = await commitImageAsset({
+        sessionId: sessionId.trim(),
+        userId: adminUser._id.toString(),
+        userObjectId: adminUser._id,
+        purpose: 'creator-avatar',
+        quotaScope: 'avatar',
+        blurhashTarget: {
+          kind: 'creator-avatar',
+          creatorId: creator._id.toString(),
+        },
+      });
+
+      if (creator.avatar) {
+        creator.previousAvatar = creator.avatar;
+      }
+      creator.avatar = asset;
+      await creator.save();
+
+      const linkedUser = creator.userId ? await User.findById(creator.userId) : null;
+      if (linkedUser) {
+        linkedUser.avatar = asset;
+        await linkedUser.save();
+        await bumpCreatorProfileRevisionForAdmin(creator.userId);
+        invalidateCreatorDashboard(linkedUser._id.toString()).catch(() => {});
+        try {
+          const freshUser = await User.findById(linkedUser._id);
+          if (freshUser?.firebaseUid) {
+            const streamPayload = await getStreamUpsertPayload(freshUser);
+            await ensureStreamUser(freshUser.firebaseUid, streamPayload);
+            await invalidateOtherMemberCacheForFirebaseUid(freshUser.firebaseUid);
+          }
+        } catch (syncErr) {
+          console.error('⚠️ [ADMIN] Stream sync after avatar commit failed:', syncErr);
+        }
+        try {
+          if (linkedUser.firebaseUid) {
+            emitCreatorDataUpdated(linkedUser.firebaseUid, { reason: 'profile_updated' });
+          }
+        } catch (emitErr) {
+          console.error('⚠️ [ADMIN] emitCreatorDataUpdated after avatar commit failed:', emitErr);
+        }
+      }
+
+      invalidateCreatorCatalogCaches().catch(() => {});
+      invalidateCreatorDetailCache(creator._id.toString()).catch(() => {});
+
+      const creatorMedia = buildCreatorMediaPayload(creator);
+      const userMedia = linkedUser ? buildUserMediaPayload(linkedUser) : null;
+
+      res.json({
+        success: true,
+        data: {
+          avatar: creatorMedia.avatar,
+          avatarUrl: creatorMedia.avatarUrl,
+          photo: creatorMedia.photo,
+          galleryImages: creatorMedia.galleryImages,
+          user: userMedia
+            ? { avatar: userMedia.avatar, avatarUrl: userMedia.avatarUrl }
+            : null,
+        },
+      });
+      return;
+    } catch (commitError) {
+      if (commitError instanceof CommitImageAssetError) {
+        res.status(commitError.status).json({
+          success: false,
+          code: commitError.code,
+          error: commitError.message,
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesCircuitOpenError) {
+        setDegradedHeader(res);
+        res.status(503).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_UNAVAILABLE',
+          error: 'image service is temporarily unavailable; please retry',
+        });
+        return;
+      }
+      if (commitError instanceof CloudflareImagesError) {
+        res.status(commitError.status >= 500 ? 502 : commitError.status).json({
+          success: false,
+          code: 'CLOUDFLARE_IMAGES_ERROR',
+          error: safeCloudflareImagesClientError(commitError.status),
+        });
+        return;
+      }
+      throw commitError;
+    }
+  } catch (error) {
+    console.error('❌ [ADMIN] adminCreatorAvatarCommit error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

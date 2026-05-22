@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
-import { User } from '../user/user.model';
+import { User, type IUser } from '../user/user.model';
+import { resolveStaffCommissionBps } from '../payment/commission-resolve.service';
+import { isAgencyRole, isBdRole } from '../../utils/staff-roles';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { StaffPayoutAccount } from './staff-payout-account.model';
@@ -82,6 +84,36 @@ export function validatePayoutAccountInput(input: PayoutAccountInput): string | 
   if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) return 'Invalid IFSC format';
   if (upi && !/^[\w.\-]{2,}@[\w.\-]{2,}$/i.test(upi)) return 'Invalid UPI ID format';
   return null;
+}
+
+export async function getStaffWalletCommissionMeta(
+  staff: Pick<IUser, '_id' | 'role' | 'bdId'>
+): Promise<{ commissionPctOfHostEarnings: number; commissionNote: string }> {
+  if (isBdRole(staff.role)) {
+    const rates = await resolveStaffCommissionBps({
+      bdUserId: staff._id,
+      bdId: null,
+    });
+    const commissionPctOfHostEarnings = rates.bdBps / 100;
+    return {
+      commissionPctOfHostEarnings,
+      commissionNote:
+        'You earn this percentage of host earnings on each settled call. Credits go to this wallet and are not deducted from creators.',
+    };
+  }
+
+  const agencyId = staff._id;
+  const bdUserId = (staff.bdId ?? agencyId) as mongoose.Types.ObjectId;
+  const rates = await resolveStaffCommissionBps({
+    bdUserId,
+    bdId: isAgencyRole(staff.role) ? agencyId : null,
+  });
+  const commissionPctOfHostEarnings = rates.agencyBps / 100;
+  return {
+    commissionPctOfHostEarnings,
+    commissionNote:
+      'You earn this percentage of host earnings on each settled call. Credits go to this wallet and are not deducted from creators.',
+  };
 }
 
 export async function getStaffWalletSummary(staffUserId: mongoose.Types.ObjectId) {

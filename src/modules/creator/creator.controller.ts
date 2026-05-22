@@ -661,13 +661,13 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
       return;
     }
     
-    const { name, about, photo, userId, categories, price, age, location } = req.body;
+    const { name, about, userId, categories, price, age, location } = req.body;
     
-    // Validation
-    if (!name || !about || !photo || !userId || price === undefined) {
+    // Validation (avatar via Cloudflare commit after create — see adminCreatorAvatarCommit)
+    if (!name || !about || !userId || price === undefined) {
       res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, about, photo, userId, price',
+        error: 'Missing required fields: name, about, userId, price',
       });
       return;
     }
@@ -749,7 +749,6 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
         [{
           name,
           about,
-          photo,
           galleryImages: [],
           userId: targetUser._id,
           ...(targetUser.firebaseUid ? { firebaseUid: targetUser.firebaseUid.trim() } : {}),
