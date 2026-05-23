@@ -30,6 +30,7 @@ import { loadStaffCreatorDetailById } from '../creator/creator-staff-portal.deta
 import {
   buildCreatorMediaPayload,
   buildUserMediaPayload,
+  staffGalleryFromCreator,
 } from '../creator/creator-staff-portal.payload';
 import {
   assertCloudflareEnabled,
@@ -3369,7 +3370,7 @@ export const adminCreatorGalleryCommit = async (req: Request, res: Response): Pr
         success: true,
         data: {
           galleryItemId: newGalleryItemId,
-          galleryImages: serializeCreatorGallery(creator.galleryImages),
+          galleryImages: staffGalleryFromCreator(creator),
         },
       });
       return;
@@ -3461,7 +3462,7 @@ export const adminCreatorGalleryDelete = async (req: Request, res: Response): Pr
     res.json({
       success: true,
       data: {
-        galleryImages: serializeCreatorGallery(creator.galleryImages),
+        galleryImages: staffGalleryFromCreator(creator),
       },
     });
   } catch (error) {
@@ -3513,7 +3514,7 @@ export const adminCreatorGalleryReorder = async (req: Request, res: Response): P
     res.json({
       success: true,
       data: {
-        galleryImages: serializeCreatorGallery(creator.galleryImages),
+        galleryImages: staffGalleryFromCreator(creator),
       },
     });
   } catch (error) {

@@ -1,6 +1,7 @@
 import type { ICreator } from './creator.model';
 import type { IUser } from '../user/user.model';
 import {
+  serializeCreatorGallery,
   serializeCreatorImages,
   serializeUserImages,
   type SerializedGalleryItem,
@@ -20,13 +21,19 @@ export function pickPrimaryAvatarUrl(avatar: AvatarSerialization | null | undefi
   return avatar.avatarUrls.md ?? avatar.avatarUrls.sm ?? avatar.avatarUrls.xs ?? null;
 }
 
-export function galleryToStaffDtos(items: SerializedGalleryItem[]): StaffPortalGalleryImage[] {
+export function galleryToStaffDtos(
+  items: SerializedGalleryItem[],
+  legacyUrlById?: Map<string, string>,
+): StaffPortalGalleryImage[] {
   const out: StaffPortalGalleryImage[] = [];
   for (const item of items) {
+    const legacyFromItem = (item as SerializedGalleryItem & { url?: string }).url;
     const url =
       item.image?.galleryUrls?.md ??
       item.image?.galleryUrls?.xl ??
       item.image?.galleryUrls?.thumb ??
+      legacyUrlById?.get(item.id) ??
+      (typeof legacyFromItem === 'string' ? legacyFromItem.trim() || null : null) ??
       null;
     if (!url) continue;
     out.push({
@@ -40,6 +47,21 @@ export function galleryToStaffDtos(items: SerializedGalleryItem[]): StaffPortalG
     });
   }
   return out;
+}
+
+/** Flat gallery DTO for staff portals (detail + mutate responses). */
+export function staffGalleryFromCreator(
+  creator: Pick<ICreator, 'galleryImages'>,
+): StaffPortalGalleryImage[] {
+  const raw = creator.galleryImages || [];
+  const legacyUrlById = new Map<string, string>();
+  for (const item of raw) {
+    const legacy = (item as { url?: string }).url;
+    if (typeof legacy === 'string' && legacy.trim().length > 0) {
+      legacyUrlById.set(item.id, legacy.trim());
+    }
+  }
+  return galleryToStaffDtos(serializeCreatorGallery(raw), legacyUrlById);
 }
 
 export function buildCreatorMediaPayload(
