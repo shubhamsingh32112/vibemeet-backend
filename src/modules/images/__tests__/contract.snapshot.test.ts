@@ -241,6 +241,14 @@ test('every /images/* error envelope carries { success:false, code, error }', as
   }
 });
 
+test('direct-upload success payload includes uploadURL and uploadUrl alias', () => {
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  const { join } = require('node:path') as typeof import('node:path');
+  const src = readFileSync(join(__dirname, '..', 'images.controller.ts'), 'utf8');
+  assert.ok(src.includes('uploadURL: cloudflare.uploadURL'), 'must expose uploadURL for Flutter');
+  assert.ok(src.includes('uploadUrl: cloudflare.uploadURL'), 'must expose uploadUrl alias for admin web');
+});
+
 // ── Routing surface lock ────────────────────────────────────────────────
 test('images.routes registers /health, /direct-upload, /presets only', () => {
   // Lock route surface via source inspection: drift in this file would

@@ -221,6 +221,7 @@ export async function createDirectUploadHandler(req: Request, res: Response): Pr
       success: true,
       data: {
         uploadURL: cloudflare.uploadURL,
+        uploadUrl: cloudflare.uploadURL,
         imageId: cloudflare.imageId,
         sessionId: session.sessionId,
         expiresAt: new Date(session.expiresAt).toISOString(),
