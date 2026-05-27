@@ -1177,6 +1177,82 @@ export const applyReferralPost = async (req: Request, res: Response): Promise<vo
 };
 
 // Get all users (for creators to see - excludes other creators)
+export const getUserByFirebaseUid = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+      });
+      return;
+    }
+
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    if (currentUser.role !== 'creator' && !isSuperAdminRole(currentUser.role)) {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden: Only creators can view users',
+      });
+      return;
+    }
+
+    const firebaseUid = String(req.params.firebaseUid ?? '').trim();
+    if (!firebaseUid) {
+      res.status(400).json({
+        success: false,
+        error: 'firebaseUid is required',
+      });
+      return;
+    }
+
+    const user = await User.findOne({
+      firebaseUid,
+      $or: [{ role: 'user' }, { role: { $exists: false } }, { role: null }],
+    }).select('username avatar gender categories createdAt firebaseUid');
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    const { avatar } = serializeUserImages(user);
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id: user._id.toString(),
+          username: user.username,
+          avatar,
+          gender: user.gender,
+          categories: user.categories || [],
+          firebaseUid: user.firebaseUid,
+          createdAt: user.createdAt,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('❌ [USER] Get user by firebase uid error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
 export const getAllUsers = async (req: Request, res: Response): Promise<void> => {
   try {
     console.log('📋 [USER] Get all users request');

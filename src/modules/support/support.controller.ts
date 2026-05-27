@@ -16,6 +16,17 @@ type CreatorResolution = {
 };
 
 const MAX_DAILY_TICKETS = 5;
+const MAX_SUPPORT_ATTACHMENTS = 5;
+const MAX_SUPPORT_ATTACHMENT_BYTES = 1500000;
+const ALLOWED_SUPPORT_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+type NormalizedSupportAttachment = {
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  dataBase64: string;
+  isScreenshot: boolean;
+};
 
 function resolveTicketRole(userRole: string): 'user' | 'creator' | 'agency' | 'bd' {
   if (userRole === 'creator') return 'creator';
@@ -69,6 +80,66 @@ const releaseDailySupportTicketSlot = async (userId: string): Promise<void> => {
     { userId, dayKey, count: { $gt: 0 } },
     { $inc: { count: -1 } }
   );
+};
+
+const normalizeSupportAttachments = (raw: unknown): NormalizedSupportAttachment[] => {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error('Attachments must be an array');
+  }
+  if (raw.length > MAX_SUPPORT_ATTACHMENTS) {
+    throw new Error(`You can upload up to ${MAX_SUPPORT_ATTACHMENTS} attachments`);
+  }
+
+  return raw.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`Attachment #${index + 1} is invalid`);
+    }
+    const record = entry as Record<string, unknown>;
+    const nameRaw = typeof record.name === 'string' ? record.name.trim() : '';
+    const mimeTypeRaw = typeof record.mimeType === 'string' ? record.mimeType.trim().toLowerCase() : '';
+    const dataBase64Raw = typeof record.dataBase64 === 'string' ? record.dataBase64.trim() : '';
+    const declaredSize = Number(record.sizeBytes);
+    const safeName = nameRaw.length > 0 ? nameRaw.slice(0, 120) : `attachment-${index + 1}`;
+
+    if (!ALLOWED_SUPPORT_MIME_TYPES.has(mimeTypeRaw)) {
+      throw new Error(`Attachment #${index + 1} has unsupported format`);
+    }
+    if (!dataBase64Raw) {
+      throw new Error(`Attachment #${index + 1} is missing image data`);
+    }
+
+    let decoded: Buffer;
+    try {
+      decoded = Buffer.from(dataBase64Raw, 'base64');
+    } catch {
+      throw new Error(`Attachment #${index + 1} has invalid image encoding`);
+    }
+    if (!decoded || decoded.length === 0) {
+      throw new Error(`Attachment #${index + 1} is empty`);
+    }
+    if (decoded.length > MAX_SUPPORT_ATTACHMENT_BYTES) {
+      throw new Error(
+        `Attachment #${index + 1} is too large. Max ${Math.floor(
+          MAX_SUPPORT_ATTACHMENT_BYTES / 1000000
+        )} MB per file.`
+      );
+    }
+    if (!Number.isFinite(declaredSize) || declaredSize <= 0) {
+      throw new Error(`Attachment #${index + 1} has invalid size`);
+    }
+    if (Math.abs(declaredSize - decoded.length) > 2048) {
+      throw new Error(`Attachment #${index + 1} size mismatch`);
+    }
+
+    return {
+      name: safeName,
+      mimeType: mimeTypeRaw,
+      sizeBytes: decoded.length,
+      dataBase64: dataBase64Raw,
+      isScreenshot: Boolean(record.isScreenshot),
+    };
+  });
 };
 
 const resolveReportedCreator = async (params: {
@@ -156,6 +227,7 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       relatedCallId,
       creatorLookupId,
       creatorFirebaseUid,
+      attachments,
     } = req.body;
 
     if (!category || typeof category !== 'string' || category.trim().length < 2) {
@@ -170,6 +242,14 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
 
     if (!message || typeof message !== 'string' || message.trim().length < 10) {
       res.status(400).json({ success: false, error: 'Message is required (min 10 characters)' });
+      return;
+    }
+
+    let normalizedAttachments: NormalizedSupportAttachment[] = [];
+    try {
+      normalizedAttachments = normalizeSupportAttachments(attachments);
+    } catch (error: any) {
+      res.status(400).json({ success: false, error: error?.message || 'Invalid attachments' });
       return;
     }
 
@@ -215,6 +295,7 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
         category: category.trim(),
         subject: subject.trim(),
         message: message.trim(),
+        attachments: normalizedAttachments,
         priority: ticketPriority,
         source: ticketSource,
         relatedCallId: callId,
@@ -255,6 +336,14 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
         role: ticket.role,
         category: ticket.category,
         subject: ticket.subject,
+        attachments: (ticket.attachments || []).map((attachment) => ({
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.sizeBytes,
+          isScreenshot: Boolean(attachment.isScreenshot),
+          dataBase64: attachment.dataBase64,
+          dataUrl: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
+        })),
         status: ticket.status,
         priority: ticket.priority,
         createdAt: ticket.createdAt.toISOString(),
@@ -298,6 +387,14 @@ export const getMyTickets = async (req: Request, res: Response): Promise<void> =
           category: t.category,
           subject: t.subject,
           message: t.message,
+          attachments: (t.attachments || []).map((attachment) => ({
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+            isScreenshot: Boolean(attachment.isScreenshot),
+            dataBase64: attachment.dataBase64,
+            dataUrl: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
+          })),
           source: t.source || 'other',
           relatedCallId: t.relatedCallId || null,
           reportedCreatorUserId: t.reportedCreatorUserId?.toString() || null,

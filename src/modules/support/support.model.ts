@@ -1,5 +1,13 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
+export interface ISupportTicketAttachment {
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  dataBase64: string;
+  isScreenshot: boolean;
+}
+
 /**
  * SupportTicket — Unified support system for Users & Creators.
  *
@@ -14,6 +22,7 @@ export interface ISupportTicket extends Document {
   category: string;
   subject: string;
   message: string;
+  attachments: ISupportTicketAttachment[];
   source?: 'chat' | 'post_call' | 'other' | 'staff_portal';
   relatedCallId?: string;
   reportedCreatorUserId?: mongoose.Types.ObjectId;
@@ -53,6 +62,38 @@ const supportTicketSchema = new Schema<ISupportTicket>(
     message: {
       type: String,
       required: true,
+    },
+    attachments: {
+      type: [
+        {
+          name: {
+            type: String,
+            required: true,
+            trim: true,
+            maxlength: 120,
+          },
+          mimeType: {
+            type: String,
+            required: true,
+            trim: true,
+            maxlength: 64,
+          },
+          sizeBytes: {
+            type: Number,
+            required: true,
+            min: 1,
+          },
+          dataBase64: {
+            type: String,
+            required: true,
+          },
+          isScreenshot: {
+            type: Boolean,
+            default: false,
+          },
+        },
+      ],
+      default: [],
     },
     source: {
       type: String,

@@ -429,6 +429,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             gender: user.gender,
             age: user.age,
             username: user.username,
+            avatarAsset: serializeAvatar(user.avatar),
             avatar: user.avatar,
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,

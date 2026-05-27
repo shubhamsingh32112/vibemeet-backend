@@ -6,6 +6,7 @@ import {
   applyReferralAgencyPost,
   updateProfile,
   getAllUsers,
+  getUserByFirebaseUid,
   searchUsers,
   promoteToCreator,
   addCoins,
@@ -36,6 +37,7 @@ router.post(
   applyReferralAgencyPost
 );
 router.get('/list', verifyFirebaseToken, getAllUsers);
+router.get('/by-firebase-uid/:firebaseUid', verifyFirebaseToken, getUserByFirebaseUid);
 router.get('/search', verifyFirebaseToken, searchUsers); // Admin only - search users
 router.put('/profile', verifyFirebaseToken, updateProfile);
 router.post('/coins', verifyFirebaseToken, addCoins); // Add coins to user account
