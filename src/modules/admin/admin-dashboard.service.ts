@@ -9,10 +9,12 @@ import { Withdrawal } from '../creator/withdrawal.model';
 import { SupportTicket } from '../support/support.model';
 import { FraudSignal } from '../fraud/fraud-signal.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
+import axios from 'axios';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import { countOnlineCreatorsPlatform } from '../availability/presence-dashboard.service';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
+import { logError } from '../../utils/logger';
 
 const TOP_BD_ROLE = { role: 'bd' as const };
 const MIDDLE_AGENCY_ROLE = { role: 'agency' as const };
@@ -531,6 +533,7 @@ export async function dashboardRazorpayBalance() {
       configured: false,
       fetchedAt: new Date().toISOString(),
       note: 'RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are missing on this backend environment.',
+      fetchError: null as string | null,
       totals: {
         currency: 'INR',
         available: 0,
@@ -547,37 +550,78 @@ export async function dashboardRazorpayBalance() {
     };
   }
 
-  const razorpay = getRazorpayInstance() as unknown as {
-    balance?: { fetch: () => Promise<unknown> };
-  };
-  if (!razorpay.balance?.fetch) {
-    throw new Error('Razorpay SDK balance API is unavailable in current package version.');
-  }
-  const balance = await razorpay.balance.fetch();
-  const channels = extractBalanceRows(balance);
-  const total = channels.reduce(
-    (acc, row) => ({
-      available: acc.available + row.available,
-      onHold: acc.onHold + row.onHold,
-      pending: acc.pending + row.pending,
-      reserved: acc.reserved + row.reserved,
-      settled: acc.settled + row.settled,
-      net: acc.net + row.net,
-    }),
-    { available: 0, onHold: 0, pending: 0, reserved: 0, settled: 0, net: 0 }
-  );
+  try {
+    const sdk = getRazorpayInstance() as unknown as { balance?: { fetch: () => Promise<unknown> } };
+    let balance: unknown;
 
-  return {
-    configured: true,
-    fetchedAt: new Date().toISOString(),
-    note: 'Balances are fetched live from Razorpay. Reserve/max-negative depends on your account configuration.',
-    totals: {
-      currency: channels[0]?.currency ?? 'INR',
-      ...total,
-    },
-    hasNegativeAvailable: total.available < 0,
-    maxNegativeLimit: total.reserved,
-    channels,
-    raw: balance as unknown,
-  };
+    if (sdk.balance?.fetch) {
+      balance = await sdk.balance.fetch();
+    } else {
+      const keyId = String(process.env.RAZORPAY_KEY_ID ?? '');
+      const keySecret = String(process.env.RAZORPAY_KEY_SECRET ?? '');
+      const response = await axios.get('https://api.razorpay.com/v1/balance', {
+        auth: { username: keyId, password: keySecret },
+        timeout: 15_000,
+      });
+      balance = response.data;
+    }
+
+    const channels = extractBalanceRows(balance);
+    const total = channels.reduce(
+      (acc, row) => ({
+        available: acc.available + row.available,
+        onHold: acc.onHold + row.onHold,
+        pending: acc.pending + row.pending,
+        reserved: acc.reserved + row.reserved,
+        settled: acc.settled + row.settled,
+        net: acc.net + row.net,
+      }),
+      { available: 0, onHold: 0, pending: 0, reserved: 0, settled: 0, net: 0 }
+    );
+
+    return {
+      configured: true,
+      fetchedAt: new Date().toISOString(),
+      note: 'Balances are fetched live from Razorpay. Reserve/max-negative depends on your account configuration.',
+      fetchError: null as string | null,
+      totals: {
+        currency: channels[0]?.currency ?? 'INR',
+        ...total,
+      },
+      hasNegativeAvailable: total.available < 0,
+      maxNegativeLimit: total.reserved,
+      channels,
+      raw: balance as unknown,
+    };
+  } catch (error) {
+    logError('dashboardRazorpayBalance failed', error as Error);
+    const axiosStatus =
+      typeof error === 'object' && error && 'response' in error
+        ? Number((error as { response?: { status?: number } }).response?.status ?? 0)
+        : 0;
+    const fetchError =
+      axiosStatus === 401
+        ? 'Razorpay auth failed (401). Verify KEY_ID/KEY_SECRET and test/live mode match.'
+        : 'Unable to fetch balance from Razorpay at the moment.';
+
+    return {
+      configured: true,
+      fetchedAt: new Date().toISOString(),
+      note: 'Razorpay balance fetch failed; showing empty fallback values.',
+      fetchError,
+      totals: {
+        currency: 'INR',
+        available: 0,
+        onHold: 0,
+        pending: 0,
+        reserved: 0,
+        settled: 0,
+        net: 0,
+      },
+      hasNegativeAvailable: false,
+      maxNegativeLimit: 0,
+      channels: [] as RazorpayBalanceBucket[],
+      raw: null as unknown,
+    };
+  }
 }
