@@ -449,6 +449,34 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
     const images = serializeCreatorImages(creator as unknown as ICreator);
     const legacyPhoto =
       (creator as unknown as { photo?: string | null }).photo ?? null;
+    const avatarUrls = images.avatar?.avatarUrls;
+    const hasCallPhoto =
+      typeof avatarUrls?.callPhoto === 'string' &&
+      avatarUrls.callPhoto.trim().length > 0;
+    const hasMd =
+      typeof avatarUrls?.md === 'string' && avatarUrls.md.trim().length > 0;
+    const hasAnyAvatar = hasCallPhoto || hasMd || Boolean(legacyPhoto);
+    if (!hasAnyAvatar) {
+      logError('creator.by_uid.avatar_missing', new Error('creator avatar missing'), {
+        endpoint: 'GET /creator/by-firebase-uid/:uid',
+        firebaseUid: uidRaw,
+        creatorId: creator._id.toString(),
+        availability,
+        hasCallPhoto,
+        hasMd,
+        hasLegacyPhoto: Boolean(legacyPhoto),
+      });
+    } else {
+      logInfo('creator.by_uid.avatar_coverage', {
+        endpoint: 'GET /creator/by-firebase-uid/:uid',
+        firebaseUid: uidRaw,
+        creatorId: creator._id.toString(),
+        availability,
+        hasCallPhoto,
+        hasMd,
+        hasLegacyPhoto: Boolean(legacyPhoto),
+      });
+    }
 
     logInfo('creator.by_uid.timing', { totalMs: Date.now() - t0 });
     res.json({

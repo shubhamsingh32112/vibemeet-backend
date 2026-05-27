@@ -202,6 +202,31 @@ async function refreshActiveCallSlotsTtl(
   ]);
 }
 
+function isBootstrappingSession(session: Partial<CallSession>): boolean {
+  const version = Number(session.version ?? 0);
+  const ppsMicros = Number(session.pricePerSecondMicros ?? 0);
+  return (
+    version <= 0 ||
+    !String(session.userMongoId || '').trim() ||
+    !String(session.creatorMongoId || '').trim() ||
+    ppsMicros <= 0
+  );
+}
+
+async function clearCallSessionSeed(
+  redis: ReturnType<typeof getRedis>,
+  callId: string
+): Promise<void> {
+  await redis
+    .multi()
+    .del(callSessionKey(callId))
+    .del(callUserIntroMicrosKey(callId))
+    .del(callUserWalletMicrosKey(callId))
+    .del(callCreatorEarningsKey(callId))
+    .del(callUserCoinsKey(callId))
+    .exec();
+}
+
 /** Max flush iterations before settlement (covers worst-case wall lag vs MAX_BILLING_DELTA_MS). */
 export const MAX_SETTLEMENT_FLUSH_ITERATIONS = 50;
 
@@ -657,8 +682,10 @@ export class BillingService {
       if (sessionDuringLock) {
         try {
           const parsed = JSON.parse(sessionDuringLock) as CallSession;
-          normalizeV4SessionFields(parsed);
-          await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+          if (!isBootstrappingSession(parsed)) {
+            normalizeV4SessionFields(parsed);
+            await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+          }
         } catch (replayErr) {
           logError(
             'Failed to replay billing:started after start lock busy',
@@ -687,29 +714,62 @@ export class BillingService {
 
     const existingSession = await redis.get(callSessionKey(callId));
     if (existingSession) {
-      logInfo('Billing session already exists (idempotent) — replaying billing:started', {
-        ...billingLifecycleLogContext({
-          callId,
-          source,
-          payerFirebaseUid: userFirebaseUid,
-          creatorFirebaseUid,
-          initiatedByFirebaseUid,
-          initiatedByRole,
-        }),
-        attemptedSource: source,
-      });
-      recordBillingMetric('session_start_duplicate', 1, {
-        source,
-        callIdPrefix,
-      });
       try {
         const parsed = JSON.parse(existingSession) as CallSession;
-        normalizeV4SessionFields(parsed);
-        await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+        const startTimeMs = Number(parsed.startTime || 0);
+        const ageMs = startTimeMs > 0 ? Math.max(0, Date.now() - startTimeMs) : 0;
+        if (isBootstrappingSession(parsed)) {
+          if (ageMs > 60_000) {
+            await clearCallSessionSeed(redis, callId);
+            logWarning('Cleared stale bootstrapping billing session seed', {
+              callId,
+              ageMs,
+              source,
+            });
+          } else {
+            logInfo('Billing session bootstrap in progress (idempotent duplicate)', {
+              ...billingLifecycleLogContext({
+                callId,
+                source,
+                payerFirebaseUid: userFirebaseUid,
+                creatorFirebaseUid,
+                initiatedByFirebaseUid,
+                initiatedByRole,
+              }),
+              ageMs,
+              attemptedSource: source,
+            });
+            recordBillingMetric('session_start_duplicate', 1, {
+              source,
+              callIdPrefix,
+              reason: 'bootstrap_in_progress',
+            });
+            return;
+          }
+        } else {
+          logInfo('Billing session already exists (idempotent) — replaying billing:started', {
+            ...billingLifecycleLogContext({
+              callId,
+              source,
+              payerFirebaseUid: userFirebaseUid,
+              creatorFirebaseUid,
+              initiatedByFirebaseUid,
+              initiatedByRole,
+            }),
+            attemptedSource: source,
+          });
+          recordBillingMetric('session_start_duplicate', 1, {
+            source,
+            callIdPrefix,
+          });
+          normalizeV4SessionFields(parsed);
+          await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+          return;
+        }
       } catch (replayErr) {
         logError('Failed to replay billing:started for existing session', replayErr, { callId });
+        return;
       }
-      return;
     }
 
     // Pair anti-race lock: prevents dual billing sessions for the same user↔creator pair.
@@ -753,29 +813,88 @@ export class BillingService {
     }
 
     let slotsToReleaseOnFailure = true;
+    let seededEarlySession = false;
+    let finalSessionPersisted = false;
 
     try {
-    const user = await User.findOne({ firebaseUid: userFirebaseUid });
-    if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
-    if (user.role !== 'user') {
-      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
-      slotsToReleaseOnFailure = false;
-      void forceTerminateCall(io, {
+      const seedStartTime = Date.now();
+      const earlySession: CallSession = {
+        schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+        billingVersion: 1,
+        initialIntroMicros: 0,
+        initialWalletMicros: 0,
+        billingPricePerSecondMicros: 0,
+        introPromoActive: false,
+        introPromoSessionId: callId,
+        totalIntroDeductedMicros: 0,
+        totalWalletDeductedMicros: 0,
         callId,
         userFirebaseUid,
         creatorFirebaseUid,
-        reason: 'unknown',
-        creatorReason: 'unknown',
-        userPayload: { message: 'Invalid call participants.' },
-      }).catch(() => {});
-      return;
-    }
+        userMongoId: '',
+        creatorMongoId: String(creatorMongoId || ''),
+        initiatedByFirebaseUid,
+        initiatedByRole,
+        pricePerMinute: 0,
+        pricePerSecondMicros: 0,
+        creatorEarningsPerSecondMicros: 0,
+        creatorShareAtCallTime: 0,
+        startTime: seedStartTime,
+        lastProcessedAt: seedStartTime,
+        version: 0,
+        totalDeductedMicros: 0,
+        totalEarnedMicros: 0,
+        elapsedSeconds: 0,
+        effectiveDurationLimitSeconds: MAX_CALL_DURATION_SECONDS,
+        lastCheckpointAtMs: 0,
+        expectedNextTickAtMs: seedStartTime + BILLING_PROCESS_INTERVAL_MS,
+      };
+      normalizeV4SessionFields(earlySession);
+      await redis
+        .multi()
+        .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(earlySession))
+        .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, '0')
+        .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, '0')
+        .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
+        .exec();
+      seededEarlySession = true;
+      logInfo('billing_session_seeded_early', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        seededAt: new Date(seedStartTime).toISOString(),
+      });
+      recordBillingMetric('session_start_seeded_early', 1, {
+        source,
+        callIdPrefix,
+      });
 
-    let creator = await Creator.findById(creatorMongoId);
-    if (!creator) {
-      creator = await Creator.findOne({ userId: creatorMongoId });
-    }
-    if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
+      const user = await User.findOne({ firebaseUid: userFirebaseUid });
+      if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
+      if (user.role !== 'user') {
+        await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+        slotsToReleaseOnFailure = false;
+        void forceTerminateCall(io, {
+          callId,
+          userFirebaseUid,
+          creatorFirebaseUid,
+          reason: 'unknown',
+          creatorReason: 'unknown',
+          userPayload: { message: 'Invalid call participants.' },
+        }).catch(() => {});
+        return;
+      }
+
+      let creator = await Creator.findById(creatorMongoId);
+      if (!creator) {
+        creator = await Creator.findOne({ userId: creatorMongoId });
+      }
+      if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
 
     // Server-authoritative validation: creatorMongoId must belong to creatorFirebaseUid.
     // Also prevents creator↔creator and spoofed payout attempts.
@@ -909,6 +1028,18 @@ export class BillingService {
         .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
         .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
         .exec();
+      finalSessionPersisted = true;
+      logInfo('billing_session_promoted_full', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        promotedDelayMs: Math.max(0, Date.now() - seedStartTime),
+      });
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
       logInfo('Billing session started - Redis keys seeded', {
@@ -1144,6 +1275,9 @@ export class BillingService {
       }
     }
     } catch (err) {
+      if (seededEarlySession && !finalSessionPersisted) {
+        await clearCallSessionSeed(redis, callId).catch(() => {});
+      }
       if (slotsToReleaseOnFailure) {
         await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
       }
