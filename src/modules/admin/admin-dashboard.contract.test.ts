@@ -18,4 +18,20 @@ test('admin-dashboard.controller exports handlers', () => {
   const src = readFileSync(join(__dirname, 'admin-dashboard.controller.ts'), 'utf8');
   assert.ok(src.includes('getDashboardOverview'));
   assert.ok(src.includes('assertAdmin'));
+  assert.ok(src.includes('parseAdminDateRange'));
+  assert.ok(src.includes('admin_dashboard_date_filter_applied'));
+});
+
+test('dashboard service keeps leaderboard numeric contract', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  assert.ok(src.includes('bds: a.bdId ? 1 : 0'));
+  assert.ok(src.includes('selectedRange: selectedRangePayload(range)'));
+  assert.ok(src.includes('metricContract: buildOverviewMetricContract()'));
+});
+
+test('admin date range parser reports invalid reasons', () => {
+  const src = readFileSync(join(__dirname, 'admin-date-range.ts'), 'utf8');
+  assert.ok(src.includes("invalidReason: 'missing_from'"));
+  assert.ok(src.includes("invalidReason: 'missing_to'"));
+  assert.ok(src.includes("invalidReason: 'invalid_bounds'"));
 });

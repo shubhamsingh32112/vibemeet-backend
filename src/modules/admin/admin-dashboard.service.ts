@@ -20,6 +20,21 @@ const TOP_BD_ROLE = { role: 'bd' as const };
 const MIDDLE_AGENCY_ROLE = { role: 'agency' as const };
 const MAX = 100;
 
+export type DashboardDateFilter = {
+  from: Date;
+  to: Date;
+  fromIso?: string;
+  toIso?: string;
+};
+
+type DashboardMetricDefinition = {
+  label: string;
+  backendField: string;
+  scope: 'selected_range' | 'realtime';
+  unit: string;
+  definition: string;
+};
+
 type RazorpayBalanceBucket = {
   key: string;
   channelLabel: string;
@@ -54,9 +69,63 @@ function dashboardCreatorAvatarSmUrl(avatar: IImageAsset | null | undefined): st
   }
 }
 
-export async function dashboardOverviewPayload() {
+function createdAtRangeMatch(range?: DashboardDateFilter): Record<string, Date> {
+  if (!range) return {};
+  return { $gte: range.from, $lte: range.to };
+}
+
+function selectedRangePayload(range?: DashboardDateFilter): { from: string; to: string } | undefined {
+  if (!range) return undefined;
+  return {
+    from: (range.fromIso ?? range.from.toISOString()),
+    to: (range.toIso ?? range.to.toISOString()),
+  };
+}
+
+function buildOverviewMetricContract(): Record<string, DashboardMetricDefinition> {
+  return {
+    revenueCoinsToday: {
+      label: 'Net wallet coin flow',
+      backendField: 'revenueCoinsToday',
+      scope: 'selected_range',
+      unit: 'coins',
+      definition: 'Completed wallet credits minus completed wallet debits in the selected time window.',
+    },
+    liveCallsProxy: {
+      label: 'Live calls (5m proxy)',
+      backendField: 'liveCallsProxy',
+      scope: 'realtime',
+      unit: 'calls',
+      definition: 'Count of user-side call history rows created in the trailing 5 minutes.',
+    },
+    totalCallMinutesToday: {
+      label: 'Call minutes',
+      backendField: 'totalCallMinutesToday',
+      scope: 'selected_range',
+      unit: 'minutes',
+      definition: 'Sum of user-side call durations in the selected time window, converted to minutes.',
+    },
+    totalCallsToday: {
+      label: 'Calls',
+      backendField: 'totalCallsToday',
+      scope: 'selected_range',
+      unit: 'calls',
+      definition: 'Total user-side calls created in the selected time window.',
+    },
+    coinsSpentOnCallsToday: {
+      label: 'Coins spent on calls',
+      backendField: 'coinsSpentOnCallsToday',
+      scope: 'selected_range',
+      unit: 'coins',
+      definition: 'Sum of user-side coins deducted from call history in the selected time window.',
+    },
+  };
+}
+
+export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
   const today = utcStartOfDay();
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+  const selectedCreatedAt = range ? createdAtRangeMatch(range) : { $gte: today };
 
   const [
     onlineCreators,
@@ -73,7 +142,7 @@ export async function dashboardOverviewPayload() {
     User.countDocuments(TOP_BD_ROLE),
     Withdrawal.countDocuments({ status: 'pending' }),
     CallHistory.aggregate([
-      { $match: { createdAt: { $gte: today }, ownerRole: 'user' } },
+      { $match: { createdAt: selectedCreatedAt, ownerRole: 'user' } },
       {
         $group: {
           _id: null,
@@ -84,7 +153,7 @@ export async function dashboardOverviewPayload() {
       },
     ]),
     CoinTransaction.aggregate([
-      { $match: { createdAt: { $gte: today }, status: 'completed' } },
+      { $match: { createdAt: selectedCreatedAt, status: 'completed' } },
       { $group: { _id: '$type', total: { $sum: '$coins' }, count: { $sum: 1 } } },
     ]),
     CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
@@ -99,10 +168,11 @@ export async function dashboardOverviewPayload() {
   const credits = coinFlowToday.find((r: { _id: string }) => r._id === 'credit');
   const debits = coinFlowToday.find((r: { _id: string }) => r._id === 'debit');
   const revenueCoinsToday = (credits?.total ?? 0) - (debits?.total ?? 0);
+  const rangeLabel = range ? 'selected range' : 'today (UTC)';
 
   return {
     revenueCoinsToday,
-    revenueCoinsTodayNote: 'Net completed wallet coin flow today (credits minus debits).',
+    revenueCoinsTodayNote: `Net completed wallet coin flow for ${rangeLabel} (credits minus debits).`,
     liveCallsProxy: recentCalls5m,
     activeUnsettledUserCalls: activeZeroDuration,
     onlineHosts: onlineCreators,
@@ -113,18 +183,23 @@ export async function dashboardOverviewPayload() {
     totalCallsToday: callT.totalCalls,
     coinsSpentOnCallsToday: callT.totalCoinsSpent,
     growthPlaceholder: { revenuePct: null, callsPct: null, hostsPct: null },
+    selectedRange: selectedRangePayload(range),
+    metricContract: buildOverviewMetricContract(),
     generatedAt: new Date().toISOString(),
   };
 }
 
-export async function dashboardRevenueSeries(days: number) {
+export async function dashboardRevenueSeries(days: number, range?: DashboardDateFilter) {
   const d = Math.min(90, Math.max(1, days));
-  const from = new Date();
-  from.setUTCHours(0, 0, 0, 0);
-  from.setUTCDate(from.getUTCDate() - (d - 1));
+  const from = range ? new Date(range.from) : new Date();
+  if (!range) {
+    from.setUTCHours(0, 0, 0, 0);
+    from.setUTCDate(from.getUTCDate() - (d - 1));
+  }
+  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
 
   const agg = await CallHistory.aggregate<{ _id: string; revenue: number; commission: number }>([
-    { $match: { createdAt: { $gte: from }, ownerRole: 'user' } },
+    { $match: { createdAt, ownerRole: 'user' } },
     {
       $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
@@ -141,7 +216,10 @@ export async function dashboardRevenueSeries(days: number) {
       revenueCoins: r.revenue,
       commissionCoins: r.commission,
     })),
-    note: 'Revenue series uses user-side call history coins deducted per UTC day.',
+    note: range
+      ? 'Revenue series uses user-side call history coins deducted per UTC day inside the selected range.'
+      : 'Revenue series uses user-side call history coins deducted per UTC day.',
+    selectedRange: selectedRangePayload(range),
   };
 }
 
@@ -195,46 +273,105 @@ export async function dashboardRealtimePayload() {
   };
 }
 
-export async function dashboardTopHosts(limit: number) {
-  const lim = clampDashboardLimit(limit, 10);
-  const rows = await Creator.find({})
-    .sort({ earningsCoins: -1 })
-    .limit(lim)
-    .select('name earningsCoins userId avatar')
-    .lean();
-  const totalCalls = await CallHistory.aggregate([
-    { $match: { ownerRole: 'creator' } },
+async function aggregateCreatorPerformanceInRange(range?: DashboardDateFilter) {
+  const createdAt = createdAtRangeMatch(range);
+  const creatorStats = await CallHistory.aggregate<{
+    _id: import('mongoose').Types.ObjectId;
+    calls: number;
+    minutes: number;
+    earnings: number;
+  }>([
+    { $match: { ownerRole: 'creator', ...(range ? { createdAt } : {}) } },
     {
       $group: {
         _id: '$ownerUserId',
         calls: { $sum: 1 },
         minutes: { $sum: { $divide: ['$durationSeconds', 60] } },
+        earnings: { $sum: '$coinsEarned' },
       },
     },
   ]);
-  const map = new Map(totalCalls.map((t) => [t._id.toString(), t]));
+
+  if (creatorStats.length === 0) {
+    return {
+      creatorStatsByUserId: new Map<string, { calls: number; minutes: number; earnings: number }>(),
+      agencyRevenueByAgencyId: new Map<string, number>(),
+      callCountByAgencyId: new Map<string, number>(),
+    };
+  }
+
+  const ownerUserIds = creatorStats.map((row) => row._id);
+  const creators = await Creator.find({ userId: { $in: ownerUserIds } })
+    .select('_id userId assignedAgencyId')
+    .lean();
+  const creatorByUserId = new Map(creators.map((c) => [c.userId?.toString() ?? '', c]));
+
+  const creatorStatsByUserId = new Map<string, { calls: number; minutes: number; earnings: number }>();
+  const agencyRevenueByAgencyId = new Map<string, number>();
+  const callCountByAgencyId = new Map<string, number>();
+
+  for (const row of creatorStats) {
+    const ownerUserId = row._id.toString();
+    creatorStatsByUserId.set(ownerUserId, {
+      calls: row.calls ?? 0,
+      minutes: row.minutes ?? 0,
+      earnings: row.earnings ?? 0,
+    });
+
+    const creator = creatorByUserId.get(ownerUserId);
+    const agencyId = creator?.assignedAgencyId?.toString();
+    if (!agencyId) continue;
+    agencyRevenueByAgencyId.set(agencyId, (agencyRevenueByAgencyId.get(agencyId) ?? 0) + (row.earnings ?? 0));
+    callCountByAgencyId.set(agencyId, (callCountByAgencyId.get(agencyId) ?? 0) + (row.calls ?? 0));
+  }
+
+  return { creatorStatsByUserId, agencyRevenueByAgencyId, callCountByAgencyId };
+}
+
+export async function dashboardTopHosts(limit: number, range?: DashboardDateFilter) {
+  const lim = clampDashboardLimit(limit, 10);
+  const rows = await Creator.find({})
+    .select('name earningsCoins userId avatar')
+    .lean();
+  const { creatorStatsByUserId } = await aggregateCreatorPerformanceInRange(range);
+
+  const ranked = rows
+    .map((c) => {
+      const ownerUserId = c.userId?.toString() ?? '';
+      const stat = creatorStatsByUserId.get(ownerUserId);
+      return {
+        creator: c,
+        calls: stat?.calls ?? 0,
+        minutes: stat?.minutes ?? 0,
+        earningsCoins: stat?.earnings ?? 0,
+      };
+    })
+    .sort((a, b) => b.earningsCoins - a.earningsCoins || b.calls - a.calls)
+    .slice(0, lim);
 
   return {
-    rows: rows.map((c, i) => {
-      const stat = c.userId ? map.get(c.userId.toString()) : undefined;
+    rows: ranked.map((row, i) => {
+      const c = row.creator;
       return {
         rank: i + 1,
-        host: c.name,
+        host: c.name || c.userId?.toString() || c._id.toString(),
         creatorId: c._id.toString(),
         avatarUrl: dashboardCreatorAvatarSmUrl(c.avatar as IImageAsset | null | undefined),
-        minutes: Math.round((stat?.minutes ?? 0) * 100) / 100,
-        calls: stat?.calls ?? 0,
-        earningsCoins: c.earningsCoins ?? 0,
+        minutes: Math.round(row.minutes * 100) / 100,
+        calls: row.calls,
+        earningsCoins: row.earningsCoins,
       };
     }),
+    note: range
+      ? 'Host ranking is based on creator-side call earnings within the selected range.'
+      : 'Host ranking is based on creator-side call earnings (all time).',
+    selectedRange: selectedRangePayload(range),
   };
 }
 
-export async function dashboardTopBds(limit: number) {
+export async function dashboardTopBds(limit: number, range?: DashboardDateFilter) {
   const lim = clampDashboardLimit(limit, 10);
   const bds = await User.find(TOP_BD_ROLE)
-    .sort({ staffCoinsBalance: -1 })
-    .limit(lim)
     .select('displayName email staffCoinsBalance')
     .lean();
   const bdIds = bds.map((b) => b._id);
@@ -250,31 +387,43 @@ export async function dashboardTopBds(limit: number) {
   const agenciesByBd = await User.find({ bdId: { $in: bdIds }, ...MIDDLE_AGENCY_ROLE })
     .select('_id bdId')
     .lean();
+  const { agencyRevenueByAgencyId } = await aggregateCreatorPerformanceInRange(range);
 
-  return {
-    rows: bds.map((b, i) => {
+  const rankedRows = bds
+    .map((b) => {
       const childAgencies = agenciesByBd.filter((a) => a.bdId?.toString() === b._id.toString());
       const hostTotal = childAgencies.reduce(
         (sum, a) => sum + (hostsByAgency.get(a._id.toString()) ?? 0),
         0
       );
+      const revenueCoins = childAgencies.reduce(
+        (sum, a) => sum + (agencyRevenueByAgencyId.get(a._id.toString()) ?? 0),
+        0
+      );
       return {
-        rank: i + 1,
         bdName: b.displayName || b.email || b._id.toString(),
         agencies: childAgencies.length,
         hosts: hostTotal,
-        revenueCoins: b.staffCoinsBalance ?? 0,
+        revenueCoins,
         commissionCoins: 0,
       };
-    }),
+    })
+    .sort((a, b) => b.revenueCoins - a.revenueCoins || b.hosts - a.hosts)
+    .slice(0, lim)
+    .map((row, idx) => ({ rank: idx + 1, ...row }));
+
+  return {
+    rows: rankedRows,
+    note: range
+      ? 'BD ranking uses rollup of creator-side earnings from agencies in the selected range.'
+      : 'BD ranking uses rollup of creator-side earnings from agencies (all time).',
+    selectedRange: selectedRangePayload(range),
   };
 }
 
-export async function dashboardTopAgencies(limit: number) {
+export async function dashboardTopAgencies(limit: number, range?: DashboardDateFilter) {
   const lim = clampDashboardLimit(limit, 10);
   const agencies = await User.find(MIDDLE_AGENCY_ROLE)
-    .sort({ staffCoinsBalance: -1 })
-    .limit(lim)
     .select('_id email displayName staffCoinsBalance bdId')
     .lean();
   const ids = agencies.map((a) => a._id);
@@ -286,15 +435,24 @@ export async function dashboardTopAgencies(limit: number) {
           { $group: { _id: '$assignedAgencyId', c: { $sum: 1 } } },
         ]);
   const hostsPerAgency = new Map(hostCounts.map((h) => [h._id.toString(), h.c]));
+  const { agencyRevenueByAgencyId } = await aggregateCreatorPerformanceInRange(range);
 
   return {
-    rows: agencies.map((a, i) => ({
-      rank: i + 1,
-      agencyName: a.displayName || a.email || a._id.toString(),
-      hosts: hostsPerAgency.get(a._id.toString()) ?? 0,
-      revenueCoins: a.staffCoinsBalance ?? 0,
-      parentBdId: a.bdId?.toString() ?? null,
-    })),
+    rows: agencies
+      .map((a) => ({
+        agencyName: a.displayName || a.email || a._id.toString(),
+        bds: a.bdId ? 1 : 0,
+        hosts: hostsPerAgency.get(a._id.toString()) ?? 0,
+        revenueCoins: agencyRevenueByAgencyId.get(a._id.toString()) ?? 0,
+        parentBdId: a.bdId?.toString() ?? null,
+      }))
+      .sort((a, b) => b.revenueCoins - a.revenueCoins || b.hosts - a.hosts)
+      .slice(0, lim)
+      .map((row, idx) => ({ rank: idx + 1, ...row })),
+    note: range
+      ? 'Agency ranking uses creator-side earnings in the selected range.'
+      : 'Agency ranking uses creator-side earnings (all time).',
+    selectedRange: selectedRangePayload(range),
   };
 }
 
@@ -357,14 +515,16 @@ export function dashboardHeatmapDemo() {
   return { isDemo: true, cells, note: 'Demo heatmap until hourly activity aggregation exists.' };
 }
 
-export async function dashboardCallAnalytics() {
+export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
   const today = utcStartOfDay();
   const thirty = new Date(today);
   thirty.setUTCDate(thirty.getUTCDate() - 30);
+  const createdAt = range ? createdAtRangeMatch(range) : { $gte: today };
+  const volumeCreatedAt = range ? createdAtRangeMatch(range) : { $gte: thirty };
 
   const [todayAgg, monthAgg] = await Promise.all([
     CallHistory.aggregate([
-      { $match: { createdAt: { $gte: today }, ownerRole: 'user' } },
+      { $match: { createdAt, ownerRole: 'user' } },
       {
         $group: {
           _id: null,
@@ -376,7 +536,7 @@ export async function dashboardCallAnalytics() {
       },
     ]),
     CallHistory.aggregate([
-      { $match: { createdAt: { $gte: thirty }, ownerRole: 'user' } },
+      { $match: { createdAt: volumeCreatedAt, ownerRole: 'user' } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
@@ -396,12 +556,16 @@ export async function dashboardCallAnalytics() {
       avgCallDurationSec: Math.round(t.avgDur || 0),
     },
     dailyVolume: monthAgg.map((r) => ({ date: r._id, calls: r.c })),
+    selectedRange: selectedRangePayload(range),
   };
 }
 
-export async function dashboardPayouts(limit: number) {
+export async function dashboardPayouts(limit: number, range?: DashboardDateFilter) {
   const lim = clampDashboardLimit(limit, 25);
-  const rows = await Withdrawal.find({ status: 'pending' })
+  const rows = await Withdrawal.find({
+    status: 'pending',
+    ...(range ? { requestedAt: createdAtRangeMatch(range) } : {}),
+  })
     .sort({ requestedAt: -1 })
     .limit(lim)
     .populate({ path: 'creatorUserId', select: 'email role' })
@@ -423,6 +587,7 @@ export async function dashboardPayouts(limit: number) {
         status: w.status,
       };
     }),
+    selectedRange: selectedRangePayload(range),
   };
 }
 

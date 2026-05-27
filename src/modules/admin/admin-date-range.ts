@@ -7,6 +7,7 @@ export type ParsedDateRange = {
   /** ISO strings as provided (useful to echo back) */
   fromIso?: string;
   toIso?: string;
+  invalidReason?: 'missing_from' | 'missing_to' | 'invalid_bounds' | 'range_too_wide';
 };
 
 const MAX_RANGE_DAYS = 366;
@@ -26,13 +27,17 @@ export function parseAdminDateRange(req: Request): ParsedDateRange {
   const hasRange = Boolean(from || to);
   if (!hasRange) return { hasRange: false };
 
-  // Require both for deterministic behavior.
-  if (!from || !to) return { hasRange: false };
+  if (!from) return { hasRange: false, fromIso, toIso, invalidReason: 'missing_from' };
+  if (!to) return { hasRange: false, fromIso, toIso, invalidReason: 'missing_to' };
 
-  if (to.getTime() <= from.getTime()) return { hasRange: false };
+  if (to.getTime() <= from.getTime()) {
+    return { hasRange: false, fromIso, toIso, invalidReason: 'invalid_bounds' };
+  }
 
   const maxMs = MAX_RANGE_DAYS * 24 * 60 * 60 * 1000;
-  if (to.getTime() - from.getTime() > maxMs) return { hasRange: false };
+  if (to.getTime() - from.getTime() > maxMs) {
+    return { hasRange: false, fromIso, toIso, invalidReason: 'range_too_wide' };
+  }
 
   return { from, to, hasRange: true, fromIso, toIso };
 }

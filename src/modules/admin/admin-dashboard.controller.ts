@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { assertAdmin } from '../../middlewares/staff.middleware';
-import { logError } from '../../utils/logger';
+import { logError, logInfo } from '../../utils/logger';
+import { parseAdminDateRange } from './admin-date-range';
 import {
   dashboardAlerts,
   dashboardCallAnalytics,
@@ -17,10 +18,36 @@ import {
   dashboardTopHosts,
 } from './admin-dashboard.service';
 
+function extractDashboardRange(req: Request) {
+  const parsed = parseAdminDateRange(req);
+  if (parsed.hasRange && parsed.from && parsed.to) {
+    logInfo('admin_dashboard_date_filter_applied', {
+      path: req.path,
+      from: parsed.fromIso ?? parsed.from.toISOString(),
+      to: parsed.toIso ?? parsed.to.toISOString(),
+    });
+    return {
+      from: parsed.from,
+      to: parsed.to,
+      fromIso: parsed.fromIso,
+      toIso: parsed.toIso,
+    };
+  }
+  if (parsed.invalidReason) {
+    logInfo('admin_dashboard_date_filter_ignored', {
+      path: req.path,
+      reason: parsed.invalidReason,
+      from: parsed.fromIso ?? null,
+      to: parsed.toIso ?? null,
+    });
+  }
+  return undefined;
+}
+
 export const getDashboardOverview = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardOverviewPayload();
+    const data = await dashboardOverviewPayload(extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardOverview', error as Error);
@@ -32,7 +59,7 @@ export const getDashboardRevenue = async (req: Request, res: Response): Promise<
   try {
     if (!(await assertAdmin(req, res))) return;
     const days = Math.min(90, Math.max(1, parseInt(String(req.query.days ?? '14'), 10) || 14));
-    const data = await dashboardRevenueSeries(days);
+    const data = await dashboardRevenueSeries(days, extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardRevenue', error as Error);
@@ -65,7 +92,7 @@ export const getDashboardRealtime = async (req: Request, res: Response): Promise
 export const getDashboardTopHosts = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardTopHosts(parseInt(String(req.query.limit ?? '10'), 10));
+    const data = await dashboardTopHosts(parseInt(String(req.query.limit ?? '10'), 10), extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardTopHosts', error as Error);
@@ -76,7 +103,7 @@ export const getDashboardTopHosts = async (req: Request, res: Response): Promise
 export const getDashboardTopBds = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardTopBds(parseInt(String(req.query.limit ?? '10'), 10));
+    const data = await dashboardTopBds(parseInt(String(req.query.limit ?? '10'), 10), extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardTopBds', error as Error);
@@ -87,7 +114,7 @@ export const getDashboardTopBds = async (req: Request, res: Response): Promise<v
 export const getDashboardTopAgencies = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardTopAgencies(parseInt(String(req.query.limit ?? '10'), 10));
+    const data = await dashboardTopAgencies(parseInt(String(req.query.limit ?? '10'), 10), extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardTopAgencies', error as Error);
@@ -120,7 +147,7 @@ export const getDashboardHeatmap = async (req: Request, res: Response): Promise<
 export const getDashboardCallAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardCallAnalytics();
+    const data = await dashboardCallAnalytics(extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardCallAnalytics', error as Error);
@@ -131,7 +158,7 @@ export const getDashboardCallAnalytics = async (req: Request, res: Response): Pr
 export const getDashboardPayouts = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const data = await dashboardPayouts(parseInt(String(req.query.limit ?? '25'), 10));
+    const data = await dashboardPayouts(parseInt(String(req.query.limit ?? '25'), 10), extractDashboardRange(req));
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardPayouts', error as Error);
