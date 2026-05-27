@@ -458,6 +458,8 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
           firebaseUid: creator.firebaseUid ? String(creator.firebaseUid) : uidRaw,
           name: creator.name,
           avatar: images.avatar,
+          photo: creator.photo ?? null,
+          imageUrl: creator.photo ?? null,
           availability,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
