@@ -12,10 +12,24 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import { countOnlineCreatorsPlatform } from '../availability/presence-dashboard.service';
+import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 
 const TOP_BD_ROLE = { role: 'bd' as const };
 const MIDDLE_AGENCY_ROLE = { role: 'agency' as const };
 const MAX = 100;
+
+type RazorpayBalanceBucket = {
+  key: string;
+  channelLabel: string;
+  currency: string;
+  available: number;
+  onHold: number;
+  pending: number;
+  reserved: number;
+  settled: number;
+  net: number;
+  raw: Record<string, unknown>;
+};
 
 function utcStartOfDay(d = new Date()): Date {
   const x = new Date(d);
@@ -427,5 +441,143 @@ export function dashboardGeoMock() {
       { code: 'OTHER', label: 'Others', pct: 17 },
     ],
     note: 'Geo distribution is illustrative until country telemetry is stored.',
+  };
+}
+
+function toNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function normalizeChannelLabel(input: string | null | undefined): string {
+  const v = String(input ?? '').trim().toLowerCase();
+  if (!v) return 'Overall';
+  if (v.includes('online')) return 'Online';
+  if (v.includes('in-person') || v.includes('inperson') || v.includes('pos')) return 'In-Person';
+  if (v.includes('international') || v.includes('apm')) return 'APM International';
+  return input ?? 'Other';
+}
+
+function extractBalanceRows(rawBalance: unknown): RazorpayBalanceBucket[] {
+  if (!rawBalance || typeof rawBalance !== 'object') return [];
+  const obj = rawBalance as Record<string, unknown>;
+  const itemsRaw = Array.isArray(obj.items) ? obj.items : [];
+  const rows = itemsRaw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item, idx) => {
+      const currency = String(item.currency ?? 'INR').toUpperCase();
+      const channelRaw =
+        typeof item.channel === 'string'
+          ? item.channel
+          : typeof item.channel_type === 'string'
+            ? item.channel_type
+            : typeof item.type === 'string'
+              ? item.type
+              : null;
+      const channelLabel = normalizeChannelLabel(channelRaw);
+      const available = toNumber(item.available) ?? 0;
+      const onHold = toNumber(item.on_hold) ?? toNumber(item.onHold) ?? 0;
+      const pending = toNumber(item.pending) ?? 0;
+      const reserved = toNumber(item.reserved) ?? toNumber(item.reserve) ?? 0;
+      const settled = toNumber(item.settled) ?? 0;
+      const net = toNumber(item.balance) ?? available - onHold;
+      const key = `${channelLabel}-${currency}-${idx}`;
+      return {
+        key,
+        channelLabel,
+        currency,
+        available,
+        onHold,
+        pending,
+        reserved,
+        settled,
+        net,
+        raw: item,
+      };
+    });
+
+  if (rows.length > 0) return rows;
+
+  const fallbackCurrency = String(obj.currency ?? 'INR').toUpperCase();
+  const available = toNumber(obj.available) ?? 0;
+  const onHold = toNumber(obj.on_hold) ?? toNumber(obj.onHold) ?? 0;
+  const pending = toNumber(obj.pending) ?? 0;
+  const reserved = toNumber(obj.reserved) ?? toNumber(obj.reserve) ?? 0;
+  const settled = toNumber(obj.settled) ?? 0;
+  const net = toNumber(obj.balance) ?? available - onHold;
+  return [
+    {
+      key: `Overall-${fallbackCurrency}`,
+      channelLabel: 'Overall',
+      currency: fallbackCurrency,
+      available,
+      onHold,
+      pending,
+      reserved,
+      settled,
+      net,
+      raw: obj,
+    },
+  ];
+}
+
+export async function dashboardRazorpayBalance() {
+  if (!isRazorpayConfigured()) {
+    return {
+      configured: false,
+      fetchedAt: new Date().toISOString(),
+      note: 'RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are missing on this backend environment.',
+      totals: {
+        currency: 'INR',
+        available: 0,
+        onHold: 0,
+        pending: 0,
+        reserved: 0,
+        settled: 0,
+        net: 0,
+      },
+      hasNegativeAvailable: false,
+      maxNegativeLimit: 0,
+      channels: [] as RazorpayBalanceBucket[],
+      raw: null as unknown,
+    };
+  }
+
+  const razorpay = getRazorpayInstance() as unknown as {
+    balance?: { fetch: () => Promise<unknown> };
+  };
+  if (!razorpay.balance?.fetch) {
+    throw new Error('Razorpay SDK balance API is unavailable in current package version.');
+  }
+  const balance = await razorpay.balance.fetch();
+  const channels = extractBalanceRows(balance);
+  const total = channels.reduce(
+    (acc, row) => ({
+      available: acc.available + row.available,
+      onHold: acc.onHold + row.onHold,
+      pending: acc.pending + row.pending,
+      reserved: acc.reserved + row.reserved,
+      settled: acc.settled + row.settled,
+      net: acc.net + row.net,
+    }),
+    { available: 0, onHold: 0, pending: 0, reserved: 0, settled: 0, net: 0 }
+  );
+
+  return {
+    configured: true,
+    fetchedAt: new Date().toISOString(),
+    note: 'Balances are fetched live from Razorpay. Reserve/max-negative depends on your account configuration.',
+    totals: {
+      currency: channels[0]?.currency ?? 'INR',
+      ...total,
+    },
+    hasNegativeAvailable: total.available < 0,
+    maxNegativeLimit: total.reserved,
+    channels,
+    raw: balance as unknown,
   };
 }

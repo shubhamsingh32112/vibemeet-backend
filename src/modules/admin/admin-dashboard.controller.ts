@@ -9,6 +9,7 @@ import {
   dashboardLiveCalls,
   dashboardOverviewPayload,
   dashboardPayouts,
+  dashboardRazorpayBalance,
   dashboardRealtimePayload,
   dashboardRevenueSeries,
   dashboardTopAgencies,
@@ -145,6 +146,17 @@ export const getDashboardGeo = async (req: Request, res: Response): Promise<void
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardGeo', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getDashboardRazorpayBalance = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const data = await dashboardRazorpayBalance();
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getDashboardRazorpayBalance', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

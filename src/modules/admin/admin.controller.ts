@@ -733,7 +733,13 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
           computeUsersAnalytics(undefined, undefined, undefined, undefined)
         );
 
-    res.json({ success: true, data: { users: data } });
+    res.json({
+      success: true,
+      data: {
+        users: data.users,
+        total: data.total,
+      },
+    });
   } catch (error) {
     console.error('❌ [ADMIN] Users analytics error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -760,6 +766,8 @@ async function computeUsersAnalytics(
   if (from && to) {
     filter.createdAt = { $gte: from, $lt: to };
   }
+
+  const total = await User.countDocuments(filter);
 
   const users = await User.find(filter)
     .select('firebaseUid email phone gender username avatar categories coins role usernameChangeCount createdAt referredBy')
@@ -896,7 +904,10 @@ async function computeUsersAnalytics(
   else if (sortField === 'calls') userList.sort((a, b) => b.callCount - a.callCount);
   else if (sortField === 'coins') userList.sort((a, b) => b.coins - a.coins);
 
-  return userList;
+  return {
+    users: userList,
+    total,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -25,6 +25,7 @@ import {
   getDashboardLiveCalls,
   getDashboardOverview,
   getDashboardPayouts,
+  getDashboardRazorpayBalance,
   getDashboardRealtime,
   getDashboardRevenue,
   getDashboardTopAgencies,
@@ -134,6 +135,7 @@ router.get('/dashboard/heatmap', getDashboardHeatmap);
 router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
 router.get('/dashboard/payouts', getDashboardPayouts);
 router.get('/dashboard/geo', getDashboardGeo);
+router.get('/dashboard/razorpay-balance', getDashboardRazorpayBalance);
 
 // ── Top-tier BDs (super-admin) ─────────────────────────────────────────────
 router.post('/bds', createBd);
