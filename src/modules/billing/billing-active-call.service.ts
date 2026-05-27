@@ -1,49 +1,34 @@
 import { Redis } from 'ioredis';
-import {
-  ACTIVE_BILLING_CALLS_KEY,
-  activeCallByUserKey,
-  callSessionKey,
-} from '../../config/redis';
+import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
+import { BillingLifecycleState } from './billing-lifecycle.machine';
 
 interface ActiveCallCheckParams {
   callId: string;
   userFirebaseUid?: string;
   creatorFirebaseUid?: string;
-  includeLegacySchedulerCheck?: boolean;
 }
 
 export async function isCallActive(
-  redis: Redis,
+  _redis: Redis,
   params: ActiveCallCheckParams
 ): Promise<boolean> {
-  const { callId, userFirebaseUid, creatorFirebaseUid, includeLegacySchedulerCheck } = params;
-
-  const sessionRaw = await redis.get(callSessionKey(callId));
-  if (sessionRaw) {
-    return true;
+  const { callId, userFirebaseUid, creatorFirebaseUid } = params;
+  const runtime = await resolveBillingRuntimeState(callId);
+  if (!runtime.session) {
+    return false;
   }
 
-  const userChecks: Array<Promise<string | null>> = [];
-  if (userFirebaseUid) {
-    userChecks.push(redis.get(activeCallByUserKey(userFirebaseUid)));
-  }
-  if (creatorFirebaseUid) {
-    userChecks.push(redis.get(activeCallByUserKey(creatorFirebaseUid)));
+  const lifecycle = String(runtime.session.lifecycleState || 'ACTIVE') as BillingLifecycleState;
+  const terminal = lifecycle === 'SETTLED' || lifecycle === 'FAILED';
+  if (terminal) {
+    return false;
   }
 
-  if (userChecks.length > 0) {
-    const userMappedCalls = await Promise.all(userChecks);
-    if (userMappedCalls.some((mappedCallId) => mappedCallId === callId)) {
-      return true;
-    }
+  if (userFirebaseUid && runtime.session.userFirebaseUid !== userFirebaseUid) {
+    return false;
   }
-
-  if (includeLegacySchedulerCheck) {
-    const inScheduler = await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
-    if (inScheduler) {
-      return true;
-    }
+  if (creatorFirebaseUid && runtime.session.creatorFirebaseUid !== creatorFirebaseUid) {
+    return false;
   }
-
-  return false;
+  return true;
 }

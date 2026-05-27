@@ -6,7 +6,13 @@ import { Creator } from '../creator/creator.model';
 import { pricingService } from './pricing.service';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp } from '../billing/billing.gateway';
-import { getRedis, callSessionKey, webhookIdKey, WEBHOOK_IDEMPOTENCY_TTL } from '../../config/redis';
+import {
+  getRedis,
+  callSessionKey,
+  webhookIdKey,
+  WEBHOOK_IDEMPOTENCY_TTL,
+  activeCallByUserKey,
+} from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { transitionCallStatus } from './call-state.service';
 import {
@@ -15,6 +21,7 @@ import {
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { parseAppVideoCallId } from '../billing/billing-call-id.util';
+import { markStreamCallEnded } from '../billing/billing-termination.stream';
 
 export interface StreamVideoWebhookPayload {
   type: string;
@@ -384,6 +391,24 @@ export class CallLifecycleService {
         });
         await markCreatorBusyForCall(callId, creatorUser.firebaseUid, 'session_started');
       }
+      const callerUser = await User.findById(call.callerUserId);
+      const creatorDoc = await Creator.findOne({ userId: call.creatorUserId }).select('_id').lean();
+      if (callerUser?.firebaseUid && creatorUser?.firebaseUid && creatorDoc?._id) {
+        await handleCallStartedHttp(
+          getIO(),
+          callerUser.firebaseUid,
+          {
+            callId,
+            creatorFirebaseUid: creatorUser.firebaseUid,
+            creatorMongoId: String(creatorDoc._id),
+          },
+          {
+            source: 'webhook_session_started',
+            initiatedByFirebaseUid: callerUser.firebaseUid,
+            initiatedByRole: 'user',
+          }
+        );
+      }
       return;
     }
 
@@ -569,6 +594,13 @@ export class CallLifecycleService {
     // 🔥 FIX: Create call record if it doesn't exist (for SDK-created calls)
     // This ensures we can extract creator UID even if call wasn't created via REST API
     await this.ensureCallRecordExists(payload, callId);
+    const overlapRejected = await this.rejectOverlappingIncomingCallIfNeeded(
+      payload,
+      callId
+    );
+    if (overlapRejected) {
+      return;
+    }
 
     const creatorFirebaseUid = await this.extractCreatorFirebaseUid(payload, callId);
     if (!creatorFirebaseUid) {
@@ -586,6 +618,99 @@ export class CallLifecycleService {
 
     logInfo('Marking creator busy (call ringing)', { callId, creatorFirebaseUid });
     await markCreatorBusyForCall(callId, creatorFirebaseUid, 'ringing');
+  }
+
+  private async rejectOverlappingIncomingCallIfNeeded(
+    payload: StreamVideoWebhookPayload,
+    callId: string
+  ): Promise<boolean> {
+    const participants = await this.resolveParticipantsFromPayload(payload, callId);
+    if (!participants) {
+      return false;
+    }
+    const callerFirebaseUid =
+      participants.callerUser?.firebaseUid != null
+        ? String(participants.callerUser.firebaseUid)
+        : null;
+    const creatorFirebaseUid =
+      participants.creatorUser?.firebaseUid != null
+        ? String(participants.creatorUser.firebaseUid)
+        : null;
+    if (!callerFirebaseUid || !creatorFirebaseUid) {
+      return false;
+    }
+
+    const redis = getRedis();
+    const [callerConflict, creatorConflict] = await Promise.all([
+      this.readActiveCallConflict(redis, callerFirebaseUid, callId),
+      this.readActiveCallConflict(redis, creatorFirebaseUid, callId),
+    ]);
+    const conflictingActiveCallId = callerConflict ?? creatorConflict;
+    if (!conflictingActiveCallId) {
+      return false;
+    }
+
+    const dedupeKey = `call:overlap:reject:${callId}`;
+    const dedupeResult = await redis.set(dedupeKey, '1', 'EX', 15 * 60, 'NX');
+    if (dedupeResult !== 'OK') {
+      return true;
+    }
+
+    logInfo('call_overlap_rejected', {
+      callId,
+      webhookType: payload.type,
+      callerFirebaseUid,
+      creatorFirebaseUid,
+      conflictingActiveCallId,
+    });
+    recordCallMetric('call_overlap_rejected', 1, {
+      webhookType: payload.type || 'unknown',
+    });
+
+    try {
+      await markStreamCallEnded(callId, 'overlap_active_call_conflict');
+    } catch (error) {
+      logError('call_overlap_mark_ended_failed', error, {
+        callId,
+        conflictingActiveCallId,
+      });
+      recordCallMetric('call_overlap_mark_ended_failed', 1, {
+        webhookType: payload.type || 'unknown',
+      });
+    }
+
+    try {
+      const io = getIO();
+      await finalizeCallEnd(io, callId, 'webhook_overlap_rejected');
+    } catch (error) {
+      logError('call_overlap_finalize_failed', error, {
+        callId,
+        conflictingActiveCallId,
+      });
+      recordCallMetric('call_overlap_finalize_failed', 1, {
+        webhookType: payload.type || 'unknown',
+      });
+    }
+
+    return true;
+  }
+
+  private async readActiveCallConflict(
+    redis: ReturnType<typeof getRedis>,
+    firebaseUid: string,
+    callId: string
+  ): Promise<string | null> {
+    const slotKey = activeCallByUserKey(firebaseUid);
+    const activeCallId = await redis.get(slotKey);
+    if (!activeCallId || activeCallId === callId) {
+      return null;
+    }
+    const hasLiveSession = await redis.get(callSessionKey(activeCallId));
+    if (!hasLiveSession) {
+      await redis.del(slotKey).catch(() => {});
+      return null;
+    }
+    return activeCallId;
   }
 
   /**

@@ -27,16 +27,12 @@
  * - Forces creators to re-announce presence
  */
 
-import { getRedis, isRedisConfigured } from '../../config/redis';
+import { getRedis, isRedisConfigured, creatorPresenceKey } from '../../config/redis';
 
 export type CreatorAvailability = 'online' | 'busy';
 
 // Redis key prefix
 const KEY_PREFIX = 'creator:availability:';
-
-// TTL in seconds (2 minutes)
-// Creators must re-announce presence within this window
-const AVAILABILITY_TTL = 120;
 
 /**
  * Set a creator's availability status
@@ -47,18 +43,11 @@ export async function setAvailability(
   creatorId: string,
   status: CreatorAvailability
 ): Promise<void> {
-  if (!isRedisConfigured()) {
-    console.error('❌ [AVAILABILITY] Redis not configured');
-    return;
-  }
-
-  try {
-    const redis = getRedis();
-    await redis.setex(`${KEY_PREFIX}${creatorId}`, AVAILABILITY_TTL, status);
-    console.log(`📡 [AVAILABILITY] Set: ${creatorId} → ${status} (TTL: ${AVAILABILITY_TTL}s)`);
-  } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to set status:`, err);
-  }
+  void creatorId;
+  void status;
+  throw new Error(
+    'setAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
+  );
 }
 
 /**
@@ -73,6 +62,13 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
 
   try {
     const redis = getRedis();
+    const v2 = await redis.get(creatorPresenceKey(creatorId));
+    if (v2) {
+      try {
+        const parsed = JSON.parse(v2) as { state?: string };
+        return (parsed.state === 'online' ? 'online' : 'busy') as CreatorAvailability;
+      } catch {}
+    }
     const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
     return (status === 'online' ? 'online' : 'busy') as CreatorAvailability;
   } catch (err) {
@@ -87,22 +83,10 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
  * @param creatorId - The creator's Firebase UID
  */
 export async function refreshAvailability(creatorId: string): Promise<void> {
-  if (!isRedisConfigured()) {
-    return;
-  }
-
-  try {
-    const redis = getRedis();
-    const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
-    
-    if (status === 'online') {
-      // Re-set with fresh TTL
-      await redis.setex(`${KEY_PREFIX}${creatorId}`, AVAILABILITY_TTL, 'online');
-      console.log(`🔄 [AVAILABILITY] Refreshed TTL: ${creatorId}`);
-    }
-  } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to refresh:`, err);
-  }
+  void creatorId;
+  throw new Error(
+    'refreshAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
+  );
 }
 
 /**
@@ -110,17 +94,10 @@ export async function refreshAvailability(creatorId: string): Promise<void> {
  * @param creatorId - The creator's Firebase UID
  */
 export async function removeAvailability(creatorId: string): Promise<void> {
-  if (!isRedisConfigured()) {
-    return;
-  }
-
-  try {
-    const redis = getRedis();
-    await redis.del(`${KEY_PREFIX}${creatorId}`);
-    console.log(`🗑️  [AVAILABILITY] Removed: ${creatorId}`);
-  } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to remove:`, err);
-  }
+  void creatorId;
+  throw new Error(
+    'removeAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
+  );
 }
 
 /**
@@ -188,16 +165,41 @@ export async function getBatchAvailability(
   try {
     const redis = getRedis();
     const result: Record<string, CreatorAvailability> = {};
-    
-    // Railway Redis supports mget
-    const keys = creatorIds.map(id => `${KEY_PREFIX}${id}`);
-    const values = await redis.mget(...keys);
-    
+
+    // Prefer explicit v2 presence payloads, fallback to legacy online/busy key.
+    const v2Keys = creatorIds.map((id) => creatorPresenceKey(id));
+    const v2Vals = await redis.mget(...v2Keys);
+    const fallbackIds: string[] = [];
+
     creatorIds.forEach((id, index) => {
-      const value = values[index];
-      result[id] = (value === 'online' ? 'online' : 'busy') as CreatorAvailability;
+      const raw = v2Vals[index];
+      if (!raw) {
+        fallbackIds.push(id);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw) as { state?: string };
+        result[id] = parsed.state === 'online' ? 'online' : 'busy';
+      } catch {
+        fallbackIds.push(id);
+      }
     });
-    
+
+    if (fallbackIds.length > 0) {
+      const keys = fallbackIds.map(id => `${KEY_PREFIX}${id}`);
+      const values = await redis.mget(...keys);
+      fallbackIds.forEach((id, index) => {
+        const value = values[index];
+        result[id] = (value == 'online' ? 'online' : 'busy') as CreatorAvailability;
+      });
+    }
+
+    creatorIds.forEach((id) => {
+      if (result[id] == null) {
+        result[id] = 'busy';
+      }
+    });
+
     return result;
   } catch (err) {
     console.error(`❌ [AVAILABILITY] Failed to get batch:`, err);

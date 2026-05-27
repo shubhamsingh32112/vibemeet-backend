@@ -15,6 +15,16 @@ export interface BillingCheckpointSnapshotInput {
   creatorEarningsPerSecondMicros: number;
   totalDeductedMicros: number;
   totalEarnedMicros: number;
+  billingSequence: number;
+  lifecycleState:
+    | 'INIT'
+    | 'STARTING'
+    | 'ACTIVE'
+    | 'ENDING'
+    | 'SETTLING'
+    | 'SETTLED'
+    | 'FAILED'
+    | 'RECOVERING';
   status?: 'active' | 'settling' | 'settled';
 }
 
@@ -24,6 +34,8 @@ export async function upsertBillingCheckpoint(data: {
   creatorMongoId: string;
   totalDeductedMicros: number;
   totalEarnedMicros: number;
+  billingSequence?: number;
+  lifecycleState?: BillingCheckpointSnapshotInput['lifecycleState'];
 }): Promise<void> {
   try {
     await CallBillingCheckpoint.findOneAndUpdate(
@@ -34,6 +46,8 @@ export async function upsertBillingCheckpoint(data: {
           creatorMongoId: data.creatorMongoId,
           totalDeductedMicros: data.totalDeductedMicros,
           totalEarnedMicros: data.totalEarnedMicros,
+          billingSequence: Math.max(0, Number(data.billingSequence ?? 0)),
+          lifecycleState: data.lifecycleState ?? 'ACTIVE',
           updatedAt: new Date(),
         },
       },
@@ -63,6 +77,8 @@ export async function upsertBillingCheckpointSnapshot(
           creatorEarningsPerSecondMicros: data.creatorEarningsPerSecondMicros,
           totalDeductedMicros: data.totalDeductedMicros,
           totalEarnedMicros: data.totalEarnedMicros,
+          billingSequence: Math.max(0, Number(data.billingSequence || 0)),
+          lifecycleState: data.lifecycleState,
           schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
           status: data.status || 'active',
           updatedAt: new Date(),
@@ -99,6 +115,8 @@ export async function advanceBillingCheckpointCursor(
           creatorEarningsPerSecondMicros: data.creatorEarningsPerSecondMicros,
           totalDeductedMicros: data.totalDeductedMicros,
           totalEarnedMicros: data.totalEarnedMicros,
+          billingSequence: Math.max(0, Number(data.billingSequence || 0)),
+          lifecycleState: data.lifecycleState,
           schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
           status: data.status || 'active',
           updatedAt: new Date(),

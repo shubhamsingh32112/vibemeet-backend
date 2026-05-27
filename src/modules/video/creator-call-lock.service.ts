@@ -1,11 +1,12 @@
 import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
 import { getStreamClient } from '../../config/stream';
-import { getAvailability, setAvailability, type CreatorAvailability } from '../availability/availability.service';
-import { emitCreatorStatus } from '../availability/availability.socket';
+import { getAvailability, type CreatorAvailability } from '../availability/availability.service';
 import { getRedis, activeCallByUserKey } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
+import { getIO } from '../../config/socket';
+import { transitionCreatorPresence } from '../availability/presence.service';
 
 /**
  * Centralised helper for creator call locking and availability updates.
@@ -52,8 +53,12 @@ export async function acquireCreatorCallLock(
     const creatorFirebaseUid = creatorUser.firebaseUid;
 
     // Backend-authoritative availability: mark busy in Redis + Socket.IO.
-    await setAvailability(creatorFirebaseUid, 'busy');
-    emitCreatorStatus(creatorFirebaseUid, 'busy');
+    await transitionCreatorPresence(
+      getIO(),
+      creatorFirebaseUid,
+      'CALL_STARTED',
+      'creator-call-lock.acquireCreatorCallLock'
+    );
 
     // Legacy Stream Chat presence (kept for backwards compatibility).
     const streamClient = getStreamClient();
@@ -147,8 +152,12 @@ export async function markCreatorBusyForCall(
 
     const current = await getAvailability(creatorFirebaseUid);
     if (shouldEnforceAvailabilityWrites() && current !== 'busy') {
-      await setAvailability(creatorFirebaseUid, 'busy');
-      emitCreatorStatus(creatorFirebaseUid, 'busy');
+      await transitionCreatorPresence(
+        getIO(),
+        creatorFirebaseUid,
+        'CALL_STARTED',
+        `creator-call-lock.markCreatorBusyForCall:${phase}`
+      );
       recordCallMetric('creator.busy.set', 1, { callId, phase });
     }
 
@@ -236,8 +245,12 @@ export async function updateCreatorAvailabilityAfterCall(
     const isAvailableToggleOn = creator.isOnline === true;
     const newStatus = isAvailableToggleOn ? 'online' : 'busy';
 
-    await setAvailability(creatorFirebaseUid, newStatus);
-    emitCreatorStatus(creatorFirebaseUid, newStatus);
+    await transitionCreatorPresence(
+      getIO(),
+      creatorFirebaseUid,
+      newStatus === 'online' ? 'CALL_ENDED' : 'DISCONNECTED',
+      'creator-call-lock.updateCreatorAvailabilityAfterCall'
+    );
 
     const streamClient = getStreamClient();
     await streamClient.partialUpdateUser({
@@ -310,8 +323,12 @@ export async function finalizeCreatorAvailabilityForCall(
       : 'online') as CreatorAvailability;
 
     if (shouldEnforceAvailabilityWrites()) {
-      await setAvailability(creatorFirebaseUid, restoredStatus);
-      emitCreatorStatus(creatorFirebaseUid, restoredStatus);
+      await transitionCreatorPresence(
+        getIO(),
+        creatorFirebaseUid,
+        restoredStatus === 'online' ? 'CALL_ENDED' : 'DISCONNECTED',
+        'creator-call-lock.finalizeCreatorAvailabilityForCall'
+      );
     }
     await redis.del(precallSnapshotKey(callId, creatorFirebaseUid));
     recordCallMetric(snapshot != null ? 'creator.restore.snapshot_used' : 'creator.restore.snapshot_missing', 1, {

@@ -2,23 +2,25 @@ import { Server } from 'socket.io';
 import {
   getRedis,
   callSessionKey,
-  callUserCoinsKey,
-  callUserIntroMicrosKey,
-  callUserWalletMicrosKey,
-  callCreatorEarningsKey,
-  activeCallByUserKey,
   pendingCallEndKey,
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService } from './billing.service';
 import { finalizeCallSession } from './billing-session-finalization.service';
-import { isBullmqBillingEnabled } from './billing.queue';
 import { isCallActive } from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
 import { finalizeCallEnd } from '../video/call-finalization.service';
+import {
+  resolveActiveRuntimeStateForUser,
+  resolveBillingRuntimeState,
+} from './billing-runtime-resolver.service';
+import {
+  emitBillingRecoverStateFromSnapshot,
+  emitBillingRecoverStateResponse,
+} from './billing-emitter.service';
 
 /** Shape of Redis billing session JSON (recover-state handler). */
 interface BillingRecoverSession {
@@ -38,6 +40,8 @@ interface BillingRecoverSession {
   lastProcessedAt?: number;
   totalDeductedMicros?: number;
   totalEarnedMicros?: number;
+  billingSequence?: number;
+  lifecycleState?: string;
   elapsedSeconds: number;
   effectiveDurationLimitSeconds?: number;
 }
@@ -161,7 +165,6 @@ export function setupBillingGateway(io: Server): void {
         const active = await isCallActive(redis, {
           callId: data.callId,
           userFirebaseUid: firebaseUid,
-          includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
         });
 
         if (!active) {
@@ -181,10 +184,10 @@ export function setupBillingGateway(io: Server): void {
         logInfo('State recovery requested', { firebaseUid });
         const redis = getRedis();
 
-        const callId = await redis.get(activeCallByUserKey(firebaseUid));
-
-        if (!callId) {
-          socket.emit('billing:recover-state:response', {
+        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
+        const callId = activeRuntime.callId;
+        if (!callId || !activeRuntime.runtime.session) {
+          emitBillingRecoverStateResponse(socket, {
             success: true,
             activeCalls: [],
           });
@@ -194,51 +197,31 @@ export function setupBillingGateway(io: Server): void {
         const active = await isCallActive(redis, {
           callId,
           userFirebaseUid: firebaseUid,
-          includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
         });
         if (!active) {
-          await redis.del(activeCallByUserKey(firebaseUid));
-          socket.emit('billing:recover-state:response', {
+          emitBillingRecoverStateResponse(socket, {
             success: true,
             activeCalls: [],
           });
           return;
         }
 
-        const sessionRaw = await redis.get(callSessionKey(callId));
-        if (!sessionRaw) {
-          await redis.del(activeCallByUserKey(firebaseUid));
-          socket.emit('billing:recover-state:response', {
+        const runtime = activeRuntime.runtime.session
+          ? activeRuntime.runtime
+          : await resolveBillingRuntimeState(callId);
+        if (!runtime.session) {
+          emitBillingRecoverStateResponse(socket, {
             success: true,
             activeCalls: [],
           });
           return;
         }
 
-        const session: BillingRecoverSession =
-          typeof sessionRaw === 'string'
-            ? JSON.parse(sessionRaw)
-            : (sessionRaw as BillingRecoverSession);
-
-        const [introR, walletR, legacyMerged, earningsRaw] = await Promise.all([
-          redis.get(callUserIntroMicrosKey(callId)),
-          redis.get(callUserWalletMicrosKey(callId)),
-          redis.get(callUserCoinsKey(callId)),
-          redis.get(callCreatorEarningsKey(callId)),
-        ]);
-
-        let introMicros = Math.max(0, parseInt(String(introR ?? '0'), 10) || 0);
-        let walletMicros = Math.max(0, parseInt(String(walletR ?? '0'), 10) || 0);
-        if (introR === null && walletR === null && legacyMerged !== null && legacyMerged !== undefined) {
-          walletMicros = Math.max(0, parseInt(String(legacyMerged), 10) || 0);
-          introMicros = 0;
-        }
-        const balanceMicros = introMicros + walletMicros;
-
-        const earnRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
-        let earningsMicros = earnRaw;
+        const session = runtime.session as BillingRecoverSession;
+        const balanceMicros = runtime.balanceMicros;
+        let earningsMicros = runtime.earningsMicros;
         if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION) {
-          earningsMicros = Math.round((earnRaw * COIN_MICROS) / 10000);
+          earningsMicros = Math.round((earningsMicros * COIN_MICROS) / 10000);
         }
         const earningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
 
@@ -249,34 +232,34 @@ export function setupBillingGateway(io: Server): void {
 
         const serverTimestamp = Date.now();
 
-        socket.emit('billing:recover-state:response', {
-          success: true,
-          activeCalls: [
-            {
-              callId: session.callId,
-              coins: microsToWholeCoinsFloor(balanceMicros),
-              coinsExact: balanceMicros / COIN_MICROS,
-              pricePerSecond: pps / COIN_MICROS,
-              pricePerSecondMicros: pps,
-              elapsedSeconds: session.elapsedSeconds,
-              remainingSeconds,
-              earnings: earningsDisplay,
-              serverTimestamp,
-              callStartTime: session.startTime,
-            },
-          ],
-        });
+        emitBillingRecoverStateFromSnapshot(socket, [
+          {
+            callId: session.callId,
+            coins: microsToWholeCoinsFloor(balanceMicros),
+            coinsExact: balanceMicros / COIN_MICROS,
+            billingSequence: Math.max(0, Number(session.billingSequence) || 0),
+            lifecycleState: String(session.lifecycleState || 'ACTIVE'),
+            pricePerSecond: pps / COIN_MICROS,
+            pricePerSecondMicros: pps,
+            elapsedSeconds: session.elapsedSeconds,
+            remainingSeconds,
+            earnings: earningsDisplay,
+            serverTimestamp,
+            callStartTime: session.startTime,
+          },
+        ]);
 
         logInfo('State recovery completed', {
           firebaseUid,
           callId,
           elapsedSeconds: session.elapsedSeconds,
+          source: runtime.source,
         });
 
         recordBillingMetric('state_recovery', 1, { callId, firebaseUid });
       } catch (err) {
         logError('State recovery failed', err, { firebaseUid });
-        socket.emit('billing:recover-state:response', {
+        emitBillingRecoverStateResponse(socket, {
           success: false,
           error: 'Failed to recover state',
           activeCalls: [],

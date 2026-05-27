@@ -118,9 +118,13 @@ export function isRedisConfigured(): boolean {
 
 // Redis key helpers
 export const AVAILABILITY_KEY_PREFIX = 'creator:availability:';
+export const CREATOR_PRESENCE_KEY_PREFIX = 'creator:presence:';
 
 export const availabilityKey = (firebaseUid: string): string =>
   `${AVAILABILITY_KEY_PREFIX}${firebaseUid}`;
+
+export const creatorPresenceKey = (firebaseUid: string): string =>
+  `${CREATOR_PRESENCE_KEY_PREFIX}${firebaseUid}`;
 
 /** Epoch ms when creator Redis presence last flipped busy → online (for daily online-time stats). */
 export const creatorAvailOnlineSinceKey = (firebaseUid: string): string =>

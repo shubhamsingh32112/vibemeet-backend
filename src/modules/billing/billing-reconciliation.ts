@@ -13,7 +13,6 @@ import {
   BILLING_DLQ_SSCAN_CURSOR_KEY,
   RECONCILIATION_LAST_RUN_KEY,
   RECONCILIATION_INTERVAL_MS,
-  ACTIVE_BILLING_CALLS_KEY,
   callSessionKey,
   BILLING_RECONCILIATION_LOCK_KEY,
   RECONCILIATION_LOCK_TTL_MS,
@@ -57,8 +56,6 @@ const DLQ_PARALLELISM = readNumber(process.env.BILLING_RECON_DLQ_PARALLELISM, 8,
 const DLQ_BATCH_PAUSE_MS = readNumber(process.env.BILLING_RECON_DLQ_BATCH_PAUSE_MS, 120, 0, 1000);
 const DLQ_SCAN_COUNT = readNumber(process.env.BILLING_RECON_DLQ_SCAN_COUNT, 200, 20, 1000);
 const DLQ_SCAN_MAX_MS = readNumber(process.env.BILLING_RECON_DLQ_SCAN_MAX_MS, 200, 50, 3000);
-const STALE_BATCH_SIZE = readNumber(process.env.BILLING_RECON_STALE_BATCH_SIZE, 40, 10, 200);
-const STALE_PARALLELISM = readNumber(process.env.BILLING_RECON_STALE_PARALLELISM, 5, 1, 20);
 const RUN_BUDGET_MS = readNumber(process.env.BILLING_RECON_MAX_RUN_MS, 45_000, 10_000, 180_000);
 const BULLMQ_STALE_BATCH_SIZE = readNumber(process.env.BILLING_BULLMQ_STALE_BATCH_SIZE, 40, 10, 200);
 const BULLMQ_STALE_SCAN_COUNT = readNumber(process.env.BILLING_BULLMQ_STALE_SCAN_COUNT, 200, 50, 1000);
@@ -178,7 +175,6 @@ export function startReconciliationJob(io: Server): void {
       await processDLQ(io, startedAt);
       await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
       await runBullmqBillingWatchdog(startedAt);
-      await runStaleBillingWatchdog(io, startedAt);
       recordBillingMetric('reconciliation_run_ms', Date.now() - startedAt, {});
     }).catch((err) => {
       logError('Error in reconciliation run', err);
@@ -338,60 +334,6 @@ async function runSettlementOrphanRepair(io: Server, startedAt: number): Promise
   } while (cursor !== '0');
 }
 
-/** ZSET-only: recover calls whose next-process score is far in the past (stuck scheduler). */
-async function runStaleBillingWatchdog(io: Server, startedAt: number): Promise<void> {
-  if (isBullmqBillingEnabled()) {
-    return;
-  }
-  const redis = getRedis();
-  const STALE_AFTER_MS = 120_000;
-  const now = Date.now();
-  const maxScore = now - STALE_AFTER_MS;
-  const stale = await redis.zrangebyscore(
-    ACTIVE_BILLING_CALLS_KEY,
-    0,
-    maxScore,
-    'LIMIT',
-    0,
-    STALE_BATCH_SIZE
-  );
-  const callIds: string[] = Array.isArray(stale) ? stale : [];
-  if (callIds.length === 0) return;
-
-  logWarning('Stale billing schedules detected', { count: callIds.length });
-
-  await processInParallel(callIds, STALE_PARALLELISM, async (callId) => {
-    if (Date.now() - startedAt > RUN_BUDGET_MS) {
-      return;
-    }
-    try {
-      const r = await billingService.processBillingTick(io, callId);
-      if (r === 'tick_ok') {
-        const sessionRaw = await redis.get(callSessionKey(callId));
-        if (sessionRaw) {
-          try {
-            const sess = JSON.parse(sessionRaw as string) as { lastProcessedAt?: number };
-            const lp = Number(sess.lastProcessedAt) || Date.now();
-            await redis.zadd(ACTIVE_BILLING_CALLS_KEY, lp + BILLING_PROCESS_INTERVAL_MS, callId);
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-      if (r === 'stop_needs_settlement') {
-        await finalizeCallSession(io, {
-          callId,
-          reason: 'timeout',
-          source: 'reconciliation_worker',
-        }).catch((e) => logError('Watchdog finalizeCallSession failed', e, { callId }));
-      }
-      recordBillingMetric('billing_stale_recovered', 1, { callId });
-    } catch (e) {
-      logError('Watchdog billing cycle failed', e, { callId });
-    }
-  });
-}
-
 /**
  * Stop the reconciliation job
  */
@@ -471,11 +413,7 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
         // If call session doesn't exist or call is not in active billing set,
         // the call has ended and we should remove it from DLQ
         const sessionExists = await redis.get(callSessionKey(callId));
-        const isInActiveBilling = isBullmqBillingEnabled()
-          ? null
-          : await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
-
-        if (!sessionExists && (isBullmqBillingEnabled() || !isInActiveBilling)) {
+        if (!sessionExists) {
           // Call has ended, remove from DLQ
           await Promise.all([
             redis.del(dlqKey),
@@ -500,17 +438,9 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
           } else {
             const sessionRaw = await redis.get(callSessionKey(callId));
             if (sessionRaw) {
-              try {
-                const sess = JSON.parse(sessionRaw as string) as { lastProcessedAt?: number };
-                const lp = Number(sess.lastProcessedAt) || Date.now();
-                await redis.zadd(
-                  ACTIVE_BILLING_CALLS_KEY,
-                  lp + BILLING_PROCESS_INTERVAL_MS,
-                  callId
-                );
-              } catch {
-                /* ignore */
-              }
+              await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS).catch((e) =>
+                logError('DLQ: schedule billing cycle failed', e, { callId })
+              );
             }
           }
           await Promise.all([
@@ -534,11 +464,7 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
           logInfo('Settled call from DLQ after tick stop', { callId });
         } else {
           const sessionStillExists = await redis.get(callSessionKey(callId));
-          const stillInActiveBilling = isBullmqBillingEnabled()
-            ? null
-            : await redis.zscore(ACTIVE_BILLING_CALLS_KEY, callId);
-
-          if (!sessionStillExists && (isBullmqBillingEnabled() || !stillInActiveBilling)) {
+          if (!sessionStillExists) {
             await Promise.all([
               redis.del(dlqKey),
               redis.srem(dlqSetKey, dlqKey),

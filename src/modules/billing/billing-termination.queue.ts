@@ -168,7 +168,6 @@ export function startTerminationRetryWorker(): Worker | null {
         callId,
         userFirebaseUid,
         creatorFirebaseUid,
-        includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
       });
       if (!stillActive) {
         await releaseMarkEndedLease(callId);

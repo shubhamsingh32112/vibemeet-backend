@@ -18,6 +18,13 @@ test('call lifecycle routes busy and finalize through centralized helpers', () =
   assert.ok(!src.includes('private async markCreatorBusy('));
 });
 
+test('call lifecycle rejects overlapping ringing calls via active slots', () => {
+  const src = readFileSync(join(__dirname, 'call-lifecycle.service.ts'), 'utf8');
+  assert.ok(src.includes('call_overlap_rejected'));
+  assert.ok(src.includes('activeCallByUserKey('));
+  assert.ok(src.includes('markStreamCallEnded('));
+});
+
 test('call finalizer has idempotency lock and done markers', () => {
   const src = readFileSync(join(__dirname, 'call-finalization.service.ts'), 'utf8');
   assert.ok(src.includes('call:finalize:lock:'));

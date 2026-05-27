@@ -17,6 +17,16 @@ export interface ICallBillingCheckpoint extends mongoose.Document {
   creatorEarningsPerSecondMicros: number;
   totalDeductedMicros: number;
   totalEarnedMicros: number;
+  billingSequence: number;
+  lifecycleState:
+    | 'INIT'
+    | 'STARTING'
+    | 'ACTIVE'
+    | 'ENDING'
+    | 'SETTLING'
+    | 'SETTLED'
+    | 'FAILED'
+    | 'RECOVERING';
   schemaVersion: number;
   version: number;
   status: 'active' | 'settling' | 'settled';
@@ -37,6 +47,14 @@ const callBillingCheckpointSchema = new Schema<ICallBillingCheckpoint>(
     creatorEarningsPerSecondMicros: { type: Number, required: false },
     totalDeductedMicros: { type: Number, required: true },
     totalEarnedMicros: { type: Number, required: true },
+    billingSequence: { type: Number, required: true, default: 0 },
+    lifecycleState: {
+      type: String,
+      enum: ['INIT', 'STARTING', 'ACTIVE', 'ENDING', 'SETTLING', 'SETTLED', 'FAILED', 'RECOVERING'],
+      required: true,
+      default: 'INIT',
+      index: true,
+    },
     schemaVersion: { type: Number, required: true, default: 3 },
     version: { type: Number, required: true, default: 1 },
     status: {

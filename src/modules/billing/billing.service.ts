@@ -11,7 +11,6 @@ import {
   callUserIntroMicrosKey,
   callUserWalletMicrosKey,
   callCreatorEarningsKey,
-  ACTIVE_BILLING_CALLS_KEY,
   activeCallByUserKey,
   ACTIVE_CALL_BY_USER_TTL,
 } from '../../config/redis';
@@ -42,6 +41,7 @@ import {
   coinsWholeToMicros,
   microsToWholeCoinsFloor,
   getBillingCheckpointIntervalMs,
+  getBillingCheckpointEverySequences,
   getBillingCheckpointMinDeltaMicros,
   getBillingEmitIntervalMs,
   getBillingRedisBackpressureMs,
@@ -59,6 +59,16 @@ import {
   updateBackpressureStage,
 } from './billing-backpressure';
 import { featureFlags } from '../../config/feature-flags';
+import {
+  BillingLifecycleState,
+  transitionBillingState,
+  transitionBillingStateWithAudit,
+} from './billing-lifecycle.machine';
+import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
+import {
+  emitBillingStartedFromSnapshot,
+  emitBillingUpdateFromSnapshot,
+} from './billing-emitter.service';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
@@ -281,6 +291,8 @@ export interface CallSession {
   startTime: number;
   lastProcessedAt: number;
   version: number;
+  billingSequence: number;
+  lifecycleState: BillingLifecycleState;
   totalDeductedMicros: number;
   totalEarnedMicros: number;
   elapsedSeconds: number;
@@ -319,10 +331,24 @@ export function normalizeV4SessionFields(session: CallSession): void {
     session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
   session.totalIntroDeductedMicros = session.totalIntroDeductedMicros ?? 0;
   session.totalWalletDeductedMicros = session.totalWalletDeductedMicros ?? 0;
+  session.billingSequence = Math.max(0, Number(session.billingSequence ?? 0));
+  session['lifecycleState'] = (session.lifecycleState ?? 'INIT') as BillingLifecycleState;
+  if (session.lifecycleState === 'INIT' && (session.elapsedSeconds ?? 0) > 0) {
+    const transitioned = transitionBillingState({
+      callId: session.callId || 'unknown',
+      from: session.lifecycleState,
+      to: 'ACTIVE',
+      source: 'billing.normalizeV4SessionFields',
+      reason: 'legacy_elapsed_seconds_backfill',
+    });
+    session['lifecycleState'] = transitioned.next;
+  }
 }
 
 export type BillingStartedUserPayload = {
   callId: string;
+  billingSequence: number;
+  lifecycleState: BillingLifecycleState;
   coins: number;
   introCreditsRemainingApprox: number;
   introPromoActive: boolean;
@@ -398,6 +424,8 @@ export async function buildBillingStartedUserPayload(
 
   return {
     callId,
+    billingSequence: session.billingSequence ?? 0,
+    lifecycleState: session.lifecycleState ?? 'INIT',
     coins: microsToWholeCoinsFloor(balanceMicros),
     introCreditsRemainingApprox: introPromo ? microsToWholeCoinsFloor(introMicros) : 0,
     introPromoActive: introPromo,
@@ -417,15 +445,11 @@ export async function getBillingStartedUserPayloadForCall(
   callId: string
 ): Promise<BillingStartedUserPayload | null> {
   const redis = getRedis();
-  const sessionRaw = await redis.get(callSessionKey(callId));
-  if (!sessionRaw) return null;
-  try {
-    const session = JSON.parse(sessionRaw) as CallSession;
-    normalizeV4SessionFields(session);
-    return await buildBillingStartedUserPayload(redis, callId, session);
-  } catch {
-    return null;
-  }
+  const resolved = await resolveBillingRuntimeState(callId);
+  if (!resolved.session) return null;
+  const session = resolved.session as CallSession;
+  normalizeV4SessionFields(session);
+  return await buildBillingStartedUserPayload(redis, callId, session);
 }
 
 /**
@@ -456,19 +480,25 @@ async function replayBillingStartedFromRedisSession(
     Math.max(0, Math.round((session.creatorEarningsPerSecond ?? 0) * COIN_MICROS));
   const earningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
 
-  io.to(`user:${userFirebaseUid}`).emit('billing:started', userPayload);
-
-  io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
-    callId,
-    earnings: earningsDisplay,
-    pricePerSecond: creatorEpsMicros / COIN_MICROS,
-    pricePerSecondMicros: creatorEpsMicros,
-    creatorEarningsPerSecond: creatorEpsMicros / COIN_MICROS,
-    creatorSharePercentage: session.creatorShareAtCallTime,
-    elapsedSeconds: session.elapsedSeconds ?? 0,
-    serverTimestamp: userPayload.serverTimestamp,
-    callStartTime: session.startTime,
-  });
+  emitBillingStartedFromSnapshot(
+    io,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    userPayload,
+    {
+      callId,
+      billingSequence: session.billingSequence ?? 0,
+      lifecycleState: session.lifecycleState ?? 'INIT',
+      earnings: earningsDisplay,
+      pricePerSecond: creatorEpsMicros / COIN_MICROS,
+      pricePerSecondMicros: creatorEpsMicros,
+      creatorEarningsPerSecond: creatorEpsMicros / COIN_MICROS,
+      creatorSharePercentage: session.creatorShareAtCallTime,
+      elapsedSeconds: session.elapsedSeconds ?? 0,
+      serverTimestamp: userPayload.serverTimestamp,
+      callStartTime: session.startTime,
+    }
+  );
 
   logInfo('Replayed billing:started for existing Redis session', {
     callId,
@@ -537,6 +567,8 @@ function migrateSession(
     startTime,
     lastProcessedAt,
     version: Math.max(1, Math.floor(Number(raw.version) || 1)),
+    billingSequence: Math.max(0, Math.floor(Number(raw.billingSequence) || 0)),
+    lifecycleState: ((raw.lifecycleState as BillingLifecycleState) || 'ACTIVE'),
     totalDeductedMicros,
     totalEarnedMicros,
     elapsedSeconds,
@@ -603,6 +635,8 @@ function buildSessionFromCheckpoint(
     startTime: startTimeMs,
     lastProcessedAt: lastProcessedAtMs,
     version: Math.max(1, Number(checkpoint.version) || 1),
+    billingSequence: Math.max(0, Number(checkpoint.billingSequence) || 0),
+    lifecycleState: (checkpoint.lifecycleState as BillingLifecycleState) || 'RECOVERING',
     totalDeductedMicros,
     totalEarnedMicros,
     elapsedSeconds,
@@ -842,6 +876,8 @@ export class BillingService {
         startTime: seedStartTime,
         lastProcessedAt: seedStartTime,
         version: 0,
+        billingSequence: 0,
+        lifecycleState: 'STARTING',
         totalDeductedMicros: 0,
         totalEarnedMicros: 0,
         elapsedSeconds: 0,
@@ -993,6 +1029,8 @@ export class BillingService {
       startTime,
       lastProcessedAt: startTime,
       version: 1,
+      billingSequence: 0,
+      lifecycleState: 'STARTING',
       totalDeductedMicros: 0,
       totalEarnedMicros: 0,
       elapsedSeconds: 0,
@@ -1105,6 +1143,8 @@ export class BillingService {
 
     const userBillingStartedPayload: BillingStartedUserPayload = {
       callId,
+      billingSequence: 1,
+      lifecycleState: 'ACTIVE',
       coins: microsToWholeCoinsFloor(spendableMicros),
       introCreditsRemainingApprox: introPromoActive
         ? microsToWholeCoinsFloor(initialIntroMicros)
@@ -1120,19 +1160,37 @@ export class BillingService {
       durationLimit: effectiveDurationLimitSeconds,
     };
 
-    io.to(`user:${userFirebaseUid}`).emit('billing:started', userBillingStartedPayload);
-
-    io.to(`user:${creatorFirebaseUid}`).emit('billing:started', {
+    session['lifecycleState'] = (
+      await transitionBillingStateWithAudit({
       callId,
-      earnings: 0,
-      pricePerSecond: creatorEarningsPerSecondMicros / COIN_MICROS,
-      pricePerSecondMicros: creatorEarningsPerSecondMicros,
-      creatorEarningsPerSecond: creatorEarningsPerSecondMicros / COIN_MICROS,
-      creatorSharePercentage: pricing.creatorShareAtCallTime,
-      elapsedSeconds: 0,
-      serverTimestamp,
-      callStartTime: session.startTime,
-    });
+      from: session.lifecycleState,
+      to: 'ACTIVE',
+      source: 'billing.startBillingSession',
+      reason: 'session_started_emit',
+      })
+    ).next;
+    session.billingSequence = 1;
+    await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+
+    emitBillingStartedFromSnapshot(
+      io,
+      userFirebaseUid,
+      creatorFirebaseUid,
+      userBillingStartedPayload,
+      {
+        callId,
+        billingSequence: session.billingSequence,
+        lifecycleState: session.lifecycleState,
+        earnings: 0,
+        pricePerSecond: creatorEarningsPerSecondMicros / COIN_MICROS,
+        pricePerSecondMicros: creatorEarningsPerSecondMicros,
+        creatorEarningsPerSecond: creatorEarningsPerSecondMicros / COIN_MICROS,
+        creatorSharePercentage: pricing.creatorShareAtCallTime,
+        elapsedSeconds: 0,
+        serverTimestamp,
+        callStartTime: session.startTime,
+      }
+    );
 
     recordBillingMetric('session_started', 1, {
       callId,
@@ -1163,6 +1221,8 @@ export class BillingService {
           creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
           totalDeductedMicros: session.totalDeductedMicros,
           totalEarnedMicros: session.totalEarnedMicros,
+          billingSequence: session.billingSequence,
+          lifecycleState: session.lifecycleState,
           status: 'active',
         });
       } catch (cpErr) {
@@ -1197,31 +1257,7 @@ export class BillingService {
           driver: 'bullmq',
         });
       } else {
-        const nextBillingTime = startTime + BILLING_PROCESS_INTERVAL_MS;
-        await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
-        logInfo('Billing session registered for processing', {
-          ...billingLifecycleLogContext({
-            callId,
-            source,
-            payerFirebaseUid: userFirebaseUid,
-            creatorFirebaseUid,
-            initiatedByFirebaseUid,
-            initiatedByRole,
-          }),
-          nextBillingTime,
-        });
-        logInfo('billing_lifecycle_scheduler_registered', {
-          ...billingLifecycleLogContext({
-            callId,
-            source,
-            payerFirebaseUid: userFirebaseUid,
-            creatorFirebaseUid,
-            initiatedByFirebaseUid,
-            initiatedByRole,
-          }),
-          driver: 'zset',
-          nextBillingTime,
-        });
+        throw new Error('ZSET billing scheduler is disabled; BullMQ is required.');
       }
     } catch (registrationError) {
       logError('CRITICAL: Failed to register call for billing', registrationError, {
@@ -1538,6 +1574,15 @@ export class BillingService {
 
       if (actualDeduct <= 0) {
         if (activeSpendMicros < pricePerSecondMicros) {
+          session['lifecycleState'] = (
+            await transitionBillingStateWithAudit({
+            callId,
+            from: session.lifecycleState,
+            to: 'ENDING',
+            source: 'billing.processTick',
+            reason: 'insufficient_balance_pre_deduct',
+            })
+          ).next;
           const userReason = introPromoBilling ? 'intro_promo_exhausted' : 'insufficient_coins';
           emitSoon(() => {
             void forceTerminateCall(io, {
@@ -1581,6 +1626,18 @@ export class BillingService {
         throw new Error('Billing totals violated monotonicity invariant');
       }
       session.version += 1;
+      session.billingSequence += 1;
+      if (session.lifecycleState === 'STARTING' || session.lifecycleState === 'RECOVERING') {
+        session['lifecycleState'] = (
+          await transitionBillingStateWithAudit({
+          callId,
+          from: session.lifecycleState,
+          to: 'ACTIVE',
+          source: 'billing.processTick',
+          reason: 'first_successful_tick',
+          })
+        ).next;
+      }
 
       session.elapsedSeconds =
         pricePerSecondMicros > 0
@@ -1600,6 +1657,35 @@ export class BillingService {
 
       const effectiveLimit = session.effectiveDurationLimitSeconds;
       const secondsUntilLimit = effectiveLimit - session.elapsedSeconds;
+      const remainingSeconds =
+        pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
+      const roundedEarningsDisplay =
+        Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
+      const serverTimestamp = Date.now();
+      const billingSnapshot = {
+        callId,
+        billingSequence: session.billingSequence,
+        lifecycleState: session.lifecycleState,
+        userMongoId: session.userMongoId,
+        creatorMongoId: session.creatorMongoId,
+        userFirebaseUid: session.userFirebaseUid,
+        creatorFirebaseUid: session.creatorFirebaseUid,
+        startTimeMs: session.startTime,
+        lastProcessedAtMs: session.lastProcessedAt,
+        remainingUserBalanceMicros: balanceMicros,
+        pricePerSecondMicros: session.pricePerSecondMicros,
+        creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+        totalDeductedMicros: session.totalDeductedMicros,
+        totalEarnedMicros: session.totalEarnedMicros,
+        elapsedSeconds: session.elapsedSeconds,
+        remainingSeconds,
+        durationLimit: effectiveLimit,
+        serverTimestamp,
+        introPromoActive: introPromoBilling,
+        coins: microsToWholeCoinsFloor(balanceMicros),
+        coinsExact: balanceMicros / COIN_MICROS,
+        earnings: roundedEarningsDisplay,
+      } as const;
 
       if (secondsUntilLimit <= CALL_DURATION_WARNING_SECONDS && secondsUntilLimit > 0) {
         emitSoon(() => {
@@ -1620,6 +1706,15 @@ export class BillingService {
       }
 
       if (session.elapsedSeconds >= effectiveLimit) {
+        session['lifecycleState'] = (
+          await transitionBillingStateWithAudit({
+          callId,
+          from: session.lifecycleState,
+          to: 'ENDING',
+          source: 'billing.processTick',
+          reason: 'duration_limit_reached',
+          })
+        ).next;
         recordBillingMetric('duration_limit_reached', 1, { callId });
         monitoring.recordError(
           'Call duration limit reached',
@@ -1649,6 +1744,7 @@ export class BillingService {
       }
 
       const cpInterval = getBillingCheckpointIntervalMs();
+      const cpEverySequences = getBillingCheckpointEverySequences();
       const minDeltaMicros = getBillingCheckpointMinDeltaMicros();
       if (featureFlags.billingDeltaCursorV3Enabled) {
         await advanceBillingCheckpointCursor({
@@ -1657,20 +1753,26 @@ export class BillingService {
           creatorMongoId: session.creatorMongoId,
           userFirebaseUid: session.userFirebaseUid,
           creatorFirebaseUid: session.creatorFirebaseUid,
-          startTimeMs: session.startTime,
-          lastProcessedAtMs: session.lastProcessedAt,
-          remainingUserBalanceMicros: balanceMicros,
-          pricePerSecondMicros: session.pricePerSecondMicros,
-          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
-          totalDeductedMicros: session.totalDeductedMicros,
-          totalEarnedMicros: session.totalEarnedMicros,
+          startTimeMs: billingSnapshot.startTimeMs,
+          lastProcessedAtMs: billingSnapshot.lastProcessedAtMs,
+          remainingUserBalanceMicros: billingSnapshot.remainingUserBalanceMicros,
+          pricePerSecondMicros: billingSnapshot.pricePerSecondMicros,
+          creatorEarningsPerSecondMicros: billingSnapshot.creatorEarningsPerSecondMicros,
+          totalDeductedMicros: billingSnapshot.totalDeductedMicros,
+          totalEarnedMicros: billingSnapshot.totalEarnedMicros,
+          billingSequence: billingSnapshot.billingSequence,
+          lifecycleState: billingSnapshot.lifecycleState,
           expectedVersion: session.version - 1,
           status: 'active',
         });
       } else {
         const checkpointDue =
           cpInterval > 0 && Date.now() - (session.lastCheckpointAtMs || 0) >= cpInterval;
-        if (checkpointDue) {
+        const checkpointDueBySequence =
+          cpEverySequences > 0 &&
+          session.billingSequence > 0 &&
+          session.billingSequence % cpEverySequences === 0;
+        if (checkpointDue || checkpointDueBySequence) {
           const prevDed = session.lastCheckpointDeductedMicros;
           const prevEarn = session.lastCheckpointEarnedMicros;
           const noPriorCheckpoint = prevDed === undefined && prevEarn === undefined;
@@ -1689,6 +1791,8 @@ export class BillingService {
               creatorMongoId: session.creatorMongoId,
               totalDeductedMicros: session.totalDeductedMicros,
               totalEarnedMicros: session.totalEarnedMicros,
+              billingSequence: session.billingSequence,
+              lifecycleState: session.lifecycleState,
             });
             session.lastCheckpointDeductedMicros = session.totalDeductedMicros;
             session.lastCheckpointEarnedMicros = session.totalEarnedMicros;
@@ -1724,12 +1828,6 @@ export class BillingService {
       recordBillingMetric('redis_write_ms', redisWriteMs, { callId });
       const activeStage = updateBackpressureStage({ redisWriteMs });
 
-      const remainingSeconds =
-        pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
-      const roundedEarningsDisplay =
-        Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
-      const serverTimestamp = Date.now();
-
       recordBillingMetric('tick_processed', 1, { callId });
       recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });
 
@@ -1750,28 +1848,36 @@ export class BillingService {
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'emit_state_persist' });
         emitSoon(() => {
-          io.to(`user:${session.userFirebaseUid}`).emit('billing:update', {
-            callId,
-            coins: microsToWholeCoinsFloor(balanceMicros),
-            coinsExact: balanceMicros / COIN_MICROS,
-            elapsedSeconds: session.elapsedSeconds,
-            remainingSeconds,
-            durationLimit: effectiveLimit,
-            serverTimestamp,
-            callStartTime: session.startTime,
-            introPromoActive: introPromoBilling,
-            pricePerSecondMicros,
-          });
-
-          io.to(`user:${session.creatorFirebaseUid}`).emit('billing:update', {
-            callId,
-            earnings: roundedEarningsDisplay,
-            elapsedSeconds: session.elapsedSeconds,
-            durationLimit: effectiveLimit,
-            serverTimestamp,
-            callStartTime: session.startTime,
-            pricePerSecondMicros: creatorEarningsPerSecondMicros,
-          });
+          emitBillingUpdateFromSnapshot(
+            io,
+            session.userFirebaseUid,
+            session.creatorFirebaseUid,
+            {
+              callId: billingSnapshot.callId,
+              billingSequence: billingSnapshot.billingSequence,
+              lifecycleState: billingSnapshot.lifecycleState,
+              coins: billingSnapshot.coins,
+              coinsExact: billingSnapshot.coinsExact,
+              elapsedSeconds: billingSnapshot.elapsedSeconds,
+              remainingSeconds: billingSnapshot.remainingSeconds,
+              durationLimit: billingSnapshot.durationLimit,
+              serverTimestamp: billingSnapshot.serverTimestamp,
+              callStartTime: session.startTime,
+              introPromoActive: billingSnapshot.introPromoActive,
+              pricePerSecondMicros: billingSnapshot.pricePerSecondMicros,
+            },
+            {
+              callId: billingSnapshot.callId,
+              billingSequence: billingSnapshot.billingSequence,
+              lifecycleState: billingSnapshot.lifecycleState,
+              earnings: billingSnapshot.earnings,
+              elapsedSeconds: billingSnapshot.elapsedSeconds,
+              durationLimit: billingSnapshot.durationLimit,
+              serverTimestamp: billingSnapshot.serverTimestamp,
+              callStartTime: session.startTime,
+              pricePerSecondMicros: billingSnapshot.creatorEarningsPerSecondMicros,
+            }
+          );
         });
         recordBillingMetric('emit_update_sent', 1, { callId });
       } else {
@@ -1782,6 +1888,15 @@ export class BillingService {
       }
 
       if (activeRemain < pricePerSecondMicros) {
+        session['lifecycleState'] = (
+          await transitionBillingStateWithAudit({
+          callId,
+          from: session.lifecycleState,
+          to: 'ENDING',
+          source: 'billing.processTick',
+          reason: 'insufficient_balance_post_deduct',
+          })
+        ).next;
         emitSoon(() => {
           void forceTerminateCall(io, {
             callId,

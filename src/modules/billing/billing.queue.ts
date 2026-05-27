@@ -233,6 +233,15 @@ export async function scheduleBillingJob(
   }
 }
 
+export async function cancelBillingCycleJob(callId: string): Promise<void> {
+  assertBullmqRuntimeSafety();
+  const q = getQueue();
+  const job = await q.getJob(billingCycleJobId(callId));
+  if (!job) return;
+  await job.remove().catch(() => {});
+  recordBillingMetric('bullmq_cycle_cancelled', 1, { callId });
+}
+
 export function startBillingBullWorker(): Worker {
   assertBullmqRuntimeSafety();
   if (billingWorker) {

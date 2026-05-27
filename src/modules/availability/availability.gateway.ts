@@ -1,10 +1,7 @@
 import { Server, Socket } from 'socket.io';
-import { getRedis, availabilityKey, activeCallByUserKey } from '../../config/redis';
+import { getRedis, activeCallByUserKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
-import { emitStaffDomainEvent, getCreatorStaffScope } from '../staff/staff-dashboard-invalidation.service';
-import {
-  updateOnlinePresenceSets,
-} from './presence-dashboard.service';
+import { transitionCreatorPresence, getBatchCreatorPresence } from './presence.service';
 import { User } from '../user/user.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
@@ -13,11 +10,6 @@ import {
   refreshUserAvailability,
   getBatchUserAvailability,
 } from './user-availability.service';
-import {
-  recordCreatorAvailabilityBecameBusy,
-  recordCreatorAvailabilityBecameOnline,
-} from './creator-daily-online.service';
-
 // Keep this aligned with the availability service TTL.
 const AVAILABILITY_TTL_SECONDS = 120;
 
@@ -297,18 +289,13 @@ export function setupAvailabilityGateway(io: Server): void {
               await setCreatorAvailability(io, firebaseUid, 'busy');
               logDebug('Heartbeat: Creator on active call, kept as busy', { firebaseUid });
             } else {
-              const redis = getRedis();
-              const status = await redis.get(availabilityKey(firebaseUid));
-              if (status === 'online') {
-                await redis.setex(availabilityKey(firebaseUid), AVAILABILITY_TTL_SECONDS, 'online');
-                logDebug('Heartbeat refreshed TTL', { firebaseUid });
-              } else {
-                // 🔥 PRODUCT: creators should remain online while app is running.
-                // If the creator was marked busy during the call, flip them back to
-                // online as soon as the active-call slot is gone (no reconnect needed).
-                await setCreatorAvailability(io, firebaseUid, 'online');
-                logInfo('Heartbeat restored creator to online (post-call)', { firebaseUid });
-              }
+              await transitionCreatorPresence(
+                io,
+                firebaseUid,
+                'HEARTBEAT',
+                'availability.gateway.creator_heartbeat'
+              );
+              logDebug('Heartbeat refreshed creator presence state', { firebaseUid });
             }
           } catch (err) {
             logError('Heartbeat failed', err, { firebaseUid });
@@ -413,18 +400,21 @@ export function setupAvailabilityGateway(io: Server): void {
           }
 
           const result: Record<string, string> = {};
-          const redis = getRedis();
-
-          // Build keys array for batch fetch
-          const keys = creatorIds.map((id) => availabilityKey(id));
-
-          // MGET: one round-trip for all keys
-          const values = await redis.mget(...keys);
-
-          // Map results — null / missing → "busy", "online" → "online"
-          for (let i = 0; i < creatorIds.length; i++) {
-            const val = values[i];
-            result[creatorIds[i]] = val === 'online' ? 'online' : 'busy';
+          const resultV2: Record<
+            string,
+            { status: 'online' | 'busy'; version: number; updatedAt: number; source: string }
+          > = {};
+          const records = await getBatchCreatorPresence(creatorIds);
+          for (const creatorId of creatorIds) {
+            const rec = records[creatorId];
+            const state = rec?.state ?? 'busy';
+            result[creatorId] = state;
+            resultV2[creatorId] = {
+              status: state,
+              version: Math.max(0, Number(rec?.version) || 0),
+              updatedAt: Math.max(0, Number(rec?.updatedAt) || Date.now()),
+              source: String(rec?.source || 'fallback'),
+            };
           }
 
           logDebug('Availability batch fetched', {
@@ -432,6 +422,7 @@ export function setupAvailabilityGateway(io: Server): void {
             creatorCount: Object.keys(result).length,
           });
           socket.emit('availability:batch', result);
+          socket.emit('availability:batch:v2', resultV2);
         } catch (err) {
           logError('Error handling availability:get', err, { socketId: socket.id });
           socket.emit('availability:batch', {});
@@ -566,13 +557,18 @@ export function setupAvailabilityGateway(io: Server): void {
             logInfo('Creator disconnected - automatically set to offline', { firebaseUid: uid });
           } catch (err) {
             logError('Failed to set creator offline on disconnect', err, { firebaseUid: uid });
-            // Even if Redis fails, try to broadcast the status change
-            const payload = {
-              creatorId: uid,
-              status: 'busy',
-            };
-            io.to('consumers').emit('creator:status', payload);
-            io.to('creators').emit('creator:status', payload);
+            try {
+              await transitionCreatorPresence(
+                io,
+                uid,
+                'DISCONNECTED',
+                'availability.gateway.disconnect_fallback'
+              );
+            } catch (fallbackErr) {
+              logError('Failed to transition creator offline on disconnect fallback', fallbackErr, {
+                firebaseUid: uid,
+              });
+            }
           }
         } else {
           // Still have other devices connected - just decrement count
@@ -657,59 +653,18 @@ export async function setCreatorAvailability(
   status: 'online' | 'busy'
 ): Promise<void> {
   const startedAt = Date.now();
-  const redis = getRedis();
-  const key = availabilityKey(creatorFirebaseUid);
-  const existing = await redis.get(key);
-  const currentStatus = existing === 'online' ? 'online' : 'busy';
-
-  if (currentStatus === status) {
-    recordCallMetric('presence.creator_status_noop', 1, { status });
-    return;
-  }
-
-  if (status === 'online') {
-    await redis.setex(key, AVAILABILITY_TTL_SECONDS, 'online');
-    await recordCreatorAvailabilityBecameOnline(creatorFirebaseUid);
-  } else {
-    await recordCreatorAvailabilityBecameBusy(creatorFirebaseUid);
-    await redis.del(key);
-  }
-
-  const scope = await getCreatorStaffScope(creatorFirebaseUid);
-  await updateOnlinePresenceSets(
+  const transition = await transitionCreatorPresence(
+    io,
     creatorFirebaseUid,
-    status === 'online' ? 'online' : 'offline',
-    scope
+    status === 'online' ? 'CONNECTED' : 'FORCE_OFFLINE',
+    'availability.gateway.setCreatorAvailability'
   );
-
-  // Fanout to user-facing consumers and creators without a global broadcast.
-  const payload = {
-    creatorId: creatorFirebaseUid,
-    status,
-  };
-  io.to('consumers').emit('creator:status', payload);
-  io.to('creators').emit('creator:status', payload);
-  recordCallMetric('presence.creator_status_emit', 1, { status });
+  if (transition.state === status) {
+    recordCallMetric('presence.creator_status_emit', 1, { status });
+  } else {
+    recordCallMetric('presence.creator_status_noop', 1, { status });
+  }
   recordCallMetric('presence.creator_status_propagation_ms', Date.now() - startedAt, { status });
-
-  logDebug('Broadcast creator status to presence rooms', {
-    creatorFirebaseUid,
-    status,
-    consumersRoomSize: io.sockets.adapter.rooms.get('consumers')?.size ?? 0,
-    creatorsRoomSize: io.sockets.adapter.rooms.get('creators')?.size ?? 0,
-  });
-
-  emitStaffDomainEvent({
-    type: 'creator:status_changed',
-    scope: { bdId: scope.bdId, agencyId: scope.agencyId },
-    entityId: creatorFirebaseUid,
-    meta: { status },
-  });
-
-  logDebug('Broadcast creator status', {
-    creatorFirebaseUid,
-    status,
-  });
 }
 
 async function sweepStaleHeartbeats(io: Server): Promise<void> {

@@ -38,8 +38,34 @@ test('forceTerminateCall triggers finalizeCallSession before Stream mark_ended',
   assert.ok(finalizeIdx < streamIdx, 'settlement must not be gated on Stream success');
 });
 
-test('batch processor uses finalizeCallSession on stop_needs_settlement', () => {
-  const src = readFileSync(join(__dirname, 'billing-batch.processor.ts'), 'utf8');
+test('bullmq worker uses finalizeCallSession on stop_needs_settlement', () => {
+  const src = readFileSync(join(__dirname, 'billing.queue.ts'), 'utf8');
+  assert.ok(src.includes("result === 'stop_needs_settlement'"));
   assert.ok(src.includes('finalizeCallSession'));
   assert.ok(!src.includes("from './billing-settlement.service'"));
+});
+
+test('finalizer keeps duplicate suppression and retry safeguards', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('isAlreadySettled(callId)'));
+  assert.ok(src.includes("return { status: 'duplicate', callId }"));
+  assert.ok(src.includes('enqueueSettlementRetry(params)'));
+  assert.ok(src.includes('settlementClaimKey(callId)'));
+  assert.ok(src.includes('RELEASE_IF_MATCH_LUA'));
+});
+
+test('finalizer keeps ordering: remove scheduling before persistence', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  const removeIdx = src.indexOf('await removeCallFromBilling(callId);');
+  const settleIdx = src.indexOf('const persistResult = await settleCall');
+  assert.ok(removeIdx >= 0 && settleIdx >= 0);
+  assert.ok(removeIdx < settleIdx, 'call must be unscheduled before persistence');
+});
+
+test('finalizer checkpoints SETTLED before billing:settled emit', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  const checkpointIdx = src.indexOf("await checkpointLifecycleState(callId, 'SETTLED', 'settled');");
+  const emitIdx = src.indexOf('emitBillingSettledFromSnapshot(');
+  assert.ok(checkpointIdx >= 0 && emitIdx >= 0);
+  assert.ok(checkpointIdx < emitIdx, 'checkpoint must persist before settled emit');
 });

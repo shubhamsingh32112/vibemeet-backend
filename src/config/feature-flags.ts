@@ -13,6 +13,18 @@ export const featureFlags = {
    */
   billingDeltaCursorV3Enabled: process.env.BILLING_DELTA_CURSOR_V3_ENABLED === 'true',
   /**
+   * Dual-write billing sequence/lifecycle payload fields while keeping legacy payload compatibility.
+   */
+  billingSequenceContractEnabled: process.env.BILLING_SEQUENCE_CONTRACT_ENABLED !== 'false',
+  /**
+   * Presence v2 explicit JSON state in Redis (`creator:presence:*`) with legacy fallback reads.
+   */
+  presenceV2Enabled: process.env.PRESENCE_V2_ENABLED !== 'false',
+  /**
+   * Watchdog that auto-recovers stalled active/settling sessions.
+   */
+  billingWatchdogEnabled: process.env.BILLING_WATCHDOG_ENABLED !== 'false',
+  /**
    * Onboarding strict mode rollout:
    * - log-only: log invalid transitions, allow
    * - soft-enforce: ignore invalid transitions

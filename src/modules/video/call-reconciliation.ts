@@ -5,8 +5,8 @@ import { randomUUID } from 'crypto';
 import { Call } from './call.model';
 import { User } from '../user/user.model';
 import { generateServerSideToken } from '../../config/stream-video';
-import { setAvailability, getAvailability } from '../availability/availability.service';
-import { emitCreatorStatus } from '../availability/availability.socket';
+import { getAvailability } from '../availability/availability.service';
+import { transitionCreatorPresence } from '../availability/presence.service';
 import {
   getRedis,
   CALL_RECONCILIATION_LOCK_KEY,
@@ -137,8 +137,12 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
             const currentStatus = await getAvailability(creatorUser.firebaseUid);
 
             if (currentStatus !== 'busy') {
-              await setAvailability(creatorUser.firebaseUid, 'busy');
-              emitCreatorStatus(creatorUser.firebaseUid, 'busy');
+              await transitionCreatorPresence(
+                getIO(),
+                creatorUser.firebaseUid,
+                'CALL_STARTED',
+                'call-reconciliation.ensureCreatorsWithActiveCallsAreBusy'
+              );
               logInfo('Reconciliation: Fixed creator busy status', {
                 callId: call.callId,
                 creatorFirebaseUid: creatorUser.firebaseUid,

@@ -16,7 +16,6 @@ import {
   invalidateCreatorDashboard,
   invalidateCreatorTasks,
   invalidateAdminCaches,
-  ACTIVE_BILLING_CALLS_KEY,
   activeCallByUserKey,
   settledCallKey,
   SETTLED_CALL_TTL,
@@ -46,6 +45,8 @@ import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { resolveStaffCommissionBps } from '../payment/commission-resolve.service';
 import { computeStaffCutsFromHostEarnings } from './staff-revenue-share';
 import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
+import { cancelBillingCycleJob } from './billing.queue';
+import { emitBillingSettledFromSnapshot } from './billing-emitter.service';
 
 interface CallSession {
   schemaVersion?: number;
@@ -146,8 +147,7 @@ function formatDurationLabel(totalSeconds: number): string {
 }
 
 export async function removeCallFromBilling(callId: string): Promise<void> {
-  const redis = getRedis();
-  await redis.zrem(ACTIVE_BILLING_CALLS_KEY, callId);
+  await cancelBillingCycleJob(callId);
   logDebug('Removed call from active billing', { callId });
 }
 
@@ -195,6 +195,7 @@ export interface SettleCallFromFinalizerOptions {
   _fromFinalizer: true;
   lockToken: string;
   settleLockRedisKey: string;
+  suppressSettledEmit?: boolean;
 }
 
 export interface SettlePersistResult {
@@ -204,6 +205,8 @@ export interface SettlePersistResult {
   userFirebaseUid: string;
   creatorFirebaseUid: string;
   userMongoId: string;
+  billingSequence: number;
+  finalUserCoins: number;
 }
 
 /**
@@ -812,6 +815,11 @@ export async function settleCall(
       userFirebaseUid: session.userFirebaseUid,
       creatorFirebaseUid: session.creatorFirebaseUid,
       userMongoId: session.userMongoId,
+      billingSequence: Math.max(
+        0,
+        Number((session as { billingSequence?: number }).billingSequence) || 0
+      ),
+      finalUserCoins: updatedUserCoins,
     };
 
     io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
@@ -860,18 +868,34 @@ export async function settleCall(
       logError('Failed to post call activity in chat', chatErr, { callId });
     }
 
-    io.to(`user:${session.userFirebaseUid}`).emit('billing:settled', {
-      callId,
-      finalCoins: updatedUserCoins,
-      totalDeducted,
-      durationSeconds,
-    });
-
-    io.to(`user:${session.creatorFirebaseUid}`).emit('billing:settled', {
-      callId,
-      totalEarned: totalEarnedCreator,
-      durationSeconds,
-    });
+    if (!opts?.suppressSettledEmit) {
+      emitBillingSettledFromSnapshot(
+        io,
+        session.userFirebaseUid,
+        session.creatorFirebaseUid,
+        {
+          callId,
+          billingSequence: Math.max(
+            0,
+            Number((session as { billingSequence?: number }).billingSequence) || 0
+          ),
+          lifecycleState: 'SETTLED',
+          finalCoins: updatedUserCoins,
+          totalDeducted,
+          durationSeconds,
+        },
+        {
+          callId,
+          billingSequence: Math.max(
+            0,
+            Number((session as { billingSequence?: number }).billingSequence) || 0
+          ),
+          lifecycleState: 'SETTLED',
+          totalEarned: totalEarnedCreator,
+          durationSeconds,
+        }
+      );
+    }
 
     const sideEffects: Promise<unknown>[] = [
       invalidateAdminCaches('overview', 'coins', 'creators_performance'),

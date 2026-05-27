@@ -119,7 +119,6 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
     callId,
     userFirebaseUid,
     creatorFirebaseUid,
-    includeLegacySchedulerCheck: !isBullmqBillingEnabled(),
   });
 
   if (!active) {

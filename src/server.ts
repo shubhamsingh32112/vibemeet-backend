@@ -22,6 +22,7 @@ import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcess
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
 import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
 import { startReconciliationJob, stopReconciliationJob } from './modules/billing/billing-reconciliation';
+import { startBillingWatchdog, stopBillingWatchdog } from './modules/billing/billing-watchdog.service';
 import {
   startStaffWalletReconciliationScheduler,
   stopStaffWalletReconciliationScheduler,
@@ -901,6 +902,7 @@ const startServer = async () => {
     startTerminationRetryWorker();
     // 🔥 FIX 5: Start reconciliation job for error recovery
     startReconciliationJob(io);
+    startBillingWatchdog(io);
     startStaffWalletReconciliationScheduler();
     startDomainEventWorker();
     logInfo('Global billing batch processor started');
@@ -1041,6 +1043,7 @@ process.on('uncaughtException', async (error) => {
   logError('Uncaught exception - cleaning up and exiting', error);
   await cleanupBillingIntervals().catch(() => {});
   stopReconciliationJob();
+  stopBillingWatchdog();
   stopStaffWalletReconciliationScheduler();
   stopDomainEventWorker();
   stopCallReconciliationJob();
@@ -1057,6 +1060,7 @@ process.on('SIGTERM', async () => {
   logInfo('SIGTERM received — cleaning up', { signal: 'SIGTERM' });
   await cleanupBillingIntervals();
   stopReconciliationJob();
+  stopBillingWatchdog();
   stopStaffWalletReconciliationScheduler();
   stopDomainEventWorker();
   stopCallReconciliationJob();
@@ -1073,6 +1077,7 @@ process.on('SIGINT', async () => {
   logInfo('SIGINT received — cleaning up', { signal: 'SIGINT' });
   await cleanupBillingIntervals();
   stopReconciliationJob();
+  stopBillingWatchdog();
   stopStaffWalletReconciliationScheduler();
   stopDomainEventWorker();
   stopCallReconciliationJob();

@@ -8,12 +8,15 @@ import os from 'os';
 import {
   getRedis,
   callSessionKey,
+  callUserIntroMicrosKey,
+  callUserWalletMicrosKey,
   settledCallKey,
   SETTLED_CALL_TTL,
   settlementClaimKey,
   SETTLEMENT_CLAIM_TTL_SECONDS,
   BILLING_SETTLEMENT_RETRY_KEY,
 } from '../../config/redis';
+import { getBillingCheckpoint, upsertBillingCheckpointSnapshot } from './billing-checkpoint.service';
 import { Call } from '../video/call.model';
 import { CallHistory } from './call-history.model';
 import { billingService, finalFlushMarkerKey } from './billing.service';
@@ -29,8 +32,10 @@ import {
   settleCall,
   type SettlePersistResult,
 } from './billing-settlement.service';
+import { emitBillingSettledFromSnapshot } from './billing-emitter.service';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logInfo, logWarning } from '../../utils/logger';
+import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
 
 export type SettlementReason =
   | 'insufficient_coins'
@@ -72,6 +77,12 @@ type FinalizePartyContext = {
   creatorFirebaseUid?: string;
   initiatedByFirebaseUid?: string;
   initiatedByRole?: 'user' | 'creator' | 'admin';
+};
+
+type FinalizationSnapshotMeta = {
+  billingSequence: number;
+  snapshotVersion: number;
+  recoverySource: 'redis_session' | 'checkpoint_fallback' | 'missing';
 };
 
 const SETTLE_LOCK_PREFIX = 'settle:lock:';
@@ -161,6 +172,45 @@ async function readFinalizePartyContext(callId: string): Promise<FinalizePartyCo
   } catch {
     return {};
   }
+}
+
+async function readFinalizationSnapshotMeta(callId: string): Promise<FinalizationSnapshotMeta> {
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (sessionRaw) {
+    try {
+      const session = JSON.parse(sessionRaw) as {
+        billingSequence?: number;
+        version?: number;
+      };
+      return {
+        billingSequence: Math.max(0, Number(session.billingSequence) || 0),
+        snapshotVersion: Math.max(1, Number(session.version) || 1),
+        recoverySource: 'redis_session',
+      };
+    } catch {
+      return {
+        billingSequence: 0,
+        snapshotVersion: 1,
+        recoverySource: 'redis_session',
+      };
+    }
+  }
+  const checkpoint = (await getBillingCheckpoint(callId)) as
+    | { billingSequence?: number; version?: number }
+    | null;
+  if (checkpoint) {
+    return {
+      billingSequence: Math.max(0, Number(checkpoint.billingSequence) || 0),
+      snapshotVersion: Math.max(1, Number(checkpoint.version) || 1),
+      recoverySource: 'checkpoint_fallback',
+    };
+  }
+  return {
+    billingSequence: 0,
+    snapshotVersion: 1,
+    recoverySource: 'missing',
+  };
 }
 
 async function pollUntilSettled(callId: string): Promise<boolean> {
@@ -338,6 +388,89 @@ async function runPostPersistRedisCleanup(
   }
 }
 
+async function checkpointLifecycleState(
+  callId: string,
+  targetState: 'SETTLING' | 'SETTLED' | 'FAILED',
+  status: 'settling' | 'settled'
+): Promise<void> {
+  try {
+    const redis = getRedis();
+    const sessionRaw = await redis.get(callSessionKey(callId));
+    if (!sessionRaw) return;
+    const session = JSON.parse(sessionRaw) as {
+      userMongoId?: string;
+      creatorMongoId?: string;
+      userFirebaseUid?: string;
+      creatorFirebaseUid?: string;
+      startTime?: number;
+      lastProcessedAt?: number;
+      pricePerSecondMicros?: number;
+      creatorEarningsPerSecondMicros?: number;
+      totalDeductedMicros?: number;
+      totalEarnedMicros?: number;
+      billingSequence?: number;
+      lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING';
+    };
+    if (
+      !session.userMongoId ||
+      !session.creatorMongoId ||
+      !session.userFirebaseUid ||
+      !session.creatorFirebaseUid
+    ) {
+      return;
+    }
+    const [introRaw, walletRaw] = await Promise.all([
+      redis.get(callUserIntroMicrosKey(callId)),
+      redis.get(callUserWalletMicrosKey(callId)),
+    ]);
+    const remainingUserBalanceMicros =
+      Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0) +
+      Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+
+    const currentState = (session.lifecycleState || 'ACTIVE') as
+      | 'INIT'
+      | 'STARTING'
+      | 'ACTIVE'
+      | 'ENDING'
+      | 'SETTLING'
+      | 'SETTLED'
+      | 'FAILED'
+      | 'RECOVERING';
+    const transition = await transitionBillingStateWithAudit({
+      callId,
+      from: currentState,
+      to: targetState,
+      source: 'billing.finalization.checkpoint',
+      reason: `checkpoint_${status}`,
+    });
+    session.lifecycleState = transition.next;
+    await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
+
+    await upsertBillingCheckpointSnapshot({
+      callId,
+      userMongoId: session.userMongoId,
+      creatorMongoId: session.creatorMongoId,
+      userFirebaseUid: session.userFirebaseUid,
+      creatorFirebaseUid: session.creatorFirebaseUid,
+      startTimeMs: Number(session.startTime) || Date.now(),
+      lastProcessedAtMs: Number(session.lastProcessedAt) || Date.now(),
+      remainingUserBalanceMicros,
+      pricePerSecondMicros: Math.max(0, Number(session.pricePerSecondMicros) || 0),
+      creatorEarningsPerSecondMicros: Math.max(
+        0,
+        Number(session.creatorEarningsPerSecondMicros) || 0
+      ),
+      totalDeductedMicros: Math.max(0, Number(session.totalDeductedMicros) || 0),
+      totalEarnedMicros: Math.max(0, Number(session.totalEarnedMicros) || 0),
+      billingSequence: Math.max(0, Number(session.billingSequence) || 0),
+      lifecycleState: transition.next,
+      status,
+    });
+  } catch (error) {
+    logError('Failed lifecycle checkpoint upsert', error, { callId, targetState });
+  }
+}
+
 /**
  * Single orchestration entry for call settlement. Invokes persistCallSettlement only after
  * flush, ownership, and billing scheduler removal.
@@ -347,6 +480,7 @@ export async function finalizeCallSession(
   params: FinalizeCallSessionParams
 ): Promise<FinalizeResult> {
   const { callId, reason, source } = params;
+  const finalizeAttemptId = crypto.randomUUID();
 
   if (!isUnifiedBillingFinalizerEnabled()) {
     await settleCall(io, callId);
@@ -354,9 +488,24 @@ export async function finalizeCallSession(
   }
 
   const partyContext = await readFinalizePartyContext(callId);
+  const snapshotMeta = await readFinalizationSnapshotMeta(callId);
 
-  logInfo('billing_finalize_begin', { callId, source, reason, ...partyContext });
-  logInfo('billing_lifecycle_settle_begin', { callId, source, reason, ...partyContext });
+  logInfo('billing_finalize_begin', {
+    callId,
+    source,
+    reason,
+    finalizeAttemptId,
+    ...snapshotMeta,
+    ...partyContext,
+  });
+  logInfo('billing_lifecycle_settle_begin', {
+    callId,
+    source,
+    reason,
+    finalizeAttemptId,
+    ...snapshotMeta,
+    ...partyContext,
+  });
 
   if (await isAlreadySettled(callId)) {
     recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
@@ -364,6 +513,13 @@ export async function finalizeCallSession(
       source,
       reason,
       result: 'duplicate',
+    });
+    logInfo('billing_finalize_duplicate_suppressed', {
+      callId,
+      source,
+      reason,
+      finalizeAttemptId,
+      ...snapshotMeta,
     });
     return { status: 'duplicate', callId };
   }
@@ -391,6 +547,14 @@ export async function finalizeCallSession(
     const polled = await pollUntilSettled(callId);
     if (polled) {
       recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
+      logInfo('billing_finalize_duplicate_suppressed', {
+        callId,
+        source,
+        reason,
+        finalizeAttemptId,
+        duplicateSuppression: 'claim_contention_poll_settled',
+        ...snapshotMeta,
+      });
       return { status: 'duplicate', callId };
     }
     await enqueueSettlementRetry(params);
@@ -411,6 +575,14 @@ export async function finalizeCallSession(
     await redis.del(settlementClaimKey(callId)).catch(() => {});
     const polled = await pollUntilSettled(callId);
     if (polled) {
+      logInfo('billing_finalize_duplicate_suppressed', {
+        callId,
+        source,
+        reason,
+        finalizeAttemptId,
+        duplicateSuppression: 'settle_lock_contention_poll_settled',
+        ...snapshotMeta,
+      });
       return { status: 'duplicate', callId };
     }
     recordBillingMetric('billing_finalize_claim_timeout_total', 1, { callId, source });
@@ -428,6 +600,7 @@ export async function finalizeCallSession(
 
   try {
     settlementVersion = await markCallSettling(callId, source, reason, ownerToken, ownerInstanceId);
+    await checkpointLifecycleState(callId, 'SETTLING', 'settling');
 
     await billingService.flushBillingToQuiescence(io, callId);
     const flushMarkerRaw = await redis.get(finalFlushMarkerKey(callId));
@@ -437,6 +610,14 @@ export async function finalizeCallSession(
 
     if (await isAlreadySettled(callId)) {
       recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
+      logInfo('billing_finalize_duplicate_suppressed', {
+        callId,
+        source,
+        reason,
+        finalizeAttemptId,
+        duplicateSuppression: 'post_flush_duplicate_guard',
+        ...snapshotMeta,
+      });
       return { status: 'duplicate', callId };
     }
 
@@ -446,6 +627,7 @@ export async function finalizeCallSession(
       _fromFinalizer: true,
       lockToken,
       settleLockRedisKey,
+      suppressSettledEmit: true,
     });
 
     if (!persistResult) {
@@ -457,6 +639,27 @@ export async function finalizeCallSession(
     }
 
     await markCallSettled(callId, source, reason, settlementVersion);
+    await checkpointLifecycleState(callId, 'SETTLED', 'settled');
+    emitBillingSettledFromSnapshot(
+      io,
+      persistResult.userFirebaseUid,
+      persistResult.creatorFirebaseUid,
+      {
+        callId,
+        billingSequence: persistResult.billingSequence,
+        lifecycleState: 'SETTLED',
+        finalCoins: persistResult.finalUserCoins,
+        totalDeducted: persistResult.totalDeducted,
+        durationSeconds: persistResult.durationSeconds,
+      },
+      {
+        callId,
+        billingSequence: persistResult.billingSequence,
+        lifecycleState: 'SETTLED',
+        totalEarned: persistResult.totalEarnedCreator,
+        durationSeconds: persistResult.durationSeconds,
+      }
+    );
     await runPostPersistRedisCleanup(callId, persistResult);
 
     await appendSettlementAttempt(callId, {
@@ -478,18 +681,22 @@ export async function finalizeCallSession(
       callId,
       source,
       reason,
+      finalizeAttemptId,
       ...partyContext,
       durationSeconds: persistResult.durationSeconds,
       coinsDeducted: persistResult.totalDeducted,
       coinsEarned: persistResult.totalEarnedCreator,
       settlementVersion,
+      ...snapshotMeta,
     });
     logInfo('billing_lifecycle_settle_success', {
       callId,
       source,
       reason,
+      finalizeAttemptId,
       ...partyContext,
       settlementVersion,
+      ...snapshotMeta,
     });
 
     return {
@@ -501,11 +708,21 @@ export async function finalizeCallSession(
       durationSeconds: persistResult.durationSeconds,
     };
   } catch (error) {
-    logError('billing_finalize_failure', error, { callId, source, reason, ...partyContext });
+    await checkpointLifecycleState(callId, 'FAILED', 'settling');
+    logError('billing_finalize_failure', error, {
+      callId,
+      source,
+      reason,
+      finalizeAttemptId,
+      ...snapshotMeta,
+      ...partyContext,
+    });
     logError('billing_lifecycle_settle_failed', error, {
       callId,
       source,
       reason,
+      finalizeAttemptId,
+      ...snapshotMeta,
       ...partyContext,
     });
     recordBillingMetric('billing_finalize_failure', 1, { callId, source });

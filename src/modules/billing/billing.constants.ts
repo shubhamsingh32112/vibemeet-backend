@@ -173,14 +173,24 @@ export function getBackpressureStage2EmitIntervalMs(): number {
 
 /** Minimum checkpoint interval clamp (ms). */
 const MIN_BILLING_CHECKPOINT_INTERVAL_MS = 10_000;
+const DEFAULT_BILLING_CHECKPOINT_INTERVAL_MS = 15_000;
 
 /** Optional Mongo checkpoint for in-flight billing (0 = disabled). */
 export function getBillingCheckpointIntervalMs(): number {
   const raw = process.env.BILLING_CHECKPOINT_INTERVAL_MS;
-  if (raw === undefined || raw === '') return 0;
+  if (raw === undefined || raw === '') return DEFAULT_BILLING_CHECKPOINT_INTERVAL_MS;
   const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return 0;
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_BILLING_CHECKPOINT_INTERVAL_MS;
   return Math.min(300_000, Math.max(MIN_BILLING_CHECKPOINT_INTERVAL_MS, n));
+}
+
+/** Checkpoint at least once every N processed billing sequences. */
+export function getBillingCheckpointEverySequences(): number {
+  const raw = process.env.BILLING_CHECKPOINT_EVERY_SEQUENCES;
+  if (raw === undefined || raw === '') return 5;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 5;
+  return Math.min(100, n);
 }
 
 const DEFAULT_BILLING_CHECKPOINT_MIN_DELTA_MICROS = 1_000_000;

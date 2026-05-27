@@ -6,7 +6,7 @@
  */
 
 import { Server } from 'socket.io';
-import { getRedis, ACTIVE_BILLING_CALLS_KEY, callSessionKey, CALL_SESSION_PREFIX } from '../../config/redis';
+import { getRedis, CALL_SESSION_PREFIX } from '../../config/redis';
 import {
   isBullmqBillingEnabled,
   needsBillingCycleReschedule,
@@ -15,6 +15,7 @@ import {
 import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
 import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
+import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
 
 function readStartupEnsureMax(): number {
   const raw = parseInt(process.env.BILLING_STARTUP_ENSURE_CYCLE_MAX || '200', 10);
@@ -31,9 +32,8 @@ export async function recoverBillingScheduleForCall(
   source: 'start_registration_failed' | 'reconciliation' | 'manual' = 'manual'
 ): Promise<boolean> {
   try {
-    const redis = getRedis();
-    const sessionRaw = await redis.get(callSessionKey(callId));
-    if (!sessionRaw) {
+    const resolved = await resolveBillingRuntimeState(callId);
+    if (!resolved.session) {
       logWarning('Billing schedule recovery skipped: session missing', { callId, source });
       return false;
     }
@@ -47,20 +47,8 @@ export async function recoverBillingScheduleForCall(
         logInfo('BullMQ billing schedule already healthy during recovery', { callId, source });
       }
     } else {
-      let nextBillingTime = Date.now() + BILLING_PROCESS_INTERVAL_MS;
-      try {
-        const parsed = JSON.parse(sessionRaw) as { lastProcessedAt?: number };
-        const lastProcessedAt = Number(parsed.lastProcessedAt) || Date.now();
-        nextBillingTime = lastProcessedAt + BILLING_PROCESS_INTERVAL_MS;
-      } catch {
-        // Keep fallback nextBillingTime.
-      }
-      await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
-      logInfo('Recovered ZSET billing schedule for call', {
-        callId,
-        source,
-        nextBillingTime,
-      });
+      logWarning('Billing schedule recovery skipped: zset scheduler disabled', { callId, source });
+      return false;
     }
 
     recordBillingMetric('billing_schedule_recovery_success', 1, { callId, source });
@@ -82,25 +70,18 @@ export async function verifyStartupRecovery(_io: Server): Promise<void> {
     const redis = getRedis();
     const startTime = Date.now();
     
-    let activeCallIds: string[] = [];
-    if (isBullmqBillingEnabled()) {
-      const seen = new Set<string>();
-      let cursor = '0';
-      do {
-        const scanResult = await redis.scan(cursor, 'MATCH', `${CALL_SESSION_PREFIX}*`, 'COUNT', '200');
-        cursor = scanResult[0];
-        const keys = scanResult[1] || [];
-        for (const key of keys) {
-          const callId = key.replace(CALL_SESSION_PREFIX, '');
-          if (callId) seen.add(callId);
-        }
-      } while (cursor !== '0' && seen.size < 2000);
-      activeCallIds = Array.from(seen);
-    } else {
-      // Get all active calls from Redis sorted set
-      // Get all calls (score doesn't matter for verification)
-      activeCallIds = await redis.zrange(ACTIVE_BILLING_CALLS_KEY, 0, -1);
-    }
+    const seen = new Set<string>();
+    let cursor = '0';
+    do {
+      const scanResult = await redis.scan(cursor, 'MATCH', `${CALL_SESSION_PREFIX}*`, 'COUNT', '200');
+      cursor = scanResult[0];
+      const keys = scanResult[1] || [];
+      for (const key of keys) {
+        const callId = key.replace(CALL_SESSION_PREFIX, '');
+        if (callId) seen.add(callId);
+      }
+    } while (cursor !== '0' && seen.size < 2000);
+    const activeCallIds: string[] = Array.from(seen);
     
     // Handle both string array and object array responses
     const callIds: string[] = Array.isArray(activeCallIds)
@@ -125,8 +106,8 @@ export async function verifyStartupRecovery(_io: Server): Promise<void> {
 
     for (const callId of callIds) {
       try {
-        const sessionRaw = await redis.get(callSessionKey(callId));
-        if (sessionRaw) {
+        const resolved = await resolveBillingRuntimeState(callId);
+        if (resolved.session) {
           validCalls++;
           if (
             isBullmqBillingEnabled() &&

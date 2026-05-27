@@ -132,7 +132,6 @@ export async function processTerminationRedisRetries(
       callId,
       userFirebaseUid: payload.userFirebaseUid,
       creatorFirebaseUid: payload.creatorFirebaseUid,
-      includeLegacySchedulerCheck: true,
     });
     if (!stillActive) {
       await releaseMarkEndedLease(callId);
