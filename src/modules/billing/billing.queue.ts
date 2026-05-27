@@ -10,7 +10,7 @@ import { getIO } from '../../config/socket';
 import { billingService } from './billing.service';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
-import { getRedis, callSessionKey } from '../../config/redis';
+import { getRedis, callSessionKey, isRedisConfigured } from '../../config/redis';
 import { isBullmqBillingEnabled } from './billing-driver';
 import { updateBackpressureStage } from './billing-backpressure';
 import { featureFlags } from '../../config/feature-flags';
@@ -162,6 +162,13 @@ function getQueue(): Queue {
   return billingQueue;
 }
 
+function assertBullmqRuntimeSafety(): void {
+  if (!isBullmqBillingEnabled()) return;
+  if (!isRedisConfigured()) {
+    throw new Error('BILLING_DRIVER=bullmq requires Redis configuration');
+  }
+}
+
 /**
  * Schedule the next billing cycle for a call (chain of delayed jobs).
  * Relies on per-call `billing:cycle_lock:` + idempotent ticks in `processBillingTick` (MAX_BILLING_DELTA_MS).
@@ -172,6 +179,7 @@ export async function scheduleBillingJob(
   callId: string,
   delayMs: number = BILLING_PROCESS_INTERVAL_MS
 ): Promise<void> {
+  assertBullmqRuntimeSafety();
   const q = getQueue();
   const jobId = billingCycleJobId(callId);
   recordBillingMetric('bullmq_cycle_enqueue_attempted', 1, { callId });
@@ -226,6 +234,7 @@ export async function scheduleBillingJob(
 }
 
 export function startBillingBullWorker(): Worker {
+  assertBullmqRuntimeSafety();
   if (billingWorker) {
     logWarning('Billing BullMQ worker already running', {});
     return billingWorker;

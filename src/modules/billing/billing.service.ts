@@ -311,6 +311,26 @@ export type BillingStartedUserPayload = {
   durationLimit: number | undefined;
 };
 
+type BillingLifecycleLogContext = {
+  callId: string;
+  source?: string;
+  payerFirebaseUid?: string;
+  creatorFirebaseUid?: string;
+  initiatedByFirebaseUid?: string;
+  initiatedByRole?: 'user' | 'creator' | 'admin';
+};
+
+function billingLifecycleLogContext(ctx: BillingLifecycleLogContext): Record<string, unknown> {
+  return {
+    callId: ctx.callId,
+    source: ctx.source,
+    payerFirebaseUid: ctx.payerFirebaseUid,
+    creatorFirebaseUid: ctx.creatorFirebaseUid,
+    initiatedByFirebaseUid: ctx.initiatedByFirebaseUid,
+    initiatedByRole: ctx.initiatedByRole,
+  };
+}
+
 async function readLiveUserSpendBalancesMicros(
   redis: ReturnType<typeof getRedis>,
   callId: string
@@ -606,6 +626,14 @@ export class BillingService {
     const callIdPrefix = callId.length > 16 ? callId.slice(0, 16) : callId;
     const startLockToken = randomUUID();
     const startLockKey = billingSessionStartLockKey(callId);
+    logInfo('billing_lifecycle_start_received', billingLifecycleLogContext({
+      callId,
+      source,
+      payerFirebaseUid: userFirebaseUid,
+      creatorFirebaseUid,
+      initiatedByFirebaseUid,
+      initiatedByRole,
+    }));
     const startLock = await redis.set(
       startLockKey,
       startLockToken,
@@ -615,7 +643,14 @@ export class BillingService {
     );
     if (startLock !== 'OK') {
       logInfo('Billing session start lock busy (idempotent duplicate)', {
-        callId,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         attemptedSource: source,
       });
       const sessionDuringLock = await redis.get(callSessionKey(callId));
@@ -653,7 +688,14 @@ export class BillingService {
     const existingSession = await redis.get(callSessionKey(callId));
     if (existingSession) {
       logInfo('Billing session already exists (idempotent) — replaying billing:started', {
-        callId,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         attemptedSource: source,
       });
       recordBillingMetric('session_start_duplicate', 1, {
@@ -691,8 +733,14 @@ export class BillingService {
     );
     if (slotReserve === 'conflict') {
       logWarning('Active call slot conflict — rejecting billing session start', {
-        callId,
-        userFirebaseUid,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         callIdPrefix,
       });
       recordBillingMetric('session_start_active_slot_conflict', 1, { source, callIdPrefix });
@@ -864,19 +912,52 @@ export class BillingService {
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
       logInfo('Billing session started - Redis keys seeded', {
-        callId,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         introPromoActive,
         initialIntroMicros,
         initialWalletMicros,
         billingStartSource: source,
       });
+      logInfo('billing_lifecycle_seed_redis_success', billingLifecycleLogContext({
+        callId,
+        source,
+        payerFirebaseUid: userFirebaseUid,
+        creatorFirebaseUid,
+        initiatedByFirebaseUid,
+        initiatedByRole,
+      }));
     } catch (redisError) {
       recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'session_seed' });
       logError('CRITICAL: Failed to start billing session in Redis', redisError, {
-        callId,
-        userFirebaseUid,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         alert: true,
       });
+      logError(
+        'billing_lifecycle_seed_redis_failed',
+        redisError,
+        billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        })
+      );
       io.to(`user:${userFirebaseUid}`).emit('billing:error', {
         callId,
         error: 'REDIS_UNAVAILABLE',
@@ -965,17 +1046,102 @@ export class BillingService {
       const { isBullmqBillingEnabled, scheduleBillingJob } = await import('./billing.queue');
       if (isBullmqBillingEnabled()) {
         await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
-        logInfo('Billing session scheduled (BullMQ)', { callId });
+        logInfo('Billing session scheduled (BullMQ)', billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }));
+        logInfo('billing_lifecycle_scheduler_registered', {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+          driver: 'bullmq',
+        });
       } else {
         const nextBillingTime = startTime + BILLING_PROCESS_INTERVAL_MS;
         await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
-        logInfo('Billing session registered for processing', { callId, nextBillingTime });
+        logInfo('Billing session registered for processing', {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+          nextBillingTime,
+        });
+        logInfo('billing_lifecycle_scheduler_registered', {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+          driver: 'zset',
+          nextBillingTime,
+        });
       }
     } catch (registrationError) {
       logError('CRITICAL: Failed to register call for billing', registrationError, {
-        callId,
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
         alert: true,
       });
+      logError(
+        'billing_lifecycle_scheduler_registration_failed',
+        registrationError,
+        billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        })
+      );
+      try {
+        const { recoverBillingScheduleForCall } = await import('./billing-recovery');
+        const recovered = await recoverBillingScheduleForCall(callId, 'start_registration_failed');
+        logInfo('billing_lifecycle_scheduler_recovery_attempted', {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+          recovered,
+        });
+      } catch (recoveryErr) {
+        logError('billing_lifecycle_scheduler_recovery_failed', recoveryErr, {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+        });
+      }
     }
     } catch (err) {
       if (slotsToReleaseOnFailure) {
@@ -1206,6 +1372,7 @@ export class BillingService {
       const creatorEarningsPerSecondMicros = session.creatorEarningsPerSecondMicros;
       const previousDeductedMicros = session.totalDeductedMicros;
       const previousEarnedMicros = session.totalEarnedMicros;
+      const previousElapsedSeconds = session.elapsedSeconds ?? 0;
 
       if (pricePerSecondMicros <= 0) {
         logWarning('Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });
@@ -1285,6 +1452,16 @@ export class BillingService {
         pricePerSecondMicros > 0
           ? Math.floor(session.totalDeductedMicros / pricePerSecondMicros)
           : 0;
+      if (previousElapsedSeconds <= 0 && session.elapsedSeconds > 0) {
+        logInfo('billing_lifecycle_first_tick_success', billingLifecycleLogContext({
+          callId,
+          source: 'tick_processor',
+          payerFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+          initiatedByFirebaseUid: session.initiatedByFirebaseUid,
+          initiatedByRole: session.initiatedByRole,
+        }));
+      }
       session.expectedNextTickAtMs = session.lastProcessedAt + BILLING_PROCESS_INTERVAL_MS;
 
       const effectiveLimit = session.effectiveDurationLimitSeconds;

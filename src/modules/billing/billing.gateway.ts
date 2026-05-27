@@ -58,10 +58,22 @@ export async function handleCallStartedHttp(
     initiatedByRole?: 'user' | 'creator' | 'admin';
   }
 ): Promise<void> {
+  const resolvedSource = opts?.source ?? 'client_http';
   logInfo('handleCallStartedHttp', {
     callId: data.callId,
     userFirebaseUid,
-    source: opts?.source,
+    source: resolvedSource,
+    initiatedByFirebaseUid: opts?.initiatedByFirebaseUid,
+    initiatedByRole: opts?.initiatedByRole,
+    creatorFirebaseUid: data.creatorFirebaseUid,
+  });
+  logInfo('billing_lifecycle_start_received', {
+    callId: data.callId,
+    source: resolvedSource,
+    initiatedByFirebaseUid: opts?.initiatedByFirebaseUid,
+    initiatedByRole: opts?.initiatedByRole,
+    payerFirebaseUid: userFirebaseUid,
+    creatorFirebaseUid: data.creatorFirebaseUid,
   });
   await handleCallStarted(io, userFirebaseUid, data, opts);
 

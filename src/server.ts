@@ -739,6 +739,33 @@ function assertProductionRedis(): void {
   }
 }
 
+function enforceProductionBillingDriverSafety(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  const isRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+  const bullmq = isBullmqBillingEnabled();
+  if (bullmq) {
+    logInfo('Production billing driver safety check passed', { billingDriver: 'bullmq' });
+    return;
+  }
+  const allowUnsafe = process.env.BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION === 'true';
+  if (!isRailway) {
+    logWarning('Production is running billing driver without BullMQ', {
+      billingDriver: process.env.BILLING_DRIVER || 'zset',
+    });
+    return;
+  }
+  if (allowUnsafe) {
+    logWarning('Unsafe Railway billing driver override is enabled', {
+      billingDriver: process.env.BILLING_DRIVER || 'zset',
+      env: 'BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION=true',
+    });
+    return;
+  }
+  throw new Error(
+    'Unsafe Railway billing configuration: set BILLING_DRIVER=bullmq for production replicas, or explicitly override with BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION=true.'
+  );
+}
+
 const startServer = async () => {
   try {
     // Initialize Firebase Admin
@@ -747,6 +774,7 @@ const startServer = async () => {
     assertProductionSecurity();
     warnIfMissingPublicUrls();
     assertProductionRedis();
+    enforceProductionBillingDriverSafety();
 
     // 🔥 FIX 12: Validate pricing configuration on startup
     validatePricingConfig();
@@ -761,12 +789,6 @@ const startServer = async () => {
       }, 1000);
     }
 
-    if (process.env.NODE_ENV === 'production' && !isBullmqBillingEnabled()) {
-      logWarning('Production is running without BILLING_DRIVER=bullmq; scale may be limited', {
-        billingDriver: process.env.BILLING_DRIVER || 'zset',
-      });
-    }
-    
     // 🔥 FIX 40: Log rate limiting configuration on startup
     logRateLimitConfig();
     

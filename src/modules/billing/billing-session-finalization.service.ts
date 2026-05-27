@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import os from 'os';
 import {
   getRedis,
+  callSessionKey,
   settledCallKey,
   SETTLED_CALL_TTL,
   settlementClaimKey,
@@ -65,6 +66,13 @@ export interface FinalizeResult {
   coinsEarned?: number;
   durationSeconds?: number;
 }
+
+type FinalizePartyContext = {
+  payerFirebaseUid?: string;
+  creatorFirebaseUid?: string;
+  initiatedByFirebaseUid?: string;
+  initiatedByRole?: 'user' | 'creator' | 'admin';
+};
 
 const SETTLE_LOCK_PREFIX = 'settle:lock:';
 const settleLockKey = (callId: string): string => `${SETTLE_LOCK_PREFIX}${callId}`;
@@ -129,6 +137,30 @@ async function isAlreadySettled(callId: string): Promise<boolean> {
   }
   const call = await Call.findOne({ callId }).select('settlement.status').lean();
   return call?.settlement?.status === 'settled';
+}
+
+async function readFinalizePartyContext(callId: string): Promise<FinalizePartyContext> {
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) {
+    return {};
+  }
+  try {
+    const session = JSON.parse(sessionRaw) as {
+      userFirebaseUid?: string;
+      creatorFirebaseUid?: string;
+      initiatedByFirebaseUid?: string;
+      initiatedByRole?: 'user' | 'creator' | 'admin';
+    };
+    return {
+      payerFirebaseUid: session.userFirebaseUid,
+      creatorFirebaseUid: session.creatorFirebaseUid,
+      initiatedByFirebaseUid: session.initiatedByFirebaseUid,
+      initiatedByRole: session.initiatedByRole,
+    };
+  } catch {
+    return {};
+  }
 }
 
 async function pollUntilSettled(callId: string): Promise<boolean> {
@@ -321,7 +353,10 @@ export async function finalizeCallSession(
     return { status: 'settled', callId };
   }
 
-  logInfo('billing_finalize_begin', { callId, source, reason });
+  const partyContext = await readFinalizePartyContext(callId);
+
+  logInfo('billing_finalize_begin', { callId, source, reason, ...partyContext });
+  logInfo('billing_lifecycle_settle_begin', { callId, source, reason, ...partyContext });
 
   if (await isAlreadySettled(callId)) {
     recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
@@ -443,9 +478,17 @@ export async function finalizeCallSession(
       callId,
       source,
       reason,
+      ...partyContext,
       durationSeconds: persistResult.durationSeconds,
       coinsDeducted: persistResult.totalDeducted,
       coinsEarned: persistResult.totalEarnedCreator,
+      settlementVersion,
+    });
+    logInfo('billing_lifecycle_settle_success', {
+      callId,
+      source,
+      reason,
+      ...partyContext,
       settlementVersion,
     });
 
@@ -458,7 +501,13 @@ export async function finalizeCallSession(
       durationSeconds: persistResult.durationSeconds,
     };
   } catch (error) {
-    logError('billing_finalize_failure', error, { callId, source, reason });
+    logError('billing_finalize_failure', error, { callId, source, reason, ...partyContext });
+    logError('billing_lifecycle_settle_failed', error, {
+      callId,
+      source,
+      reason,
+      ...partyContext,
+    });
     recordBillingMetric('billing_finalize_failure', 1, { callId, source });
     await appendSettlementAttempt(callId, {
       source,

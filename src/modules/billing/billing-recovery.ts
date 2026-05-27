@@ -23,6 +23,56 @@ function readStartupEnsureMax(): number {
 }
 
 /**
+ * Best-effort immediate schedule recovery for one active call.
+ * Used when call start succeeded but scheduler registration failed.
+ */
+export async function recoverBillingScheduleForCall(
+  callId: string,
+  source: 'start_registration_failed' | 'reconciliation' | 'manual' = 'manual'
+): Promise<boolean> {
+  try {
+    const redis = getRedis();
+    const sessionRaw = await redis.get(callSessionKey(callId));
+    if (!sessionRaw) {
+      logWarning('Billing schedule recovery skipped: session missing', { callId, source });
+      return false;
+    }
+
+    if (isBullmqBillingEnabled()) {
+      const shouldReschedule = await needsBillingCycleReschedule(callId);
+      if (shouldReschedule) {
+        await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
+        logInfo('Recovered BullMQ billing schedule for call', { callId, source });
+      } else {
+        logInfo('BullMQ billing schedule already healthy during recovery', { callId, source });
+      }
+    } else {
+      let nextBillingTime = Date.now() + BILLING_PROCESS_INTERVAL_MS;
+      try {
+        const parsed = JSON.parse(sessionRaw) as { lastProcessedAt?: number };
+        const lastProcessedAt = Number(parsed.lastProcessedAt) || Date.now();
+        nextBillingTime = lastProcessedAt + BILLING_PROCESS_INTERVAL_MS;
+      } catch {
+        // Keep fallback nextBillingTime.
+      }
+      await redis.zadd(ACTIVE_BILLING_CALLS_KEY, nextBillingTime, callId);
+      logInfo('Recovered ZSET billing schedule for call', {
+        callId,
+        source,
+        nextBillingTime,
+      });
+    }
+
+    recordBillingMetric('billing_schedule_recovery_success', 1, { callId, source });
+    return true;
+  } catch (error) {
+    logError('Billing schedule recovery failed', error, { callId, source });
+    recordBillingMetric('billing_schedule_recovery_failed', 1, { callId, source });
+    return false;
+  }
+}
+
+/**
  * Verify startup recovery for active calls
  * Called on server startup to ensure billing resumes correctly
  */

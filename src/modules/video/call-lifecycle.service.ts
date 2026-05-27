@@ -14,6 +14,7 @@ import {
 } from './creator-call-lock.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
+import { parseAppVideoCallId } from '../billing/billing-call-id.util';
 
 export interface StreamVideoWebhookPayload {
   type: string;
@@ -201,6 +202,61 @@ export class CallLifecycleService {
     }
   }
 
+  private async resolveParticipantsFromPayload(
+    payload: StreamVideoWebhookPayload,
+    callId: string
+  ): Promise<{ callerUser: any; creatorUser: any } | null> {
+    const members = payload.call?.members || payload.session?.participants || [];
+    const parsed = parseAppVideoCallId(callId);
+    const candidateUids = Array.from(
+      new Set(
+        [
+          ...members.map((m) => m.user_id).filter(Boolean),
+          parsed?.initiatorFirebaseUid,
+        ].filter((v): v is string => !!v && v.trim().length > 0)
+      )
+    );
+    if (candidateUids.length === 0) {
+      return null;
+    }
+
+    const users = await User.find({ firebaseUid: { $in: candidateUids } });
+    const byUid = new Map(users.map((u: any) => [String(u.firebaseUid), u]));
+    const initiatorUser = parsed?.initiatorFirebaseUid
+      ? byUid.get(parsed.initiatorFirebaseUid)
+      : undefined;
+
+    let creatorUser = users.find((u: any) => u.role === 'creator' || u.role === 'admin');
+    let callerUser = users.find((u: any) => u.role === 'user');
+
+    if (initiatorUser) {
+      if (
+        (initiatorUser.role === 'creator' || initiatorUser.role === 'admin') &&
+        !creatorUser
+      ) {
+        creatorUser = initiatorUser;
+      }
+      if (initiatorUser.role === 'user' && !callerUser) {
+        callerUser = initiatorUser;
+      }
+    }
+
+    if (!creatorUser && users.length === 2 && callerUser) {
+      const callerId = String(callerUser._id);
+      creatorUser = users.find((u: any) => String(u._id) !== callerId);
+    }
+    if (!callerUser && users.length === 2 && creatorUser) {
+      const creatorId = String(creatorUser._id);
+      callerUser = users.find((u: any) => String(u._id) !== creatorId);
+    }
+
+    if (!creatorUser || !callerUser || String(creatorUser._id) === String(callerUser._id)) {
+      return null;
+    }
+
+    return { callerUser, creatorUser };
+  }
+
   /**
    * Handle call.ended event:
    * - Settle billing (Redis-based)
@@ -228,14 +284,8 @@ export class CallLifecycleService {
     let call = await Call.findOne({ callId });
     if (!call) {
       logInfo('Call record not found, creating from webhook payload', { callId });
-
-      const members = payload.call?.members || payload.session?.participants || [];
-      const callerMember = members.find((m) => m.role === 'admin') || members[0];
-      const creatorMember =
-        members.find((m) => m.role === 'call_member') ||
-        members.find((m) => m.user_id && callerMember && m.user_id !== callerMember.user_id);
-
-      if (!callerMember?.user_id || !creatorMember?.user_id) {
+      const participants = await this.resolveParticipantsFromPayload(payload, callId);
+      if (!participants) {
         logError(
           'Unable to infer caller/creator from payload for call.ended',
           new Error('Missing members'),
@@ -243,18 +293,7 @@ export class CallLifecycleService {
         );
         return;
       }
-
-      const callerUser = await User.findOne({ firebaseUid: callerMember.user_id });
-      const creatorUser = await User.findOne({ firebaseUid: creatorMember.user_id });
-
-      if (!callerUser || !creatorUser) {
-        logError(
-          'Unable to resolve caller/creator users for call.ended',
-          new Error('Missing users'),
-          { callId }
-        );
-        return;
-      }
+      const { callerUser, creatorUser } = participants;
 
       const priceSnap = await this.snapshotPricingForCreatorUserId(creatorUser._id);
       call = await Call.create({
@@ -601,35 +640,16 @@ export class CallLifecycleService {
     }
 
     logInfo('Call record not found, creating from webhook payload', { callId });
-
-    // Extract members from payload
-    const members = payload.call?.members || payload.session?.participants || [];
-    const callerMember = members.find((m) => m.role === 'admin') || members[0];
-    const creatorMember =
-      members.find((m) => m.role === 'call_member') ||
-      members.find((m) => m.user_id && callerMember && m.user_id !== callerMember.user_id);
-
-    if (!callerMember?.user_id || !creatorMember?.user_id) {
+    const participants = await this.resolveParticipantsFromPayload(payload, callId);
+    if (!participants) {
       logError(
         'Cannot create call record: missing members in payload',
         new Error('Missing members'),
-        { callId, members }
+        { callId, members: payload.call?.members || payload.session?.participants || [] }
       );
       return;
     }
-
-    // Find users by Firebase UID
-    const callerUser = await User.findOne({ firebaseUid: callerMember.user_id });
-    const creatorUser = await User.findOne({ firebaseUid: creatorMember.user_id });
-
-    if (!callerUser || !creatorUser) {
-      logError(
-        'Cannot create call record: users not found',
-        new Error('Users missing'),
-        { callId, callerUid: callerMember.user_id, creatorUid: creatorMember.user_id }
-      );
-      return;
-    }
+    const { callerUser, creatorUser } = participants;
 
     // Create call record
     try {
@@ -675,6 +695,16 @@ export class CallLifecycleService {
     payload: StreamVideoWebhookPayload,
     callId: string
   ): Promise<string | null> {
+    const participants = await this.resolveParticipantsFromPayload(payload, callId);
+    if (participants?.creatorUser?.firebaseUid) {
+      const resolved = String(participants.creatorUser.firebaseUid);
+      logInfo('Resolved creator Firebase UID from participant role mapping', {
+        callId,
+        creatorFirebaseUid: resolved,
+      });
+      return resolved;
+    }
+
     // Method 1: Extract from call members in payload (most reliable)
     if (payload.call?.members) {
       const creatorMember = payload.call.members.find((m) => m.role === 'call_member');

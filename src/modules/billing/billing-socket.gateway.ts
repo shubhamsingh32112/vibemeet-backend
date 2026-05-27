@@ -70,9 +70,21 @@ export function setupBillingGateway(io: Server): void {
 
           logInfo('call:started received', {
             callId: data.callId,
+            source: 'client_socket',
             socketFirebaseUid: firebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
             payerFirebaseUid,
+            creatorFirebaseUid: data.creatorFirebaseUid,
             isCreatorInitiated: !!data.userFirebaseUid,
+          });
+          logInfo('billing_lifecycle_start_received', {
+            callId: data.callId,
+            source: 'client_socket',
+            initiatedByFirebaseUid,
+            initiatedByRole,
+            payerFirebaseUid,
+            creatorFirebaseUid: data.creatorFirebaseUid,
           });
 
           const rateLimitCheck = await checkCallRateLimit(payerFirebaseUid);
@@ -271,6 +283,34 @@ export function setupBillingGateway(io: Server): void {
         });
       }
     });
+
+    socket.on(
+      'billing:sync-warning',
+      async (data: { callId?: string; stuckSeconds?: number; phase?: string; reportedAt?: string }) => {
+        const callId = String(data?.callId || '').trim();
+        if (!callId) return;
+        try {
+          const redis = getRedis();
+          const hasSession = (await redis.exists(callSessionKey(callId))) === 1;
+          logWarning('billing_sync_warning_client', {
+            callId,
+            firebaseUid,
+            phase: data?.phase || 'unknown',
+            stuckSeconds: Number(data?.stuckSeconds || 0),
+            reportedAt: data?.reportedAt,
+            hasSession,
+          });
+          recordBillingMetric('client_billing_sync_warning', 1, {
+            callId,
+            firebaseUid,
+            phase: String(data?.phase || 'unknown'),
+            hasSession: hasSession ? '1' : '0',
+          });
+        } catch (err) {
+          logError('Failed to process billing:sync-warning', err, { callId, firebaseUid });
+        }
+      }
+    );
 
     socket.on('disconnect', async (reason) => {
       logInfo('Socket disconnected', { firebaseUid, reason });
