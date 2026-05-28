@@ -11,7 +11,10 @@ import {
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService, ensureBillingStartedReplayFreshness } from './billing.service';
 import { finalizeCallSession } from './billing-session-finalization.service';
-import { isCallActive } from './billing-active-call.service';
+import {
+  isCallActiveForParticipant,
+  isNonTerminalLifecycle,
+} from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
@@ -37,6 +40,13 @@ const SYNC_WARNING_DEDUP_SECONDS = Math.min(
 const SYNC_WARNING_AUTOHEAL_THRESHOLD = Math.min(
   10,
   Math.max(2, parseInt(process.env.BILLING_SYNC_WARNING_AUTOHEAL_THRESHOLD || '3', 10) || 3)
+);
+const SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD = Math.min(
+  3,
+  Math.max(
+    1,
+    parseInt(process.env.BILLING_SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD || '1', 10) || 1
+  )
 );
 
 /** Shape of Redis billing session JSON (recover-state handler). */
@@ -201,10 +211,15 @@ export function setupBillingGateway(io: Server): void {
         logInfo('call:ended received', { callId: data.callId, firebaseUid });
 
         const redis = getRedis();
-        const active = await isCallActive(redis, {
-          callId: data.callId,
-          userFirebaseUid: firebaseUid,
-        });
+        const sessionForEnd = (await resolveBillingRuntimeState(data.callId)).session;
+        const active = sessionForEnd
+          ? isNonTerminalLifecycle(sessionForEnd.lifecycleState) &&
+            (sessionForEnd.userFirebaseUid === firebaseUid ||
+              sessionForEnd.creatorFirebaseUid === firebaseUid)
+          : await isCallActiveForParticipant(redis, {
+              callId: data.callId,
+              participantFirebaseUid: firebaseUid,
+            });
 
         if (!active) {
           await redis.setex(pendingCallEndKey(data.callId), PENDING_CALL_END_TTL, '1');
@@ -312,22 +327,42 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const active = await isCallActive(redis, {
-          callId,
-          userFirebaseUid: firebaseUid,
-        });
+        const recoverySession = activeRuntime.runtime.session;
+        const recoveryLifecycleState = String(recoverySession?.lifecycleState || 'ACTIVE');
+        const isSessionParticipant =
+          recoverySession != null &&
+          (recoverySession.userFirebaseUid === firebaseUid ||
+            recoverySession.creatorFirebaseUid === firebaseUid);
+        const active =
+          recoverySession != null &&
+          isNonTerminalLifecycle(recoveryLifecycleState) &&
+          (isSessionParticipant ||
+            (await isCallActiveForParticipant(redis, {
+              callId,
+              participantFirebaseUid: firebaseUid,
+            })));
+
         if (!active) {
-          logWarning('billing_state_recovery_inactive_call', {
+          const reason =
+            recoverySession && isNonTerminalLifecycle(recoveryLifecycleState)
+              ? 'participant_mismatch'
+              : 'call_inactive';
+          const logFn =
+            recoverySession && isNonTerminalLifecycle(recoveryLifecycleState)
+              ? logWarning
+              : logInfo;
+          logFn('billing_state_recovery_inactive_call', {
             firebaseUid,
             recoveryRequestId,
             clientRecoveryRequestId,
             callId,
             lookupSource: activeRuntime.source,
             runtimeSource: activeRuntime.runtime.source,
-            reason: 'call_inactive',
+            lifecycleState: recoveryLifecycleState,
+            reason,
           });
           recordRecoveryOutcome(firebaseUid, 'recover_empty', {
-            reason: 'call_inactive',
+            reason,
           });
           emitBillingRecoverStateResponse(socket, {
             success: true,
@@ -337,7 +372,7 @@ export function setupBillingGateway(io: Server): void {
             generatedAtMs: Date.now(),
             runtimeSource: activeRuntime.runtime.source,
             status: 'no_active_call',
-            reason: 'call_inactive',
+            reason,
             recoveryOutcome: 'recover_empty',
           });
           return;
@@ -546,6 +581,15 @@ export function setupBillingGateway(io: Server): void {
               // Non-fatal: sync-warning logging still proceeds.
             }
           }
+          const connectedPhase = phase === 'connected';
+          const liveLifecycle =
+            lifecycleState === 'ACTIVE' ||
+            lifecycleState === 'RECOVERING' ||
+            lifecycleState === 'STARTING';
+          const autohealThreshold = connectedPhase && liveLifecycle
+            ? SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD
+            : SYNC_WARNING_AUTOHEAL_THRESHOLD;
+          const willAutoheal = hasSession && warningCount >= autohealThreshold;
           logWarning('billing_sync_warning_client', {
             callId,
             firebaseUid,
@@ -556,8 +600,8 @@ export function setupBillingGateway(io: Server): void {
             warningCount,
             lifecycleState,
             billingSequence,
-            autohealThreshold: SYNC_WARNING_AUTOHEAL_THRESHOLD,
-            willAutoheal: hasSession && warningCount >= SYNC_WARNING_AUTOHEAL_THRESHOLD,
+            autohealThreshold,
+            willAutoheal,
           });
           recordBillingMetric('client_billing_sync_warning', 1, {
             callId,
@@ -565,7 +609,7 @@ export function setupBillingGateway(io: Server): void {
             phase,
             hasSession: hasSession ? '1' : '0',
           });
-          if (hasSession && warningCount >= SYNC_WARNING_AUTOHEAL_THRESHOLD) {
+          if (willAutoheal) {
             recordBillingMetric('billing_sync_autoheal_triggered', 1, {
               callId,
               firebaseUid,

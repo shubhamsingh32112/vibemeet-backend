@@ -28,7 +28,7 @@
  */
 
 import { getRedis, isRedisConfigured, creatorPresenceKey } from '../../config/redis';
-import { logError, logInfo } from '../../utils/logger';
+import { logError, logInfo, logWarning } from '../../utils/logger';
 
 export type CreatorAvailability = 'online' | 'busy';
 
@@ -187,10 +187,22 @@ export async function getBatchAvailability(
     });
 
     if (fallbackIds.length > 0) {
+      const batchSize = creatorIds.length;
+      const fallbackRate = batchSize > 0 ? fallbackIds.length / batchSize : 0;
       logInfo('creator_availability_batch_legacy_fallback', {
         count: fallbackIds.length,
+        batchSize,
+        fallbackRate,
         sampleIds: fallbackIds.slice(0, 5),
       });
+      if (batchSize >= 5 && fallbackRate > 0.05) {
+        logWarning('creator_availability_batch_legacy_fallback_high', {
+          count: fallbackIds.length,
+          batchSize,
+          fallbackRate,
+          threshold: 0.05,
+        });
+      }
       const keys = fallbackIds.map(id => `${KEY_PREFIX}${id}`);
       const values = await redis.mget(...keys);
       fallbackIds.forEach((id, index) => {

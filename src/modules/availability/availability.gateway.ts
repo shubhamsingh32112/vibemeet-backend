@@ -1,5 +1,5 @@
 import { Server, Socket } from 'socket.io';
-import { getRedis, activeCallByUserKey } from '../../config/redis';
+import { getRedis, activeCallByUserKey, callSessionKey } from '../../config/redis';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { transitionCreatorPresence, getBatchCreatorPresence } from './presence.service';
 import { User } from '../user/user.model';
@@ -37,6 +37,68 @@ const activeSocketsByUser = new Map<string, Set<string>>();
 const activeSocketsByCreator = new Map<string, Set<string>>();
 const lastCreatorHeartbeatAtMs = new Map<string, number>();
 const lastUserHeartbeatAtMs = new Map<string, number>();
+
+const CREATOR_DISCONNECT_GRACE_MS = Math.min(
+  10000,
+  Math.max(1000, parseInt(process.env.CREATOR_DISCONNECT_GRACE_MS || '3000', 10) || 3000)
+);
+const pendingCreatorDisconnectTimers = new Map<string, NodeJS.Timeout>();
+
+function creatorHasAnyConnectedSocket(io: Server, firebaseUid: string): boolean {
+  const tracked = activeSocketsByCreator.get(firebaseUid);
+  if (tracked) {
+    for (const socketId of tracked) {
+      const socketInstance = io.sockets.sockets.get(socketId);
+      if (
+        socketInstance?.connected &&
+        (socketInstance.data.firebaseUid as string) === firebaseUid
+      ) {
+        return true;
+      }
+    }
+  }
+  for (const [, socketInstance] of io.sockets.sockets) {
+    if (
+      socketInstance.connected &&
+      (socketInstance.data.firebaseUid as string) === firebaseUid &&
+      Boolean(socketInstance.data.isCreator)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cancelPendingCreatorDisconnect(firebaseUid: string): void {
+  const pending = pendingCreatorDisconnectTimers.get(firebaseUid);
+  if (pending) {
+    clearTimeout(pending);
+    pendingCreatorDisconnectTimers.delete(firebaseUid);
+  }
+}
+
+function scheduleCreatorAway(io: Server, firebaseUid: string): void {
+  cancelPendingCreatorDisconnect(firebaseUid);
+  const timer = setTimeout(() => {
+    pendingCreatorDisconnectTimers.delete(firebaseUid);
+    const remainingDevices = creatorSocketCounts.get(firebaseUid) ?? 0;
+    if (remainingDevices > 0) return;
+    if (creatorHasAnyConnectedSocket(io, firebaseUid)) return;
+    void transitionCreatorPresence(
+      io,
+      firebaseUid,
+      'DISCONNECTED',
+      'availability.gateway.disconnect_grace'
+    )
+      .then(() => {
+        logInfo('Creator marked away after disconnect grace', { firebaseUid });
+      })
+      .catch((err) => {
+        logError('Failed to mark creator away after disconnect grace', err, { firebaseUid });
+      });
+  }, CREATOR_DISCONNECT_GRACE_MS);
+  pendingCreatorDisconnectTimers.set(firebaseUid, timer);
+}
 
 /**
  * 🔥 SCALABILITY: Periodic cleanup of stale socket tracking entries
@@ -106,12 +168,10 @@ function cleanupStaleSocketTracking(io: Server): void {
       // Clean up socket count
       creatorSocketCounts.delete(firebaseUid);
       
-      // 🔥 CRITICAL: Set status to busy if we're cleaning up (safety net)
-      // This ensures creators are marked busy even if disconnect handler missed it
-      setCreatorAvailability(io, firebaseUid, 'busy').catch((err) => {
-        logError('Failed to set creator busy during cleanup', err, { firebaseUid });
-      });
-      
+      if (!creatorHasAnyConnectedSocket(io, firebaseUid)) {
+        scheduleCreatorAway(io, firebaseUid);
+      }
+
       cleanedCreators++;
     }
   }
@@ -137,8 +197,27 @@ function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefin
 async function hasActiveCallForUid(firebaseUid: string): Promise<boolean> {
   try {
     const redis = getRedis();
-    const activeCall = await redis.get(activeCallByUserKey(firebaseUid));
-    return Boolean(activeCall && activeCall.length > 0);
+    const slotKey = activeCallByUserKey(firebaseUid);
+    const activeCallId = await redis.get(slotKey);
+    if (!activeCallId) {
+      return false;
+    }
+    const sessionRaw = await redis.get(callSessionKey(activeCallId));
+    if (!sessionRaw) {
+      await redis.del(slotKey).catch(() => {});
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(sessionRaw) as { lifecycleState?: string };
+      const lifecycle = String(parsed.lifecycleState || 'ACTIVE');
+      if (lifecycle === 'SETTLED' || lifecycle === 'FAILED') {
+        await redis.del(slotKey).catch(() => {});
+        return false;
+      }
+    } catch {
+      // Unparseable session — treat slot as active to avoid false "online" during billing.
+    }
+    return true;
   } catch {
     return false;
   }
@@ -235,6 +314,7 @@ export function setupAvailabilityGateway(io: Server): void {
       // Product requirement: creators are automatically online when app opens
       // BUT: Don't overwrite busy status if creator is on an active call
       if (currentCount === 0) {
+        cancelPendingCreatorDisconnect(firebaseUid);
         lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
         if (hasActiveCall) {
           // Creator is on a call - keep them busy
@@ -252,10 +332,12 @@ export function setupAvailabilityGateway(io: Server): void {
             // 🔥 CRITICAL FIX: Verify creator still has active sockets before refreshing
             const activeSockets = activeSocketsByCreator.get(firebaseUid);
             if (!activeSockets || activeSockets.size === 0) {
-              // No active sockets - stop heartbeat and set offline
+              if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
+                return;
+              }
               clearInterval(heartbeatInterval);
               creatorHeartbeatIntervals.delete(firebaseUid);
-              await setCreatorAvailability(io, firebaseUid, 'busy');
+              scheduleCreatorAway(io, firebaseUid);
               logWarning('Heartbeat stopped: no active sockets', { firebaseUid });
               return;
             }
@@ -271,11 +353,13 @@ export function setupAvailabilityGateway(io: Server): void {
             }
             
             if (!hasConnectedSocket) {
-              // All sockets disconnected - stop heartbeat and set offline
+              if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
+                return;
+              }
               clearInterval(heartbeatInterval);
               creatorHeartbeatIntervals.delete(firebaseUid);
               activeSocketsByCreator.delete(firebaseUid);
-              await setCreatorAvailability(io, firebaseUid, 'busy');
+              scheduleCreatorAway(io, firebaseUid);
               logWarning('Heartbeat stopped: all sockets disconnected', { firebaseUid });
               return;
             }
@@ -461,6 +545,10 @@ export function setupAvailabilityGateway(io: Server): void {
         logWarning('Unauthorized creator:offline request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
+      if (creatorHasAnyConnectedSocket(io, uid)) {
+        logDebug('Ignoring creator:offline — sockets still connected', { firebaseUid: uid });
+        return;
+      }
       await setCreatorAvailability(io, uid, 'busy');
       lastCreatorHeartbeatAtMs.set(uid, Date.now());
       logInfo('Creator set to offline', { firebaseUid: uid });
@@ -549,26 +637,16 @@ export function setupAvailabilityGateway(io: Server): void {
             logDebug('Creator heartbeat stopped on disconnect', { firebaseUid: uid });
           }
           
-          // 🔥 CRITICAL: Set status to busy and broadcast BEFORE cleanup
-          // This ensures all clients receive the status change immediately
-          // Even if heartbeat cleanup failed, we MUST set status to busy
-          try {
-            await setCreatorAvailability(io, uid, 'busy');
-            logInfo('Creator disconnected - automatically set to offline', { firebaseUid: uid });
-          } catch (err) {
-            logError('Failed to set creator offline on disconnect', err, { firebaseUid: uid });
-            try {
-              await transitionCreatorPresence(
-                io,
-                uid,
-                'DISCONNECTED',
-                'availability.gateway.disconnect_fallback'
-              );
-            } catch (fallbackErr) {
-              logError('Failed to transition creator offline on disconnect fallback', fallbackErr, {
-                firebaseUid: uid,
-              });
-            }
+          if (creatorHasAnyConnectedSocket(io, uid)) {
+            logDebug('Creator disconnect ignored — other sockets still connected', {
+              firebaseUid: uid,
+            });
+          } else {
+            scheduleCreatorAway(io, uid);
+            logInfo('Creator disconnect scheduled away grace', {
+              firebaseUid: uid,
+              graceMs: CREATOR_DISCONNECT_GRACE_MS,
+            });
           }
         } else {
           // Still have other devices connected - just decrement count

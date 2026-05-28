@@ -62,8 +62,10 @@ async function resolveTargetState(
 ): Promise<CreatorPresenceState> {
   switch (eventType) {
     case 'CALL_STARTED':
-    case 'DISCONNECTED':
     case 'FORCE_OFFLINE':
+      return 'busy';
+    case 'DISCONNECTED':
+      // A disconnected creator must always be treated as not available.
       return 'busy';
     case 'CALL_ENDED':
     case 'CONNECTED':
@@ -116,10 +118,22 @@ export async function getBatchCreatorPresence(
   });
 
   if (legacyFallbackIds.length > 0) {
+    const batchSize = creatorIds.length;
+    const fallbackRate = batchSize > 0 ? legacyFallbackIds.length / batchSize : 0;
     logInfo('creator_presence_batch_legacy_fallback', {
       count: legacyFallbackIds.length,
+      batchSize,
+      fallbackRate,
       sampleIds: legacyFallbackIds.slice(0, 5),
     });
+    if (batchSize >= 5 && fallbackRate > 0.05) {
+      logWarning('creator_presence_batch_legacy_fallback_high', {
+        count: legacyFallbackIds.length,
+        batchSize,
+        fallbackRate,
+        threshold: 0.05,
+      });
+    }
     const legacyKeys = legacyFallbackIds.map((id) => availabilityKey(id));
     const legacyVals = await redis.mget(...legacyKeys);
     legacyFallbackIds.forEach((id, idx) => {

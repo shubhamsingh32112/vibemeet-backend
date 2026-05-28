@@ -32,3 +32,30 @@ export async function isCallActive(
   }
   return true;
 }
+
+/** True when the call session exists, is non-terminal, and the UID is payer or creator. */
+export async function isCallActiveForParticipant(
+  _redis: Redis,
+  params: { callId: string; participantFirebaseUid: string }
+): Promise<boolean> {
+  const runtime = await resolveBillingRuntimeState(params.callId);
+  if (!runtime.session) {
+    return false;
+  }
+  const { userFirebaseUid, creatorFirebaseUid } = runtime.session;
+  if (
+    params.participantFirebaseUid !== userFirebaseUid &&
+    params.participantFirebaseUid !== creatorFirebaseUid
+  ) {
+    return false;
+  }
+  const lifecycle = String(runtime.session.lifecycleState || 'ACTIVE') as BillingLifecycleState;
+  return lifecycle !== 'SETTLED' && lifecycle !== 'FAILED';
+}
+
+export function isNonTerminalLifecycle(
+  lifecycleState: string | undefined
+): boolean {
+  const lifecycle = String(lifecycleState || 'ACTIVE') as BillingLifecycleState;
+  return lifecycle !== 'SETTLED' && lifecycle !== 'FAILED';
+}

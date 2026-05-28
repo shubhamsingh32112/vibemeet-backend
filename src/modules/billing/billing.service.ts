@@ -193,7 +193,7 @@ return "ok"
   return result === 'ok' ? 'ok' : 'conflict';
 }
 
-async function releaseActiveCallSlotsIfOurs(
+export async function releaseActiveCallSlotsIfOurs(
   redis: ReturnType<typeof getRedis>,
   callId: string,
   userFirebaseUid: string,
@@ -204,6 +204,31 @@ async function releaseActiveCallSlotsIfOurs(
   const [u, c] = await Promise.all([redis.get(userKey), redis.get(creatorKey)]);
   if (u === callId) await redis.del(userKey).catch(() => {});
   if (c === callId) await redis.del(creatorKey).catch(() => {});
+}
+
+async function releaseActiveCallSlotsIfTerminal(
+  redis: ReturnType<typeof getRedis>,
+  session: Pick<CallSession, 'callId' | 'userFirebaseUid' | 'creatorFirebaseUid' | 'lifecycleState'>
+): Promise<void> {
+  const lifecycle = String(session.lifecycleState || '');
+  if (lifecycle !== 'SETTLED' && lifecycle !== 'FAILED') {
+    return;
+  }
+  await releaseActiveCallSlotsIfOurs(
+    redis,
+    session.callId,
+    session.userFirebaseUid,
+    session.creatorFirebaseUid
+  );
+}
+
+async function persistCallSession(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  session: CallSession
+): Promise<void> {
+  await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+  await releaseActiveCallSlotsIfTerminal(redis, session);
 }
 
 async function refreshActiveCallSlotsTtl(
@@ -836,23 +861,53 @@ export class BillingService {
       'NX'
     );
     if (orchestratorClaim !== 'OK') {
-      recordBillingMetric('session_start_duplicate', 1, {
-        source,
-        callIdPrefix,
-        reason: 'suppressed_non_owner',
-      });
-      logInfo('billing_start_orchestrator_suppressed', {
-        callId,
-        source,
-        startIngress,
-        startCorrelationId,
-      });
-      await ensureBillingStartedReplayFreshness(io, callId, source, {
-        startCorrelationId,
-        startIngress,
-        replayReason: 'suppressed_non_owner',
-      }).catch(() => {});
-      return;
+      const existingSessionOnSuppress = await redis.get(callSessionKey(callId));
+      if (!existingSessionOnSuppress) {
+        recordBillingMetric('billing_start_suppressed_but_no_session', 1, {
+          source,
+          callIdPrefix,
+        });
+        logWarning('billing_start_suppressed_but_no_session', {
+          callId,
+          source,
+          startIngress,
+          startCorrelationId,
+        });
+        await redis.del(orchestratorKey).catch(() => {});
+        const retryClaim = await redis.set(
+          orchestratorKey,
+          orchestratorPayload,
+          'EX',
+          BILLING_START_ORCHESTRATOR_TTL_SECONDS,
+          'NX'
+        );
+        if (retryClaim !== 'OK') {
+          await ensureBillingStartedReplayFreshness(io, callId, source, {
+            startCorrelationId,
+            startIngress,
+            replayReason: 'suppressed_retry_failed',
+          }).catch(() => {});
+          return;
+        }
+      } else {
+        recordBillingMetric('session_start_duplicate', 1, {
+          source,
+          callIdPrefix,
+          reason: 'suppressed_non_owner',
+        });
+        logInfo('billing_start_orchestrator_suppressed', {
+          callId,
+          source,
+          startIngress,
+          startCorrelationId,
+        });
+        await ensureBillingStartedReplayFreshness(io, callId, source, {
+          startCorrelationId,
+          startIngress,
+          replayReason: 'suppressed_non_owner',
+        }).catch(() => {});
+        return;
+      }
     }
     const startLockToken = randomUUID();
     const startLockKey = billingSessionStartLockKey(callId);
@@ -1353,7 +1408,7 @@ export class BillingService {
       })
     ).next;
     session.billingSequence = 1;
-    await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+    await persistCallSession(redis, callId, session);
 
     emitBillingStartedFromSnapshot(
       io,
@@ -1421,7 +1476,7 @@ export class BillingService {
       await refreshActiveCallSlotsTtl(redis, userFirebaseUid, creatorFirebaseUid);
       const { isBullmqBillingEnabled, scheduleBillingJob } = await import('./billing.queue');
       if (isBullmqBillingEnabled()) {
-        await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
+        await scheduleBillingJob(callId, 0);
         logInfo('Billing session scheduled (BullMQ)', billingLifecycleLogContext({
           callId,
           source,
@@ -1996,6 +2051,7 @@ export class BillingService {
           .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, String(earningsMicros))
           .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
           .exec();
+        await releaseActiveCallSlotsIfTerminal(redis, session);
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'tick_persist' });
       } catch (redisError) {
@@ -2041,7 +2097,7 @@ export class BillingService {
       if (shouldEmitUpdate) {
         session.lastEmitAtMs = nowMs;
         recordBillingMetric('redis_ops', 1, { callId, path: 'emit_state_persist' });
-        await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+        await persistCallSession(redis, callId, session);
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'emit_state_persist' });
         emitSoon(() => {
