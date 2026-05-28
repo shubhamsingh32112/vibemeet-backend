@@ -6,6 +6,7 @@ import { Creator } from '../creator/creator.model';
 import { pricingService } from './pricing.service';
 import { getIO } from '../../config/socket';
 import { handleCallStartedHttp } from '../billing/billing.gateway';
+import { ensureBillingStartedReplayFreshness } from '../billing/billing.service';
 import {
   getRedis,
   callSessionKey,
@@ -394,19 +395,14 @@ export class CallLifecycleService {
       const callerUser = await User.findById(call.callerUserId);
       const creatorDoc = await Creator.findOne({ userId: call.creatorUserId }).select('_id').lean();
       if (callerUser?.firebaseUid && creatorUser?.firebaseUid && creatorDoc?._id) {
-        await handleCallStartedHttp(
+        await ensureBillingStartedReplayFreshness(
           getIO(),
-          callerUser.firebaseUid,
+          callId,
+          'webhook_replay_guard',
           {
-            callId,
-            creatorFirebaseUid: creatorUser.firebaseUid,
-            creatorMongoId: String(creatorDoc._id),
+            startIngress: 'webhook',
+            replayReason: 'session_started_existing_session',
           },
-          {
-            source: 'webhook_session_started',
-            initiatedByFirebaseUid: callerUser.firebaseUid,
-            initiatedByRole: 'user',
-          }
         );
       }
       return;
@@ -498,7 +494,10 @@ export class CallLifecycleService {
           creatorFirebaseUid: creatorUser.firebaseUid,
           creatorMongoId: creator._id.toString(),
         },
-        { source: 'webhook_session_started' }
+        {
+          source: 'webhook_session_started',
+          startIngress: 'webhook',
+        }
       );
       logInfo('Redis billing started for call', { callId });
     } catch (error) {

@@ -1,4 +1,5 @@
 import { Server } from 'socket.io';
+import { randomUUID } from 'crypto';
 import {
   getRedis,
   callSessionKey,
@@ -33,6 +34,8 @@ async function handleCallStarted(
     requestReceivedAtMs?: number;
     initiatedByFirebaseUid?: string;
     initiatedByRole?: 'user' | 'creator' | 'admin';
+    startCorrelationId?: string;
+    startIngress?: 'socket' | 'http' | 'webhook' | 'system';
   }
 ): Promise<void> {
   await billingService.startBillingSession(io, userFirebaseUid, data, opts);
@@ -56,26 +59,27 @@ export async function handleCallStartedHttp(
     requestReceivedAtMs?: number;
     initiatedByFirebaseUid?: string;
     initiatedByRole?: 'user' | 'creator' | 'admin';
+    startCorrelationId?: string;
+    startIngress?: 'socket' | 'http' | 'webhook' | 'system';
   }
 ): Promise<void> {
   const resolvedSource = opts?.source ?? 'client_http';
+  const startCorrelationId = opts?.startCorrelationId || randomUUID();
   logInfo('handleCallStartedHttp', {
     callId: data.callId,
     userFirebaseUid,
     source: resolvedSource,
+    startCorrelationId,
+    startIngress: opts?.startIngress ?? 'http',
     initiatedByFirebaseUid: opts?.initiatedByFirebaseUid,
     initiatedByRole: opts?.initiatedByRole,
     creatorFirebaseUid: data.creatorFirebaseUid,
   });
-  logInfo('billing_lifecycle_start_received', {
-    callId: data.callId,
-    source: resolvedSource,
-    initiatedByFirebaseUid: opts?.initiatedByFirebaseUid,
-    initiatedByRole: opts?.initiatedByRole,
-    payerFirebaseUid: userFirebaseUid,
-    creatorFirebaseUid: data.creatorFirebaseUid,
+  await handleCallStarted(io, userFirebaseUid, data, {
+    ...opts,
+    startCorrelationId,
+    startIngress: opts?.startIngress ?? 'http',
   });
-  await handleCallStarted(io, userFirebaseUid, data, opts);
 
   const redis = getRedis();
   const pendingEndKey = pendingCallEndKey(data.callId);

@@ -251,6 +251,19 @@ export const billingWatchdogAttemptsKey = (callId: string): string =>
 export const billingRecoveryDeadLetterKey = (callId: string): string =>
   `${BILLING_RECOVERY_DEADLETTER_PREFIX}${callId}`;
 
+export const BILLING_START_ORCHESTRATOR_PREFIX = 'billing:start:orchestrator:';
+export const BILLING_START_REPLAY_GUARD_PREFIX = 'billing:start:replay_guard:';
+export const BILLING_SYNC_WARNING_DEDUP_PREFIX = 'billing:sync_warning:dedup:';
+export const BILLING_SYNC_WARNING_COUNT_PREFIX = 'billing:sync_warning:count:';
+export const billingStartOrchestratorKey = (callId: string): string =>
+  `${BILLING_START_ORCHESTRATOR_PREFIX}${callId}`;
+export const billingStartReplayGuardKey = (callId: string): string =>
+  `${BILLING_START_REPLAY_GUARD_PREFIX}${callId}`;
+export const billingSyncWarningDedupKey = (callId: string, phase: string): string =>
+  `${BILLING_SYNC_WARNING_DEDUP_PREFIX}${callId}:${phase}`;
+export const billingSyncWarningCountKey = (callId: string, phase: string): string =>
+  `${BILLING_SYNC_WARNING_COUNT_PREFIX}${callId}:${phase}`;
+
 // 🔥 FIX 3: Distributed lock for batch processor
 export const BATCH_PROCESSOR_LOCK_KEY = 'lock:billing:batch_processor';
 export const BATCH_PROCESSOR_LOCK_TTL = 2; // 2 seconds (renewed each tick)

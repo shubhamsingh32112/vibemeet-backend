@@ -13,6 +13,8 @@ import {
   callCreatorEarningsKey,
   activeCallByUserKey,
   ACTIVE_CALL_BY_USER_TTL,
+  billingStartOrchestratorKey,
+  billingStartReplayGuardKey,
 } from '../../config/redis';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -83,6 +85,11 @@ function billingCycleLockKey(callId: string): string {
 }
 const BILLING_SESSION_START_LOCK_PREFIX = 'billing:start_lock:';
 const BILLING_SESSION_START_LOCK_TTL_SECONDS = 30;
+const BILLING_START_ORCHESTRATOR_TTL_SECONDS = 20;
+const BILLING_START_REPLAY_GUARD_TTL_SECONDS = Math.min(
+  120,
+  Math.max(5, parseInt(process.env.BILLING_START_REPLAY_GUARD_TTL_SECONDS || '20', 10) || 20)
+);
 function billingSessionStartLockKey(callId: string): string {
   return `${BILLING_SESSION_START_LOCK_PREFIX}${callId}`;
 }
@@ -369,6 +376,8 @@ type BillingLifecycleLogContext = {
   creatorFirebaseUid?: string;
   initiatedByFirebaseUid?: string;
   initiatedByRole?: 'user' | 'creator' | 'admin';
+  startCorrelationId?: string;
+  startIngress?: string;
 };
 
 function billingLifecycleLogContext(ctx: BillingLifecycleLogContext): Record<string, unknown> {
@@ -379,6 +388,8 @@ function billingLifecycleLogContext(ctx: BillingLifecycleLogContext): Record<str
     creatorFirebaseUid: ctx.creatorFirebaseUid,
     initiatedByFirebaseUid: ctx.initiatedByFirebaseUid,
     initiatedByRole: ctx.initiatedByRole,
+    startCorrelationId: ctx.startCorrelationId,
+    startIngress: ctx.startIngress,
   };
 }
 
@@ -462,12 +473,81 @@ async function replayBillingStartedFromRedisSession(
   redis: ReturnType<typeof getRedis>,
   callId: string,
   session: CallSession,
-  source: BillingSessionStartSource
+  source: BillingSessionStartSource,
+  meta?: {
+    startCorrelationId?: string;
+    startIngress?: string;
+    replayReason?: string;
+  }
 ): Promise<void> {
   const userFirebaseUid = session.userFirebaseUid;
   const creatorFirebaseUid = session.creatorFirebaseUid;
 
   const userPayload = await buildBillingStartedUserPayload(redis, callId, session);
+  const nextTuple = {
+    billingSequence: Number(userPayload.billingSequence) || 0,
+    serverTimestamp: Number(userPayload.serverTimestamp) || 0,
+    callStartTime: Number(userPayload.callStartTime) || 0,
+    lifecycleState: String(userPayload.lifecycleState || 'INIT'),
+  };
+  const monotonicKey = `billing:emit_tuple:last:${callId}`;
+  const prevTupleRaw = await redis.get(monotonicKey);
+  if (prevTupleRaw) {
+    try {
+      const prev = JSON.parse(prevTupleRaw) as {
+        billingSequence?: number;
+        serverTimestamp?: number;
+      };
+      if (
+        Number.isFinite(prev.billingSequence) &&
+        nextTuple.billingSequence < Number(prev.billingSequence)
+      ) {
+        logWarning('billing_emit_tuple_regression_skipped', {
+          callId,
+          source,
+          previousSequence: prev.billingSequence,
+          nextSequence: nextTuple.billingSequence,
+          ...meta,
+        });
+        recordBillingMetric('billing_emit_tuple_regression', 1, {
+          callId,
+          source,
+          reason: 'sequence_regression',
+        });
+        return;
+      }
+      if (
+        Number.isFinite(prev.serverTimestamp) &&
+        nextTuple.serverTimestamp < Number(prev.serverTimestamp)
+      ) {
+        logWarning('billing_emit_tuple_regression_skipped', {
+          callId,
+          source,
+          previousServerTimestamp: prev.serverTimestamp,
+          nextServerTimestamp: nextTuple.serverTimestamp,
+          ...meta,
+        });
+        recordBillingMetric('billing_emit_tuple_regression', 1, {
+          callId,
+          source,
+          reason: 'timestamp_regression',
+        });
+        return;
+      }
+    } catch {
+      // best-effort parsing; proceed when malformed
+    }
+  }
+  if (nextTuple.billingSequence <= 0 || nextTuple.callStartTime <= 0 || nextTuple.serverTimestamp <= 0) {
+    logWarning('billing_emit_tuple_invalid_skipped', {
+      callId,
+      source,
+      ...nextTuple,
+      ...meta,
+    });
+    recordBillingMetric('billing_emit_tuple_invalid', 1, { callId, source });
+    return;
+  }
 
   const earningsRaw = await redis.get(callCreatorEarningsKey(callId));
   const earnRaw = parseInt(String(earningsRaw ?? '0'), 10) || 0;
@@ -499,17 +579,66 @@ async function replayBillingStartedFromRedisSession(
       callStartTime: session.startTime,
     }
   );
+  await redis
+    .setex(
+      monotonicKey,
+      CALL_SESSION_TTL,
+      JSON.stringify({
+        billingSequence: nextTuple.billingSequence,
+        serverTimestamp: nextTuple.serverTimestamp,
+        callStartTime: nextTuple.callStartTime,
+        lifecycleState: nextTuple.lifecycleState,
+        source,
+      })
+    )
+    .catch(() => {});
 
   logInfo('Replayed billing:started for existing Redis session', {
     callId,
     source,
     elapsedSeconds: session.elapsedSeconds,
     remainingSeconds: userPayload.remainingSeconds,
+    ...meta,
   });
   recordBillingMetric('session_start_idempotent_replay', 1, {
     callIdPrefix: callId.length > 16 ? callId.slice(0, 16) : callId,
     source,
   });
+}
+
+export async function ensureBillingStartedReplayFreshness(
+  io: Server,
+  callId: string,
+  source: BillingSessionStartSource,
+  opts?: {
+    force?: boolean;
+    startCorrelationId?: string;
+    startIngress?: string;
+    replayReason?: string;
+  }
+): Promise<boolean> {
+  const redis = getRedis();
+  const guardKey = billingStartReplayGuardKey(callId);
+  if (!opts?.force) {
+    const guard = await redis.set(guardKey, String(Date.now()), 'EX', BILLING_START_REPLAY_GUARD_TTL_SECONDS, 'NX');
+    if (guard !== 'OK') {
+      recordBillingMetric('session_start_replay_guard_suppressed', 1, { callId, source });
+      return false;
+    }
+  } else {
+    await redis.setex(guardKey, BILLING_START_REPLAY_GUARD_TTL_SECONDS, String(Date.now())).catch(() => {});
+  }
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) {
+    return false;
+  }
+  const parsed = JSON.parse(sessionRaw) as CallSession;
+  if (isBootstrappingSession(parsed)) {
+    return false;
+  }
+  normalizeV4SessionFields(parsed);
+  await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source, opts);
+  return true;
 }
 
 function migrateSession(
@@ -658,8 +787,19 @@ export type BillingSessionStartSource =
   | 'client_socket'
   | 'client_http'
   | 'webhook_session_started'
+  | 'webhook_replay_guard'
+  | 'sync_warning_autoheal'
   | 'recovery'
   | 'unknown';
+
+type BillingStartOpts = {
+  source?: BillingSessionStartSource;
+  requestReceivedAtMs?: number;
+  initiatedByFirebaseUid?: string;
+  initiatedByRole?: 'user' | 'creator' | 'admin';
+  startCorrelationId?: string;
+  startIngress?: 'socket' | 'http' | 'webhook' | 'system';
+};
 
 export class BillingService {
   async startBillingSession(
@@ -670,19 +810,50 @@ export class BillingService {
       creatorFirebaseUid: string;
       creatorMongoId: string;
     },
-    opts?: {
-      source?: BillingSessionStartSource;
-      requestReceivedAtMs?: number;
-      initiatedByFirebaseUid?: string;
-      initiatedByRole?: 'user' | 'creator' | 'admin';
-    }
+    opts?: BillingStartOpts
   ): Promise<void> {
     const redis = getRedis();
     const { callId, creatorFirebaseUid, creatorMongoId } = data;
     const source: BillingSessionStartSource = opts?.source ?? 'unknown';
     const initiatedByFirebaseUid = opts?.initiatedByFirebaseUid;
     const initiatedByRole = opts?.initiatedByRole;
+    const startCorrelationId = opts?.startCorrelationId || randomUUID();
+    const startIngress = opts?.startIngress || 'system';
     const callIdPrefix = callId.length > 16 ? callId.slice(0, 16) : callId;
+    const orchestratorKey = billingStartOrchestratorKey(callId);
+    const orchestratorPayload = JSON.stringify({
+      source,
+      startIngress,
+      startCorrelationId,
+      instanceId: `${process.pid}`,
+      firstSeenAt: Date.now(),
+    });
+    const orchestratorClaim = await redis.set(
+      orchestratorKey,
+      orchestratorPayload,
+      'EX',
+      BILLING_START_ORCHESTRATOR_TTL_SECONDS,
+      'NX'
+    );
+    if (orchestratorClaim !== 'OK') {
+      recordBillingMetric('session_start_duplicate', 1, {
+        source,
+        callIdPrefix,
+        reason: 'suppressed_non_owner',
+      });
+      logInfo('billing_start_orchestrator_suppressed', {
+        callId,
+        source,
+        startIngress,
+        startCorrelationId,
+      });
+      await ensureBillingStartedReplayFreshness(io, callId, source, {
+        startCorrelationId,
+        startIngress,
+        replayReason: 'suppressed_non_owner',
+      }).catch(() => {});
+      return;
+    }
     const startLockToken = randomUUID();
     const startLockKey = billingSessionStartLockKey(callId);
     logInfo('billing_lifecycle_start_received', billingLifecycleLogContext({
@@ -692,6 +863,8 @@ export class BillingService {
       creatorFirebaseUid,
       initiatedByFirebaseUid,
       initiatedByRole,
+      startCorrelationId,
+      startIngress,
     }));
     const startLock = await redis.set(
       startLockKey,
@@ -718,7 +891,11 @@ export class BillingService {
           const parsed = JSON.parse(sessionDuringLock) as CallSession;
           if (!isBootstrappingSession(parsed)) {
             normalizeV4SessionFields(parsed);
-            await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+            await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source, {
+              startCorrelationId,
+              startIngress,
+              replayReason: 'start_lock_busy',
+            });
           }
         } catch (replayErr) {
           logError(
@@ -797,7 +974,11 @@ export class BillingService {
             callIdPrefix,
           });
           normalizeV4SessionFields(parsed);
-          await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source);
+          await replayBillingStartedFromRedisSession(io, redis, callId, parsed, source, {
+            startCorrelationId,
+            startIngress,
+            replayReason: 'session_exists',
+          });
           return;
         }
       } catch (replayErr) {
@@ -1197,12 +1378,14 @@ export class BillingService {
       pricePerSecondMicros: String(pricePerSecondMicros),
       source,
       callIdPrefix,
+      startIngress,
     });
     if (opts?.requestReceivedAtMs != null) {
       recordBillingMetric('billing_start_latency_ms', Date.now() - opts.requestReceivedAtMs, {
         callId,
         callIdPrefix,
         source,
+        startIngress,
       });
     }
 
@@ -1314,6 +1497,7 @@ export class BillingService {
       if (seededEarlySession && !finalSessionPersisted) {
         await clearCallSessionSeed(redis, callId).catch(() => {});
       }
+      await redis.del(orchestratorKey).catch(() => {});
       if (slotsToReleaseOnFailure) {
         await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
       }

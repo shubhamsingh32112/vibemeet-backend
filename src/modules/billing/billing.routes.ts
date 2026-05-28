@@ -77,7 +77,11 @@ router.post('/call-started', verifyFirebaseToken, billingLimiter, async (req: Re
         creatorFirebaseUid,
         creatorMongoId,
       },
-      { source: 'client_http', requestReceivedAtMs: callStartedRequestAt }
+      {
+        source: 'client_http',
+        startIngress: 'http',
+        requestReceivedAtMs: callStartedRequestAt,
+      }
     );
 
     const billing = await getBillingStartedUserPayloadForCall(callId);

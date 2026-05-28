@@ -93,22 +93,40 @@ export function emitBillingSettledFromSnapshot(
 
 export function emitBillingRecoverStateFromSnapshot(
   socket: Socket,
-  activeCalls: Record<string, unknown>[]
+  activeCalls: Record<string, unknown>[],
+  metadata?: {
+    recoveryRequestId?: number;
+    generatedAtMs?: number;
+    runtimeSource?: string;
+  }
 ): void {
   emitBillingRecoverStateResponse(socket, {
     success: true,
     activeCalls,
+    ...(metadata ?? {}),
   });
 }
 
 export function emitBillingRecoverStateResponse(
   socket: Socket,
-  payload: { success: boolean; activeCalls: Record<string, unknown>[]; error?: string }
+  payload: {
+    success: boolean;
+    activeCalls: Record<string, unknown>[];
+    error?: string;
+    recoveryRequestId?: number;
+    generatedAtMs?: number;
+    runtimeSource?: string;
+  }
 ): void {
   socket.emit('billing:recover-state:response', {
     success: payload.success,
     activeCalls: payload.activeCalls,
     ...(payload.error ? { error: payload.error } : {}),
+    ...(payload.recoveryRequestId !== undefined
+      ? { recoveryRequestId: payload.recoveryRequestId }
+      : {}),
+    ...(payload.generatedAtMs !== undefined ? { generatedAtMs: payload.generatedAtMs } : {}),
+    ...(payload.runtimeSource ? { runtimeSource: payload.runtimeSource } : {}),
   });
 }
 
