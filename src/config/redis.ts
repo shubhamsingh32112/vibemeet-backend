@@ -110,37 +110,61 @@ export const getRedis = (): Redis => {
       });
     }
     
-    // 🔥 FIX: Add event listeners for connection monitoring
-    redis.on('connect', () => {
-      logInfo('Redis connected successfully');
-    });
-    
-    redis.on('ready', () => {
-      logInfo('Redis ready to accept commands');
-    });
-    
-    redis.on('error', (err) => {
-      bumpRedisError();
-      logError('CRITICAL: Redis connection error', err, {
-        alert: true,
-        impact: 'Billing operations will fail',
-      });
-    });
-    
-    redis.on('close', () => {
-      bumpRedisClose();
-      logWarning('Redis connection closed', {
-        alert: true,
-        impact: 'Billing operations will fail',
-      });
-    });
-    
-    redis.on('reconnecting', (delay: number) => {
-      logWarning('Redis reconnecting', { delay });
-    });
+    attachRedisClientMonitoring(redis, 'billing');
   }
   return redis;
 };
+
+/** Shared connection lifecycle logs for billing Redis and Socket.IO adapter clients. */
+export function attachRedisClientMonitoring(client: Redis, role: string): void {
+  client.on('connect', () => {
+    logInfo('redis_client_connected', {
+      role,
+      endpointMode: getRedisEndpointMode(),
+    });
+  });
+
+  client.on('ready', () => {
+    logInfo('redis_client_ready', {
+      role,
+      endpointMode: getRedisEndpointMode(),
+    });
+  });
+
+  client.on('error', (err) => {
+    if (role === 'billing') {
+      bumpRedisError();
+    }
+    logError('redis_client_error', err, {
+      role,
+      endpointMode: getRedisEndpointMode(),
+      alert: true,
+      impact:
+        role === 'billing'
+          ? 'Billing and presence Redis commands may fail'
+          : 'Multi-node Socket.IO broadcasts may desync',
+    });
+  });
+
+  client.on('close', () => {
+    if (role === 'billing') {
+      bumpRedisClose();
+    }
+    logWarning('redis_client_closed', {
+      role,
+      endpointMode: getRedisEndpointMode(),
+      alert: true,
+    });
+  });
+
+  client.on('reconnecting', (delay: number) => {
+    logWarning('redis_client_reconnecting', {
+      role,
+      delayMs: delay,
+      endpointMode: getRedisEndpointMode(),
+    });
+  });
+}
 
 /**
  * Check if Redis is configured

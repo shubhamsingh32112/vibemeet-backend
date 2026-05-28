@@ -12,6 +12,7 @@ import { getBillingCheckpoint } from './billing-checkpoint.service';
 import { BILLING_PROCESS_INTERVAL_MS, BILLING_SESSION_SCHEMA_VERSION } from './billing.constants';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { BillingLifecycleState } from './billing-lifecycle.machine';
+import { logInfo, logWarning, logDebug } from '../../utils/logger';
 
 export interface BillingRuntimeSession {
   schemaVersion?: number;
@@ -113,6 +114,14 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
     const earningsMicros = Math.max(0, parseInt(String(earningsRaw ?? '0'), 10) || 0);
     recordBillingMetric('billing_recovery_source', 1, { source: 'redis', callId });
     recordBillingMetric('billing_reconnect_replay_count', 1, { source: 'redis', callId });
+    logInfo('billing_runtime_resolved', {
+      callId,
+      source: 'redis',
+      lifecycleState: session.lifecycleState,
+      billingSequence: session.billingSequence,
+      balanceMicros: introMicros + walletMicros,
+      elapsedSeconds: session.elapsedSeconds,
+    });
     return {
       source: 'redis',
       session,
@@ -125,6 +134,7 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
 
   const checkpoint = (await getBillingCheckpoint(callId)) as Record<string, unknown> | null;
   if (!checkpoint) {
+    logWarning('billing_runtime_missing', { callId, source: 'missing', reason: 'no_session_no_checkpoint' });
     recordBillingMetric('billing_recovery_source', 1, { source: 'missing', callId });
     return {
       source: 'missing',
@@ -138,6 +148,11 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
 
   const session = buildSessionFromCheckpoint(checkpoint, callId);
   if (!session) {
+    logWarning('billing_runtime_missing', {
+      callId,
+      source: 'missing',
+      reason: 'checkpoint_unparseable',
+    });
     recordBillingMetric('billing_recovery_source', 1, { source: 'missing', callId });
     return {
       source: 'missing',
@@ -172,6 +187,14 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
   recordBillingMetric('billing_reconstruction_count', 1, { source: 'checkpoint', callId });
   recordBillingMetric('billing_checkpoint_fallback_count', 1, { callId });
   recordBillingMetric('billing_reconnect_replay_count', 1, { source: 'checkpoint', callId });
+  logWarning('billing_runtime_reconstructed_from_checkpoint', {
+    callId,
+    source: 'checkpoint',
+    lifecycleState: session.lifecycleState,
+    billingSequence: session.billingSequence,
+    balanceMicros,
+    elapsedSeconds: session.elapsedSeconds,
+  });
   return {
     source: 'checkpoint',
     session,
@@ -190,6 +213,12 @@ export async function resolveActiveRuntimeStateForUser(
   if (slotCallId) {
     const runtime = await resolveBillingRuntimeState(slotCallId);
     if (runtime.session) {
+      logDebug('billing_active_runtime_lookup', {
+        firebaseUid,
+        callId: slotCallId,
+        lookupSource: 'slot',
+        runtimeSource: runtime.source,
+      });
       recordBillingMetric('billing_recovery_active_user_lookup', 1, {
         source: 'slot',
         firebaseUid,
@@ -200,6 +229,11 @@ export async function resolveActiveRuntimeStateForUser(
         source: 'slot',
       };
     }
+    logWarning('billing_active_call_slot_stale', {
+      firebaseUid,
+      staleCallId: slotCallId,
+      runtimeSource: runtime.source,
+    });
     await redis.del(activeCallByUserKey(firebaseUid)).catch(() => {});
   }
 
@@ -229,6 +263,13 @@ export async function resolveActiveRuntimeStateForUser(
       await redis
         .setex(activeCallByUserKey(firebaseUid), 7200, callId)
         .catch(() => {});
+      logInfo('billing_active_runtime_lookup', {
+        firebaseUid,
+        callId,
+        lookupSource: 'scan',
+        runtimeSource: runtime.source,
+        scannedKeys: scanned,
+      });
       recordBillingMetric('billing_recovery_active_user_lookup', 1, {
         source: 'scan',
         firebaseUid,
@@ -241,6 +282,11 @@ export async function resolveActiveRuntimeStateForUser(
     }
   } while (cursor !== '0' && scanned < scanLimit);
 
+  logDebug('billing_active_runtime_lookup', {
+    firebaseUid,
+    lookupSource: 'none',
+    scannedKeys: scanned,
+  });
   recordBillingMetric('billing_recovery_active_user_lookup', 1, {
     source: 'none',
     firebaseUid,

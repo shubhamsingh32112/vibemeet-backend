@@ -4,8 +4,13 @@ export interface ISupportTicketAttachment {
   name: string;
   mimeType: string;
   sizeBytes: number;
-  dataBase64: string;
   isScreenshot: boolean;
+  /** Legacy inline storage (read-only for old tickets). */
+  dataBase64?: string;
+  /** Cloudflare Images id (preferred for new tickets). */
+  imageId?: string;
+  /** CDN delivery URL (galleryMd). */
+  url?: string;
 }
 
 /**
@@ -22,6 +27,8 @@ export interface ISupportTicket extends Document {
   category: string;
   subject: string;
   message: string;
+  /** Contact phone provided by submitter (E.164). Required for app users; optional for staff portal. */
+  contactPhone?: string;
   attachments: ISupportTicketAttachment[];
   source?: 'chat' | 'post_call' | 'other' | 'staff_portal';
   relatedCallId?: string;
@@ -63,6 +70,13 @@ const supportTicketSchema = new Schema<ISupportTicket>(
       type: String,
       required: true,
     },
+    contactPhone: {
+      type: String,
+      trim: true,
+      maxlength: 20,
+      index: true,
+      sparse: true,
+    },
     attachments: {
       type: [
         {
@@ -81,11 +95,18 @@ const supportTicketSchema = new Schema<ISupportTicket>(
           sizeBytes: {
             type: Number,
             required: true,
-            min: 1,
+            min: 0,
           },
           dataBase64: {
             type: String,
-            required: true,
+          },
+          imageId: {
+            type: String,
+            trim: true,
+          },
+          url: {
+            type: String,
+            trim: true,
           },
           isScreenshot: {
             type: Boolean,

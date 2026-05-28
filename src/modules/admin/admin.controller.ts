@@ -68,6 +68,8 @@ import { appendAuditEvent, extractAuditContext } from '../audit/audit-event.serv
 import { getLastStaffWalletReconciliationSummary } from '../billing/staff-wallet-reconciliation.service';
 import { getDomainEventWorkerStatsExtended } from '../events/domain-event.worker';
 import { Withdrawal } from '../creator/withdrawal.model';
+import { mapSupportAttachmentsForApi } from '../support/support-attachment.mapper';
+import { emitSupportTicketUpdatedToUser } from '../support/support-emitter.service';
 import {
   assertAdmin,
   assertAdminOrOwningAgentForCreator,
@@ -2427,19 +2429,13 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
             username: displayName,
             email: user?.email || null,
             phone: user?.phone || null,
+            contactPhone: t.contactPhone || null,
             userRole: user?.role || null,
             role: t.role,
             category: t.category,
             subject: t.subject,
             message: t.message,
-            attachments: (t.attachments || []).map((attachment: any) => ({
-              name: attachment.name,
-              mimeType: attachment.mimeType,
-              sizeBytes: attachment.sizeBytes,
-              isScreenshot: Boolean(attachment.isScreenshot),
-              dataBase64: attachment.dataBase64,
-              dataUrl: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
-            })),
+            attachments: mapSupportAttachmentsForApi(t.attachments || []),
             status: t.status,
             priority: t.priority,
             assignedAdminId: t.assignedAdminId?.toString() || null,
@@ -2506,8 +2502,9 @@ export const updateTicketStatus = async (req: Request, res: Response): Promise<v
     }
 
     const oldStatus = ticket.status;
+    const notesAppended = Boolean(adminNotes?.trim());
     ticket.status = status;
-    if (adminNotes?.trim()) {
+    if (notesAppended) {
       ticket.adminNotes = (ticket.adminNotes || '') + (ticket.adminNotes ? '\n---\n' : '') + adminNotes.trim();
     }
     await ticket.save();
@@ -2528,6 +2525,7 @@ export const updateTicketStatus = async (req: Request, res: Response): Promise<v
       oldStatus,
       newStatus: status,
     });
+    await emitSupportTicketUpdatedToUser(ticket, { hasNewReply: notesAppended });
 
     res.json({
       success: true,

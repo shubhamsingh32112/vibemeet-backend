@@ -14,7 +14,12 @@ import { attachFirebaseRateLimitIdentity } from './middlewares/firebase-rate-lim
 import { attachStaffRateLimitIdentity } from './middlewares/staff-rate-limit.middleware';
 import { connectDatabase } from './config/database';
 import { initializeFirebase } from './config/firebase';
-import { isRedisConfigured, getRedis, metricsKey } from './config/redis';
+import {
+  isRedisConfigured,
+  getRedis,
+  metricsKey,
+  attachRedisClientMonitoring,
+} from './config/redis';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
@@ -286,6 +291,9 @@ app.get('/metrics', async (req, res) => {
     const tickDrift = byName['billing.tick_drift_ms'];
     const settlementTotal = byName['billing.settlement_total_ms'];
     const backpressureStage = byName['billing.backpressure_stage'];
+    const stateRecovery = byName['billing.state_recovery'];
+    const stateRecoverySuppressed = byName['billing.state_recovery_suppressed'];
+    const recoveryOutcome = byName['billing.recovery_outcome'];
     const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
     const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
     const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
@@ -405,6 +413,15 @@ app.get('/metrics', async (req, res) => {
     if ((tickDrift?.p95 ?? 0) > 100 || (tickDrift?.p99 ?? 0) > 300) {
       metricsAlerts.push('billing_tick_drift_high');
     }
+    if ((backpressureStage?.max ?? 0) >= 3) {
+      metricsAlerts.push('billing_backpressure_stage3');
+    }
+    const recoverySuccess = stateRecovery?.sum ?? 0;
+    const recoverySuppressed = stateRecoverySuppressed?.sum ?? 0;
+    const recoveryTotal = recoverySuccess + recoverySuppressed;
+    if (recoveryTotal >= 20 && recoverySuppressed / recoveryTotal > 0.85) {
+      metricsAlerts.push('billing_recovery_suppressed_high');
+    }
     if ((settlementTotal?.p95 ?? 0) > 5000) {
       metricsAlerts.push('billing_settlement_p95_high');
     }
@@ -447,6 +464,13 @@ app.get('/metrics', async (req, res) => {
       billing: {
         backpressure: {
           currentStage: Math.round(backpressureStage?.max ?? 0),
+        },
+        recovery: {
+          stateRecoverySamples: stateRecovery?.count ?? 0,
+          stateRecoverySuccessSum: recoverySuccess,
+          stateRecoverySuppressedSamples: stateRecoverySuppressed?.count ?? 0,
+          stateRecoverySuppressedSum: recoverySuppressed,
+          recoveryOutcomeSamples: recoveryOutcome?.count ?? 0,
         },
         tickDriftMs: tickDrift
           ? {
@@ -877,6 +901,8 @@ const startServer = async () => {
         }
         if (pubClient) {
           const subClient = pubClient.duplicate();
+          attachRedisClientMonitoring(pubClient, 'socket_adapter_pub');
+          attachRedisClientMonitoring(subClient, 'socket_adapter_sub');
           io.adapter(createAdapter(pubClient, subClient));
           logInfo('Socket.IO Redis adapter enabled (multi-node broadcasts)');
         }

@@ -25,12 +25,14 @@ export interface CloudflareConfig {
 export interface ImageQuotaConfig {
   avatarPerDay: number;
   galleryPerHour: number;
+  supportPerDay: number;
 }
 
 const DEFAULT_DELIVERY_HOST = 'imagedelivery.net';
 const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const DEFAULT_AVATAR_QUOTA = 15;
 const DEFAULT_GALLERY_QUOTA = 60;
+const DEFAULT_SUPPORT_QUOTA = 5;
 
 let cachedConfig: CloudflareConfig | null = null;
 
@@ -108,6 +110,7 @@ export function getImageQuotaConfig(): ImageQuotaConfig {
   return {
     avatarPerDay: readNumberEnv('IMAGE_QUOTA_AVATAR_PER_DAY', DEFAULT_AVATAR_QUOTA),
     galleryPerHour: readNumberEnv('IMAGE_QUOTA_GALLERY_PER_HOUR', DEFAULT_GALLERY_QUOTA),
+    supportPerDay: readNumberEnv('IMAGE_QUOTA_SUPPORT_PER_DAY', DEFAULT_SUPPORT_QUOTA),
   };
 }
 

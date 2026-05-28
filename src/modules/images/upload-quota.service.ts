@@ -16,7 +16,7 @@ import { getImageQuotaConfig } from '../../config/cloudflare';
 import { logWarning } from '../../utils/logger';
 import { bumpImageCounter } from './image-metrics';
 
-export type QuotaScope = 'avatar' | 'gallery';
+export type QuotaScope = 'avatar' | 'gallery' | 'support';
 
 export class UploadQuotaExceededError extends Error {
   readonly code = 'UPLOAD_QUOTA_EXCEEDED';
@@ -40,6 +40,10 @@ function hourBucket(now: Date): string {
 
 function dailyKey(userId: string, date: Date): string {
   return `image:quota:avatar:${userId}:${dayBucket(date)}`;
+}
+
+function supportDailyKey(userId: string, date: Date): string {
+  return `image:quota:support:${userId}:${dayBucket(date)}`;
 }
 
 function hourlyKey(userId: string, date: Date): string {
@@ -87,6 +91,12 @@ export async function assertCanUpload(userId: string, scope: QuotaScope): Promis
         bumpImageCounter('quota.rejected', { scope });
         throw new UploadQuotaExceededError(scope, secondsUntilNextDay(now));
       }
+    } else if (scope === 'support') {
+      const count = Number((await redis.get(supportDailyKey(userId, now))) || 0);
+      if (count >= quotas.supportPerDay) {
+        bumpImageCounter('quota.rejected', { scope });
+        throw new UploadQuotaExceededError(scope, secondsUntilNextDay(now));
+      }
     } else {
       const count = Number((await redis.get(hourlyKey(userId, now))) || 0);
       if (count >= quotas.galleryPerHour) {
@@ -113,6 +123,10 @@ export async function recordUpload(userId: string, scope: QuotaScope): Promise<v
   try {
     if (scope === 'avatar') {
       const key = dailyKey(userId, now);
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, secondsUntilNextDay(now));
+    } else if (scope === 'support') {
+      const key = supportDailyKey(userId, now);
       const count = await redis.incr(key);
       if (count === 1) await redis.expire(key, secondsUntilNextDay(now));
     } else {

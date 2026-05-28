@@ -28,6 +28,7 @@
  */
 
 import { getRedis, isRedisConfigured, creatorPresenceKey } from '../../config/redis';
+import { logError, logInfo } from '../../utils/logger';
 
 export type CreatorAvailability = 'online' | 'busy';
 
@@ -72,7 +73,7 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
     const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
     return (status === 'online' ? 'online' : 'busy') as CreatorAvailability;
   } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to get status:`, err);
+    logError('creator_availability_get_failed', err, { creatorId, failSafe: 'busy' });
     return 'busy'; // Error = Busy (fail safe)
   }
 }
@@ -142,7 +143,7 @@ export async function getAllOnlineCreators(): Promise<string[]> {
     
     return onlineCreators;
   } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to get all online:`, err);
+    logError('creator_availability_get_all_online_failed', err, { alert: true });
     return [];
   }
 }
@@ -186,6 +187,10 @@ export async function getBatchAvailability(
     });
 
     if (fallbackIds.length > 0) {
+      logInfo('creator_availability_batch_legacy_fallback', {
+        count: fallbackIds.length,
+        sampleIds: fallbackIds.slice(0, 5),
+      });
       const keys = fallbackIds.map(id => `${KEY_PREFIX}${id}`);
       const values = await redis.mget(...keys);
       fallbackIds.forEach((id, index) => {
@@ -202,7 +207,11 @@ export async function getBatchAvailability(
 
     return result;
   } catch (err) {
-    console.error(`❌ [AVAILABILITY] Failed to get batch:`, err);
+    logError('creator_availability_batch_get_failed', err, {
+      creatorCount: creatorIds.length,
+      alert: true,
+      failSafe: 'all_busy',
+    });
     // Return all as busy on error
     const result: Record<string, CreatorAvailability> = {};
     creatorIds.forEach(id => { result[id] = 'busy'; });

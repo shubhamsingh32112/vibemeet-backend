@@ -12,6 +12,7 @@ import {
   recordCreatorAvailabilityBecameOnline,
 } from './creator-daily-online.service';
 import { recordCallMetric } from '../../utils/monitoring';
+import { logInfo, logWarning, logError, logDebug } from '../../utils/logger';
 
 export type CreatorPresenceState = 'online' | 'busy';
 export type PresenceTransitionEventType =
@@ -83,6 +84,10 @@ export async function readCreatorPresenceState(firebaseUid: string): Promise<Cre
   }
   // Dual-read fallback to legacy key during migration.
   const legacy = await redis.get(availabilityKey(firebaseUid));
+  logDebug('creator_presence_legacy_fallback', {
+    firebaseUid,
+    legacyState: legacy === 'online' ? 'online' : 'busy',
+  });
   return {
     state: legacy === 'online' ? 'online' : 'busy',
     updatedAt: Date.now(),
@@ -111,6 +116,10 @@ export async function getBatchCreatorPresence(
   });
 
   if (legacyFallbackIds.length > 0) {
+    logInfo('creator_presence_batch_legacy_fallback', {
+      count: legacyFallbackIds.length,
+      sampleIds: legacyFallbackIds.slice(0, 5),
+    });
     const legacyKeys = legacyFallbackIds.map((id) => availabilityKey(id));
     const legacyVals = await redis.mget(...legacyKeys);
     legacyFallbackIds.forEach((id, idx) => {
@@ -143,12 +152,37 @@ export async function transitionCreatorPresence(
     version: nextVersion,
   };
 
-  await redis
-    .multi()
-    .setex(creatorPresenceKey(firebaseUid), PRESENCE_TTL_SECONDS, JSON.stringify(nextRecord))
-    // Dual-write legacy key for migration compatibility.
-    .setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextState)
-    .exec();
+  const activeCallId = await redis.get(activeCallByUserKey(firebaseUid));
+  try {
+    const pipelineResult = await redis
+      .multi()
+      .setex(creatorPresenceKey(firebaseUid), PRESENCE_TTL_SECONDS, JSON.stringify(nextRecord))
+      // Dual-write legacy key for migration compatibility.
+      .setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextState)
+      .exec();
+    const pipelineFailed = pipelineResult?.some((entry) => entry?.[0] != null);
+    if (pipelineFailed) {
+      logError('creator_presence_redis_pipeline_failed', new Error('Redis MULTI/EXEC returned errors'), {
+        firebaseUid,
+        eventType,
+        source,
+        fromState: current.state,
+        toState: nextState,
+        activeCallId: activeCallId || null,
+      });
+    }
+  } catch (redisErr) {
+    logError('creator_presence_redis_write_failed', redisErr, {
+      firebaseUid,
+      eventType,
+      source,
+      fromState: current.state,
+      toState: nextState,
+      activeCallId: activeCallId || null,
+      alert: true,
+    });
+    throw redisErr;
+  }
 
   if (nextState === 'online') {
     await recordCreatorAvailabilityBecameOnline(firebaseUid);
@@ -160,7 +194,11 @@ export async function transitionCreatorPresence(
   await updateOnlinePresenceSets(firebaseUid, nextState === 'online' ? 'online' : 'offline', scope);
 
   const statusChanged = current.state !== nextRecord.state;
-  if (statusChanged || eventType === 'RECOVERED') {
+  if (
+    statusChanged ||
+    eventType === 'RECOVERED' ||
+    eventType === 'CONNECTED'
+  ) {
     io.to('consumers').emit('creator:status', {
       creatorId: firebaseUid,
       status: nextRecord.state,
@@ -189,6 +227,47 @@ export async function transitionCreatorPresence(
     status: nextRecord.state,
     changed: statusChanged ? '1' : '0',
   });
+
+  if (statusChanged || eventType === 'RECOVERED' || eventType === 'RECONCILED') {
+    logInfo('creator_presence_transition', {
+      firebaseUid,
+      eventType,
+      source,
+      fromState: current.state,
+      toState: nextRecord.state,
+      version: nextRecord.version,
+      statusChanged,
+      activeCallId: activeCallId || null,
+      previousSource: current.source,
+    });
+  } else {
+    logDebug('creator_presence_heartbeat_no_status_change', {
+      firebaseUid,
+      eventType,
+      source,
+      state: nextRecord.state,
+      version: nextRecord.version,
+      activeCallId: activeCallId || null,
+    });
+  }
+
+  if (
+    statusChanged &&
+    ((current.state === 'online' && nextRecord.state === 'busy') ||
+      (current.state === 'busy' && nextRecord.state === 'online'))
+  ) {
+    const unexpectedBusyWhileNoCall =
+      nextRecord.state === 'busy' && !activeCallId && eventType !== 'CALL_STARTED';
+    if (unexpectedBusyWhileNoCall) {
+      logWarning('creator_presence_busy_without_active_call', {
+        firebaseUid,
+        eventType,
+        source,
+        fromState: current.state,
+        activeCallId: activeCallId || null,
+      });
+    }
+  }
 
   return nextRecord;
 }

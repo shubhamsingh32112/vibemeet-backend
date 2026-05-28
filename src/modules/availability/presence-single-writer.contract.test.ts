@@ -22,6 +22,11 @@ test('legacy availability socket path is hard-disabled', () => {
 test('gateway disconnect fallback uses transition, not direct creator emits', () => {
   const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
   assert.ok(src.includes('availability.gateway.disconnect_fallback'));
-  assert.ok(!src.includes("io.to('consumers').emit('creator:status', payload)"));
+  assert.ok(!src.includes("io.to('consumors').emit('creator:status', payload)"));
+});
+
+test('presence service broadcasts creator:status on CONNECTED', () => {
+  const src = readFileSync(join(__dirname, 'presence.service.ts'), 'utf8');
+  assert.ok(src.includes("eventType === 'CONNECTED'"));
 });
 

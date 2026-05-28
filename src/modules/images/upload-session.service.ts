@@ -25,7 +25,8 @@ export type UploadPurpose =
   | 'creator-avatar'
   | 'creator-gallery'
   | 'user-avatar'
-  | 'admin-moderation';
+  | 'admin-moderation'
+  | 'support-ticket';
 
 export interface UploadSession {
   sessionId: string;

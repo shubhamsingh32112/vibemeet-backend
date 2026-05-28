@@ -40,6 +40,7 @@ const VALID_PURPOSES: UploadPurpose[] = [
   'creator-avatar',
   'creator-gallery',
   'user-avatar',
+  'support-ticket',
 ];
 
 const PURPOSE_QUOTA: Record<UploadPurpose, QuotaScope> = {
@@ -47,6 +48,7 @@ const PURPOSE_QUOTA: Record<UploadPurpose, QuotaScope> = {
   'creator-gallery': 'gallery',
   'user-avatar': 'avatar',
   'admin-moderation': 'avatar',
+  'support-ticket': 'support',
 };
 
 const MAX_DECLARED_SIZE_BYTES = 25 * 1024 * 1024;

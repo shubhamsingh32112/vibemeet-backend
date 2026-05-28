@@ -1294,6 +1294,8 @@ export class BillingService {
           initiatedByFirebaseUid,
           initiatedByRole,
         }),
+        redisPath: 'session_seed',
+        redisOpCount: 8,
         alert: true,
       });
       logError(
@@ -1998,7 +2000,18 @@ export class BillingService {
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'tick_persist' });
       } catch (redisError) {
         recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'tick_persist' });
-        logError('CRITICAL: Redis error during billing cycle', redisError, { callId, alert: true });
+        logError('CRITICAL: Redis error during billing cycle', redisError, {
+          callId,
+          alert: true,
+          redisPath: 'tick_persist',
+          redisOpCount: 4,
+          redisWriteMs: Date.now() - redisWriteStartedAt,
+          lifecycleState: session.lifecycleState,
+          billingSequence: session.billingSequence,
+          elapsedSeconds: session.elapsedSeconds,
+          payerFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+        });
         emitSoon(() => {
           io.to(`user:${session.userFirebaseUid}`).emit('billing:error', {
             callId,

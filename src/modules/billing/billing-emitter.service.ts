@@ -1,4 +1,6 @@
+//D:\zztherapy\backend\src\modules\billing\billing-emitter.service.ts
 import { Server, Socket } from 'socket.io';
+import { logInfo, logDebug } from '../../utils/logger';
 
 type UserBillingStartedSnapshot = {
   callId: string;
@@ -38,6 +40,15 @@ export function emitBillingStartedFromSnapshot(
   userSnapshot: UserBillingStartedSnapshot,
   creatorSnapshot: CreatorBillingStartedSnapshot
 ): void {
+  logInfo('billing_emit_started', {
+    callId: userSnapshot.callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    billingSequence: userSnapshot.billingSequence,
+    lifecycleState: userSnapshot.lifecycleState,
+    elapsedSeconds: userSnapshot.elapsedSeconds,
+    remainingSeconds: userSnapshot.remainingSeconds,
+  });
   io.to(`user:${userFirebaseUid}`).emit('billing:started', userSnapshot);
   io.to(`user:${creatorFirebaseUid}`).emit('billing:started', creatorSnapshot);
 }
@@ -76,6 +87,15 @@ export function emitBillingUpdateFromSnapshot(
   userSnapshot: BillingUpdateUserSnapshot,
   creatorSnapshot: BillingUpdateCreatorSnapshot
 ): void {
+  logDebug('billing_emit_update', {
+    callId: userSnapshot.callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    billingSequence: userSnapshot.billingSequence,
+    lifecycleState: userSnapshot.lifecycleState,
+    elapsedSeconds: userSnapshot.elapsedSeconds,
+    remainingSeconds: userSnapshot.remainingSeconds,
+  });
   io.to(`user:${userFirebaseUid}`).emit('billing:update', userSnapshot);
   io.to(`user:${creatorFirebaseUid}`).emit('billing:update', creatorSnapshot);
 }
@@ -87,6 +107,11 @@ export function emitBillingSettledFromSnapshot(
   userSnapshot: Record<string, unknown>,
   creatorSnapshot: Record<string, unknown>
 ): void {
+  logInfo('billing_emit_settled', {
+    callId: String(userSnapshot.callId ?? creatorSnapshot.callId ?? ''),
+    userFirebaseUid,
+    creatorFirebaseUid,
+  });
   io.to(`user:${userFirebaseUid}`).emit('billing:settled', userSnapshot);
   io.to(`user:${creatorFirebaseUid}`).emit('billing:settled', creatorSnapshot);
 }
@@ -96,8 +121,12 @@ export function emitBillingRecoverStateFromSnapshot(
   activeCalls: Record<string, unknown>[],
   metadata?: {
     recoveryRequestId?: number;
+    clientRecoveryRequestId?: string;
     generatedAtMs?: number;
     runtimeSource?: string;
+    status?: string;
+    reason?: string;
+    recoveryOutcome?: string;
   }
 ): void {
   emitBillingRecoverStateResponse(socket, {
@@ -114,10 +143,25 @@ export function emitBillingRecoverStateResponse(
     activeCalls: Record<string, unknown>[];
     error?: string;
     recoveryRequestId?: number;
+    clientRecoveryRequestId?: string;
     generatedAtMs?: number;
     runtimeSource?: string;
+    status?: string;
+    reason?: string;
+    recoveryOutcome?: string;
   }
 ): void {
+  logInfo('billing_emit_recover_state', {
+    success: payload.success,
+    activeCallCount: payload.activeCalls.length,
+    recoveryRequestId: payload.recoveryRequestId,
+    clientRecoveryRequestId: payload.clientRecoveryRequestId,
+    runtimeSource: payload.runtimeSource,
+    status: payload.status,
+    reason: payload.reason,
+    recoveryOutcome: payload.recoveryOutcome,
+    error: payload.error,
+  });
   socket.emit('billing:recover-state:response', {
     success: payload.success,
     activeCalls: payload.activeCalls,
@@ -125,8 +169,14 @@ export function emitBillingRecoverStateResponse(
     ...(payload.recoveryRequestId !== undefined
       ? { recoveryRequestId: payload.recoveryRequestId }
       : {}),
+    ...(payload.clientRecoveryRequestId
+      ? { clientRecoveryRequestId: payload.clientRecoveryRequestId }
+      : {}),
     ...(payload.generatedAtMs !== undefined ? { generatedAtMs: payload.generatedAtMs } : {}),
     ...(payload.runtimeSource ? { runtimeSource: payload.runtimeSource } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    ...(payload.reason ? { reason: payload.reason } : {}),
+    ...(payload.recoveryOutcome ? { recoveryOutcome: payload.recoveryOutcome } : {}),
   });
 }
 

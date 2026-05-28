@@ -1,13 +1,23 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import { User } from '../user/user.model';
-import { SupportTicket } from './support.model';
+import { SupportTicket, type ISupportTicket, type ISupportTicketAttachment } from './support.model';
 import { SupportDailyCounter } from './support-daily-counter.model';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { invalidateAdminCaches } from '../../config/redis';
 import { Creator } from '../creator/creator.model';
 import { CallHistory } from '../billing/call-history.model';
 import { isAgencyRole, isBdRole } from '../../utils/staff-roles';
+import { validateSupportContactPhone } from './support-phone.util';
+import { mapSupportAttachmentsForApi } from './support-attachment.mapper';
+import {
+  commitSupportAttachmentsFromSessions,
+  SupportAttachmentCommitError,
+} from './support-attachment-commit.service';
+import {
+  assertCloudflareEnabled,
+  CloudflareImagesDisabledError,
+} from '../../config/cloudflare';
 
 type CreatorResolution = {
   creatorUserId?: any;
@@ -20,13 +30,38 @@ const MAX_SUPPORT_ATTACHMENTS = 5;
 const MAX_SUPPORT_ATTACHMENT_BYTES = 1500000;
 const ALLOWED_SUPPORT_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
-type NormalizedSupportAttachment = {
+type NormalizedLegacyAttachment = {
   name: string;
   mimeType: string;
   sizeBytes: number;
   dataBase64: string;
   isScreenshot: boolean;
 };
+
+function serializeTicketForApi(t: ISupportTicket | Record<string, any>) {
+  const id = typeof t._id?.toString === 'function' ? t._id.toString() : String(t.id || t._id || '');
+  return {
+    id,
+    userId: t.userId?.toString?.() ?? String(t.userId || ''),
+    role: t.role,
+    category: t.category,
+    subject: t.subject,
+    message: t.message,
+    contactPhone: t.contactPhone || null,
+    attachments: mapSupportAttachmentsForApi(t.attachments as ISupportTicketAttachment[]),
+    source: t.source || 'other',
+    relatedCallId: t.relatedCallId || null,
+    reportedCreatorUserId: t.reportedCreatorUserId?.toString?.() || null,
+    reportedCreatorFirebaseUid: t.reportedCreatorFirebaseUid || null,
+    reportedCreatorName: t.reportedCreatorName || null,
+    status: t.status,
+    priority: t.priority,
+    assignedAdminId: t.assignedAdminId?.toString?.() || null,
+    adminNotes: t.adminNotes || null,
+    createdAt: t.createdAt,
+    updatedAt: t.updatedAt,
+  };
+}
 
 function resolveTicketRole(userRole: string): 'user' | 'creator' | 'agency' | 'bd' {
   if (userRole === 'creator') return 'creator';
@@ -82,7 +117,7 @@ const releaseDailySupportTicketSlot = async (userId: string): Promise<void> => {
   );
 };
 
-const normalizeSupportAttachments = (raw: unknown): NormalizedSupportAttachment[] => {
+const normalizeLegacySupportAttachments = (raw: unknown): NormalizedLegacyAttachment[] => {
   if (raw == null) return [];
   if (!Array.isArray(raw)) {
     throw new Error('Attachments must be an array');
@@ -197,6 +232,90 @@ const resolveReportedCreator = async (params: {
 // ══════════════════════════════════════════════════════════════════════════
 
 /**
+ * POST /support/attachments/commit
+ *
+ * Commit Cloudflare direct-upload sessions into support attachment refs.
+ * Body: { sessionIds: string[], sessionMeta?: { sessionId, name?, isScreenshot? }[] }
+ */
+export const commitSupportAttachments = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!req.auth) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    try {
+      assertCloudflareEnabled();
+    } catch (error) {
+      if (error instanceof CloudflareImagesDisabledError) {
+        res.status(503).json({
+          success: false,
+          code: 'IMAGES_DISABLED',
+          error: 'Image uploads are temporarily unavailable',
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const currentUser = await User.findOne({ firebaseUid: req.auth.firebaseUid });
+    if (!currentUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const rawIds = req.body?.sessionIds;
+    if (!Array.isArray(rawIds) || rawIds.length === 0) {
+      res.status(400).json({ success: false, error: 'sessionIds must be a non-empty array' });
+      return;
+    }
+    if (rawIds.length > MAX_SUPPORT_ATTACHMENTS) {
+      res.status(400).json({
+        success: false,
+        error: `You can upload up to ${MAX_SUPPORT_ATTACHMENTS} attachments`,
+      });
+      return;
+    }
+
+    const sessionIds = rawIds
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      .map((id) => id.trim());
+
+    const rawMeta = req.body?.sessionMeta;
+    const sessionMeta = Array.isArray(rawMeta)
+      ? rawMeta
+          .filter((m) => m && typeof m === 'object' && typeof (m as any).sessionId === 'string')
+          .map((m) => ({
+            sessionId: String((m as any).sessionId).trim(),
+            name: typeof (m as any).name === 'string' ? (m as any).name : undefined,
+            isScreenshot: Boolean((m as any).isScreenshot),
+          }))
+      : undefined;
+
+    const attachments = await commitSupportAttachmentsFromSessions({
+      userId: currentUser._id.toString(),
+      userObjectId: currentUser._id,
+      sessionIds,
+      sessionMeta,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        attachments: mapSupportAttachmentsForApi(attachments),
+      },
+    });
+  } catch (error) {
+    if (error instanceof SupportAttachmentCommitError) {
+      res.status(error.status).json({ success: false, error: error.message });
+      return;
+    }
+    console.error('❌ [SUPPORT] Commit attachments error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
  * POST /support/ticket
  *
  * Create a support ticket. Role is auto-set from the user's role.
@@ -228,6 +347,8 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       creatorLookupId,
       creatorFirebaseUid,
       attachments,
+      attachmentSessionIds,
+      contactPhone,
     } = req.body;
 
     if (!category || typeof category !== 'string' || category.trim().length < 2) {
@@ -245,17 +366,105 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    let normalizedAttachments: NormalizedSupportAttachment[] = [];
-    try {
-      normalizedAttachments = normalizeSupportAttachments(attachments);
-    } catch (error: any) {
-      res.status(400).json({ success: false, error: error?.message || 'Invalid attachments' });
-      return;
-    }
-
     // Auto-detect role for ticket queue (agency / BD tickets go to super-admin support).
     const ticketRole = resolveTicketRole(currentUser.role);
     const staffPortal = isStaffPortalUser(currentUser.role);
+
+    let normalizedContactPhone: string | undefined;
+    if (!staffPortal) {
+      try {
+        normalizedContactPhone = validateSupportContactPhone(contactPhone);
+      } catch (error: any) {
+        res.status(400).json({ success: false, error: error?.message || 'Invalid phone number' });
+        return;
+      }
+    } else if (typeof contactPhone === 'string' && contactPhone.trim().length > 0) {
+      try {
+        normalizedContactPhone = validateSupportContactPhone(contactPhone);
+      } catch {
+        normalizedContactPhone = contactPhone.trim().slice(0, 20);
+      }
+    }
+
+    const hasLegacyAttachments = attachments != null && (
+      Array.isArray(attachments) ? attachments.length > 0 : true
+    );
+    const hasSessionAttachments =
+      Array.isArray(attachmentSessionIds) && attachmentSessionIds.length > 0;
+
+    if (hasLegacyAttachments && hasSessionAttachments) {
+      res.status(400).json({
+        success: false,
+        error: 'Use either attachments or attachmentSessionIds, not both',
+      });
+      return;
+    }
+
+    let ticketAttachments: ISupportTicketAttachment[] = [];
+
+    if (hasSessionAttachments) {
+      if (attachmentSessionIds.length > MAX_SUPPORT_ATTACHMENTS) {
+        res.status(400).json({
+          success: false,
+          error: `You can upload up to ${MAX_SUPPORT_ATTACHMENTS} attachments`,
+        });
+        return;
+      }
+      try {
+        assertCloudflareEnabled();
+      } catch (error) {
+        if (error instanceof CloudflareImagesDisabledError) {
+          res.status(503).json({
+            success: false,
+            code: 'IMAGES_DISABLED',
+            error: 'Image uploads are temporarily unavailable',
+          });
+          return;
+        }
+        throw error;
+      }
+      const sessionIds = attachmentSessionIds
+        .filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0)
+        .map((id: string) => id.trim());
+      const rawMeta = req.body?.attachmentSessionMeta;
+      const sessionMeta = Array.isArray(rawMeta)
+        ? rawMeta
+            .filter((m) => m && typeof m === 'object' && typeof (m as any).sessionId === 'string')
+            .map((m) => ({
+              sessionId: String((m as any).sessionId).trim(),
+              name: typeof (m as any).name === 'string' ? (m as any).name : undefined,
+              isScreenshot: Boolean((m as any).isScreenshot),
+            }))
+        : undefined;
+      try {
+        ticketAttachments = await commitSupportAttachmentsFromSessions({
+          userId: currentUser._id.toString(),
+          userObjectId: currentUser._id,
+          sessionIds,
+          sessionMeta,
+        });
+      } catch (error) {
+        if (error instanceof SupportAttachmentCommitError) {
+          res.status(error.status).json({ success: false, error: error.message });
+          return;
+        }
+        throw error;
+      }
+    } else if (hasLegacyAttachments) {
+      try {
+        const legacy = normalizeLegacySupportAttachments(attachments);
+        ticketAttachments = legacy.map((a) => ({
+          name: a.name,
+          mimeType: a.mimeType,
+          sizeBytes: a.sizeBytes,
+          dataBase64: a.dataBase64,
+          isScreenshot: a.isScreenshot,
+        }));
+      } catch (error: any) {
+        res.status(400).json({ success: false, error: error?.message || 'Invalid attachments' });
+        return;
+      }
+    }
 
     let ticketSlotReserved = true;
     if (!staffPortal) {
@@ -295,7 +504,8 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
         category: category.trim(),
         subject: subject.trim(),
         message: message.trim(),
-        attachments: normalizedAttachments,
+        contactPhone: normalizedContactPhone,
+        attachments: ticketAttachments,
         priority: ticketPriority,
         source: ticketSource,
         relatedCallId: callId,
@@ -329,24 +539,13 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
 
     invalidateAdminCaches('overview').catch(() => {});
 
+    const serialized = serializeTicketForApi(ticket);
     res.status(201).json({
       success: true,
       data: {
         ticketId: ticket._id.toString(),
-        role: ticket.role,
-        category: ticket.category,
-        subject: ticket.subject,
-        attachments: (ticket.attachments || []).map((attachment) => ({
-          name: attachment.name,
-          mimeType: attachment.mimeType,
-          sizeBytes: attachment.sizeBytes,
-          isScreenshot: Boolean(attachment.isScreenshot),
-          dataBase64: attachment.dataBase64,
-          dataUrl: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
-        })),
-        status: ticket.status,
-        priority: ticket.priority,
-        createdAt: ticket.createdAt.toISOString(),
+        ...serialized,
+        ticket: serialized,
       },
     });
   } catch (error) {
@@ -381,31 +580,7 @@ export const getMyTickets = async (req: Request, res: Response): Promise<void> =
     res.json({
       success: true,
       data: {
-        tickets: tickets.map((t) => ({
-          id: t._id.toString(),
-          role: t.role,
-          category: t.category,
-          subject: t.subject,
-          message: t.message,
-          attachments: (t.attachments || []).map((attachment) => ({
-            name: attachment.name,
-            mimeType: attachment.mimeType,
-            sizeBytes: attachment.sizeBytes,
-            isScreenshot: Boolean(attachment.isScreenshot),
-            dataBase64: attachment.dataBase64,
-            dataUrl: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
-          })),
-          source: t.source || 'other',
-          relatedCallId: t.relatedCallId || null,
-          reportedCreatorUserId: t.reportedCreatorUserId?.toString() || null,
-          reportedCreatorFirebaseUid: t.reportedCreatorFirebaseUid || null,
-          reportedCreatorName: t.reportedCreatorName || null,
-          status: t.status,
-          priority: t.priority,
-          adminNotes: t.adminNotes || null,
-          createdAt: t.createdAt,
-          updatedAt: t.updatedAt,
-        })),
+        tickets: tickets.map((t) => serializeTicketForApi(t)),
       },
     });
   } catch (error) {
