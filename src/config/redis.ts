@@ -3,6 +3,7 @@ import { bumpRedisClose, bumpRedisError } from '../utils/driver-metrics';
 import { logInfo, logError, logWarning } from '../utils/logger';
 
 let redis: Redis | null = null;
+export type RedisEndpointMode = 'internal' | 'public' | 'host-mode' | 'unknown';
 
 /** 0 = IPv4+IPv6 (A/AAAA), 4 = IPv4, 6 = IPv6. Use REDIS_FAMILY=0 if Railway DNS is flaky. */
 function getRedisFamily(): number | undefined {
@@ -11,6 +12,34 @@ function getRedisFamily(): number | undefined {
   const n = parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 0) return undefined;
   return n;
+}
+
+function redactRedisUrl(url: string): string {
+  return url.replace(/:[^:@]+@/, ':****@');
+}
+
+function classifyRedisUrl(url: string): RedisEndpointMode {
+  const normalized = String(url || '').toLowerCase();
+  if (normalized.includes('.railway.internal') || normalized.includes('@redis:')) {
+    return 'internal';
+  }
+  if (normalized.startsWith('rediss://') || normalized.includes('proxy.rlwy.net')) {
+    return 'public';
+  }
+  return 'unknown';
+}
+
+export function getRedisEndpointMode(): RedisEndpointMode {
+  if (process.env.REDIS_URL) {
+    return classifyRedisUrl(process.env.REDIS_URL);
+  }
+  if (process.env.REDIS_PUBLIC_URL) {
+    return classifyRedisUrl(process.env.REDIS_PUBLIC_URL);
+  }
+  if (process.env.REDISHOST) {
+    return 'host-mode';
+  }
+  return 'unknown';
 }
 
 export const getRedis = (): Redis => {
@@ -29,7 +58,14 @@ export const getRedis = (): Redis => {
       throw error;
     }
     
+    if (process.env.REDIS_URL && process.env.REDIS_PUBLIC_URL) {
+      logWarning('Both REDIS_URL and REDIS_PUBLIC_URL are set; REDIS_URL takes precedence', {
+        selectedMode: classifyRedisUrl(process.env.REDIS_URL),
+      });
+    }
+
     if (redisUrl) {
+      const endpointMode = classifyRedisUrl(redisUrl);
       // Use connection URL if provided
       redis = new Redis(redisUrl, {
         ...(family !== undefined ? { family } : {}),
@@ -42,7 +78,8 @@ export const getRedis = (): Redis => {
         connectTimeout: 10000,
       });
       logInfo('Railway Redis client initialized from URL', {
-        url: redisUrl.replace(/:[^:@]+@/, ':****@'), // Mask password in logs
+        endpointMode,
+        url: redactRedisUrl(redisUrl),
       });
     } else {
       // Fall back to individual connection parameters
@@ -66,6 +103,7 @@ export const getRedis = (): Redis => {
         connectTimeout: 10000,
       });
       logInfo('Railway Redis client initialized from individual parameters', {
+        endpointMode: 'host-mode',
         host,
         port,
         username: username || 'default',
@@ -192,6 +230,26 @@ export const SETTLEMENT_CLAIM_TTL_SECONDS = Math.min(
 );
 
 export const BILLING_SETTLEMENT_RETRY_KEY = 'billing:settlement-retry';
+export const BILLING_SETTLEMENT_RETRY_PAYLOAD_PREFIX = 'billing:settlement-retry:payload:';
+export const BILLING_SETTLEMENT_RETRY_DEDUP_PREFIX = 'billing:settlement-retry:dedup:';
+export const billingSettlementRetryPayloadKey = (callId: string): string =>
+  `${BILLING_SETTLEMENT_RETRY_PAYLOAD_PREFIX}${callId}`;
+export const billingSettlementRetryDedupKey = (callId: string): string =>
+  `${BILLING_SETTLEMENT_RETRY_DEDUP_PREFIX}${callId}`;
+
+export const FINALIZE_INFLIGHT_PREFIX = 'billing:finalize:inflight:';
+export const finalizeInflightKey = (callId: string): string =>
+  `${FINALIZE_INFLIGHT_PREFIX}${callId}`;
+
+export const BILLING_WATCHDOG_COOLDOWN_PREFIX = 'billing:watchdog:recovering:cooldown:';
+export const BILLING_WATCHDOG_ATTEMPTS_PREFIX = 'billing:watchdog:recovering:attempts:';
+export const BILLING_RECOVERY_DEADLETTER_PREFIX = 'billing:recovery:deadletter:';
+export const billingWatchdogCooldownKey = (callId: string): string =>
+  `${BILLING_WATCHDOG_COOLDOWN_PREFIX}${callId}`;
+export const billingWatchdogAttemptsKey = (callId: string): string =>
+  `${BILLING_WATCHDOG_ATTEMPTS_PREFIX}${callId}`;
+export const billingRecoveryDeadLetterKey = (callId: string): string =>
+  `${BILLING_RECOVERY_DEADLETTER_PREFIX}${callId}`;
 
 // 🔥 FIX 3: Distributed lock for batch processor
 export const BATCH_PROCESSOR_LOCK_KEY = 'lock:billing:batch_processor';

@@ -26,10 +26,11 @@ export interface ICallBillingCheckpoint extends mongoose.Document {
     | 'SETTLING'
     | 'SETTLED'
     | 'FAILED'
-    | 'RECOVERING';
+    | 'RECOVERING'
+    | 'FAILED_RECOVERY_SETTLEMENT';
   schemaVersion: number;
   version: number;
-  status: 'active' | 'settling' | 'settled';
+  status: 'active' | 'settling' | 'settled' | 'failed';
   updatedAt: Date;
 }
 
@@ -50,7 +51,17 @@ const callBillingCheckpointSchema = new Schema<ICallBillingCheckpoint>(
     billingSequence: { type: Number, required: true, default: 0 },
     lifecycleState: {
       type: String,
-      enum: ['INIT', 'STARTING', 'ACTIVE', 'ENDING', 'SETTLING', 'SETTLED', 'FAILED', 'RECOVERING'],
+      enum: [
+        'INIT',
+        'STARTING',
+        'ACTIVE',
+        'ENDING',
+        'SETTLING',
+        'SETTLED',
+        'FAILED',
+        'RECOVERING',
+        'FAILED_RECOVERY_SETTLEMENT',
+      ],
       required: true,
       default: 'INIT',
       index: true,
@@ -59,7 +70,7 @@ const callBillingCheckpointSchema = new Schema<ICallBillingCheckpoint>(
     version: { type: Number, required: true, default: 1 },
     status: {
       type: String,
-      enum: ['active', 'settling', 'settled'],
+      enum: ['active', 'settling', 'settled', 'failed'],
       default: 'active',
       index: true,
     },

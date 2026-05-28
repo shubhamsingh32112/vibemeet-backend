@@ -21,12 +21,16 @@ test('allows expected lifecycle transitions', () => {
   assert.equal(run('ENDING', 'SETTLING').valid, true);
   assert.equal(run('SETTLING', 'SETTLED').valid, true);
   assert.equal(run('SETTLING', 'FAILED').valid, true);
+  assert.equal(run('FAILED', 'SETTLING').valid, true);
+  assert.equal(run('RECOVERING', 'FAILED_RECOVERY_SETTLEMENT').valid, true);
+  assert.equal(run('SETTLING', 'FAILED_RECOVERY_SETTLEMENT').valid, true);
 });
 
 test('rejects invalid lifecycle transitions', () => {
   assert.equal(run('ACTIVE', 'STARTING').valid, false);
   assert.equal(run('SETTLED', 'ACTIVE').valid, false);
   assert.equal(run('FAILED', 'ACTIVE').valid, false);
+  assert.equal(run('FAILED_RECOVERY_SETTLEMENT', 'ACTIVE').valid, false);
   assert.equal(run('SETTLED', 'ENDING').valid, false);
 });
 

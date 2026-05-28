@@ -24,8 +24,9 @@ export interface BillingCheckpointSnapshotInput {
     | 'SETTLING'
     | 'SETTLED'
     | 'FAILED'
-    | 'RECOVERING';
-  status?: 'active' | 'settling' | 'settled';
+    | 'RECOVERING'
+    | 'FAILED_RECOVERY_SETTLEMENT';
+  status?: 'active' | 'settling' | 'settled' | 'failed';
 }
 
 export async function upsertBillingCheckpoint(data: {

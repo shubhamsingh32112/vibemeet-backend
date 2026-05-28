@@ -3,13 +3,21 @@ import {
   getRedis,
   ACTIVE_CALL_BY_USER_PREFIX,
   callSessionKey,
+  billingWatchdogCooldownKey,
+  billingWatchdogAttemptsKey,
+  billingRecoveryDeadLetterKey,
 } from '../../config/redis';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { recoverBillingScheduleForCall } from './billing-recovery';
-import { finalizeCallSession } from './billing-session-finalization.service';
+import {
+  finalizeCallSession,
+  getRecoveryOwnerInstanceId,
+  moveCallToRecoveryDeadLetter,
+} from './billing-session-finalization.service';
 import { featureFlags } from '../../config/feature-flags';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
+import { randomUUID } from 'crypto';
 
 let watchdogTimer: NodeJS.Timeout | null = null;
 
@@ -24,6 +32,14 @@ const STALLED_ACTIVE_MS = readInt('BILLING_WATCHDOG_STALLED_ACTIVE_MS', 15000, 5
 const STALLED_SETTLING_MS = readInt('BILLING_WATCHDOG_STALLED_SETTLING_MS', 60000, 15000, 600000);
 const STALLED_RECOVERING_MS = readInt('BILLING_WATCHDOG_STALLED_RECOVERING_MS', 30000, 5000, 600000);
 const CHECKPOINT_LAG_MS = readInt('BILLING_WATCHDOG_CHECKPOINT_LAG_MS', 20000, 10000, 300000);
+const WATCHDOG_COOLDOWN_SECONDS = readInt('BILLING_WATCHDOG_RECOVERY_COOLDOWN_SECONDS', 45, 10, 600);
+const WATCHDOG_ATTEMPT_CAP = readInt('BILLING_WATCHDOG_RECOVERY_ATTEMPT_CAP', 6, 1, 100);
+const WATCHDOG_ATTEMPT_TTL_SECONDS = readInt(
+  'BILLING_WATCHDOG_RECOVERY_ATTEMPT_TTL_SECONDS',
+  3600,
+  60,
+  86400
+);
 
 type BillingWatchdogSession = {
   callId: string;
@@ -58,6 +74,8 @@ async function getActiveCallIds(): Promise<Set<string>> {
 async function runWatchdogPass(io: Server): Promise<void> {
   const redis = getRedis();
   const now = Date.now();
+  const watchdogPassId = randomUUID();
+  const recoveryOwnerInstanceId = getRecoveryOwnerInstanceId();
   const callIds = await getActiveCallIds();
   recordBillingMetric('billing_watchdog_active_calls', callIds.size, {});
 
@@ -86,22 +104,45 @@ async function runWatchdogPass(io: Server): Promise<void> {
         logWarning('Watchdog detected stalled ACTIVE billing session', {
           callId,
           stalledForMs,
+          watchdogPassId,
+          recoveryOwnerInstanceId,
         });
         await recoverBillingScheduleForCall(callId, 'reconciliation');
       }
 
       if (lifecycleState === 'SETTLING' && stalledForMs > STALLED_SETTLING_MS) {
-        await transitionBillingStateWithAudit({
-          callId,
-          from: 'SETTLING',
-          to: 'FAILED',
-          source: 'billing.watchdog',
-          reason: 'stalled_settling_detected',
-        });
+        if (await redis.get(billingRecoveryDeadLetterKey(callId))) {
+          continue;
+        }
+        if (await redis.get(billingWatchdogCooldownKey(callId))) {
+          recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+            callId,
+            reason: 'cooldown_skip',
+          });
+          continue;
+        }
+        const attempt = await redis.incr(billingWatchdogAttemptsKey(callId));
+        await redis.expire(billingWatchdogAttemptsKey(callId), WATCHDOG_ATTEMPT_TTL_SECONDS).catch(() => 0);
+        if (attempt > WATCHDOG_ATTEMPT_CAP) {
+          await moveCallToRecoveryDeadLetter(
+            callId,
+            'watchdog_attempt_cap_reached',
+            'reconciliation_worker'
+          );
+          continue;
+        }
+        await redis.setex(
+          billingWatchdogCooldownKey(callId),
+          WATCHDOG_COOLDOWN_SECONDS,
+          JSON.stringify({ attempt, watchdogPassId, recoveryOwnerInstanceId, at: now })
+        );
         recordBillingMetric('billing_watchdog_stalled_settling', 1, { callId });
         logWarning('Watchdog detected stalled SETTLING billing session', {
           callId,
           stalledForMs,
+          watchdogAttempt: attempt,
+          watchdogPassId,
+          recoveryOwnerInstanceId,
         });
         await finalizeCallSession(io, {
           callId,
@@ -111,10 +152,35 @@ async function runWatchdogPass(io: Server): Promise<void> {
       }
 
       if (lifecycleState === 'RECOVERING' && stalledForMs > STALLED_RECOVERING_MS) {
+        if (await redis.get(billingRecoveryDeadLetterKey(callId))) {
+          continue;
+        }
+        if (await redis.get(billingWatchdogCooldownKey(callId))) {
+          recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+            callId,
+            reason: 'cooldown_skip',
+          });
+          continue;
+        }
+        const attempt = await redis.incr(billingWatchdogAttemptsKey(callId));
+        await redis.expire(billingWatchdogAttemptsKey(callId), WATCHDOG_ATTEMPT_TTL_SECONDS).catch(() => 0);
+        if (attempt > WATCHDOG_ATTEMPT_CAP) {
+          await moveCallToRecoveryDeadLetter(
+            callId,
+            'watchdog_attempt_cap_reached',
+            'reconciliation_worker'
+          );
+          continue;
+        }
+        await redis.setex(
+          billingWatchdogCooldownKey(callId),
+          WATCHDOG_COOLDOWN_SECONDS,
+          JSON.stringify({ attempt, watchdogPassId, recoveryOwnerInstanceId, at: now })
+        );
         await transitionBillingStateWithAudit({
           callId,
           from: 'RECOVERING',
-          to: 'FAILED',
+          to: 'ENDING',
           source: 'billing.watchdog',
           reason: 'stalled_recovering_detected',
         });
@@ -122,6 +188,9 @@ async function runWatchdogPass(io: Server): Promise<void> {
         logWarning('Watchdog detected stalled RECOVERING billing session', {
           callId,
           stalledForMs,
+          watchdogAttempt: attempt,
+          watchdogPassId,
+          recoveryOwnerInstanceId,
         });
         await finalizeCallSession(io, {
           callId,

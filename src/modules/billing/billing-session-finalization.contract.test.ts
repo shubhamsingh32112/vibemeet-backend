@@ -52,6 +52,8 @@ test('finalizer keeps duplicate suppression and retry safeguards', () => {
   assert.ok(src.includes('enqueueSettlementRetry(params)'));
   assert.ok(src.includes('settlementClaimKey(callId)'));
   assert.ok(src.includes('RELEASE_IF_MATCH_LUA'));
+  assert.ok(src.includes('finalizeInflightKey(callId)'));
+  assert.ok(src.includes('moveCallToRecoveryDeadLetter'));
 });
 
 test('finalizer keeps ordering: remove scheduling before persistence', () => {
@@ -68,4 +70,11 @@ test('finalizer checkpoints SETTLED before billing:settled emit', () => {
   const emitIdx = src.indexOf('emitBillingSettledFromSnapshot(');
   assert.ok(checkpointIdx >= 0 && emitIdx >= 0);
   assert.ok(checkpointIdx < emitIdx, 'checkpoint must persist before settled emit');
+});
+
+test('watchdog recovery path includes cooldown and attempt cap guards', () => {
+  const src = readFileSync(join(__dirname, 'billing-watchdog.service.ts'), 'utf8');
+  assert.ok(src.includes('WATCHDOG_ATTEMPT_CAP'));
+  assert.ok(src.includes('billingWatchdogCooldownKey(callId)'));
+  assert.ok(src.includes('moveCallToRecoveryDeadLetter'));
 });

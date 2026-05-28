@@ -15,6 +15,12 @@ import {
   settlementClaimKey,
   SETTLEMENT_CLAIM_TTL_SECONDS,
   BILLING_SETTLEMENT_RETRY_KEY,
+  billingSettlementRetryPayloadKey,
+  billingSettlementRetryDedupKey,
+  finalizeInflightKey,
+  billingWatchdogAttemptsKey,
+  billingWatchdogCooldownKey,
+  billingRecoveryDeadLetterKey,
 } from '../../config/redis';
 import { getBillingCheckpoint, upsertBillingCheckpointSnapshot } from './billing-checkpoint.service';
 import { Call } from '../video/call.model';
@@ -36,6 +42,7 @@ import { emitBillingSettledFromSnapshot } from './billing-emitter.service';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
+import { cancelBillingCycleJob } from './billing.queue';
 
 export type SettlementReason =
   | 'insufficient_coins'
@@ -55,7 +62,7 @@ export type SettlementSource =
   | 'reconciliation_worker'
   | 'deferred_pending_end';
 
-export type FinalizeStatus = 'settled' | 'duplicate' | 'pending_retry' | 'failed';
+export type FinalizeStatus = 'settled' | 'duplicate' | 'pending_retry' | 'failed' | 'dead_lettered';
 
 export interface FinalizeCallSessionParams {
   callId: string;
@@ -89,6 +96,25 @@ const SETTLE_LOCK_PREFIX = 'settle:lock:';
 const settleLockKey = (callId: string): string => `${SETTLE_LOCK_PREFIX}${callId}`;
 const SETTLE_LOCK_TTL_SECONDS = 120;
 const SETTLE_LOCK_HEARTBEAT_MS = 30_000;
+const FINALIZE_INFLIGHT_TTL_SECONDS = Math.min(
+  600,
+  Math.max(30, parseInt(process.env.BILLING_FINALIZE_INFLIGHT_TTL_SECONDS || '120', 10) || 120)
+);
+const RETRY_DEDUP_TTL_SECONDS = Math.min(
+  900,
+  Math.max(30, parseInt(process.env.BILLING_SETTLEMENT_RETRY_DEDUP_TTL_SECONDS || '180', 10) || 180)
+);
+const RETRY_MAX_AGE_MS = Math.min(
+  3_600_000,
+  Math.max(
+    60_000,
+    parseInt(process.env.BILLING_SETTLEMENT_RETRY_MAX_AGE_MS || '900000', 10) || 900_000
+  )
+);
+const RETRY_JITTER_MS = Math.min(
+  5000,
+  Math.max(0, parseInt(process.env.BILLING_SETTLEMENT_RETRY_JITTER_MS || '500', 10) || 500)
+);
 
 const RELEASE_IF_MATCH_LUA = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -97,11 +123,17 @@ end
 return 0
 `;
 
+const DEAD_LETTER_LIFECYCLE_STATE = 'FAILED_RECOVERY_SETTLEMENT' as const;
+
 function billingInstanceId(): string {
   return (
     process.env.BILLING_INSTANCE_ID?.trim() ||
     `${os.hostname()}:${process.pid}`
   );
+}
+
+export function getRecoveryOwnerInstanceId(): string {
+  return billingInstanceId();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -135,6 +167,125 @@ async function appendSettlementAttempt(
       },
     }
   ).catch(() => {});
+}
+
+async function clearSettlementRetryArtifacts(callId: string): Promise<void> {
+  const redis = getRedis();
+  await Promise.all([
+    redis.zrem(BILLING_SETTLEMENT_RETRY_KEY, callId).catch(() => 0),
+    redis.del(billingSettlementRetryPayloadKey(callId)).catch(() => 0),
+    redis.del(billingSettlementRetryDedupKey(callId)).catch(() => 0),
+  ]);
+}
+
+type DrainArtifactsReason =
+  | 'attempt_cap_reached'
+  | 'dead_letter_transition'
+  | 'convergence_impossible'
+  | 'manual_cleanup';
+
+export async function drainSettlementArtifacts(
+  callId: string,
+  reason: DrainArtifactsReason
+): Promise<void> {
+  const redis = getRedis();
+  await Promise.all([
+    cancelBillingCycleJob(callId).catch(() => {}),
+    clearSettlementRetryArtifacts(callId),
+    redis.del(settlementClaimKey(callId)).catch(() => 0),
+    redis.del(settleLockKey(callId)).catch(() => 0),
+    redis.del(finalizeInflightKey(callId)).catch(() => 0),
+    redis.del(billingWatchdogCooldownKey(callId)).catch(() => 0),
+    redis.del(billingWatchdogAttemptsKey(callId)).catch(() => 0),
+  ]);
+  logWarning('billing_settlement_artifacts_drained', { callId, reason });
+}
+
+type DeadLetterReason =
+  | 'watchdog_attempt_cap_reached'
+  | 'retry_cap_reached'
+  | 'retry_age_exhausted'
+  | 'cooldown_exhausted'
+  | 'convergence_impossible';
+
+export async function moveCallToRecoveryDeadLetter(
+  callId: string,
+  reason: DeadLetterReason,
+  source: SettlementSource
+): Promise<void> {
+  const redis = getRedis();
+  const recoveryOwnerInstanceId = billingInstanceId();
+  const now = Date.now();
+  const deadLetterKey = billingRecoveryDeadLetterKey(callId);
+  await redis.setex(
+    deadLetterKey,
+    Math.max(300, BILLING_MAX_SETTLING_MS / 1000),
+    JSON.stringify({ reason, source, at: now, recoveryOwnerInstanceId })
+  );
+
+  try {
+    const sessionRaw = await redis.get(callSessionKey(callId));
+    if (sessionRaw) {
+      const session = JSON.parse(sessionRaw) as {
+        lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING' | 'FAILED_RECOVERY_SETTLEMENT';
+      };
+      const fromState = (session.lifecycleState || 'FAILED') as
+        | 'INIT'
+        | 'STARTING'
+        | 'ACTIVE'
+        | 'ENDING'
+        | 'SETTLING'
+        | 'SETTLED'
+        | 'FAILED'
+        | 'RECOVERING'
+        | 'FAILED_RECOVERY_SETTLEMENT';
+      const transition = await transitionBillingStateWithAudit({
+        callId,
+        from: fromState,
+        to: DEAD_LETTER_LIFECYCLE_STATE,
+        source: `billing.${source}.dead_letter`,
+        reason,
+      });
+      session.lifecycleState = transition.next;
+      await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
+    }
+  } catch (error) {
+    logError('billing_recovery_dead_letter_transition_failed', error, { callId, reason, source });
+  }
+
+  await Call.updateOne(
+    { callId },
+    {
+      $set: {
+        'settlement.status': 'failed_recovery_settlement',
+        'settlement.reason': reason,
+        'settlement.source': source,
+        'settlement.updatedAt': new Date(now),
+        'settlement.ownerInstanceId': recoveryOwnerInstanceId,
+      },
+    }
+  ).catch(() => {});
+
+  await appendSettlementAttempt(callId, {
+    source,
+    reason: 'reconciliation',
+    result: 'failed',
+    error: `dead_letter:${reason}`,
+  });
+  await drainSettlementArtifacts(callId, 'dead_letter_transition');
+  recordBillingMetric('billing_recovery_dead_letter_total', 1, {
+    callId,
+    reason,
+    source,
+    recoveryOwnerInstanceId,
+  });
+  logError('billing_recovery_dead_letter_transition', new Error(reason), {
+    callId,
+    reason,
+    source,
+    recoveryOwnerInstanceId,
+    alert: true,
+  });
 }
 
 async function isAlreadySettled(callId: string): Promise<boolean> {
@@ -228,24 +379,63 @@ export async function enqueueSettlementRetry(
   params: FinalizeCallSessionParams & { attempt?: number }
 ): Promise<void> {
   const redis = getRedis();
+  const now = Date.now();
   const attempt = (params.attempt ?? 0) + 1;
+  const enqueuedAt = (params as { enqueuedAt?: number }).enqueuedAt ?? now;
+  const ageMs = Math.max(0, now - enqueuedAt);
+  const recoveryOwnerInstanceId = billingInstanceId();
+
+  if (ageMs > RETRY_MAX_AGE_MS) {
+    await moveCallToRecoveryDeadLetter(params.callId, 'retry_age_exhausted', params.source);
+    return;
+  }
+
   if (attempt > BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS) {
     recordBillingMetric('billing_finalize_failure', 1, {
       callId: params.callId,
       source: params.source,
     });
+    await moveCallToRecoveryDeadLetter(params.callId, 'retry_cap_reached', params.source);
     return;
   }
-  const score = Date.now() + Math.min(60_000, 1000 * 2 ** attempt);
-  await redis.zadd(
-    BILLING_SETTLEMENT_RETRY_KEY,
-    score,
-    JSON.stringify({ ...params, attempt })
+
+  const dedupKey = billingSettlementRetryDedupKey(params.callId);
+  const dedupeSet = await redis.set(
+    dedupKey,
+    JSON.stringify({ attempt, at: now }),
+    'EX',
+    RETRY_DEDUP_TTL_SECONDS,
+    'NX'
   );
+  if (dedupeSet !== 'OK') {
+    recordBillingMetric('billing_finalize_retry_deduped', 1, {
+      callId: params.callId,
+      source: params.source,
+      attempt: String(attempt),
+    });
+    return;
+  }
+
+  const jitterMs = RETRY_JITTER_MS > 0 ? Math.floor(Math.random() * (RETRY_JITTER_MS + 1)) : 0;
+  const score = now + Math.min(60_000, 1000 * 2 ** attempt) + jitterMs;
+  const payload = JSON.stringify({
+    ...params,
+    attempt,
+    enqueuedAt,
+    lastEnqueuedAt: now,
+    recoveryOwnerInstanceId,
+  });
+  await redis.setex(
+    billingSettlementRetryPayloadKey(params.callId),
+    Math.max(120, Math.floor(RETRY_MAX_AGE_MS / 1000)),
+    payload
+  );
+  await redis.zadd(BILLING_SETTLEMENT_RETRY_KEY, score, params.callId);
   recordBillingMetric('billing_finalize_retry_total', 1, {
     callId: params.callId,
     source: params.source,
     attempt: String(attempt),
+    recoveryOwnerInstanceId,
   });
 }
 
@@ -253,17 +443,35 @@ export async function processSettlementRetryQueue(io: Server, maxItems = 20): Pr
   const redis = getRedis();
   const now = Date.now();
   const items = await redis.zrangebyscore(BILLING_SETTLEMENT_RETRY_KEY, 0, now, 'LIMIT', 0, maxItems);
-  for (const raw of items) {
-    await redis.zrem(BILLING_SETTLEMENT_RETRY_KEY, raw);
+  for (const item of items) {
+    await redis.zrem(BILLING_SETTLEMENT_RETRY_KEY, item);
     try {
-      const parsed = JSON.parse(raw) as FinalizeCallSessionParams & { attempt?: number };
+      const payloadKey = billingSettlementRetryPayloadKey(item);
+      const payloadRaw = await redis.get(payloadKey);
+      if (!payloadRaw) {
+        if (item.startsWith('{')) {
+          const legacy = JSON.parse(item) as FinalizeCallSessionParams;
+          await finalizeCallSession(io, {
+            callId: legacy.callId,
+            reason: legacy.reason,
+            source: legacy.source,
+          });
+        }
+        await redis.del(billingSettlementRetryDedupKey(item)).catch(() => 0);
+        continue;
+      }
+      const parsed = JSON.parse(payloadRaw) as FinalizeCallSessionParams & { attempt?: number };
+      await Promise.all([
+        redis.del(payloadKey).catch(() => 0),
+        redis.del(billingSettlementRetryDedupKey(item)).catch(() => 0),
+      ]);
       await finalizeCallSession(io, {
         callId: parsed.callId,
         reason: parsed.reason,
         source: parsed.source,
       });
     } catch (e) {
-      logError('Settlement retry consumer failed', e, { raw });
+      logError('Settlement retry consumer failed', e, { item });
     }
   }
 }
@@ -390,13 +598,13 @@ async function runPostPersistRedisCleanup(
 
 async function checkpointLifecycleState(
   callId: string,
-  targetState: 'SETTLING' | 'SETTLED' | 'FAILED',
-  status: 'settling' | 'settled'
-): Promise<void> {
+  targetState: 'SETTLING' | 'SETTLED' | 'FAILED' | 'FAILED_RECOVERY_SETTLEMENT',
+  status: 'settling' | 'settled' | 'failed'
+): Promise<boolean> {
   try {
     const redis = getRedis();
     const sessionRaw = await redis.get(callSessionKey(callId));
-    if (!sessionRaw) return;
+    if (!sessionRaw) return false;
     const session = JSON.parse(sessionRaw) as {
       userMongoId?: string;
       creatorMongoId?: string;
@@ -409,7 +617,7 @@ async function checkpointLifecycleState(
       totalDeductedMicros?: number;
       totalEarnedMicros?: number;
       billingSequence?: number;
-      lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING';
+      lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING' | 'FAILED_RECOVERY_SETTLEMENT';
     };
     if (
       !session.userMongoId ||
@@ -417,7 +625,7 @@ async function checkpointLifecycleState(
       !session.userFirebaseUid ||
       !session.creatorFirebaseUid
     ) {
-      return;
+      return false;
     }
     const [introRaw, walletRaw] = await Promise.all([
       redis.get(callUserIntroMicrosKey(callId)),
@@ -435,15 +643,41 @@ async function checkpointLifecycleState(
       | 'SETTLING'
       | 'SETTLED'
       | 'FAILED'
-      | 'RECOVERING';
-    const transition = await transitionBillingStateWithAudit({
-      callId,
-      from: currentState,
-      to: targetState,
-      source: 'billing.finalization.checkpoint',
-      reason: `checkpoint_${status}`,
-    });
-    session.lifecycleState = transition.next;
+      | 'RECOVERING'
+      | 'FAILED_RECOVERY_SETTLEMENT';
+    const transitionPlan: Array<
+      'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'FAILED_RECOVERY_SETTLEMENT'
+    > = [];
+    if (targetState === 'SETTLING' && (currentState === 'ACTIVE' || currentState === 'RECOVERING')) {
+      transitionPlan.push('ENDING', 'SETTLING');
+    } else if (targetState === 'SETTLING') {
+      transitionPlan.push('SETTLING');
+    } else {
+      transitionPlan.push(targetState);
+    }
+
+    let nextState = currentState;
+    for (const nextTarget of transitionPlan) {
+      const transition = await transitionBillingStateWithAudit({
+        callId,
+        from: nextState,
+        to: nextTarget,
+        source: 'billing.finalization.checkpoint',
+        reason: `checkpoint_${status}`,
+      });
+      if (!transition.valid) {
+        logWarning('billing_lifecycle_checkpoint_transition_blocked', {
+          callId,
+          from: nextState,
+          requestedTo: nextTarget,
+          targetState,
+          status,
+        });
+        break;
+      }
+      nextState = transition.next;
+    }
+    session.lifecycleState = nextState;
     await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
 
     await upsertBillingCheckpointSnapshot({
@@ -463,11 +697,13 @@ async function checkpointLifecycleState(
       totalDeductedMicros: Math.max(0, Number(session.totalDeductedMicros) || 0),
       totalEarnedMicros: Math.max(0, Number(session.totalEarnedMicros) || 0),
       billingSequence: Math.max(0, Number(session.billingSequence) || 0),
-      lifecycleState: transition.next,
+      lifecycleState: nextState,
       status,
     });
+    return nextState === targetState;
   } catch (error) {
     logError('Failed lifecycle checkpoint upsert', error, { callId, targetState });
+    return false;
   }
 }
 
@@ -481,6 +717,9 @@ export async function finalizeCallSession(
 ): Promise<FinalizeResult> {
   const { callId, reason, source } = params;
   const finalizeAttemptId = crypto.randomUUID();
+  const recoveryOwnerInstanceId = billingInstanceId();
+  const reconciliationWorkerId =
+    source === 'reconciliation_worker' ? recoveryOwnerInstanceId : undefined;
 
   if (!isUnifiedBillingFinalizerEnabled()) {
     await settleCall(io, callId);
@@ -495,6 +734,8 @@ export async function finalizeCallSession(
     source,
     reason,
     finalizeAttemptId,
+    recoveryOwnerInstanceId,
+    reconciliationWorkerId,
     ...snapshotMeta,
     ...partyContext,
   });
@@ -503,9 +744,50 @@ export async function finalizeCallSession(
     source,
     reason,
     finalizeAttemptId,
+    recoveryOwnerInstanceId,
+    reconciliationWorkerId,
     ...snapshotMeta,
     ...partyContext,
   });
+
+  const redis = getRedis();
+  const deadLetterRaw = await redis.get(billingRecoveryDeadLetterKey(callId));
+  if (deadLetterRaw) {
+    logWarning('billing_finalize_dead_letter_suppressed', {
+      callId,
+      source,
+      reason,
+      finalizeAttemptId,
+      suppressionReason: 'recovery_dead_letter',
+      recoveryOwnerInstanceId,
+      reconciliationWorkerId,
+    });
+    return { status: 'dead_lettered', callId };
+  }
+
+  const inflightToken = crypto.randomUUID();
+  const inflightOk = await redis.set(
+    finalizeInflightKey(callId),
+    inflightToken,
+    'EX',
+    FINALIZE_INFLIGHT_TTL_SECONDS,
+    'NX'
+  );
+  if (inflightOk !== 'OK') {
+    logInfo('billing_finalize_duplicate_suppressed', {
+      callId,
+      source,
+      reason,
+      finalizeAttemptId,
+      duplicateSuppression: 'inflight_guard_hit',
+      suppressionReason: 'inflight_guard_hit',
+      recoveryOwnerInstanceId,
+      reconciliationWorkerId,
+      ...snapshotMeta,
+    });
+    recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
+    return { status: 'duplicate', callId };
+  }
 
   if (await isAlreadySettled(callId)) {
     recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
@@ -521,12 +803,12 @@ export async function finalizeCallSession(
       finalizeAttemptId,
       ...snapshotMeta,
     });
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'duplicate', callId };
   }
 
   await tryStaleSettlingTakeover(callId);
 
-  const redis = getRedis();
   const ownerToken = crypto.randomUUID();
   const ownerInstanceId = billingInstanceId();
   const claimPayload = JSON.stringify({
@@ -555,9 +837,13 @@ export async function finalizeCallSession(
         duplicateSuppression: 'claim_contention_poll_settled',
         ...snapshotMeta,
       });
+      await redis
+        .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
+        .catch(() => {});
       return { status: 'duplicate', callId };
     }
     await enqueueSettlementRetry(params);
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'pending_retry', callId };
   }
 
@@ -583,10 +869,14 @@ export async function finalizeCallSession(
         duplicateSuppression: 'settle_lock_contention_poll_settled',
         ...snapshotMeta,
       });
+      await redis
+        .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
+        .catch(() => {});
       return { status: 'duplicate', callId };
     }
     recordBillingMetric('billing_finalize_claim_timeout_total', 1, { callId, source });
     await enqueueSettlementRetry(params);
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'pending_retry', callId };
   }
 
@@ -600,7 +890,11 @@ export async function finalizeCallSession(
 
   try {
     settlementVersion = await markCallSettling(callId, source, reason, ownerToken, ownerInstanceId);
-    await checkpointLifecycleState(callId, 'SETTLING', 'settling');
+    const checkpointOk = await checkpointLifecycleState(callId, 'SETTLING', 'settling');
+    if (!checkpointOk) {
+      await moveCallToRecoveryDeadLetter(callId, 'convergence_impossible', source);
+      return { status: 'dead_lettered', callId };
+    }
 
     await billingService.flushBillingToQuiescence(io, callId);
     const flushMarkerRaw = await redis.get(finalFlushMarkerKey(callId));
@@ -682,6 +976,8 @@ export async function finalizeCallSession(
       source,
       reason,
       finalizeAttemptId,
+      recoveryOwnerInstanceId,
+      reconciliationWorkerId,
       ...partyContext,
       durationSeconds: persistResult.durationSeconds,
       coinsDeducted: persistResult.totalDeducted,
@@ -694,6 +990,8 @@ export async function finalizeCallSession(
       source,
       reason,
       finalizeAttemptId,
+      recoveryOwnerInstanceId,
+      reconciliationWorkerId,
       ...partyContext,
       settlementVersion,
       ...snapshotMeta,
@@ -708,12 +1006,13 @@ export async function finalizeCallSession(
       durationSeconds: persistResult.durationSeconds,
     };
   } catch (error) {
-    await checkpointLifecycleState(callId, 'FAILED', 'settling');
+    await checkpointLifecycleState(callId, 'FAILED', 'failed');
     logError('billing_finalize_failure', error, {
       callId,
       source,
       reason,
       finalizeAttemptId,
+      recoveryOwnerInstanceId,
       ...snapshotMeta,
       ...partyContext,
     });
@@ -722,6 +1021,7 @@ export async function finalizeCallSession(
       source,
       reason,
       finalizeAttemptId,
+      recoveryOwnerInstanceId,
       ...snapshotMeta,
       ...partyContext,
     });
@@ -740,5 +1040,6 @@ export async function finalizeCallSession(
     clearInterval(lockHeartbeat);
     await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
     await redis.del(settlementClaimKey(callId)).catch(() => {});
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
   }
 }

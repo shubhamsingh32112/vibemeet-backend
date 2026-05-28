@@ -28,7 +28,7 @@ export interface ICall extends Document {
   isSettled?: boolean; // Whether billing has been processed
 
   settlement?: {
-    status: 'pending' | 'settling' | 'settled' | 'failed';
+    status: 'pending' | 'settling' | 'settled' | 'failed' | 'failed_recovery_settlement';
     source?: string;
     reason?: string;
     settledAt?: Date;
@@ -140,7 +140,7 @@ const callSchema = new Schema<ICall>(
     settlement: {
       status: {
         type: String,
-        enum: ['pending', 'settling', 'settled', 'failed'],
+        enum: ['pending', 'settling', 'settled', 'failed', 'failed_recovery_settlement'],
       },
       source: { type: String },
       reason: { type: String },

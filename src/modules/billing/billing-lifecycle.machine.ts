@@ -10,7 +10,8 @@ export type BillingLifecycleState =
   | 'SETTLING'
   | 'SETTLED'
   | 'FAILED'
-  | 'RECOVERING';
+  | 'RECOVERING'
+  | 'FAILED_RECOVERY_SETTLEMENT';
 
 type TransitionRequest = {
   callId: string;
@@ -29,12 +30,25 @@ type TransitionResult = {
 const ALLOWED_TRANSITIONS: Record<BillingLifecycleState, ReadonlySet<BillingLifecycleState>> = {
   INIT: new Set<BillingLifecycleState>(['STARTING', 'ACTIVE', 'FAILED']),
   STARTING: new Set<BillingLifecycleState>(['ACTIVE', 'ENDING', 'FAILED', 'RECOVERING']),
-  ACTIVE: new Set<BillingLifecycleState>(['ENDING', 'RECOVERING', 'FAILED']),
-  RECOVERING: new Set<BillingLifecycleState>(['ACTIVE', 'ENDING', 'FAILED']),
-  ENDING: new Set<BillingLifecycleState>(['SETTLING', 'SETTLED', 'FAILED']),
-  SETTLING: new Set<BillingLifecycleState>(['SETTLED', 'FAILED']),
+  ACTIVE: new Set<BillingLifecycleState>([
+    'ENDING',
+    'RECOVERING',
+    'SETTLING',
+    'FAILED',
+    'FAILED_RECOVERY_SETTLEMENT',
+  ]),
+  RECOVERING: new Set<BillingLifecycleState>([
+    'ACTIVE',
+    'ENDING',
+    'SETTLING',
+    'FAILED',
+    'FAILED_RECOVERY_SETTLEMENT',
+  ]),
+  ENDING: new Set<BillingLifecycleState>(['SETTLING', 'SETTLED', 'FAILED', 'FAILED_RECOVERY_SETTLEMENT']),
+  SETTLING: new Set<BillingLifecycleState>(['SETTLED', 'FAILED', 'FAILED_RECOVERY_SETTLEMENT']),
   SETTLED: new Set<BillingLifecycleState>([]),
-  FAILED: new Set<BillingLifecycleState>([]),
+  FAILED: new Set<BillingLifecycleState>(['SETTLING', 'FAILED_RECOVERY_SETTLEMENT']),
+  FAILED_RECOVERY_SETTLEMENT: new Set<BillingLifecycleState>([]),
 };
 
 export function transitionBillingState(req: TransitionRequest): TransitionResult {
