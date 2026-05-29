@@ -1,5 +1,5 @@
 import { Server } from 'socket.io';
-import { Call } from './call.model';
+import { Call, ICall } from './call.model';
 import { getRedis } from '../../config/redis';
 import { finalizeCallSession } from '../billing/billing-session-finalization.service';
 import { finalizeCreatorAvailabilityForCall, releaseCreatorCallLock } from './creator-call-lock.service';
@@ -20,6 +20,10 @@ type CallRecordLike = {
   isSettled?: boolean;
   save(): Promise<unknown>;
 } | null;
+
+function canUseTransitionCallStatus(call: Exclude<CallRecordLike, null>): call is ICall {
+  return typeof (call as Partial<ICall>).callId === 'string';
+}
 
 let loadCallForFinalizationForTests: ((callId: string) => Promise<CallRecordLike>) | null = null;
 let finalizeCallSessionForTests:
@@ -83,10 +87,15 @@ export async function finalizeCallEnd(
       await finalizeAvailabilityFn(callId, call.creatorUserId.toString());
 
       if (call.status !== 'ended') {
-        transitionCallStatus(call, 'ended', {
-          source: `call.finalizer.${source}`,
-          eventType: 'call_end_finalize',
-        });
+        if (canUseTransitionCallStatus(call)) {
+          transitionCallStatus(call, 'ended', {
+            source: `call.finalizer.${source}`,
+            eventType: 'call_end_finalize',
+          });
+        } else {
+          // Test hooks may inject a lightweight call-like object without full ICall fields.
+          call.status = 'ended';
+        }
       }
       if (!call.isSettled) {
         call.isSettled = true;
