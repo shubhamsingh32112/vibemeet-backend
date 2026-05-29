@@ -1,4 +1,4 @@
-import { getRedis, creatorAvailOnlineSinceKey, availabilityKey } from '../../config/redis';
+import { getRedis, creatorAvailOnlineSinceKey, creatorPresenceKey } from '../../config/redis';
 import { getDailyPeriodBounds, getDailyPeriodBoundsForInstant } from '../creator/creator-tasks.config';
 import { CreatorDailyOnline } from './creator-daily-online.model';
 import { logError } from '../../utils/logger';
@@ -99,7 +99,18 @@ export async function getOnlineTodaySecondsLive(
   let seconds = doc?.onlineSeconds ?? 0;
 
   const sinceRaw = await redis.get(creatorAvailOnlineSinceKey(creatorFirebaseUid));
-  const avail = await redis.get(availabilityKey(creatorFirebaseUid));
+  const presenceRaw = await redis.get(creatorPresenceKey(creatorFirebaseUid));
+  let avail: 'online' | 'busy' = 'busy';
+  if (presenceRaw) {
+    try {
+      const parsed = JSON.parse(presenceRaw) as { state?: string } | null;
+      if (parsed?.state === 'online') {
+        avail = 'online';
+      }
+    } catch {
+      // No-op: malformed canonical payload should not break online-time stats.
+    }
+  }
 
   if (sinceRaw && avail === 'online') {
     const startMs = parseInt(sinceRaw, 10);

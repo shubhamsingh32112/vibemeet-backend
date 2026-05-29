@@ -5,6 +5,7 @@ import {
   creatorPresenceKey,
   activeCallByUserKey,
 } from '../../config/redis';
+import { featureFlags } from '../../config/feature-flags';
 import { getCreatorStaffScope, emitStaffDomainEvent } from '../staff/staff-dashboard-invalidation.service';
 import { updateOnlinePresenceSets } from './presence-dashboard.service';
 import {
@@ -33,17 +34,50 @@ export type CreatorPresenceRecord = {
 };
 
 const PRESENCE_TTL_SECONDS = 120;
+const PRESENCE_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+function parseNumberEnv(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const CANONICAL_MISSING_WARN_RATE = Math.min(
+  1,
+  Math.max(0, parseNumberEnv(process.env.CREATOR_PRESENCE_MISSING_WARN_RATE, 0.05))
+);
 
 function parsePresenceRecord(raw: string | null): CreatorPresenceRecord | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<CreatorPresenceRecord>;
-    const state: CreatorPresenceState = parsed.state === 'online' ? 'online' : 'busy';
+    const parsed = JSON.parse(raw) as Partial<CreatorPresenceRecord> | null;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    if (parsed.state !== 'online' && parsed.state !== 'busy') {
+      return null;
+    }
+    const updatedAt = Number(parsed.updatedAt);
+    if (
+      !Number.isFinite(updatedAt) ||
+      updatedAt <= 0 ||
+      updatedAt > Date.now() + PRESENCE_MAX_CLOCK_SKEW_MS
+    ) {
+      return null;
+    }
+    const version = Number(parsed.version);
+    if (!Number.isInteger(version) || version < 0) {
+      return null;
+    }
+    const source = String(parsed.source || '').trim();
+    if (!source) {
+      return null;
+    }
     return {
-      state,
-      updatedAt: Number(parsed.updatedAt) || 0,
-      source: String(parsed.source || 'unknown'),
-      version: Math.max(0, Number(parsed.version) || 0),
+      state: parsed.state,
+      updatedAt,
+      source,
+      version,
     };
   } catch {
     return null;
@@ -84,14 +118,24 @@ export async function readCreatorPresenceState(firebaseUid: string): Promise<Cre
   if (parsed) {
     return parsed;
   }
-  // Dual-read fallback to legacy key during migration.
+  recordCallMetric('presence.creator_presence_missing_canonical', 1, { scope: 'single' });
+  if (!featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
+    return {
+      state: 'busy',
+      updatedAt: Date.now(),
+      source: 'missing_canonical',
+      version: 0,
+    };
+  }
   const legacy = await redis.get(availabilityKey(firebaseUid));
-  logDebug('creator_presence_legacy_fallback', {
+  const fallbackState: CreatorPresenceState = legacy === 'online' ? 'online' : 'busy';
+  logWarning('creator_presence_legacy_fallback', {
     firebaseUid,
-    legacyState: legacy === 'online' ? 'online' : 'busy',
+    legacyState: fallbackState,
+    fallbackEnabled: featureFlags.creatorPresenceLegacyFallbackReadEnabled,
   });
   return {
-    state: legacy === 'online' ? 'online' : 'busy',
+    state: fallbackState,
     updatedAt: Date.now(),
     source: 'legacy_fallback',
     version: 0,
@@ -120,30 +164,50 @@ export async function getBatchCreatorPresence(
   if (legacyFallbackIds.length > 0) {
     const batchSize = creatorIds.length;
     const fallbackRate = batchSize > 0 ? legacyFallbackIds.length / batchSize : 0;
-    logInfo('creator_presence_batch_legacy_fallback', {
+    logInfo('creator_presence_batch_canonical_missing', {
       count: legacyFallbackIds.length,
       batchSize,
-      fallbackRate,
+      missingRate: fallbackRate,
       sampleIds: legacyFallbackIds.slice(0, 5),
     });
-    if (batchSize >= 5 && fallbackRate > 0.05) {
-      logWarning('creator_presence_batch_legacy_fallback_high', {
+    recordCallMetric('presence.creator_presence_missing_canonical', legacyFallbackIds.length, {
+      scope: 'batch',
+    });
+    if (batchSize >= 5 && fallbackRate > CANONICAL_MISSING_WARN_RATE) {
+      logWarning('creator_presence_batch_canonical_missing_high', {
+        count: legacyFallbackIds.length,
+        batchSize,
+        missingRate: fallbackRate,
+        threshold: CANONICAL_MISSING_WARN_RATE,
+      });
+    }
+    if (featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
+      logInfo('creator_presence_batch_legacy_fallback', {
         count: legacyFallbackIds.length,
         batchSize,
         fallbackRate,
-        threshold: 0.05,
+        sampleIds: legacyFallbackIds.slice(0, 5),
+      });
+      const legacyKeys = legacyFallbackIds.map((id) => availabilityKey(id));
+      const legacyVals = await redis.mget(...legacyKeys);
+      legacyFallbackIds.forEach((id, idx) => {
+        result[id] = {
+          state: legacyVals[idx] === 'online' ? 'online' : 'busy',
+          updatedAt: Date.now(),
+          source: 'legacy_fallback_batch',
+          version: 0,
+        };
+      });
+    } else {
+      legacyFallbackIds.forEach((id) => {
+        result[id] = {
+          state: 'busy',
+          updatedAt: Date.now(),
+          source: 'missing_canonical',
+          version: 0,
+        };
       });
     }
-    const legacyKeys = legacyFallbackIds.map((id) => availabilityKey(id));
-    const legacyVals = await redis.mget(...legacyKeys);
-    legacyFallbackIds.forEach((id, idx) => {
-      result[id] = {
-        state: legacyVals[idx] === 'online' ? 'online' : 'busy',
-        updatedAt: Date.now(),
-        source: 'legacy_fallback_batch',
-        version: 0,
-      };
-    });
   }
 
   return result;
@@ -168,12 +232,13 @@ export async function transitionCreatorPresence(
 
   const activeCallId = await redis.get(activeCallByUserKey(firebaseUid));
   try {
-    const pipelineResult = await redis
+    const pipeline = redis
       .multi()
-      .setex(creatorPresenceKey(firebaseUid), PRESENCE_TTL_SECONDS, JSON.stringify(nextRecord))
-      // Dual-write legacy key for migration compatibility.
-      .setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextState)
-      .exec();
+      .setex(creatorPresenceKey(firebaseUid), PRESENCE_TTL_SECONDS, JSON.stringify(nextRecord));
+    if (featureFlags.creatorPresenceLegacyDualWriteEnabled) {
+      pipeline.setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextState);
+    }
+    const pipelineResult = await pipeline.exec();
     const pipelineFailed = pipelineResult?.some((entry) => entry?.[0] != null);
     if (pipelineFailed) {
       logError('creator_presence_redis_pipeline_failed', new Error('Redis MULTI/EXEC returned errors'), {
@@ -262,6 +327,14 @@ export async function transitionCreatorPresence(
       state: nextRecord.state,
       version: nextRecord.version,
       activeCallId: activeCallId || null,
+    });
+  }
+
+  if (eventType === 'CALL_ENDED' && source.includes('billing') && nextRecord.state === 'online') {
+    recordCallMetric('presence.contract.call_ended_to_online', 1, {
+      source,
+      previousState: current.state,
+      activeCall: activeCallId ? '1' : '0',
     });
   }
 

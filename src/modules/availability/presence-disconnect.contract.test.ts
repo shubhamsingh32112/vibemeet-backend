@@ -3,11 +3,10 @@ import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-test('creator disconnect uses grace before marking away', () => {
+test('creator disconnect marks busy on last socket', () => {
   const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
-  assert.ok(src.includes('CREATOR_DISCONNECT_GRACE_MS'));
-  assert.ok(src.includes('scheduleCreatorAway'));
-  assert.ok(src.includes('creatorHasAnyConnectedSocket'));
+  assert.ok(src.includes('availability.gateway.disconnect_last_socket'));
+  assert.ok(src.includes("'DISCONNECTED'"));
 });
 
 test('creator:offline ignored when sockets still connected', () => {
@@ -21,7 +20,7 @@ test('DISCONNECTED presence resolves to busy', () => {
   assert.ok(src.match(/DISCONNECTED[\s\S]*return 'busy'/));
 });
 
-test('legacy fallback batch logs high rate warning', () => {
+test('canonical-missing batch logs high-rate warning', () => {
   const src = readFileSync(join(__dirname, 'presence.service.ts'), 'utf8');
-  assert.ok(src.includes('creator_presence_batch_legacy_fallback_high'));
+  assert.ok(src.includes('creator_presence_batch_canonical_missing_high'));
 });

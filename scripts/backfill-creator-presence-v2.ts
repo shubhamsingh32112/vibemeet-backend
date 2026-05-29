@@ -1,5 +1,5 @@
 /**
- * One-off / periodic backfill: write creator:presence:{uid} v2 keys from legacy availability.
+ * One-off / periodic backfill: write canonical creator:presence:{uid} v2 keys from legacy availability.
  *
  * Usage (from backend/):
  *   npx ts-node scripts/backfill-creator-presence-v2.ts
@@ -11,7 +11,7 @@ import { logInfo, logError } from '../src/utils/logger';
 const KEY_PREFIX = 'creator:availability:';
 const PRESENCE_TTL_SECONDS = 120;
 
-async function scanLegacyOnlineCreators(): Promise<string[]> {
+async function scanLegacyCreators(): Promise<string[]> {
   const redis = getRedis();
   const ids: string[] = [];
   let cursor = '0';
@@ -19,14 +19,11 @@ async function scanLegacyOnlineCreators(): Promise<string[]> {
     const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', `${KEY_PREFIX}*`, 'COUNT', 200);
     cursor = nextCursor;
     if (!keys.length) continue;
-    const values = await redis.mget(...keys);
-    keys.forEach((key, idx) => {
-      if (values[idx] === 'online') {
-        ids.push(key.replace(KEY_PREFIX, ''));
-      }
+    keys.forEach((key) => {
+      ids.push(key.replace(KEY_PREFIX, ''));
     });
   } while (cursor !== '0');
-  return ids;
+  return Array.from(new Set(ids));
 }
 
 async function main(): Promise<void> {
@@ -37,7 +34,7 @@ async function main(): Promise<void> {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const uids = argUids?.length ? argUids : await scanLegacyOnlineCreators();
+  const uids = argUids?.length ? argUids : await scanLegacyCreators();
   logInfo('creator_presence_v2_backfill_start', { count: uids.length });
 
   let written = 0;
@@ -59,11 +56,7 @@ async function main(): Promise<void> {
         source: 'backfill-creator-presence-v2',
         version: 1,
       };
-      await redis
-        .multi()
-        .setex(creatorPresenceKey(uid), PRESENCE_TTL_SECONDS, JSON.stringify(record))
-        .setex(availabilityKey(uid), PRESENCE_TTL_SECONDS, state)
-        .exec();
+      await redis.setex(creatorPresenceKey(uid), PRESENCE_TTL_SECONDS, JSON.stringify(record));
       written += 1;
     } catch (err) {
       logError('creator_presence_v2_backfill_failed', err, { uid });

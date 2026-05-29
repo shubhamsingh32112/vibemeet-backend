@@ -27,13 +27,28 @@
  * - Forces creators to re-announce presence
  */
 
-import { getRedis, isRedisConfigured, creatorPresenceKey } from '../../config/redis';
+import {
+  getRedis,
+  isRedisConfigured,
+  creatorPresenceKey,
+  availabilityKey,
+  CREATOR_PRESENCE_KEY_PREFIX,
+} from '../../config/redis';
+import { featureFlags } from '../../config/feature-flags';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 
 export type CreatorAvailability = 'online' | 'busy';
 
-// Redis key prefix
-const KEY_PREFIX = 'creator:availability:';
+function parsePresenceState(raw: string | null): CreatorAvailability | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { state?: string } | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed.state === 'online' ? 'online' : 'busy';
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Set a creator's availability status
@@ -64,14 +79,15 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
   try {
     const redis = getRedis();
     const v2 = await redis.get(creatorPresenceKey(creatorId));
-    if (v2) {
-      try {
-        const parsed = JSON.parse(v2) as { state?: string };
-        return (parsed.state === 'online' ? 'online' : 'busy') as CreatorAvailability;
-      } catch {}
+    const canonical = parsePresenceState(v2);
+    if (canonical) {
+      return canonical;
     }
-    const status = await redis.get(`${KEY_PREFIX}${creatorId}`);
-    return (status === 'online' ? 'online' : 'busy') as CreatorAvailability;
+    if (!featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
+      return 'busy';
+    }
+    const legacy = await redis.get(availabilityKey(creatorId));
+    return (legacy === 'online' ? 'online' : 'busy') as CreatorAvailability;
   } catch (err) {
     logError('creator_availability_get_failed', err, { creatorId, failSafe: 'busy' });
     return 'busy'; // Error = Busy (fail safe)
@@ -122,7 +138,7 @@ export async function getAllOnlineCreators(): Promise<string[]> {
       const [nextCursor, keys] = await redis.scan(
         cursor,
         'MATCH',
-        `${KEY_PREFIX}*`,
+        `${CREATOR_PRESENCE_KEY_PREFIX}*`,
         'COUNT',
         100 // Process 100 keys at a time
       );
@@ -133,8 +149,9 @@ export async function getAllOnlineCreators(): Promise<string[]> {
         // Batch get values using MGET (efficient)
         const values = await redis.mget(...keys);
         keys.forEach((key, index) => {
-          if (values[index] === 'online') {
-            const creatorId = key.replace(KEY_PREFIX, '');
+          const availability = parsePresenceState(values[index]);
+          if (availability === 'online') {
+            const creatorId = key.replace(CREATOR_PRESENCE_KEY_PREFIX, '');
             onlineCreators.push(creatorId);
           }
         });
@@ -167,48 +184,55 @@ export async function getBatchAvailability(
     const redis = getRedis();
     const result: Record<string, CreatorAvailability> = {};
 
-    // Prefer explicit v2 presence payloads, fallback to legacy online/busy key.
+    // Canonical read path is v2 presence payload.
     const v2Keys = creatorIds.map((id) => creatorPresenceKey(id));
     const v2Vals = await redis.mget(...v2Keys);
-    const fallbackIds: string[] = [];
+    const missingCanonicalIds: string[] = [];
 
     creatorIds.forEach((id, index) => {
-      const raw = v2Vals[index];
-      if (!raw) {
-        fallbackIds.push(id);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(raw) as { state?: string };
-        result[id] = parsed.state === 'online' ? 'online' : 'busy';
-      } catch {
-        fallbackIds.push(id);
+      const parsed = parsePresenceState(v2Vals[index]);
+      if (parsed) {
+        result[id] = parsed;
+      } else {
+        missingCanonicalIds.push(id);
       }
     });
 
-    if (fallbackIds.length > 0) {
+    if (missingCanonicalIds.length > 0) {
       const batchSize = creatorIds.length;
-      const fallbackRate = batchSize > 0 ? fallbackIds.length / batchSize : 0;
-      logInfo('creator_availability_batch_legacy_fallback', {
-        count: fallbackIds.length,
+      const missingRate = batchSize > 0 ? missingCanonicalIds.length / batchSize : 0;
+      logInfo('creator_availability_batch_canonical_missing', {
+        count: missingCanonicalIds.length,
         batchSize,
-        fallbackRate,
-        sampleIds: fallbackIds.slice(0, 5),
+        missingRate,
+        sampleIds: missingCanonicalIds.slice(0, 5),
       });
-      if (batchSize >= 5 && fallbackRate > 0.05) {
-        logWarning('creator_availability_batch_legacy_fallback_high', {
-          count: fallbackIds.length,
+      if (batchSize >= 5 && missingRate > 0.05) {
+        logWarning('creator_availability_batch_canonical_missing_high', {
+          count: missingCanonicalIds.length,
           batchSize,
-          fallbackRate,
+          missingRate,
           threshold: 0.05,
         });
       }
-      const keys = fallbackIds.map(id => `${KEY_PREFIX}${id}`);
-      const values = await redis.mget(...keys);
-      fallbackIds.forEach((id, index) => {
-        const value = values[index];
-        result[id] = (value == 'online' ? 'online' : 'busy') as CreatorAvailability;
-      });
+      if (featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
+        const keys = missingCanonicalIds.map((id) => availabilityKey(id));
+        const values = await redis.mget(...keys);
+        logInfo('creator_availability_batch_legacy_fallback', {
+          count: missingCanonicalIds.length,
+          batchSize,
+          missingRate,
+          sampleIds: missingCanonicalIds.slice(0, 5),
+        });
+        missingCanonicalIds.forEach((id, index) => {
+          const value = values[index];
+          result[id] = (value === 'online' ? 'online' : 'busy') as CreatorAvailability;
+        });
+      } else {
+        missingCanonicalIds.forEach((id) => {
+          result[id] = 'busy';
+        });
+      }
     }
 
     creatorIds.forEach((id) => {

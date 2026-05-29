@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import { getFirebaseAdmin } from '../config/firebase';
 import { User } from '../modules/user/user.model';
 import { logError, logInfo, logDebug, logWarning } from '../utils/logger';
+import { recordCallMetric } from '../utils/monitoring';
 import {
   isAgencyRole,
   isBdRole,
@@ -34,12 +35,21 @@ export const verifyFirebaseToken = async (
   res: Response,
   next: NextFunction
 ): Promise<void> => {
+  const authContext = req.path.includes('/creator/feed')
+    ? 'feed'
+    : req.path.includes('/call-history')
+      ? 'call-history'
+      : 'other';
   try {
     logDebug('Verifying token', { path: req.path, ip: req.ip });
 
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      recordCallMetric('presence.http_auth_failure', 1, {
+        context: authContext,
+        reason: 'missing_header',
+      });
       logWarning('No authorization header', { path: req.path, ip: req.ip });
       res.status(401).json({
         success: false,
@@ -82,6 +92,7 @@ export const verifyFirebaseToken = async (
               firebaseUid: staffUser.firebaseUid,
               email: staffUser.email,
             };
+            recordCallMetric('presence.http_auth_success', 1, { context: authContext, type: 'admin_jwt' });
             next();
             return;
           }
@@ -95,6 +106,7 @@ export const verifyFirebaseToken = async (
 
     logDebug('Verifying token with Firebase Admin', { path: req.path });
     const decodedToken = await admin.auth().verifyIdToken(token);
+    recordCallMetric('presence.http_auth_success', 1, { context: authContext, type: 'firebase' });
     logInfo('Firebase token verified', {
       firebaseUid: decodedToken.uid,
       path: req.path,
@@ -109,6 +121,14 @@ export const verifyFirebaseToken = async (
     logInfo('Authentication successful', { path: req.path });
     next();
   } catch (error) {
+    const message =
+      typeof error === 'object' && error !== null && 'message' in error
+        ? String((error as { message?: unknown }).message ?? '')
+        : '';
+    recordCallMetric('presence.http_auth_failure', 1, {
+      context: authContext,
+      reason: message.includes('expired') ? 'id-token-expired' : 'invalid_token',
+    });
     logError('Token verification error', error, {
       path: req.path,
       ip: req.ip,

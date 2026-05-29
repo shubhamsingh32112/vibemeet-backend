@@ -21,6 +21,16 @@ export const featureFlags = {
    */
   presenceV2Enabled: process.env.PRESENCE_V2_ENABLED !== 'false',
   /**
+   * Emergency rollback switch: allow legacy creator availability key reads when canonical v2 is missing.
+   */
+  creatorPresenceLegacyFallbackReadEnabled:
+    process.env.CREATOR_PRESENCE_LEGACY_FALLBACK_READ_ENABLED === 'true',
+  /**
+   * Migration-only compatibility path: dual-write legacy creator:availability key alongside canonical v2.
+   */
+  creatorPresenceLegacyDualWriteEnabled:
+    process.env.CREATOR_PRESENCE_LEGACY_DUAL_WRITE_ENABLED === 'true',
+  /**
    * Watchdog that auto-recovers stalled active/settling sessions.
    */
   billingWatchdogEnabled: process.env.BILLING_WATCHDOG_ENABLED !== 'false',

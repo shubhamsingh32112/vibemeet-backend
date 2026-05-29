@@ -12,6 +12,7 @@ import { emitCreatorDataUpdated } from './creator-notify';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
 import { getBatchAvailability } from '../availability/availability.service';
+import { getBatchCreatorPresence } from '../availability/presence.service';
 import {
   getRedis,
   creatorDashboardKey,
@@ -259,8 +260,11 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
 
     const tAvail = Date.now();
     const firebaseUids = baseRows.map((c) => c.firebaseUid).filter((uid): uid is string => uid !== null);
-    const availabilityMap =
-      firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
+    const presenceMap = firebaseUids.length > 0 ? await getBatchCreatorPresence(firebaseUids) : {};
+    const availabilityMap: Record<string, 'online' | 'busy'> = {};
+    Object.entries(presenceMap).forEach(([uid, record]) => {
+      availabilityMap[uid] = record.state === 'online' ? 'online' : 'busy';
+    });
     availabilityMs = Date.now() - tAvail;
 
     const creatorsOut = baseRows.map((c) => ({
@@ -281,6 +285,29 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
       totalMs: Date.now() - t0,
       rowCount: creatorsOut.length,
     });
+    const sampled = creatorsOut
+      .filter((c) => typeof c.firebaseUid === 'string' && Boolean(c.firebaseUid))
+      .slice(0, 5)
+      .map((creator) => {
+        const firebaseUid = creator.firebaseUid as string;
+        const record = presenceMap[firebaseUid];
+        const updatedAt = Number(record?.updatedAt) || Date.now();
+        return {
+          creatorId: creator.id,
+          firebaseUid,
+          presenceSource: record?.source ?? 'missing',
+          availability: availabilityMap[firebaseUid] ?? 'busy',
+          cacheHit,
+          presenceAgeMs: Math.max(0, Date.now() - updatedAt),
+        };
+      });
+    if (sampled.length > 0) {
+      logInfo('creator.feed.presence_diagnostics', {
+        page,
+        limit,
+        sampled,
+      });
+    }
 
     logInfo('feed.query.count', {
       mongoQueries: cacheHit ? 0 : 1,
@@ -334,9 +361,24 @@ export const getCreatorFirebaseUids = async (req: Request, res: Response): Promi
     if (isRedisConfigured()) {
       const cached = await safeRedisGet<{ firebaseUids: string[] }>(CREATOR_UIDS_CACHE_KEY);
       if (cached?.firebaseUids) {
-        logInfo('creator.uids.timing', { cacheHit: true, totalMs: Date.now() - t0, count: cached.firebaseUids.length });
-        res.json({ success: true, data: { firebaseUids: cached.firebaseUids } });
-        return;
+        if (cached.firebaseUids.length > 0) {
+          logInfo('creator.uids.timing', {
+            cacheHit: true,
+            totalMs: Date.now() - t0,
+            count: cached.firebaseUids.length,
+          });
+          res.json({ success: true, data: { firebaseUids: cached.firebaseUids } });
+          return;
+        }
+        const hasAnyCreator = await Creator.exists({});
+        if (!hasAnyCreator) {
+          logInfo('creator.uids.timing', { cacheHit: true, totalMs: Date.now() - t0, count: 0 });
+          res.json({ success: true, data: { firebaseUids: cached.firebaseUids } });
+          return;
+        }
+        logInfo('creator.uids.cache_empty_bypass', {
+          reason: 'creator_exists_but_cached_uid_list_empty',
+        });
       }
     }
 
