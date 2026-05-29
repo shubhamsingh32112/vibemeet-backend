@@ -11,6 +11,8 @@ import {
   callUserIntroMicrosKey,
   callUserWalletMicrosKey,
   settledCallKey,
+  callSessionTerminalKey,
+  BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS,
   SETTLED_CALL_TTL,
   settlementClaimKey,
   SETTLEMENT_CLAIM_TTL_SECONDS,
@@ -124,6 +126,10 @@ return 0
 `;
 
 const DEAD_LETTER_LIFECYCLE_STATE = 'FAILED_RECOVERY_SETTLEMENT' as const;
+const ACTIVE_RUNTIME_FINALIZE_GUARD_MS = Math.min(
+  120_000,
+  Math.max(5_000, parseInt(process.env.BILLING_ACTIVE_RUNTIME_FINALIZE_GUARD_MS || '45000', 10) || 45_000)
+);
 
 function billingInstanceId(): string {
   return (
@@ -579,10 +585,30 @@ async function markCallSettled(
 
 async function runPostPersistRedisCleanup(
   callId: string,
-  result: SettlePersistResult
+  result: SettlePersistResult,
+  reason: SettlementReason,
+  source: SettlementSource
 ): Promise<void> {
   const redis = getRedis();
   try {
+    const terminalSnapshot = {
+      callId,
+      lifecycleState: 'SETTLED' as const,
+      billingSequence: Math.max(0, Number(result.billingSequence) || 0),
+      elapsedSeconds: Math.max(0, Number(result.durationSeconds) || 0),
+      durationSeconds: Math.max(0, Number(result.durationSeconds) || 0),
+      finalCoins: Math.max(0, Number(result.finalUserCoins) || 0),
+      totalDeducted: Math.max(0, Number(result.totalDeducted) || 0),
+      totalEarned: Math.max(0, Number(result.totalEarnedCreator) || 0),
+      settledAt: Date.now(),
+      reason,
+      source,
+    };
+    await redis.setex(
+      callSessionTerminalKey(callId),
+      BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS,
+      JSON.stringify(terminalSnapshot)
+    );
     await deleteBillingSessionRedisKeys(
       redis,
       callId,
@@ -789,6 +815,52 @@ export async function finalizeCallSession(
     return { status: 'duplicate', callId };
   }
 
+  const activeSessionRaw = await redis.get(callSessionKey(callId));
+  if (activeSessionRaw) {
+    try {
+      const activeSession = JSON.parse(activeSessionRaw) as {
+        lifecycleState?: string;
+        instanceId?: string;
+        runtimeEpoch?: number;
+        lastSequenceAdvanceAt?: number;
+      };
+      const lifecycleState = String(activeSession.lifecycleState || 'ACTIVE');
+      const ownerInstanceId = String(activeSession.instanceId || '');
+      const lastSequenceAdvanceAt = Number(activeSession.lastSequenceAdvanceAt) || 0;
+      const sequenceAdvancedRecently =
+        lastSequenceAdvanceAt > 0 && Date.now() - lastSequenceAdvanceAt <= ACTIVE_RUNTIME_FINALIZE_GUARD_MS;
+      if (
+        lifecycleState === 'ACTIVE' &&
+        ownerInstanceId &&
+        ownerInstanceId !== recoveryOwnerInstanceId &&
+        sequenceAdvancedRecently
+      ) {
+        recordBillingMetric('billing_runtime_epoch_reject_stale_worker', 1, {
+          callId,
+          source,
+          ownerInstanceId,
+          runtimeEpoch: String(Math.max(1, Number(activeSession.runtimeEpoch) || 1)),
+          workerInstanceId: recoveryOwnerInstanceId,
+        });
+        logWarning('billing_finalize_rejected_stale_worker', {
+          callId,
+          source,
+          reason,
+          ownerInstanceId,
+          workerInstanceId: recoveryOwnerInstanceId,
+          lastSequenceAdvanceAt,
+          lifecycleState,
+        });
+        await redis
+          .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
+          .catch(() => {});
+        return { status: 'duplicate', callId };
+      }
+    } catch {
+      // best-effort guard only
+    }
+  }
+
   if (await isAlreadySettled(callId)) {
     recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
     await appendSettlementAttempt(callId, {
@@ -954,7 +1026,7 @@ export async function finalizeCallSession(
         durationSeconds: persistResult.durationSeconds,
       }
     );
-    await runPostPersistRedisCleanup(callId, persistResult);
+    await runPostPersistRedisCleanup(callId, persistResult, reason, source);
 
     await appendSettlementAttempt(callId, {
       source,

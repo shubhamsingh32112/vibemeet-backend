@@ -30,12 +30,18 @@ test('finalizer owns flush orchestration', () => {
   assert.ok(finalization.includes('BILLING_MAX_SETTLING_MS'));
 });
 
-test('forceTerminateCall triggers finalizeCallSession before Stream mark_ended', () => {
+test('forceTerminateCall triggers finalizeCallEnd before Stream mark_ended', () => {
   const src = readFileSync(join(__dirname, 'billing-termination.service.ts'), 'utf8');
-  const finalizeIdx = src.indexOf('void finalizeCallSession');
+  const finalizeIdx = src.indexOf("void finalizeCallEnd(io, callId, 'force_end')");
   const streamIdx = src.indexOf('await markStreamCallEnded');
   assert.ok(finalizeIdx >= 0 && streamIdx >= 0);
   assert.ok(finalizeIdx < streamIdx, 'settlement must not be gated on Stream success');
+});
+
+test('call finalizer maps force and deferred sources to settlement sources', () => {
+  const src = readFileSync(join(__dirname, '..', 'video', 'call-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes("source === 'force_end'"));
+  assert.ok(src.includes("source === 'deferred_pending_end'"));
 });
 
 test('bullmq worker uses finalizeCallSession on stop_needs_settlement', () => {
@@ -77,4 +83,12 @@ test('watchdog recovery path includes cooldown and attempt cap guards', () => {
   assert.ok(src.includes('WATCHDOG_ATTEMPT_CAP'));
   assert.ok(src.includes('billingWatchdogCooldownKey(callId)'));
   assert.ok(src.includes('moveCallToRecoveryDeadLetter'));
+});
+
+test('finalizer writes terminal tombstone and blocks stale worker settle on ACTIVE', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('callSessionTerminalKey(callId)'));
+  assert.ok(src.includes('BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS'));
+  assert.ok(src.includes('billing_finalize_rejected_stale_worker'));
+  assert.ok(src.includes('billing_runtime_epoch_reject_stale_worker'));
 });

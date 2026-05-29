@@ -28,10 +28,16 @@ function readInt(name: string, fallback: number, min: number, max: number): numb
 }
 
 const WATCHDOG_INTERVAL_MS = readInt('BILLING_WATCHDOG_INTERVAL_MS', 5000, 1000, 60000);
-const STALLED_ACTIVE_MS = readInt('BILLING_WATCHDOG_STALLED_ACTIVE_MS', 15000, 5000, 600000);
+const STALLED_ACTIVE_MS = readInt('BILLING_WATCHDOG_STALLED_ACTIVE_MS', 45000, 5000, 600000);
 const STALLED_SETTLING_MS = readInt('BILLING_WATCHDOG_STALLED_SETTLING_MS', 60000, 15000, 600000);
 const STALLED_RECOVERING_MS = readInt('BILLING_WATCHDOG_STALLED_RECOVERING_MS', 30000, 5000, 600000);
 const CHECKPOINT_LAG_MS = readInt('BILLING_WATCHDOG_CHECKPOINT_LAG_MS', 20000, 10000, 300000);
+const RECENT_HEALTHY_ACTIVITY_MS = readInt(
+  'BILLING_WATCHDOG_RECENT_HEALTHY_ACTIVITY_MS',
+  20000,
+  3000,
+  120000
+);
 const WATCHDOG_COOLDOWN_SECONDS = readInt('BILLING_WATCHDOG_RECOVERY_COOLDOWN_SECONDS', 45, 10, 600);
 const WATCHDOG_ATTEMPT_CAP = readInt('BILLING_WATCHDOG_RECOVERY_ATTEMPT_CAP', 6, 1, 100);
 const WATCHDOG_ATTEMPT_TTL_SECONDS = readInt(
@@ -44,10 +50,24 @@ const WATCHDOG_ATTEMPT_TTL_SECONDS = readInt(
 type BillingWatchdogSession = {
   callId: string;
   lastProcessedAt?: number;
+  lastHealthyTickAt?: number;
+  lastSocketEmitAt?: number;
+  lastSequenceAdvanceAt?: number;
   lifecycleState?: string;
   billingSequence?: number;
   lastCheckpointAtMs?: number;
 };
+
+function hasRecentHealthyEvidence(session: BillingWatchdogSession, now: number): boolean {
+  const healthyAt = Number(session.lastHealthyTickAt) || 0;
+  const socketAt = Number(session.lastSocketEmitAt) || 0;
+  const seqAt = Number(session.lastSequenceAdvanceAt) || 0;
+  return (
+    (healthyAt > 0 && now - healthyAt <= RECENT_HEALTHY_ACTIVITY_MS) ||
+    (socketAt > 0 && now - socketAt <= RECENT_HEALTHY_ACTIVITY_MS) ||
+    (seqAt > 0 && now - seqAt <= RECENT_HEALTHY_ACTIVITY_MS)
+  );
+}
 
 async function getActiveCallIds(): Promise<Set<string>> {
   const redis = getRedis();
@@ -87,8 +107,16 @@ async function runWatchdogPass(io: Server): Promise<void> {
       const lifecycleState = String(session.lifecycleState || 'ACTIVE');
       const lastProcessedAt = Number(session.lastProcessedAt) || 0;
       const stalledForMs = lastProcessedAt > 0 ? Math.max(0, now - lastProcessedAt) : 0;
+      const healthyRecently = hasRecentHealthyEvidence(session, now);
 
       if (lifecycleState === 'ACTIVE' && stalledForMs > STALLED_ACTIVE_MS) {
+        if (healthyRecently) {
+          recordBillingMetric('billing_watchdog_skip_recent_sequence_advance', 1, {
+            callId,
+            lifecycleState: 'ACTIVE',
+          });
+          continue;
+        }
         const transitioned = await transitionBillingStateWithAudit({
           callId,
           from: 'ACTIVE',
@@ -111,6 +139,13 @@ async function runWatchdogPass(io: Server): Promise<void> {
       }
 
       if (lifecycleState === 'SETTLING' && stalledForMs > STALLED_SETTLING_MS) {
+        if (healthyRecently) {
+          recordBillingMetric('billing_watchdog_skip_recent_sequence_advance', 1, {
+            callId,
+            lifecycleState: 'SETTLING',
+          });
+          continue;
+        }
         if (await redis.get(billingRecoveryDeadLetterKey(callId))) {
           continue;
         }
@@ -152,6 +187,13 @@ async function runWatchdogPass(io: Server): Promise<void> {
       }
 
       if (lifecycleState === 'RECOVERING' && stalledForMs > STALLED_RECOVERING_MS) {
+        if (healthyRecently) {
+          recordBillingMetric('billing_watchdog_skip_recent_sequence_advance', 1, {
+            callId,
+            lifecycleState: 'RECOVERING',
+          });
+          continue;
+        }
         if (await redis.get(billingRecoveryDeadLetterKey(callId))) {
           continue;
         }

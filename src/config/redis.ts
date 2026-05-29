@@ -5,6 +5,22 @@ import { logInfo, logError, logWarning } from '../utils/logger';
 let redis: Redis | null = null;
 export type RedisEndpointMode = 'internal' | 'public' | 'host-mode' | 'unknown';
 
+/**
+ * Test hook: inject a fake/in-memory Redis client.
+ * Never use in production runtime code paths.
+ */
+export function setRedisForTests(client: Redis): void {
+  redis = client;
+}
+
+/**
+ * Test hook: reset cached Redis singleton between tests.
+ * Never use in production runtime code paths.
+ */
+export function resetRedisForTests(): void {
+  redis = null;
+}
+
 /** 0 = IPv4+IPv6 (A/AAAA), 4 = IPv4, 6 = IPv6. Use REDIS_FAMILY=0 if Railway DNS is flaky. */
 function getRedisFamily(): number | undefined {
   const raw = process.env.REDIS_FAMILY;
@@ -201,6 +217,8 @@ export const CALL_CREATOR_EARNINGS_PREFIX = 'call:creator_earnings:';
 
 export const callSessionKey = (callId: string): string =>
   `${CALL_SESSION_PREFIX}${callId}`;
+export const callSessionTerminalKey = (callId: string): string =>
+  `${callSessionKey(callId)}:terminal`;
 
 /** @deprecated Legacy merged balance; prefer callUserIntroMicrosKey + callUserWalletMicrosKey. */
 export const callUserCoinsKey = (callId: string): string =>
@@ -246,6 +264,10 @@ export const PENDING_CALL_END_TTL = Math.min(
   Math.max(60, parseInt(process.env.BILLING_PENDING_CALL_END_TTL_SECONDS || '600', 10) || 600)
 ); // defaults to 10 minutes
 export const SETTLED_CALL_TTL = 300; // 5 minutes
+export const BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS = Math.min(
+  3600,
+  Math.max(60, parseInt(process.env.BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS || '600', 10) || 600)
+);
 
 // Settlement orchestration (finalizeCallSession)
 export const SETTLEMENT_CLAIM_PREFIX = 'settlement:claim:';

@@ -13,6 +13,7 @@ import {
   RECONCILIATION_LOCK_TTL_MS,
   activeCallByUserKey,
   ACTIVE_CALL_BY_USER_TTL,
+  callSessionKey,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError } from '../../utils/logger';
@@ -33,6 +34,8 @@ const RECON_PARALLELISM =
   Math.min(20, Math.max(1, parseInt(process.env.CALL_RECONCILIATION_PARALLELISM || '6', 10))) || 6;
 const RECON_BATCH_PAUSE_MS =
   Math.min(1000, Math.max(0, parseInt(process.env.CALL_RECONCILIATION_BATCH_PAUSE_MS || '100', 10))) || 100;
+const RECON_SETTLED_RESTORE_AGE_MS =
+  Math.max(30_000, parseInt(process.env.CALL_RECONCILIATION_SETTLED_RESTORE_AGE_MS || '30000', 10) || 30_000);
 const RELEASE_LOCK_LUA = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
@@ -69,6 +72,129 @@ async function fetchActiveCallBatch(
     .sort({ _id: 1 })
     .limit(RECON_BATCH_SIZE)
     .exec();
+}
+
+function settledCallFilterAfter(
+  lastId: mongoose.Types.ObjectId | null
+): mongoose.FilterQuery<typeof Call> {
+  const settledBefore = new Date(Date.now() - RECON_SETTLED_RESTORE_AGE_MS);
+  const lookbackCutoff = new Date(Date.now() - RECON_UNSETTLED_LOOKBACK_MS);
+  const base: mongoose.FilterQuery<typeof Call> = {
+    isSettled: true,
+    status: 'ended',
+    updatedAt: { $lte: settledBefore, $gte: lookbackCutoff },
+  };
+  if (!lastId) return base;
+  return { $and: [base, { _id: { $gt: lastId } }] };
+}
+
+async function fetchSettledCallBatch(
+  lastId: mongoose.Types.ObjectId | null
+): Promise<Array<InstanceType<typeof Call>>> {
+  return Call.find(settledCallFilterAfter(lastId))
+    .sort({ _id: 1 })
+    .limit(RECON_BATCH_SIZE)
+    .exec();
+}
+
+async function cleanupSettledCreatorBusyDrift(): Promise<void> {
+  try {
+    const redis = getRedis();
+    const passStarted = Date.now();
+    let lastId: mongoose.Types.ObjectId | null = null;
+    let scanned = 0;
+    let fixed = 0;
+
+    while (Date.now() - passStarted < RECON_MAX_MS_PER_TICK) {
+      const settledCalls = await fetchSettledCallBatch(lastId);
+      if (!settledCalls.length) {
+        break;
+      }
+
+      for (const call of settledCalls) {
+        try {
+          const creatorUser = await User.findById(call.creatorUserId);
+          if (!creatorUser?.firebaseUid) {
+            continue;
+          }
+          const creatorFirebaseUid = creatorUser.firebaseUid;
+          const slotKey = activeCallByUserKey(creatorFirebaseUid);
+          const slotCallId = await redis.get(slotKey);
+          const sessionForSlot = slotCallId ? await redis.get(callSessionKey(slotCallId)) : null;
+
+          if (slotCallId === call.callId && !sessionForSlot) {
+            await redis.del(slotKey).catch(() => {});
+            const keyStillExists = Boolean(await redis.get(slotKey));
+            logInfo('Reconciliation cleared stale active call slot for settled call', {
+              callId: call.callId,
+              creatorFirebaseUid,
+              activeCallKeyDeleted: true,
+              activeCallKeyExistsAfterDelete: keyStillExists,
+            });
+          }
+
+          const activeCallAfterCleanup = await redis.get(slotKey);
+          if (activeCallAfterCleanup) {
+            continue;
+          }
+
+          const hasOtherLiveCall = await Call.exists({
+            creatorUserId: call.creatorUserId,
+            _id: { $ne: call._id },
+            $or: [{ status: { $in: ['ringing', 'accepted'] } }, { isSettled: { $ne: true } }],
+          });
+          if (hasOtherLiveCall) {
+            continue;
+          }
+
+          const currentStatus = await getAvailability(creatorFirebaseUid);
+          if (currentStatus !== 'busy') {
+            continue;
+          }
+
+          const settlementAgeMs = Math.max(
+            0,
+            Date.now() - (call.updatedAt ? new Date(call.updatedAt).getTime() : Date.now())
+          );
+          if (settlementAgeMs < RECON_SETTLED_RESTORE_AGE_MS) {
+            continue;
+          }
+
+          await transitionCreatorPresence(
+            getIO(),
+            creatorFirebaseUid,
+            'RECONCILED',
+            'call-reconciliation.cleanupSettledCreatorBusyDrift'
+          );
+          fixed += 1;
+          logInfo('Reconciliation restored creator online after settled call', {
+            callId: call.callId,
+            creatorFirebaseUid,
+            settlementAgeMs,
+            thresholdMs: RECON_SETTLED_RESTORE_AGE_MS,
+          });
+        } catch (err) {
+          logError('Error reconciling settled creator busy drift', err, {
+            callId: call.callId,
+          });
+        }
+      }
+
+      scanned += settledCalls.length;
+      lastId = settledCalls[settledCalls.length - 1]._id as mongoose.Types.ObjectId;
+      if (RECON_BATCH_PAUSE_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, RECON_BATCH_PAUSE_MS));
+      }
+      if (settledCalls.length < RECON_BATCH_SIZE) {
+        break;
+      }
+    }
+
+    recordCallMetric('call_reconciliation.settled_busy_scan', scanned, {});
+    recordCallMetric('call_reconciliation.settled_busy_fixed', fixed, {});
+  } catch (err) {
+    logError('Error in cleanupSettledCreatorBusyDrift', err);
+  }
 }
 
 /**
@@ -227,6 +353,7 @@ async function reconcileActiveCalls(): Promise<void> {
   try {
     const runStartedAt = Date.now();
     await ensureCreatorsWithActiveCallsAreBusy();
+    await cleanupSettledCreatorBusyDrift();
 
     const apiKey = process.env.STREAM_API_KEY;
     const baseUrl = 'https://video.stream-io-api.com';

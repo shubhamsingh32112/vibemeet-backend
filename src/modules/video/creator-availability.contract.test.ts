@@ -36,3 +36,29 @@ test('call reconciliation delegates ended-call cleanup to centralized finalizer'
   const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
   assert.ok(src.includes('finalizeCallEnd('));
 });
+
+test('creator availability finalization verifies active-call key deletion', () => {
+  const src = readFileSync(join(__dirname, 'creator-call-lock.service.ts'), 'utf8');
+  assert.ok(src.includes('activeCallKeyExistsAfterDelete'));
+  assert.ok(src.includes('Creator availability restore transition emitted'));
+});
+
+test('pre-call snapshot restoration preserves offline creators after call end', () => {
+  const src = readFileSync(join(__dirname, 'creator-call-lock.service.ts'), 'utf8');
+  assert.ok(src.includes("snapshot === 'online' || snapshot === 'busy'"));
+  assert.ok(src.includes(": 'DISCONNECTED'"));
+});
+
+test('reconciliation includes reverse cleanup with settled-age threshold guard', () => {
+  const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('cleanupSettledCreatorBusyDrift'));
+  assert.ok(src.includes('RECON_SETTLED_RESTORE_AGE_MS'));
+  assert.ok(src.includes('settlementAgeMs'));
+  assert.ok(src.includes('activeCallKeyExistsAfterDelete'));
+});
+
+test('startup reconciliation run includes settled busy-drift cleanup pass', () => {
+  const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('reconcileActiveCallsWithLock().catch'));
+  assert.ok(src.includes('await cleanupSettledCreatorBusyDrift();'));
+});

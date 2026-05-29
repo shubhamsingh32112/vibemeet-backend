@@ -200,11 +200,17 @@ function cleanupStaleSocketTracking(io: Server): void {
 }
 
 function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefined): string[] {
+  const sanitize = (ids: unknown[]): string[] =>
+    ids
+      .filter((id): id is string => typeof id === 'string')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+
   if (Array.isArray(data)) {
-    return data.filter((id): id is string => typeof id === 'string');
+    return sanitize(data);
   }
   if (data && Array.isArray(data.creatorIds)) {
-    return data.creatorIds.filter((id): id is string => typeof id === 'string');
+    return sanitize(data.creatorIds);
   }
   return [];
 }

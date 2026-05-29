@@ -707,6 +707,13 @@ export class CallLifecycleService {
     const hasLiveSession = await redis.get(callSessionKey(activeCallId));
     if (!hasLiveSession) {
       await redis.del(slotKey).catch(() => {});
+      const staleSlotStillExists = Boolean(await redis.get(slotKey));
+      logInfo('call_overlap_stale_slot_cleanup', {
+        firebaseUid,
+        staleCallId: activeCallId,
+        activeCallKeyDeleted: true,
+        activeCallKeyExistsAfterDelete: staleSlotStillExists,
+      });
       return null;
     }
     return activeCallId;

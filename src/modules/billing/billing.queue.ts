@@ -18,6 +18,11 @@ import { featureFlags } from '../../config/feature-flags';
 export { isBullmqBillingEnabled };
 
 const QUEUE_NAME = 'billing-cycle';
+const BILLING_CYCLE_HEARTBEAT_PREFIX = 'billing:cycle:heartbeat:';
+const BILLING_CYCLE_HEARTBEAT_TTL_SECONDS = Math.min(
+  600,
+  Math.max(30, parseInt(process.env.BILLING_CYCLE_HEARTBEAT_TTL_SECONDS || '120', 10) || 120)
+);
 
 let sharedConnection: Redis | null = null;
 let billingQueue: Queue | null = null;
@@ -106,7 +111,17 @@ export async function scheduleNextBillingCycleAfterTickOk(
 }
 
 export function billingCycleJobId(callId: string): string {
-  return `billing-cycle-${callId}`;
+  return `billing:${callId}`;
+}
+
+async function touchBillingCycleHeartbeat(callId: string): Promise<void> {
+  await getRedis()
+    .setex(
+      `${BILLING_CYCLE_HEARTBEAT_PREFIX}${callId}`,
+      BILLING_CYCLE_HEARTBEAT_TTL_SECONDS,
+      String(Date.now())
+    )
+    .catch(() => {});
 }
 
 /**
@@ -116,12 +131,26 @@ export async function needsBillingCycleReschedule(callId: string): Promise<boole
   const q = getQueue();
   const job = await q.getJob(billingCycleJobId(callId));
   if (!job) {
+    recordBillingMetric('billing_cycle_missing_recreated', 1, { callId });
     return true;
   }
   const state = await job.getState();
-  if (state === 'delayed' || state === 'waiting' || state === 'active') {
+  const isHealthyState = state === 'delayed' || state === 'waiting' || state === 'active';
+  if (isHealthyState) {
+    recordBillingMetric('billing_cycle_exists_healthy', 1, { callId, state });
+    if (state === 'delayed') {
+      const delay = Number(job.delay || 0);
+      if (delay > BILLING_PROCESS_INTERVAL_MS * 5) {
+        recordBillingMetric('billing_cycle_exists_but_stale', 1, {
+          callId,
+          state,
+          delayMs: String(delay),
+        });
+      }
+    }
     return false;
   }
+  recordBillingMetric('billing_cycle_exists_but_stale', 1, { callId, state });
   return true;
 }
 
@@ -206,10 +235,11 @@ export async function scheduleBillingJob(
       {
         jobId,
         delay: delayMs,
-        removeOnComplete: 500,
-        removeOnFail: 200,
+        removeOnComplete: false,
+        removeOnFail: false,
       }
     );
+    await touchBillingCycleHeartbeat(callId);
   } catch (err) {
     recordBillingMetric('bullmq_cycle_enqueue_failed', 1, { callId });
     logError('BullMQ cycle add failed', err, { callId, jobId });
@@ -258,6 +288,7 @@ export function startBillingBullWorker(): Worker {
       const io = getIO();
       const queueLagMs = Math.max(0, Date.now() - (job.timestamp + (job.opts.delay || 0)));
       recordBillingMetric('bullmq_queue_lag_ms', queueLagMs, { callId });
+      await touchBillingCycleHeartbeat(callId);
       updateBackpressureStage({ queueLagMs });
       let result: Awaited<ReturnType<typeof billingService.processBillingTick>>;
       try {
@@ -280,6 +311,7 @@ export function startBillingBullWorker(): Worker {
       }
 
       if (result === 'tick_ok') {
+        await touchBillingCycleHeartbeat(callId);
         await scheduleNextBillingCycleAfterTickOk(callId, queueLagMs).catch((e) =>
           logError('BullMQ schedule next failed', e, { callId })
         );

@@ -58,6 +58,7 @@ test('pending call end is consumed when session becomes active', () => {
   const src = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
   assert.ok(src.includes('consumePendingCallEndIfAny'));
   assert.ok(src.includes('Deferred settlement for call after session promotion'));
+  assert.ok(src.includes("finalizeCallEnd(io, callId, 'deferred_pending_end')"));
   assert.ok(src.includes("'billing.startBillingSession.promote_active'"));
   assert.ok(src.includes("'billing.processTick'"));
 });
@@ -75,4 +76,31 @@ test('runtime missing recover path emits dedicated metric', () => {
   const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
   assert.ok(socketSrc.includes('recovery_runtime_missing'));
   assert.ok(socketSrc.includes("'runtime_missing_after_resolve'"));
+});
+
+test('recover-state serves terminal tombstone fallback when runtime is gone', () => {
+  const resolverSrc = readFileSync(join(__dirname, 'billing-runtime-resolver.service.ts'), 'utf8');
+  const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
+  assert.ok(resolverSrc.includes("source: 'terminal'"));
+  assert.ok(resolverSrc.includes('callSessionTerminalKey'));
+  assert.ok(resolverSrc.includes('billing_active_call_slot_terminal_tombstone_cleanup'));
+  assert.ok(socketSrc.includes("status: 'terminal_settled'"));
+  assert.ok(socketSrc.includes('buildTerminalRecoverEntry'));
+});
+
+test('recover-state accepts optional requested callId for fallback resolution', () => {
+  const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
+  assert.ok(socketSrc.includes('requestedCallId'));
+  assert.ok(socketSrc.includes('resolveBillingRuntimeState(requestedCallId)'));
+});
+
+test('billing runtime ownership and heartbeat fields are present for watchdog guards', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  const watchdogSrc = readFileSync(join(__dirname, 'billing-watchdog.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('lastHealthyTickAt'));
+  assert.ok(serviceSrc.includes('lastSocketEmitAt'));
+  assert.ok(serviceSrc.includes('lastSequenceAdvanceAt'));
+  assert.ok(serviceSrc.includes('ensureRuntimeOwnership'));
+  assert.ok(watchdogSrc.includes('hasRecentHealthyEvidence'));
+  assert.ok(watchdogSrc.includes('billing_watchdog_skip_recent_sequence_advance'));
 });

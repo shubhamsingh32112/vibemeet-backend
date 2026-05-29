@@ -92,6 +92,16 @@ const lifecycleDedupeKey = (callId: string, phase: string): string =>
 const precallSnapshotKey = (callId: string, creatorFirebaseUid: string): string =>
   `${PRECALL_SNAPSHOT_PREFIX}${callId}:${creatorFirebaseUid}`;
 
+let resolveCreatorFirebaseUidForTests:
+  | ((creatorUserId: string) => Promise<string | null>)
+  | null = null;
+
+export function setCreatorFirebaseUidResolverForTests(
+  resolver: ((creatorUserId: string) => Promise<string | null>) | null
+): void {
+  resolveCreatorFirebaseUidForTests = resolver;
+}
+
 export async function snapshotPreCallAvailability(
   callId: string,
   creatorFirebaseUid: string
@@ -285,18 +295,22 @@ export async function finalizeCreatorAvailabilityForCall(
   creatorUserId: string
 ): Promise<void> {
   try {
-    const creator = await Creator.findOne({ userId: creatorUserId });
-    if (!creator) {
-      logError(
-        'Cannot finalize creator availability after call — creator not found',
-        new Error('Creator missing'),
-        { callId, creatorUserId }
-      );
-      return;
+    let creatorFirebaseUid: string | null = null;
+    if (resolveCreatorFirebaseUidForTests) {
+      creatorFirebaseUid = await resolveCreatorFirebaseUidForTests(creatorUserId);
+    } else {
+      const creator = await Creator.findOne({ userId: creatorUserId });
+      if (!creator) {
+        logError(
+          'Cannot finalize creator availability after call — creator not found',
+          new Error('Creator missing'),
+          { callId, creatorUserId }
+        );
+        return;
+      }
+      const creatorUser = await User.findById(creator.userId);
+      creatorFirebaseUid = creatorUser?.firebaseUid || null;
     }
-
-    const creatorUser = await User.findById(creator.userId);
-    const creatorFirebaseUid = creatorUser?.firebaseUid;
     if (!creatorFirebaseUid) {
       logInfo('Creator user has no firebaseUid; skipping final availability', {
         callId,
@@ -308,6 +322,8 @@ export async function finalizeCreatorAvailabilityForCall(
     const redis = getRedis();
     const activeCallKey = activeCallByUserKey(creatorFirebaseUid);
     const activeCallId = await redis.get(activeCallKey);
+    let activeCallKeyDeleted = false;
+    let activeCallKeyExistsAfterDelete = false;
 
     if (activeCallId && activeCallId !== callId) {
       logInfo('Skipping availability restore due to newer active call', {
@@ -322,6 +338,8 @@ export async function finalizeCreatorAvailabilityForCall(
 
     if (activeCallId === callId) {
       await redis.del(activeCallKey);
+      activeCallKeyDeleted = true;
+      activeCallKeyExistsAfterDelete = Boolean(await redis.get(activeCallKey));
     }
 
     const snapshot = await redis.get(precallSnapshotKey(callId, creatorFirebaseUid));
@@ -342,6 +360,15 @@ export async function finalizeCreatorAvailabilityForCall(
         restoreEvent,
         'creator-call-lock.finalizeCreatorAvailabilityForCall'
       );
+      logInfo('Creator availability restore transition emitted', {
+        callId,
+        creatorUid: creatorFirebaseUid,
+        activeCallId,
+        activeCallKeyDeleted,
+        activeCallKeyExistsAfterDelete,
+        snapshotStatus: snapshot,
+        restoreEvent,
+      });
     }
     await redis.del(precallSnapshotKey(callId, creatorFirebaseUid));
     recordCallMetric(snapshot != null ? 'creator.restore.snapshot_used' : 'creator.restore.snapshot_missing', 1, {
@@ -369,6 +396,10 @@ export async function finalizeCreatorAvailabilityForCall(
       callId,
       creatorUserId,
       creatorFirebaseUid,
+      activeCallId,
+      activeCallKeyDeleted,
+      activeCallKeyExistsAfterDelete,
+      snapshotStatus: snapshot,
       restoredStatus,
       snapshotUsed: snapshot != null,
       mode: ORCHESTRATOR_MODE,

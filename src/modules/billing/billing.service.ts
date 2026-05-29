@@ -81,6 +81,12 @@ const FINAL_FLUSH_MARKER_TTL_SECONDS = 24 * 60 * 60;
 const LEGACY_EARNINGS_MICRO_FACTOR = 10_000;
 
 const BILLING_CYCLE_LOCK_PREFIX = 'billing:cycle_lock:';
+const BILLING_RUNTIME_OWNER_LOCK_PREFIX = 'billing:runtime:owner:';
+const BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS = Math.min(
+  300,
+  Math.max(30, parseInt(process.env.BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS || '120', 10) || 120)
+);
+const BILLING_RUNTIME_INSTANCE_ID = process.env.BILLING_INSTANCE_ID || `${process.pid}`;
 function billingCycleLockKey(callId: string): string {
   return `${BILLING_CYCLE_LOCK_PREFIX}${callId}`;
 }
@@ -122,6 +128,52 @@ async function releaseBillingCycleLock(
   }
 }
 
+async function ensureRuntimeOwnership(
+  redis: ReturnType<typeof getRedis>,
+  session: CallSession,
+  callId: string
+): Promise<boolean> {
+  const ownerLockKey = session.leaderLock || `${BILLING_RUNTIME_OWNER_LOCK_PREFIX}${callId}`;
+  const runtimeEpoch = Math.max(1, Number(session.runtimeEpoch) || 1);
+  const ownerValue = `${BILLING_RUNTIME_INSTANCE_ID}:${runtimeEpoch}`;
+  const existing = await redis.get(ownerLockKey);
+  if (!existing) {
+    const claimed = await redis.set(
+      ownerLockKey,
+      ownerValue,
+      'EX',
+      BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS,
+      'NX'
+    );
+    if (claimed === 'OK') {
+      session.instanceId = BILLING_RUNTIME_INSTANCE_ID;
+      session.runtimeEpoch = runtimeEpoch;
+      session.leaderLock = ownerLockKey;
+      return true;
+    }
+  }
+
+  const current = await redis.get(ownerLockKey);
+  if (!current) {
+    return false;
+  }
+  if (current !== ownerValue) {
+    recordBillingMetric('billing_runtime_epoch_reject_stale_worker', 1, {
+      callId,
+      currentOwner: current,
+      workerInstanceId: BILLING_RUNTIME_INSTANCE_ID,
+    });
+    return false;
+  }
+  await redis
+    .set(ownerLockKey, ownerValue, 'EX', BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS, 'XX')
+    .catch(() => {});
+  session.instanceId = BILLING_RUNTIME_INSTANCE_ID;
+  session.runtimeEpoch = runtimeEpoch;
+  session.leaderLock = ownerLockKey;
+  return true;
+}
+
 /** One active billed call per user/creator slot — blocks double session balance snapshots. */
 /**
  * If a user/creator slot still references a `callId` with no live billing session, clear it
@@ -132,6 +184,21 @@ async function tryClearOrphanActiveCallSlots(
   userFirebaseUid: string,
   creatorFirebaseUid: string
 ): Promise<void> {
+  const clearActiveCallSlot = async (
+    key: string,
+    roomUid: string,
+    reason: 'missing_session' | 'terminal_lifecycle' | 'stale_starting'
+  ): Promise<void> => {
+    await redis.del(key).catch(() => {});
+    const stillExists = Boolean(await redis.get(key));
+    logInfo('Active call slot cleanup verification', {
+      roomUid,
+      slotKey: key,
+      reason,
+      activeCallKeyDeleted: true,
+      activeCallKeyExistsAfterDelete: stillExists,
+    });
+  };
   for (const [roomUid, key] of [
     [userFirebaseUid, activeCallByUserKey(userFirebaseUid)],
     [creatorFirebaseUid, activeCallByUserKey(creatorFirebaseUid)],
@@ -140,7 +207,7 @@ async function tryClearOrphanActiveCallSlots(
     if (!v) continue;
     const sessionRaw = await redis.get(callSessionKey(String(v)));
     if (!sessionRaw) {
-      await redis.del(key).catch(() => {});
+      await clearActiveCallSlot(key, roomUid, 'missing_session');
       recordBillingMetric('session_start_active_slot_orphan_recovered', 1, {
         staleCallId: v,
         roomUid,
@@ -151,7 +218,7 @@ async function tryClearOrphanActiveCallSlots(
       const session = JSON.parse(sessionRaw) as { lifecycleState?: string };
       const lifecycle = String(session.lifecycleState || '').toUpperCase();
       if (lifecycle === 'SETTLED' || lifecycle === 'FAILED') {
-        await redis.del(key).catch(() => {});
+        await clearActiveCallSlot(key, roomUid, 'terminal_lifecycle');
         recordBillingMetric('session_start_active_slot_terminal_recovered', 1, {
           staleCallId: v,
           roomUid,
@@ -161,7 +228,7 @@ async function tryClearOrphanActiveCallSlots(
         const startTime = Number((session as { startTime?: number }).startTime);
         const ageMs = Number.isFinite(startTime) && startTime > 0 ? Math.max(0, Date.now() - startTime) : 0;
         if (ageMs > 120_000) {
-          await redis.del(key).catch(() => {});
+          await clearActiveCallSlot(key, roomUid, 'stale_starting');
           recordBillingMetric('session_start_active_slot_starting_recovered', 1, {
             staleCallId: v,
             roomUid,
@@ -202,12 +269,8 @@ async function consumePendingCallEndIfAny(
     // Legacy payloads used a plain sentinel value.
   }
   await redis.del(key).catch(() => {});
-  const { finalizeCallSession } = await import('./billing-session-finalization.service');
-  await finalizeCallSession(io, {
-    callId,
-    reason: 'explicit_end',
-    source: 'deferred_pending_end',
-  });
+  const { finalizeCallEnd } = await import('../video/call-finalization.service');
+  await finalizeCallEnd(io, callId, 'deferred_pending_end');
   logInfo('Deferred settlement for call after session promotion', {
     callId,
     source,
@@ -305,8 +368,26 @@ export async function releaseActiveCallSlotsIfOurs(
   const userKey = activeCallByUserKey(userFirebaseUid);
   const creatorKey = activeCallByUserKey(creatorFirebaseUid);
   const [u, c] = await Promise.all([redis.get(userKey), redis.get(creatorKey)]);
-  if (u === callId) await redis.del(userKey).catch(() => {});
-  if (c === callId) await redis.del(creatorKey).catch(() => {});
+  if (u === callId) {
+    await redis.del(userKey).catch(() => {});
+    const keyStillExists = Boolean(await redis.get(userKey));
+    logInfo('Released active call slot for payer', {
+      callId,
+      firebaseUid: userFirebaseUid,
+      activeCallKeyDeleted: true,
+      activeCallKeyExistsAfterDelete: keyStillExists,
+    });
+  }
+  if (c === callId) {
+    await redis.del(creatorKey).catch(() => {});
+    const keyStillExists = Boolean(await redis.get(creatorKey));
+    logInfo('Released active call slot for creator', {
+      callId,
+      firebaseUid: creatorFirebaseUid,
+      activeCallKeyDeleted: true,
+      activeCallKeyExistsAfterDelete: keyStillExists,
+    });
+  }
 }
 
 async function releaseActiveCallSlotsIfTerminal(
@@ -439,8 +520,16 @@ export interface CallSession {
   lastCheckpointEarnedMicros?: number;
   /** Last server emit timestamp for throttling high-frequency billing:update fanout. */
   lastEmitAtMs?: number;
+  /** Heartbeat timestamps consumed by watchdog heuristics. */
+  lastHealthyTickAt?: number;
+  lastSocketEmitAt?: number;
+  lastSequenceAdvanceAt?: number;
   /** Expected next tick time for drift telemetry. */
   expectedNextTickAtMs?: number;
+  /** Deployment-safe runtime ownership metadata. */
+  instanceId?: string;
+  runtimeEpoch?: number;
+  leaderLock?: string;
   /** @deprecated migrated from v1 */
   pricePerSecond?: number;
   creatorEarningsPerSecond?: number;
@@ -840,6 +929,18 @@ function migrateSession(
       raw.lastCheckpointEarnedMicros !== undefined
         ? Number(raw.lastCheckpointEarnedMicros)
         : undefined,
+    lastHealthyTickAt: Number(raw.lastHealthyTickAt) || 0,
+    lastSocketEmitAt: Number(raw.lastSocketEmitAt) || 0,
+    lastSequenceAdvanceAt: Number(raw.lastSequenceAdvanceAt) || 0,
+    instanceId:
+      typeof raw.instanceId === 'string' && raw.instanceId.length > 0
+        ? raw.instanceId
+        : undefined,
+    runtimeEpoch: Number(raw.runtimeEpoch) || undefined,
+    leaderLock:
+      typeof raw.leaderLock === 'string' && raw.leaderLock.length > 0
+        ? raw.leaderLock
+        : undefined,
   };
 
   normalizeV4SessionFields(session);
@@ -898,7 +999,13 @@ function buildSessionFromCheckpoint(
     totalEarnedMicros,
     elapsedSeconds,
     effectiveDurationLimitSeconds: MAX_CALL_DURATION_SECONDS,
+    lastHealthyTickAt: lastProcessedAtMs,
+    lastSocketEmitAt: Number(checkpoint.lastCheckpointAtMs) || lastProcessedAtMs,
+    lastSequenceAdvanceAt: lastProcessedAtMs,
     expectedNextTickAtMs: lastProcessedAtMs + BILLING_PROCESS_INTERVAL_MS,
+    instanceId: BILLING_RUNTIME_INSTANCE_ID,
+    runtimeEpoch: Math.max(1, Number(checkpoint.version) || 1),
+    leaderLock: `runtime:${callId}`,
   };
 
   normalizeV4SessionFields(session);
@@ -1240,7 +1347,13 @@ export class BillingService {
         elapsedSeconds: 0,
         effectiveDurationLimitSeconds: MAX_CALL_DURATION_SECONDS,
         lastCheckpointAtMs: 0,
+        lastHealthyTickAt: seedStartTime,
+        lastSocketEmitAt: seedStartTime,
+        lastSequenceAdvanceAt: seedStartTime,
         expectedNextTickAtMs: seedStartTime + BILLING_PROCESS_INTERVAL_MS,
+        instanceId: BILLING_RUNTIME_INSTANCE_ID,
+        runtimeEpoch: 1,
+        leaderLock: `runtime:${callId}`,
       };
       normalizeV4SessionFields(earlySession);
       await redis
@@ -1393,7 +1506,13 @@ export class BillingService {
       elapsedSeconds: 0,
       effectiveDurationLimitSeconds,
       lastCheckpointAtMs: 0,
+      lastHealthyTickAt: startTime,
+      lastSocketEmitAt: startTime,
+      lastSequenceAdvanceAt: startTime,
       expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
+      instanceId: BILLING_RUNTIME_INSTANCE_ID,
+      runtimeEpoch: 1,
+      leaderLock: `runtime:${callId}`,
     };
     normalizeV4SessionFields(session);
 
@@ -1553,6 +1672,9 @@ export class BillingService {
       })
     ).next;
     session.billingSequence = 1;
+    session.lastHealthyTickAt = serverTimestamp;
+    session.lastSequenceAdvanceAt = serverTimestamp;
+    session.lastSocketEmitAt = serverTimestamp;
     await persistCallSession(redis, callId, session);
 
     const settledFromPendingEnd = await consumePendingCallEndIfAny(
@@ -1915,6 +2037,18 @@ export class BillingService {
       let balanceMicros = introMicros + walletMicros;
       normalizeV4SessionFields(session);
       const introPromoBilling = session.introPromoActive === true;
+      const ownershipOk = await ensureRuntimeOwnership(redis, session, callId);
+      if (!ownershipOk) {
+        logWarning('billing_runtime_owner_rejected_tick', {
+          callId,
+          lifecycleState: session.lifecycleState,
+          billingSequence: session.billingSequence,
+          runtimeEpoch: session.runtimeEpoch,
+          ownerInstanceId: session.instanceId,
+          workerInstanceId: BILLING_RUNTIME_INSTANCE_ID,
+        });
+        return 'tick_ok';
+      }
 
       if (
         sessionRaw &&
@@ -2034,6 +2168,8 @@ export class BillingService {
       }
       session.version += 1;
       session.billingSequence += 1;
+      session.lastHealthyTickAt = now;
+      session.lastSequenceAdvanceAt = now;
       if (session.lifecycleState === 'STARTING' || session.lifecycleState === 'RECOVERING') {
         session['lifecycleState'] = (
           await transitionBillingStateWithAudit({
@@ -2262,6 +2398,7 @@ export class BillingService {
 
       if (shouldEmitUpdate) {
         session.lastEmitAtMs = nowMs;
+        session.lastSocketEmitAt = nowMs;
         recordBillingMetric('redis_ops', 1, { callId, path: 'emit_state_persist' });
         await persistCallSession(redis, callId, session);
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);

@@ -2,6 +2,7 @@ import {
   getRedis,
   CALL_SESSION_PREFIX,
   callSessionKey,
+  callSessionTerminalKey,
   activeCallByUserKey,
   callUserIntroMicrosKey,
   callUserWalletMicrosKey,
@@ -33,15 +34,36 @@ export interface BillingRuntimeSession {
   elapsedSeconds: number;
   effectiveDurationLimitSeconds?: number;
   version?: number;
+  lastHealthyTickAt?: number;
+  lastSocketEmitAt?: number;
+  lastSequenceAdvanceAt?: number;
+  instanceId?: string;
+  runtimeEpoch?: number;
+  leaderLock?: string;
+}
+
+export interface BillingTerminalSnapshot {
+  callId: string;
+  lifecycleState: 'SETTLED';
+  billingSequence: number;
+  elapsedSeconds: number;
+  durationSeconds?: number;
+  finalCoins?: number;
+  totalDeducted?: number;
+  totalEarned?: number;
+  settledAt: number;
+  reason?: string;
+  source?: string;
 }
 
 export interface ResolvedBillingRuntime {
-  source: 'redis' | 'checkpoint' | 'reconstructed' | 'missing';
+  source: 'redis' | 'checkpoint' | 'reconstructed' | 'terminal' | 'missing';
   session: BillingRuntimeSession | null;
   balanceMicros: number;
   introMicros: number;
   walletMicros: number;
   earningsMicros: number;
+  terminalSnapshot?: BillingTerminalSnapshot;
 }
 
 export interface ResolvedUserActiveRuntime {
@@ -91,6 +113,12 @@ function buildSessionFromCheckpoint(
     elapsedSeconds,
     effectiveDurationLimitSeconds: Number(checkpoint.effectiveDurationLimitSeconds) || undefined,
     version: Math.max(1, Number(checkpoint.version) || 1),
+    lastHealthyTickAt: lastProcessedAtMs,
+    lastSocketEmitAt: Number(checkpoint.lastCheckpointAtMs) || lastProcessedAtMs,
+    lastSequenceAdvanceAt: lastProcessedAtMs,
+    instanceId: String(process.env.BILLING_INSTANCE_ID || process.pid),
+    runtimeEpoch: Math.max(1, Number(checkpoint.version) || 1),
+    leaderLock: `billing:runtime:owner:${callId}`,
   };
 }
 
@@ -132,9 +160,45 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
     };
   }
 
+  const terminalRaw = await redis.get(callSessionTerminalKey(callId));
+  if (terminalRaw) {
+    try {
+      const terminalSnapshot = JSON.parse(terminalRaw) as BillingTerminalSnapshot;
+      recordBillingMetric('billing_recovery_source', 1, { source: 'terminal', callId });
+      recordBillingMetric('billing_resolver_terminal_tombstone_hits', 1, { callId });
+      logInfo('billing_runtime_resolved', {
+        callId,
+        source: 'terminal',
+        lifecycleState: terminalSnapshot.lifecycleState,
+        billingSequence: terminalSnapshot.billingSequence,
+        elapsedSeconds: terminalSnapshot.elapsedSeconds,
+      });
+      return {
+        source: 'terminal',
+        session: null,
+        introMicros: 0,
+        walletMicros: 0,
+        balanceMicros: 0,
+        earningsMicros: 0,
+        terminalSnapshot,
+      };
+    } catch (error) {
+      logWarning('billing_terminal_snapshot_unparseable', { callId, source: 'terminal' });
+      recordBillingMetric('billing_recovery_source', 1, {
+        source: 'missing',
+        callId,
+        reason: 'terminal_snapshot_unparseable',
+      });
+    }
+  }
+
   const checkpoint = (await getBillingCheckpoint(callId)) as Record<string, unknown> | null;
   if (!checkpoint) {
-    logWarning('billing_runtime_missing', { callId, source: 'missing', reason: 'no_session_no_checkpoint' });
+    logWarning('billing_runtime_missing', {
+      callId,
+      source: 'missing',
+      reason: terminalRaw ? 'terminal_unparseable_no_checkpoint' : 'no_session_no_checkpoint',
+    });
     recordBillingMetric('billing_recovery_source', 1, { source: 'missing', callId });
     return {
       source: 'missing',
@@ -212,7 +276,19 @@ export async function resolveActiveRuntimeStateForUser(
   const slotCallId = await redis.get(activeCallByUserKey(firebaseUid));
   if (slotCallId) {
     const runtime = await resolveBillingRuntimeState(slotCallId);
-    if (runtime.session) {
+    if (runtime.terminalSnapshot) {
+      await redis.del(activeCallByUserKey(firebaseUid)).catch(() => {});
+      const staleSlotStillExists = Boolean(await redis.get(activeCallByUserKey(firebaseUid)));
+      logInfo('billing_active_call_slot_terminal_tombstone_cleanup', {
+        firebaseUid,
+        staleCallId: slotCallId,
+        activeCallKeyDeleted: true,
+        activeCallKeyExistsAfterDelete: staleSlotStillExists,
+      });
+      recordBillingMetric('billing_active_slot_terminal_cleared', 1, {
+        firebaseUid,
+      });
+    } else if (runtime.session) {
       logDebug('billing_active_runtime_lookup', {
         firebaseUid,
         callId: slotCallId,
@@ -235,6 +311,13 @@ export async function resolveActiveRuntimeStateForUser(
       runtimeSource: runtime.source,
     });
     await redis.del(activeCallByUserKey(firebaseUid)).catch(() => {});
+    const staleSlotStillExists = Boolean(await redis.get(activeCallByUserKey(firebaseUid)));
+    logInfo('billing_active_call_slot_stale_cleanup', {
+      firebaseUid,
+      staleCallId: slotCallId,
+      activeCallKeyDeleted: true,
+      activeCallKeyExistsAfterDelete: staleSlotStillExists,
+    });
   }
 
   let cursor = '0';
@@ -263,6 +346,10 @@ export async function resolveActiveRuntimeStateForUser(
       await redis
         .setex(activeCallByUserKey(firebaseUid), 7200, callId)
         .catch(() => {});
+      logInfo('billing_active_call_slot_backfilled_from_scan', {
+        firebaseUid,
+        callId,
+      });
       logInfo('billing_active_runtime_lookup', {
         firebaseUid,
         callId,

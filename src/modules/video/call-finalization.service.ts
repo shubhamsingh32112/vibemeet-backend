@@ -14,6 +14,34 @@ const FINALIZER_MODE = (process.env.CALL_END_FINALIZER_MODE || 'enforce').toLowe
 const finalizeLockKey = (callId: string): string => `call:finalize:lock:${callId}`;
 const finalizeDoneKey = (callId: string): string => `call:finalize:done:${callId}`;
 
+type CallRecordLike = {
+  creatorUserId: { toString(): string };
+  status: string;
+  isSettled?: boolean;
+  save(): Promise<unknown>;
+} | null;
+
+let loadCallForFinalizationForTests: ((callId: string) => Promise<CallRecordLike>) | null = null;
+let finalizeCallSessionForTests:
+  | ((io: Server, params: { callId: string; reason: 'explicit_end'; source: any }) => Promise<unknown>)
+  | null = null;
+let releaseCreatorCallLockForTests: ((creatorUserId: string) => Promise<void>) | null = null;
+let finalizeCreatorAvailabilityForCallForTests:
+  | ((callId: string, creatorUserId: string) => Promise<void>)
+  | null = null;
+
+export function setCallFinalizationHooksForTests(hooks: {
+  loadCallForFinalization?: ((callId: string) => Promise<CallRecordLike>) | null;
+  finalizeCallSession?: ((io: Server, params: { callId: string; reason: 'explicit_end'; source: any }) => Promise<unknown>) | null;
+  releaseCreatorCallLock?: ((creatorUserId: string) => Promise<void>) | null;
+  finalizeCreatorAvailabilityForCall?: ((callId: string, creatorUserId: string) => Promise<void>) | null;
+}): void {
+  loadCallForFinalizationForTests = hooks.loadCallForFinalization ?? null;
+  finalizeCallSessionForTests = hooks.finalizeCallSession ?? null;
+  releaseCreatorCallLockForTests = hooks.releaseCreatorCallLock ?? null;
+  finalizeCreatorAvailabilityForCallForTests = hooks.finalizeCreatorAvailabilityForCall ?? null;
+}
+
 export async function finalizeCallEnd(
   io: Server,
   callId: string,
@@ -42,12 +70,17 @@ export async function finalizeCallEnd(
   }
 
   try {
-    const call = await Call.findOne({ callId });
+    const call = loadCallForFinalizationForTests
+      ? await loadCallForFinalizationForTests(callId)
+      : await Call.findOne({ callId });
     if (call) {
       // Restore creator availability ASAP so creators don’t appear “offline/busy”
       // for the entire settlement duration (which can be seconds).
-      await releaseCreatorCallLock(call.creatorUserId.toString());
-      await finalizeCreatorAvailabilityForCall(callId, call.creatorUserId.toString());
+      const releaseFn = releaseCreatorCallLockForTests ?? releaseCreatorCallLock;
+      const finalizeAvailabilityFn =
+        finalizeCreatorAvailabilityForCallForTests ?? finalizeCreatorAvailabilityForCall;
+      await releaseFn(call.creatorUserId.toString());
+      await finalizeAvailabilityFn(callId, call.creatorUserId.toString());
 
       if (call.status !== 'ended') {
         transitionCallStatus(call, 'ended', {
@@ -64,20 +97,26 @@ export async function finalizeCallEnd(
           ? 'http_call_ended'
           : source === 'socket_call_ended'
             ? 'socket_call_ended'
+            : source === 'force_end'
+              ? 'force_end'
+              : source === 'deferred_pending_end'
+                ? 'deferred_pending_end'
             : source.startsWith('reconciliation')
               ? 'reconciliation_worker'
               : source.startsWith('webhook')
                 ? 'webhook'
                 : 'webhook';
 
-      await finalizeCallSession(io, {
+      const finalizeSessionFn = finalizeCallSessionForTests ?? finalizeCallSession;
+      await finalizeSessionFn(io, {
         callId,
         reason: 'explicit_end',
         source: settlementSource,
       });
       await call.save();
     } else {
-      await finalizeCallSession(io, {
+      const finalizeSessionFn = finalizeCallSessionForTests ?? finalizeCallSession;
+      await finalizeSessionFn(io, {
         callId,
         reason: 'explicit_end',
         source: 'webhook',

@@ -21,6 +21,7 @@ import { finalizeCallEnd } from '../video/call-finalization.service';
 import {
   resolveActiveRuntimeStateForUser,
   resolveBillingRuntimeState,
+  type BillingTerminalSnapshot,
   type ResolvedBillingRuntime,
 } from './billing-runtime-resolver.service';
 import {
@@ -131,6 +132,21 @@ function buildRecoverSnapshot(
       serverTimestamp,
       callStartTime: session.startTime,
     },
+  };
+}
+
+function buildTerminalRecoverEntry(snapshot: BillingTerminalSnapshot): Record<string, unknown> {
+  return {
+    callId: snapshot.callId,
+    billingSequence: Math.max(0, Number(snapshot.billingSequence) || 0),
+    lifecycleState: 'SETTLED',
+    elapsedSeconds: Math.max(0, Number(snapshot.elapsedSeconds) || 0),
+    durationSeconds: Math.max(0, Number(snapshot.durationSeconds) || 0),
+    finalCoins: Math.max(0, Number(snapshot.finalCoins) || 0),
+    totalDeducted: Math.max(0, Number(snapshot.totalDeducted) || 0),
+    totalEarned: Math.max(0, Number(snapshot.totalEarned) || 0),
+    settledAt: Math.max(0, Number(snapshot.settledAt) || Date.now()),
+    serverTimestamp: Date.now(),
   };
 }
 
@@ -319,17 +335,38 @@ export function setupBillingGateway(io: Server): void {
       }
     });
 
-    socket.on('billing:recover-state', async (payload?: { clientRecoveryRequestId?: string }) => {
+    socket.on(
+      'billing:recover-state',
+      async (payload?: { clientRecoveryRequestId?: string; callId?: string }) => {
       const now = Date.now();
       const recoveryRequestId = ++recoveryRequestSeq;
       const clientRecoveryRequestId =
         typeof payload?.clientRecoveryRequestId === 'string'
           ? payload.clientRecoveryRequestId.trim().slice(0, 128)
           : undefined;
+      const requestedCallId =
+        typeof payload?.callId === 'string' && payload.callId.trim().length > 0
+          ? payload.callId.trim()
+          : undefined;
       const emitSuppressedRecoverySnapshot = async (reason: 'in_flight' | 'debounce') => {
         const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
         const callId = activeRuntime.callId;
         const recoverySession = activeRuntime.runtime.session;
+        const terminalSnapshot = activeRuntime.runtime.terminalSnapshot;
+        if (callId && terminalSnapshot) {
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [buildTerminalRecoverEntry(terminalSnapshot)],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: now,
+            status: 'terminal_settled',
+            reason,
+            recoveryOutcome: 'recover_success',
+            runtimeSource: activeRuntime.runtime.source,
+          });
+          return;
+        }
         if (!callId || !recoverySession) {
           emitBillingRecoverStateResponse(socket, {
             success: true,
@@ -445,15 +482,21 @@ export function setupBillingGateway(io: Server): void {
         const redis = getRedis();
 
         const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
-        const callId = activeRuntime.callId;
-        if (!callId || !activeRuntime.runtime.session) {
+        const fallbackRuntime =
+          !activeRuntime.callId && requestedCallId
+            ? await resolveBillingRuntimeState(requestedCallId)
+            : null;
+        const callId = activeRuntime.callId || requestedCallId || null;
+        const resolvedRuntime = activeRuntime.callId ? activeRuntime.runtime : fallbackRuntime;
+        if (!callId || (!resolvedRuntime?.session && !resolvedRuntime?.terminalSnapshot)) {
           logInfo('billing_state_recovery_empty', {
             firebaseUid,
             recoveryRequestId,
             clientRecoveryRequestId,
             lookupSource: activeRuntime.source,
-            runtimeSource: activeRuntime.runtime.source,
+            runtimeSource: resolvedRuntime?.source ?? activeRuntime.runtime.source,
             reason: 'runtime_missing',
+            requestedCallId,
           });
           recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {
             reason: 'runtime_missing',
@@ -472,7 +515,7 @@ export function setupBillingGateway(io: Server): void {
             recoveryRequestId,
             clientRecoveryRequestId,
             generatedAtMs: Date.now(),
-            runtimeSource: activeRuntime.runtime.source,
+            runtimeSource: resolvedRuntime?.source ?? activeRuntime.runtime.source,
             status: 'no_active_call',
             reason: 'runtime_missing',
             recoveryOutcome: 'recover_runtime_missing',
@@ -480,7 +523,31 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const recoverySession = activeRuntime.runtime.session;
+        const runtimeForRecovery = resolvedRuntime as ResolvedBillingRuntime;
+        if (runtimeForRecovery.terminalSnapshot) {
+          const terminalEntry = buildTerminalRecoverEntry(runtimeForRecovery.terminalSnapshot);
+          logInfo('billing_state_recovery_terminal', {
+            firebaseUid,
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            callId,
+            runtimeSource: runtimeForRecovery.source,
+          });
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [terminalEntry],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: Date.now(),
+            runtimeSource: runtimeForRecovery.source,
+            status: 'terminal_settled',
+            reason: 'resolved_from_terminal_tombstone',
+            recoveryOutcome: 'recover_success',
+          });
+          return;
+        }
+
+        const recoverySession = runtimeForRecovery.session;
         const recoveryLifecycleState = String(recoverySession?.lifecycleState || 'ACTIVE');
         const isSessionParticipant =
           recoverySession != null &&
@@ -510,7 +577,7 @@ export function setupBillingGateway(io: Server): void {
             clientRecoveryRequestId,
             callId,
             lookupSource: activeRuntime.source,
-            runtimeSource: activeRuntime.runtime.source,
+            runtimeSource: runtimeForRecovery.source,
             lifecycleState: recoveryLifecycleState,
             reason,
           });
@@ -523,7 +590,7 @@ export function setupBillingGateway(io: Server): void {
             recoveryRequestId,
             clientRecoveryRequestId,
             generatedAtMs: Date.now(),
-            runtimeSource: activeRuntime.runtime.source,
+            runtimeSource: runtimeForRecovery.source,
             status: 'no_active_call',
             reason,
             recoveryOutcome: 'recover_empty',
@@ -531,8 +598,8 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const runtime = activeRuntime.runtime.session
-          ? activeRuntime.runtime
+        const runtime = runtimeForRecovery.session
+          ? runtimeForRecovery
           : await resolveBillingRuntimeState(callId);
         if (!runtime.session) {
           recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {

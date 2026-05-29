@@ -77,20 +77,9 @@ export async function forceTerminateCall(
     return;
   }
 
-  const { finalizeCallSession } = await import('./billing-session-finalization.service');
-  const settlementReason =
-    reason === 'duration_limit_reached'
-      ? 'duration_limit'
-      : reason === 'insufficient_coins' || reason === 'intro_promo_exhausted'
-        ? 'insufficient_coins'
-        : 'unknown';
-
-  void finalizeCallSession(io, {
-    callId,
-    reason: settlementReason,
-    source: 'force_end',
-  }).catch((settleError) => {
-    logError('forceTerminateCall settlement trigger failed', settleError, { callId, reason });
+  const { finalizeCallEnd } = await import('../video/call-finalization.service');
+  void finalizeCallEnd(io, callId, 'force_end').catch((finalizeError) => {
+    logError('forceTerminateCall finalization trigger failed', finalizeError, { callId, reason });
   });
   recordBillingMetric('force_terminate_settlement_triggered', 1, { callId, reason });
 

@@ -368,6 +368,14 @@ export async function transitionCreatorPresence(
     status: nextRecord.state,
     changed: statusChanged ? '1' : '0',
   });
+  logInfo('creator_presence_transition_eval', {
+    firebaseUid,
+    eventType,
+    source,
+    activeCallExists: hasActiveCallState,
+    derivedState: nextRecord.state,
+    version: nextRecord.version,
+  });
 
   if (featureFlags.creatorPresenceUserModelShadowCompareEnabled) {
     const legacyTarget = resolveLegacyTargetState(hasActiveCallState, eventType);
