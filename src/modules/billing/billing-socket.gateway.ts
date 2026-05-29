@@ -10,7 +10,6 @@ import {
 } from '../../config/redis';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { billingService, ensureBillingStartedReplayFreshness } from './billing.service';
-import { finalizeCallSession } from './billing-session-finalization.service';
 import {
   isCallActiveForParticipant,
   isNonTerminalLifecycle,
@@ -22,6 +21,7 @@ import { finalizeCallEnd } from '../video/call-finalization.service';
 import {
   resolveActiveRuntimeStateForUser,
   resolveBillingRuntimeState,
+  type ResolvedBillingRuntime,
 } from './billing-runtime-resolver.service';
 import {
   emitBillingRecoverStateFromSnapshot,
@@ -48,6 +48,91 @@ const SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD = Math.min(
     parseInt(process.env.BILLING_SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD || '1', 10) || 1
   )
 );
+
+type RecoveryGate = {
+  inFlight: boolean;
+  lastRecoveryAtMs: number;
+};
+
+const recoveryGateByUid = new Map<string, RecoveryGate>();
+
+function getRecoveryGate(firebaseUid: string): RecoveryGate {
+  let gate = recoveryGateByUid.get(firebaseUid);
+  if (!gate) {
+    gate = { inFlight: false, lastRecoveryAtMs: 0 };
+    recoveryGateByUid.set(firebaseUid, gate);
+  }
+  return gate;
+}
+
+function buildRecoverSnapshot(
+  session: BillingRecoverSession,
+  runtime: ResolvedBillingRuntime,
+  serverTimestamp: number
+):
+  | {
+      kind: 'bootstrapping' | 'ok';
+      payload: Record<string, unknown>;
+      reason: string;
+      recoveryOutcome: RecoveryOutcome;
+    }
+  | null {
+  const pps =
+    session.pricePerSecondMicros ??
+    Math.max(1, Math.round((session.pricePerSecond ?? 0) * COIN_MICROS));
+  const billingSequence = Math.max(0, Number(session.billingSequence) || 0);
+  const lifecycleState = String(session.lifecycleState || 'ACTIVE');
+  const balanceMicros = runtime.balanceMicros;
+  if (
+    (lifecycleState === 'STARTING' || lifecycleState === 'RECOVERING') &&
+    Number(session.startTime) > 0 &&
+    billingSequence <= 0
+  ) {
+    return {
+      kind: 'bootstrapping',
+      reason: 'seeded_or_promoting',
+      recoveryOutcome: 'recover_bootstrapping',
+      payload: {
+        callId: session.callId,
+        lifecycleState,
+        bootstrapping: true,
+        billingSequence: 0,
+        elapsedSeconds: Math.max(0, Number(session.elapsedSeconds) || 0),
+        remainingSeconds: pps > 0 ? Math.floor(balanceMicros / pps) : 0,
+        serverTimestamp,
+        callStartTime: Number(session.startTime),
+      },
+    };
+  }
+  if (billingSequence <= 0 || Number(session.startTime) <= 0 || serverTimestamp <= 0) {
+    return null;
+  }
+
+  let earningsMicros = runtime.earningsMicros;
+  if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION) {
+    earningsMicros = Math.round((earningsMicros * COIN_MICROS) / 10000);
+  }
+
+  return {
+    kind: 'ok',
+    reason: 'snapshot',
+    recoveryOutcome: 'recover_success',
+    payload: {
+      callId: session.callId,
+      coins: microsToWholeCoinsFloor(balanceMicros),
+      coinsExact: balanceMicros / COIN_MICROS,
+      billingSequence,
+      lifecycleState,
+      pricePerSecond: pps / COIN_MICROS,
+      pricePerSecondMicros: pps,
+      elapsedSeconds: session.elapsedSeconds,
+      remainingSeconds: pps > 0 ? Math.floor(balanceMicros / pps) : 0,
+      earnings: Math.round((earningsMicros / COIN_MICROS) * 100) / 100,
+      serverTimestamp,
+      callStartTime: session.startTime,
+    },
+  };
+}
 
 /** Shape of Redis billing session JSON (recover-state handler). */
 interface BillingRecoverSession {
@@ -106,8 +191,7 @@ export function setupBillingGateway(io: Server): void {
 
     socket.join(`user:${firebaseUid}`);
     logDebug('User joined billing room', { firebaseUid, room: `user:${firebaseUid}` });
-    let recoveryInFlight = false;
-    let lastRecoveryAtMs = 0;
+    const recoveryGate = getRecoveryGate(firebaseUid);
     let recoveryRequestSeq = 0;
 
     socket.on(
@@ -181,19 +265,6 @@ export function setupBillingGateway(io: Server): void {
             initiatedByFirebaseUid,
             initiatedByRole,
           });
-
-          const redis = getRedis();
-          const pendingEndKey = pendingCallEndKey(data.callId);
-          const hasPendingEnd = await redis.get(pendingEndKey);
-          if (hasPendingEnd) {
-            await redis.del(pendingEndKey);
-            logInfo('Deferred settlement for call', { callId: data.callId });
-            await finalizeCallSession(io, {
-              callId: data.callId,
-              reason: 'explicit_end',
-              source: 'deferred_pending_end',
-            });
-          }
         } catch (err) {
           logError('Error in call:started', err, { callId: data.callId, firebaseUid });
           const redis = getRedis();
@@ -222,8 +293,23 @@ export function setupBillingGateway(io: Server): void {
             });
 
         if (!active) {
-          await redis.setex(pendingCallEndKey(data.callId), PENDING_CALL_END_TTL, '1');
-          logInfo('Deferring call:ended (session not ready)', { callId: data.callId });
+          await redis.setex(
+            pendingCallEndKey(data.callId),
+            PENDING_CALL_END_TTL,
+            JSON.stringify({
+              requestedAtMs: Date.now(),
+              source: 'socket_call_ended',
+              participantFirebaseUid: firebaseUid,
+            })
+          );
+          recordBillingMetric('deferred_call_end_queued', 1, {
+            callId: data.callId,
+            source: 'socket_call_ended',
+          });
+          logInfo('Deferring call:ended (session not ready)', {
+            callId: data.callId,
+            source: 'socket_call_ended',
+          });
           return;
         }
 
@@ -240,7 +326,84 @@ export function setupBillingGateway(io: Server): void {
         typeof payload?.clientRecoveryRequestId === 'string'
           ? payload.clientRecoveryRequestId.trim().slice(0, 128)
           : undefined;
-      if (recoveryInFlight) {
+      const emitSuppressedRecoverySnapshot = async (reason: 'in_flight' | 'debounce') => {
+        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
+        const callId = activeRuntime.callId;
+        const recoverySession = activeRuntime.runtime.session;
+        if (!callId || !recoverySession) {
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: now,
+            status: 'suppressed',
+            reason,
+            recoveryOutcome: 'recover_suppressed',
+            runtimeSource: activeRuntime.runtime.source,
+          });
+          return;
+        }
+
+        const redis = getRedis();
+        const lifecycleState = String(recoverySession.lifecycleState || 'ACTIVE');
+        const isSessionParticipant =
+          recoverySession.userFirebaseUid === firebaseUid ||
+          recoverySession.creatorFirebaseUid === firebaseUid;
+        const active =
+          isNonTerminalLifecycle(lifecycleState) &&
+          (isSessionParticipant ||
+            (await isCallActiveForParticipant(redis, {
+              callId,
+              participantFirebaseUid: firebaseUid,
+            })));
+        if (!active) {
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: now,
+            status: 'suppressed',
+            reason,
+            recoveryOutcome: 'recover_suppressed',
+            runtimeSource: activeRuntime.runtime.source,
+          });
+          return;
+        }
+
+        const serverTimestamp = Date.now();
+        const snapshot = buildRecoverSnapshot(recoverySession, activeRuntime.runtime, serverTimestamp);
+        if (!snapshot) {
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: serverTimestamp,
+            status: 'suppressed',
+            reason,
+            recoveryOutcome: 'recover_suppressed',
+            runtimeSource: activeRuntime.runtime.source,
+          });
+          return;
+        }
+        emitBillingRecoverStateFromSnapshot(
+          socket,
+          [snapshot.payload],
+          {
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: serverTimestamp,
+            runtimeSource: activeRuntime.runtime.source,
+            status: 'suppressed',
+            reason,
+            recoveryOutcome: 'recover_suppressed',
+          }
+        );
+      };
+
+      if (recoveryGate.inFlight) {
         logInfo('billing_state_recovery_suppressed', {
           firebaseUid,
           recoveryRequestId,
@@ -252,19 +415,10 @@ export function setupBillingGateway(io: Server): void {
           reason: 'in_flight',
         });
         recordRecoveryOutcome(firebaseUid, 'recover_suppressed', { reason: 'in_flight' });
-        emitBillingRecoverStateResponse(socket, {
-          success: true,
-          activeCalls: [],
-          recoveryRequestId,
-          clientRecoveryRequestId,
-          generatedAtMs: now,
-          status: 'suppressed',
-          reason: 'in_flight',
-          recoveryOutcome: 'recover_suppressed',
-        });
+        await emitSuppressedRecoverySnapshot('in_flight');
         return;
       }
-      if (now - lastRecoveryAtMs < RECOVERY_DEBOUNCE_MS) {
+      if (now - recoveryGate.lastRecoveryAtMs < RECOVERY_DEBOUNCE_MS) {
         logInfo('billing_state_recovery_suppressed', {
           firebaseUid,
           recoveryRequestId,
@@ -277,20 +431,11 @@ export function setupBillingGateway(io: Server): void {
           reason: 'debounce',
         });
         recordRecoveryOutcome(firebaseUid, 'recover_suppressed', { reason: 'debounce' });
-        emitBillingRecoverStateResponse(socket, {
-          success: true,
-          activeCalls: [],
-          recoveryRequestId,
-          clientRecoveryRequestId,
-          generatedAtMs: now,
-          status: 'suppressed',
-          reason: 'debounce',
-          recoveryOutcome: 'recover_suppressed',
-        });
+        await emitSuppressedRecoverySnapshot('debounce');
         return;
       }
-      recoveryInFlight = true;
-      lastRecoveryAtMs = now;
+      recoveryGate.inFlight = true;
+      recoveryGate.lastRecoveryAtMs = now;
       try {
         logInfo('State recovery requested', {
           firebaseUid,
@@ -311,6 +456,14 @@ export function setupBillingGateway(io: Server): void {
             reason: 'runtime_missing',
           });
           recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {
+            reason: 'runtime_missing',
+          });
+          recordBillingMetric('recovery_runtime_missing', 1, {
+            firebaseUid,
+            reason: 'runtime_missing',
+          });
+          recordBillingMetric('runtime_missing_rate', 1, {
+            firebaseUid,
             reason: 'runtime_missing',
           });
           emitBillingRecoverStateResponse(socket, {
@@ -385,6 +538,14 @@ export function setupBillingGateway(io: Server): void {
           recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {
             reason: 'runtime_missing_after_resolve',
           });
+          recordBillingMetric('recovery_runtime_missing', 1, {
+            firebaseUid,
+            reason: 'runtime_missing_after_resolve',
+          });
+          recordBillingMetric('runtime_missing_rate', 1, {
+            firebaseUid,
+            reason: 'runtime_missing_after_resolve',
+          });
           emitBillingRecoverStateResponse(socket, {
             success: true,
             activeCalls: [],
@@ -400,55 +561,12 @@ export function setupBillingGateway(io: Server): void {
         }
 
         const session = runtime.session as BillingRecoverSession;
-        const balanceMicros = runtime.balanceMicros;
-        let earningsMicros = runtime.earningsMicros;
-        if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION) {
-          earningsMicros = Math.round((earningsMicros * COIN_MICROS) / 10000);
-        }
-        const earningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
-
-        const pps =
-          session.pricePerSecondMicros ??
-          Math.max(1, Math.round((session.pricePerSecond ?? 0) * COIN_MICROS));
-        const remainingSeconds = pps > 0 ? Math.floor(balanceMicros / pps) : 0;
 
         const serverTimestamp = Date.now();
-        const billingSequence = Math.max(0, Number(session.billingSequence) || 0);
-        const lifecycleState = String(session.lifecycleState || 'ACTIVE');
-        if (
-          (lifecycleState === 'STARTING' || lifecycleState === 'RECOVERING') &&
-          Number(session.startTime) > 0 &&
-          billingSequence <= 0
-        ) {
-          const bootPayload = {
-            callId: session.callId,
-            lifecycleState,
-            bootstrapping: true,
-            billingSequence: 0,
-            elapsedSeconds: Math.max(0, Number(session.elapsedSeconds) || 0),
-            remainingSeconds: pps > 0 ? Math.floor(balanceMicros / pps) : 0,
-            serverTimestamp,
-            callStartTime: Number(session.startTime),
-          };
-          recordRecoveryOutcome(firebaseUid, 'recover_bootstrapping', {
-            reason: 'seeded_or_promoting',
-          });
-          emitBillingRecoverStateFromSnapshot(
-            socket,
-            [bootPayload],
-            {
-              recoveryRequestId,
-              clientRecoveryRequestId,
-              generatedAtMs: serverTimestamp,
-              runtimeSource: runtime.source,
-              status: 'bootstrapping',
-              reason: 'seeded_or_promoting',
-              recoveryOutcome: 'recover_bootstrapping',
-            }
-          );
-          return;
-        }
-        if (billingSequence <= 0 || Number(session.startTime) <= 0 || serverTimestamp <= 0) {
+        const snapshot = buildRecoverSnapshot(session, runtime, serverTimestamp);
+        if (!snapshot) {
+          const billingSequence = Math.max(0, Number(session.billingSequence) || 0);
+          const lifecycleState = String(session.lifecycleState || 'ACTIVE');
           logWarning('state_recovery_emit_skipped_invalid_tuple', {
             firebaseUid,
             callId,
@@ -477,33 +595,38 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
+        if (snapshot.kind === 'bootstrapping') {
+          recordRecoveryOutcome(firebaseUid, 'recover_bootstrapping', {
+            reason: snapshot.reason,
+          });
+          emitBillingRecoverStateFromSnapshot(
+            socket,
+            [snapshot.payload],
+            {
+              recoveryRequestId,
+              clientRecoveryRequestId,
+              generatedAtMs: serverTimestamp,
+              runtimeSource: runtime.source,
+              status: 'bootstrapping',
+              reason: snapshot.reason,
+              recoveryOutcome: snapshot.recoveryOutcome,
+            }
+          );
+          return;
+        }
+
         recordRecoveryOutcome(firebaseUid, 'recover_success');
         emitBillingRecoverStateFromSnapshot(
           socket,
-          [
-          {
-            callId: session.callId,
-            coins: microsToWholeCoinsFloor(balanceMicros),
-            coinsExact: balanceMicros / COIN_MICROS,
-            billingSequence,
-            lifecycleState: String(session.lifecycleState || 'ACTIVE'),
-            pricePerSecond: pps / COIN_MICROS,
-            pricePerSecondMicros: pps,
-            elapsedSeconds: session.elapsedSeconds,
-            remainingSeconds,
-            earnings: earningsDisplay,
-            serverTimestamp,
-            callStartTime: session.startTime,
-          },
-          ],
+          [snapshot.payload],
           {
             recoveryRequestId,
             clientRecoveryRequestId,
             generatedAtMs: serverTimestamp,
             runtimeSource: runtime.source,
             status: 'ok',
-            reason: 'snapshot',
-            recoveryOutcome: 'recover_success',
+            reason: snapshot.reason,
+            recoveryOutcome: snapshot.recoveryOutcome,
           }
         );
 
@@ -531,7 +654,7 @@ export function setupBillingGateway(io: Server): void {
           recoveryOutcome: 'recover_emit_skipped',
         });
       } finally {
-        recoveryInFlight = false;
+        recoveryGate.inFlight = false;
       }
     });
 

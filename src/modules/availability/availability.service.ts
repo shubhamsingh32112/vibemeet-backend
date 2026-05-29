@@ -9,13 +9,13 @@
  * - No manual toggle - status is automatic based on app lifecycle
  * 
  * Status semantics:
- * - 'online' = creator is available for calls
- * - 'busy' = creator is on a call, offline, or unavailable
+ * - Base state (`creator:availability:*`): 'online' | 'offline'
+ * - Effective API state: 'online' | 'busy' (`busy` = active call or offline)
  * 
  * Rule: Missing/unknown creators are ALWAYS 'busy'
  * 
  * Redis key design:
- *   creator:availability:{creatorId} → "online" | "busy"
+ *   creator:availability:{creatorId} → "online" | "offline"
  * 
  * 🔥 SCALABILITY OPTIMIZATION (1000 users/day, 200 creators):
  * - TTL: 120 seconds (auto-expire safety)
@@ -30,24 +30,20 @@
 import {
   getRedis,
   isRedisConfigured,
-  creatorPresenceKey,
   availabilityKey,
-  CREATOR_PRESENCE_KEY_PREFIX,
+  AVAILABILITY_KEY_PREFIX,
+  activeCallByUserKey,
 } from '../../config/redis';
-import { featureFlags } from '../../config/feature-flags';
-import { logError, logInfo, logWarning } from '../../utils/logger';
+import { logError } from '../../utils/logger';
+import { getBatchCreatorPresence, readCreatorPresenceState } from './presence.service';
 
 export type CreatorAvailability = 'online' | 'busy';
+type CreatorBaseAvailability = 'online' | 'offline';
+
+const CREATOR_BASE_TTL_SECONDS = 120;
 
 function parsePresenceState(raw: string | null): CreatorAvailability | null {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as { state?: string } | null;
-    if (!parsed || typeof parsed !== 'object') return null;
-    return parsed.state === 'online' ? 'online' : 'busy';
-  } catch {
-    return null;
-  }
+  return raw === 'online' ? 'online' : 'busy';
 }
 
 /**
@@ -59,11 +55,22 @@ export async function setAvailability(
   creatorId: string,
   status: CreatorAvailability
 ): Promise<void> {
-  void creatorId;
-  void status;
-  throw new Error(
-    'setAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
-  );
+  await setCreatorBaseAvailability(creatorId, status === 'online' ? 'online' : 'offline');
+}
+
+export async function setCreatorBaseAvailability(
+  creatorId: string,
+  status: CreatorBaseAvailability
+): Promise<void> {
+  if (!isRedisConfigured()) {
+    return;
+  }
+  try {
+    const redis = getRedis();
+    await redis.setex(availabilityKey(creatorId), CREATOR_BASE_TTL_SECONDS, status);
+  } catch (err) {
+    logError('creator_base_availability_set_failed', err, { creatorId, status });
+  }
 }
 
 /**
@@ -77,17 +84,8 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
   }
 
   try {
-    const redis = getRedis();
-    const v2 = await redis.get(creatorPresenceKey(creatorId));
-    const canonical = parsePresenceState(v2);
-    if (canonical) {
-      return canonical;
-    }
-    if (!featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
-      return 'busy';
-    }
-    const legacy = await redis.get(availabilityKey(creatorId));
-    return (legacy === 'online' ? 'online' : 'busy') as CreatorAvailability;
+    const record = await readCreatorPresenceState(creatorId);
+    return record.state === 'online' ? 'online' : 'busy';
   } catch (err) {
     logError('creator_availability_get_failed', err, { creatorId, failSafe: 'busy' });
     return 'busy'; // Error = Busy (fail safe)
@@ -100,10 +98,22 @@ export async function getAvailability(creatorId: string): Promise<CreatorAvailab
  * @param creatorId - The creator's Firebase UID
  */
 export async function refreshAvailability(creatorId: string): Promise<void> {
-  void creatorId;
-  throw new Error(
-    'refreshAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
-  );
+  await refreshCreatorBaseAvailability(creatorId);
+}
+
+export async function refreshCreatorBaseAvailability(creatorId: string): Promise<void> {
+  if (!isRedisConfigured()) {
+    return;
+  }
+  try {
+    const redis = getRedis();
+    const current = await redis.get(availabilityKey(creatorId));
+    if (current === 'online') {
+      await redis.setex(availabilityKey(creatorId), CREATOR_BASE_TTL_SECONDS, 'online');
+    }
+  } catch (err) {
+    logError('creator_base_availability_refresh_failed', err, { creatorId });
+  }
 }
 
 /**
@@ -111,10 +121,15 @@ export async function refreshAvailability(creatorId: string): Promise<void> {
  * @param creatorId - The creator's Firebase UID
  */
 export async function removeAvailability(creatorId: string): Promise<void> {
-  void creatorId;
-  throw new Error(
-    'removeAvailability is disabled. Presence writes must go through transitionCreatorPresence in presence.service.ts'
-  );
+  if (!isRedisConfigured()) {
+    return;
+  }
+  try {
+    const redis = getRedis();
+    await redis.del(availabilityKey(creatorId));
+  } catch (err) {
+    logError('creator_base_availability_remove_failed', err, { creatorId });
+  }
 }
 
 /**
@@ -138,7 +153,7 @@ export async function getAllOnlineCreators(): Promise<string[]> {
       const [nextCursor, keys] = await redis.scan(
         cursor,
         'MATCH',
-        `${CREATOR_PRESENCE_KEY_PREFIX}*`,
+        `${AVAILABILITY_KEY_PREFIX}*`,
         'COUNT',
         100 // Process 100 keys at a time
       );
@@ -148,13 +163,23 @@ export async function getAllOnlineCreators(): Promise<string[]> {
       if (keys.length > 0) {
         // Batch get values using MGET (efficient)
         const values = await redis.mget(...keys);
+        const candidateCreatorIds: string[] = [];
         keys.forEach((key, index) => {
           const availability = parsePresenceState(values[index]);
           if (availability === 'online') {
-            const creatorId = key.replace(CREATOR_PRESENCE_KEY_PREFIX, '');
-            onlineCreators.push(creatorId);
+            candidateCreatorIds.push(key.replace(AVAILABILITY_KEY_PREFIX, ''));
           }
         });
+        if (candidateCreatorIds.length > 0) {
+          const activeVals = await redis.mget(
+            ...candidateCreatorIds.map((creatorId) => activeCallByUserKey(creatorId))
+          );
+          candidateCreatorIds.forEach((creatorId, index) => {
+            if (!activeVals[index]) {
+              onlineCreators.push(creatorId);
+            }
+          });
+        }
       }
     } while (cursor !== '0');
     
@@ -181,59 +206,12 @@ export async function getBatchAvailability(
   }
 
   try {
-    const redis = getRedis();
     const result: Record<string, CreatorAvailability> = {};
-
-    // Canonical read path is v2 presence payload.
-    const v2Keys = creatorIds.map((id) => creatorPresenceKey(id));
-    const v2Vals = await redis.mget(...v2Keys);
-    const missingCanonicalIds: string[] = [];
-
-    creatorIds.forEach((id, index) => {
-      const parsed = parsePresenceState(v2Vals[index]);
-      if (parsed) {
-        result[id] = parsed;
-      } else {
-        missingCanonicalIds.push(id);
-      }
+    const presence = await getBatchCreatorPresence(creatorIds);
+    creatorIds.forEach((id) => {
+      const record = presence[id];
+      result[id] = record?.state === 'online' ? 'online' : 'busy';
     });
-
-    if (missingCanonicalIds.length > 0) {
-      const batchSize = creatorIds.length;
-      const missingRate = batchSize > 0 ? missingCanonicalIds.length / batchSize : 0;
-      logInfo('creator_availability_batch_canonical_missing', {
-        count: missingCanonicalIds.length,
-        batchSize,
-        missingRate,
-        sampleIds: missingCanonicalIds.slice(0, 5),
-      });
-      if (batchSize >= 5 && missingRate > 0.05) {
-        logWarning('creator_availability_batch_canonical_missing_high', {
-          count: missingCanonicalIds.length,
-          batchSize,
-          missingRate,
-          threshold: 0.05,
-        });
-      }
-      if (featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
-        const keys = missingCanonicalIds.map((id) => availabilityKey(id));
-        const values = await redis.mget(...keys);
-        logInfo('creator_availability_batch_legacy_fallback', {
-          count: missingCanonicalIds.length,
-          batchSize,
-          missingRate,
-          sampleIds: missingCanonicalIds.slice(0, 5),
-        });
-        missingCanonicalIds.forEach((id, index) => {
-          const value = values[index];
-          result[id] = (value === 'online' ? 'online' : 'busy') as CreatorAvailability;
-        });
-      } else {
-        missingCanonicalIds.forEach((id) => {
-          result[id] = 'busy';
-        });
-      }
-    }
 
     creatorIds.forEach((id) => {
       if (result[id] == null) {

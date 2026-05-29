@@ -3,8 +3,8 @@ import {
   getRedis,
   getRedisEndpointMode,
   availabilityKey,
-  creatorPresenceKey,
   activeCallByUserKey,
+  creatorPresenceKey,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { getCreatorStaffScope, emitStaffDomainEvent } from '../staff/staff-dashboard-invalidation.service';
@@ -17,6 +17,7 @@ import { recordCallMetric } from '../../utils/monitoring';
 import { logInfo, logWarning, logError, logDebug } from '../../utils/logger';
 
 export type CreatorPresenceState = 'online' | 'busy';
+type CreatorBaseAvailability = 'online' | 'offline';
 export type PresenceTransitionEventType =
   | 'CONNECTED'
   | 'HEARTBEAT'
@@ -34,30 +35,45 @@ export type CreatorPresenceRecord = {
   version: number;
 };
 
+type CreatorPresenceMeta = {
+  base: CreatorBaseAvailability;
+  updatedAt: number;
+  source: string;
+  version: number;
+};
+
+type CreatorPresenceSnapshot = {
+  base: CreatorBaseAvailability;
+  state: CreatorPresenceState;
+  updatedAt: number;
+  source: string;
+  version: number;
+};
+
 const PRESENCE_TTL_SECONDS = 120;
 const PRESENCE_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const META_KEY_PREFIX = 'creator:presence:meta:';
+const ONLINE_SOURCE = 'user_model.base_online';
+const OFFLINE_SOURCE = 'user_model.base_offline';
 
-function parseNumberEnv(raw: string | undefined, fallback: number): number {
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
+function creatorPresenceMetaKey(firebaseUid: string): string {
+  return `${META_KEY_PREFIX}${firebaseUid}`;
 }
 
-const CANONICAL_MISSING_WARN_RATE = Math.min(
-  1,
-  Math.max(0, parseNumberEnv(process.env.CREATOR_PRESENCE_MISSING_WARN_RATE, 0.05))
-);
+function syntheticFallbackVersion(nowMs: number): number {
+  return Math.max(0, Math.trunc(nowMs));
+}
 
-function parsePresenceRecord(raw: string | null): CreatorPresenceRecord | null {
+function parseBaseAvailability(raw: string | null): CreatorBaseAvailability {
+  return raw === 'online' ? 'online' : 'offline';
+}
+
+function parsePresenceMeta(raw: string | null): CreatorPresenceMeta | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<CreatorPresenceRecord> | null;
-    if (!parsed || typeof parsed !== 'object') {
-      return null;
-    }
-    if (parsed.state !== 'online' && parsed.state !== 'busy') {
-      return null;
-    }
+    const parsed = JSON.parse(raw) as Partial<CreatorPresenceMeta> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.base !== 'online' && parsed.base !== 'offline') return null;
     const updatedAt = Number(parsed.updatedAt);
     if (
       !Number.isFinite(updatedAt) ||
@@ -67,15 +83,11 @@ function parsePresenceRecord(raw: string | null): CreatorPresenceRecord | null {
       return null;
     }
     const version = Number(parsed.version);
-    if (!Number.isInteger(version) || version < 0) {
-      return null;
-    }
+    if (!Number.isInteger(version) || version < 0) return null;
     const source = String(parsed.source || '').trim();
-    if (!source) {
-      return null;
-    }
+    if (!source) return null;
     return {
-      state: parsed.state,
+      base: parsed.base,
       updatedAt,
       source,
       version,
@@ -85,61 +97,86 @@ function parsePresenceRecord(raw: string | null): CreatorPresenceRecord | null {
   }
 }
 
-async function hasActiveCall(firebaseUid: string): Promise<boolean> {
-  const redis = getRedis();
-  const callId = await redis.get(activeCallByUserKey(firebaseUid));
-  return Boolean(callId);
-}
-
-async function resolveTargetState(
-  firebaseUid: string,
+function resolveTargetBaseAvailability(
+  currentBase: CreatorBaseAvailability,
   eventType: PresenceTransitionEventType
-): Promise<CreatorPresenceState> {
+): CreatorBaseAvailability {
   switch (eventType) {
-    case 'CALL_STARTED':
     case 'FORCE_OFFLINE':
-      return 'busy';
     case 'DISCONNECTED':
-      // A disconnected creator must always be treated as not available.
-      return 'busy';
-    case 'CALL_ENDED':
+      return 'offline';
     case 'CONNECTED':
-    case 'HEARTBEAT':
     case 'RECOVERED':
     case 'RECONCILED':
+    case 'CALL_ENDED':
+      return 'online';
+    case 'CALL_STARTED':
+    case 'HEARTBEAT':
     default:
-      return (await hasActiveCall(firebaseUid)) ? 'busy' : 'online';
+      return currentBase;
   }
+}
+
+function derivePresenceState(
+  base: CreatorBaseAvailability,
+  hasActiveCallState: boolean
+): CreatorPresenceState {
+  if (hasActiveCallState) return 'busy';
+  return base === 'online' ? 'online' : 'busy';
+}
+
+function deriveRecordSource(
+  base: CreatorBaseAvailability,
+  hasActiveCallState: boolean,
+  source: string
+): string {
+  if (hasActiveCallState) return `${source}.active_call`;
+  return base === 'online' ? source : OFFLINE_SOURCE;
+}
+
+function resolveLegacyTargetState(
+  hasActiveCallState: boolean,
+  eventType: PresenceTransitionEventType
+): CreatorPresenceState {
+  switch (eventType) {
+    case 'FORCE_OFFLINE':
+    case 'DISCONNECTED':
+    case 'CALL_STARTED':
+      return 'busy';
+    default:
+      return hasActiveCallState ? 'busy' : 'online';
+  }
+}
+
+async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<CreatorPresenceSnapshot> {
+  const redis = getRedis();
+  const [baseRaw, metaRaw, activeCallId] = await redis.mget(
+    availabilityKey(firebaseUid),
+    creatorPresenceMetaKey(firebaseUid),
+    activeCallByUserKey(firebaseUid)
+  );
+  const base = parseBaseAvailability(baseRaw);
+  const meta = parsePresenceMeta(metaRaw);
+  const hasActiveCallState = Boolean(activeCallId);
+  const updatedAt = meta?.updatedAt ?? Date.now();
+  const source = deriveRecordSource(base, hasActiveCallState, meta?.source || ONLINE_SOURCE);
+  const version = meta?.version ?? syntheticFallbackVersion(updatedAt);
+  return {
+    base,
+    state: derivePresenceState(base, hasActiveCallState),
+    updatedAt,
+    source,
+    version,
+  };
 }
 
 export async function readCreatorPresenceState(firebaseUid: string): Promise<CreatorPresenceRecord> {
-  const redis = getRedis();
-  const raw = await redis.get(creatorPresenceKey(firebaseUid));
-  const parsed = parsePresenceRecord(raw);
-  if (parsed) {
-    return parsed;
-  }
-  recordCallMetric('presence.creator_presence_missing_canonical', 1, { scope: 'single' });
-  if (!featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
-    return {
-      state: 'busy',
-      updatedAt: Date.now(),
-      source: 'missing_canonical',
-      version: 0,
-    };
-  }
-  const legacy = await redis.get(availabilityKey(firebaseUid));
-  const fallbackState: CreatorPresenceState = legacy === 'online' ? 'online' : 'busy';
-  logWarning('creator_presence_legacy_fallback', {
-    firebaseUid,
-    legacyState: fallbackState,
-    fallbackEnabled: featureFlags.creatorPresenceLegacyFallbackReadEnabled,
-  });
+  const snapshot = await readCreatorPresenceSnapshot(firebaseUid);
   return {
-    state: fallbackState,
-    updatedAt: Date.now(),
-    source: 'legacy_fallback',
-    version: 0,
+    state: snapshot.state,
+    updatedAt: snapshot.updatedAt,
+    source: snapshot.source,
+    version: snapshot.version,
   };
 }
 
@@ -148,65 +185,65 @@ export async function getBatchCreatorPresence(
 ): Promise<Record<string, CreatorPresenceRecord>> {
   if (!creatorIds.length) return {};
   const redis = getRedis();
-  const keys = creatorIds.map((id) => creatorPresenceKey(id));
-  const raws = await redis.mget(...keys);
+  const baseKeys = creatorIds.map((id) => availabilityKey(id));
+  const metaKeys = creatorIds.map((id) => creatorPresenceMetaKey(id));
+  const activeCallKeys = creatorIds.map((id) => activeCallByUserKey(id));
+  const [baseVals, metaVals, activeCallVals] = await Promise.all([
+    redis.mget(...baseKeys),
+    redis.mget(...metaKeys),
+    redis.mget(...activeCallKeys),
+  ]);
   const result: Record<string, CreatorPresenceRecord> = {};
-  const legacyFallbackIds: string[] = [];
+  let canonicalMissingCount = 0;
+  let fallbackCount = 0;
 
   creatorIds.forEach((id, idx) => {
-    const parsed = parsePresenceRecord(raws[idx]);
-    if (parsed) {
-      result[id] = parsed;
-    } else {
-      legacyFallbackIds.push(id);
+    const base = parseBaseAvailability(baseVals[idx]);
+    const meta = parsePresenceMeta(metaVals[idx]);
+    const hasActiveCallState = Boolean(activeCallVals[idx]);
+    const updatedAt = meta?.updatedAt ?? Date.now();
+    const derivedSource = deriveRecordSource(base, hasActiveCallState, meta?.source || ONLINE_SOURCE);
+    if (!meta) {
+      canonicalMissingCount += 1;
     }
+    if (!meta || derivedSource.includes('fallback') || derivedSource === OFFLINE_SOURCE) {
+      fallbackCount += 1;
+    }
+    result[id] = {
+      state: derivePresenceState(base, hasActiveCallState),
+      updatedAt,
+      source: derivedSource,
+      version: meta?.version ?? syntheticFallbackVersion(updatedAt),
+    };
   });
-
-  if (legacyFallbackIds.length > 0) {
-    const batchSize = creatorIds.length;
-    const fallbackRate = batchSize > 0 ? legacyFallbackIds.length / batchSize : 0;
-    logInfo('creator_presence_batch_canonical_missing', {
-      count: legacyFallbackIds.length,
-      batchSize,
-      missingRate: fallbackRate,
-      sampleIds: legacyFallbackIds.slice(0, 5),
+  const batchSize = creatorIds.length;
+  if (batchSize > 0) {
+    const canonicalMissingRate = canonicalMissingCount / batchSize;
+    const fallbackRate = fallbackCount / batchSize;
+    recordCallMetric('presence.creator_batch_canonical_missing', canonicalMissingCount, {
+      batchSize: String(batchSize),
     });
-    recordCallMetric('presence.creator_presence_missing_canonical', legacyFallbackIds.length, {
-      scope: 'batch',
+    recordCallMetric('presence.creator_batch_canonical_missing_rate', canonicalMissingRate, {
+      batchSize: String(batchSize),
     });
-    if (batchSize >= 5 && fallbackRate > CANONICAL_MISSING_WARN_RATE) {
+    recordCallMetric('creator_presence_canonical_missing_rate', canonicalMissingRate, {
+      batchSize: String(batchSize),
+    });
+    recordCallMetric('presence.creator_batch_fallback', fallbackCount, {
+      batchSize: String(batchSize),
+    });
+    recordCallMetric('presence.creator_batch_fallback_rate', fallbackRate, {
+      batchSize: String(batchSize),
+    });
+    recordCallMetric('creator_presence_fallback_rate', fallbackRate, {
+      batchSize: String(batchSize),
+    });
+    if (canonicalMissingRate > 0.05) {
       logWarning('creator_presence_batch_canonical_missing_high', {
-        count: legacyFallbackIds.length,
         batchSize,
-        missingRate: fallbackRate,
-        threshold: CANONICAL_MISSING_WARN_RATE,
-      });
-    }
-    if (featureFlags.creatorPresenceLegacyFallbackReadEnabled) {
-      logInfo('creator_presence_batch_legacy_fallback', {
-        count: legacyFallbackIds.length,
-        batchSize,
-        fallbackRate,
-        sampleIds: legacyFallbackIds.slice(0, 5),
-      });
-      const legacyKeys = legacyFallbackIds.map((id) => availabilityKey(id));
-      const legacyVals = await redis.mget(...legacyKeys);
-      legacyFallbackIds.forEach((id, idx) => {
-        result[id] = {
-          state: legacyVals[idx] === 'online' ? 'online' : 'busy',
-          updatedAt: Date.now(),
-          source: 'legacy_fallback_batch',
-          version: 0,
-        };
-      });
-    } else {
-      legacyFallbackIds.forEach((id) => {
-        result[id] = {
-          state: 'busy',
-          updatedAt: Date.now(),
-          source: 'missing_canonical',
-          version: 0,
-        };
+        count: canonicalMissingCount,
+        missingRate: canonicalMissingRate,
+        threshold: 0.05,
       });
     }
   }
@@ -221,24 +258,44 @@ export async function transitionCreatorPresence(
   source: string
 ): Promise<CreatorPresenceRecord> {
   const redis = getRedis();
-  const current = await readCreatorPresenceState(firebaseUid);
-  const nextState = await resolveTargetState(firebaseUid, eventType);
-  const nextVersion = current.version + 1;
+  const current = await readCreatorPresenceSnapshot(firebaseUid);
+  const nextBase = resolveTargetBaseAvailability(current.base, eventType);
+  const activeCallId = await redis.get(activeCallByUserKey(firebaseUid));
+  const hasActiveCallState = Boolean(activeCallId);
+  const nextState = derivePresenceState(nextBase, hasActiveCallState);
+  const now = Date.now();
+  const nextVersion = Math.max(current.version + 1, syntheticFallbackVersion(now));
   const nextRecord: CreatorPresenceRecord = {
     state: nextState,
-    updatedAt: Date.now(),
-    source,
+    updatedAt: now,
+    source: deriveRecordSource(nextBase, hasActiveCallState, source || ONLINE_SOURCE),
     version: nextVersion,
   };
 
-  const activeCallId = await redis.get(activeCallByUserKey(firebaseUid));
   try {
     const pipeline = redis
       .multi()
-      .setex(creatorPresenceKey(firebaseUid), PRESENCE_TTL_SECONDS, JSON.stringify(nextRecord));
-    if (featureFlags.creatorPresenceLegacyDualWriteEnabled) {
-      pipeline.setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextState);
-    }
+      .setex(availabilityKey(firebaseUid), PRESENCE_TTL_SECONDS, nextBase)
+      .setex(
+        creatorPresenceKey(firebaseUid),
+        PRESENCE_TTL_SECONDS,
+        JSON.stringify({
+          state: nextRecord.state,
+          updatedAt: nextRecord.updatedAt,
+          source: nextRecord.source,
+          version: nextRecord.version,
+        })
+      )
+      .setex(
+        creatorPresenceMetaKey(firebaseUid),
+        PRESENCE_TTL_SECONDS,
+        JSON.stringify({
+          base: nextBase,
+          updatedAt: nextRecord.updatedAt,
+          source: source || (nextBase === 'online' ? ONLINE_SOURCE : OFFLINE_SOURCE),
+          version: nextRecord.version,
+        } satisfies CreatorPresenceMeta)
+      );
     const pipelineResult = await pipeline.exec();
     const pipelineFailed = pipelineResult?.some((entry) => entry?.[0] != null);
     if (pipelineFailed) {
@@ -248,6 +305,7 @@ export async function transitionCreatorPresence(
         source,
         fromState: current.state,
         toState: nextState,
+        toBase: nextBase,
         activeCallId: activeCallId || null,
       });
     }
@@ -258,6 +316,7 @@ export async function transitionCreatorPresence(
       source,
       fromState: current.state,
       toState: nextState,
+      toBase: nextBase,
       activeCallId: activeCallId || null,
       alert: true,
     });
@@ -273,11 +332,13 @@ export async function transitionCreatorPresence(
   const scope = await getCreatorStaffScope(firebaseUid);
   await updateOnlinePresenceSets(firebaseUid, nextState === 'online' ? 'online' : 'offline', scope);
 
-  const statusChanged = current.state !== nextRecord.state;
+  const statusChanged = current.state !== nextRecord.state || current.base !== nextBase;
   if (
     statusChanged ||
     eventType === 'RECOVERED' ||
-    eventType === 'CONNECTED'
+    eventType === 'CONNECTED' ||
+    eventType === 'CALL_STARTED' ||
+    eventType === 'CALL_ENDED'
   ) {
     io.to('consumers').emit('creator:status', {
       creatorId: firebaseUid,
@@ -299,7 +360,7 @@ export async function transitionCreatorPresence(
     type: 'creator:status_changed',
     scope: { bdId: scope.bdId, agencyId: scope.agencyId },
     entityId: firebaseUid,
-    meta: { status: nextRecord.state, version: nextRecord.version, source },
+    meta: { status: nextRecord.state, base: nextBase, version: nextRecord.version, source },
   });
   recordCallMetric('presence.transition', 1, {
     eventType,
@@ -307,6 +368,26 @@ export async function transitionCreatorPresence(
     status: nextRecord.state,
     changed: statusChanged ? '1' : '0',
   });
+
+  if (featureFlags.creatorPresenceUserModelShadowCompareEnabled) {
+    const legacyTarget = resolveLegacyTargetState(hasActiveCallState, eventType);
+    if (legacyTarget !== nextRecord.state) {
+      recordCallMetric('presence.user_model_shadow_mismatch', 1, {
+        eventType,
+        legacyTarget,
+        userModelTarget: nextRecord.state,
+      });
+      logWarning('creator_presence_user_model_shadow_mismatch', {
+        firebaseUid,
+        eventType,
+        source,
+        legacyTarget,
+        userModelTarget: nextRecord.state,
+        base: nextBase,
+        hasActiveCall: hasActiveCallState,
+      });
+    }
+  }
 
   if (statusChanged || eventType === 'RECOVERED' || eventType === 'RECONCILED') {
     logInfo('creator_presence_transition', {
@@ -316,6 +397,8 @@ export async function transitionCreatorPresence(
       redisEndpointMode: getRedisEndpointMode(),
       fromState: current.state,
       toState: nextRecord.state,
+      fromBase: current.base,
+      toBase: nextBase,
       version: nextRecord.version,
       statusChanged,
       activeCallId: activeCallId || null,
@@ -327,6 +410,7 @@ export async function transitionCreatorPresence(
       eventType,
       source,
       state: nextRecord.state,
+      base: nextBase,
       version: nextRecord.version,
       activeCallId: activeCallId || null,
     });
@@ -340,22 +424,14 @@ export async function transitionCreatorPresence(
     });
   }
 
-  if (
-    statusChanged &&
-    ((current.state === 'online' && nextRecord.state === 'busy') ||
-      (current.state === 'busy' && nextRecord.state === 'online'))
-  ) {
-    const unexpectedBusyWhileNoCall =
-      nextRecord.state === 'busy' && !activeCallId && eventType !== 'CALL_STARTED';
-    if (unexpectedBusyWhileNoCall) {
-      logWarning('creator_presence_busy_without_active_call', {
-        firebaseUid,
-        eventType,
-        source,
-        fromState: current.state,
-        activeCallId: activeCallId || null,
-      });
-    }
+  if (nextRecord.state === 'busy' && !activeCallId && nextBase === 'online') {
+    logWarning('creator_presence_busy_without_active_call', {
+      firebaseUid,
+      eventType,
+      source,
+      base: nextBase,
+      activeCallId: activeCallId || null,
+    });
   }
 
   return nextRecord;

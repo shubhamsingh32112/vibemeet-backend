@@ -2,32 +2,32 @@
 
 ## Feature Flags
 
-- `CREATOR_PRESENCE_LEGACY_FALLBACK_READ_ENABLED` (default `false`): emergency read fallback to legacy `creator:availability:*`.
-- `CREATOR_PRESENCE_LEGACY_DUAL_WRITE_ENABLED` (default `false`): migration-only dual write to legacy key.
-- `CREATOR_PRESENCE_MISSING_WARN_RATE` (default `0.05`): warn threshold for canonical-missing batch rate.
+- `CREATOR_PRESENCE_USER_MODEL_ENABLED` (default `false`): migrate creator lifecycle to user-like base presence.
+- `CREATOR_PRESENCE_USER_MODEL_SHADOW_COMPARE_ENABLED` (default `true`): emit parity diagnostics between legacy target state and user-model derived state.
 
 ## Rollout Phases
 
-1. **Instrumentation + Backfill**
-   - Run `npx tsx scripts/backfill-creator-presence-v2.ts`.
+1. **Shadow Compare**
+   - Keep `CREATOR_PRESENCE_USER_MODEL_ENABLED=false`.
+   - Keep `CREATOR_PRESENCE_USER_MODEL_SHADOW_COMPARE_ENABLED=true`.
    - Track:
-     - `creator_presence_batch_canonical_missing`
-     - `creator_availability_batch_canonical_missing`
-     - `presence.creator_presence_missing_canonical`
-2. **Canonical Enforcement (Current Default)**
-   - Keep fallback flags off.
-   - Confirm sampled `creator.feed.presence_diagnostics` has mostly `presenceSource != missing_canonical`.
+     - `presence.user_model_shadow_mismatch`
+     - `creator_presence_user_model_shadow_mismatch`
+2. **Canary Enablement**
+   - Enable `CREATOR_PRESENCE_USER_MODEL_ENABLED=true` for 5% traffic.
+   - Confirm sampled `creator.feed.presence_diagnostics` has stable `presenceAgeMs` and expected `presenceSource` values.
 3. **Client Convergence Validation**
    - Validate reconnect behavior:
      - socket rehydrates all tracked creator IDs
      - creator status converges after resume/network bounce
-4. **Canary + Parity**
+4. **Ramp**
+   - Expand from 5% -> 25% -> 50% -> 100%.
+5. **Parity**
    - Compare creator self status vs user homepage badge for synthetic accounts every 5 minutes.
    - Alert if mismatch > 1% for 15 minutes.
-5. **Emergency Rollback**
-   - If canonical keys are unexpectedly sparse, temporarily enable:
-     - `CREATOR_PRESENCE_LEGACY_FALLBACK_READ_ENABLED=true`
-   - Keep dual-write off unless migration requires back-compat writers.
+6. **Rollback**
+   - Disable `CREATOR_PRESENCE_USER_MODEL_ENABLED`.
+   - Keep shadow compare on until mismatch root cause is fixed.
 
 ## Verification Commands
 

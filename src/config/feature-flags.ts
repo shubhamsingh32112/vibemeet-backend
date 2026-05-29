@@ -17,19 +17,17 @@ export const featureFlags = {
    */
   billingSequenceContractEnabled: process.env.BILLING_SEQUENCE_CONTRACT_ENABLED !== 'false',
   /**
-   * Presence v2 explicit JSON state in Redis (`creator:presence:*`) with legacy fallback reads.
+   * Switch creator presence to user-like base key model (`creator:availability:*`)
+   * with busy derived from active call state.
    */
-  presenceV2Enabled: process.env.PRESENCE_V2_ENABLED !== 'false',
+  creatorPresenceUserModelEnabled:
+    process.env.CREATOR_PRESENCE_USER_MODEL_ENABLED === 'true',
   /**
-   * Emergency rollback switch: allow legacy creator availability key reads when canonical v2 is missing.
+   * Emit parity diagnostics comparing user-model derived state to legacy
+   * transition expectations during rollout.
    */
-  creatorPresenceLegacyFallbackReadEnabled:
-    process.env.CREATOR_PRESENCE_LEGACY_FALLBACK_READ_ENABLED === 'true',
-  /**
-   * Migration-only compatibility path: dual-write legacy creator:availability key alongside canonical v2.
-   */
-  creatorPresenceLegacyDualWriteEnabled:
-    process.env.CREATOR_PRESENCE_LEGACY_DUAL_WRITE_ENABLED === 'true',
+  creatorPresenceUserModelShadowCompareEnabled:
+    process.env.CREATOR_PRESENCE_USER_MODEL_SHADOW_COMPARE_ENABLED !== 'false',
   /**
    * Watchdog that auto-recovers stalled active/settling sessions.
    */

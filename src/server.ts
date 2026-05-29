@@ -25,7 +25,6 @@ import { featureFlags } from './config/feature-flags';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
-import { backfillCreatorPresenceV2 } from './modules/availability/presence-backfill.service';
 import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
 import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
@@ -128,28 +127,6 @@ function buildCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
   if (parts.length === 0) return '*';
   if (parts.length === 1) return parts[0];
   return parts;
-}
-
-function isEnvFlagEnabled(raw: string | undefined): boolean {
-  if (!raw) return false;
-  const normalized = raw.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
-}
-
-function parseCsvEnv(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return raw
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-}
-
-function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
-  if (!raw) return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value)) return fallback;
-  const floored = Math.floor(value);
-  return floored > 0 ? floored : fallback;
 }
 
 app.use(
@@ -319,6 +296,18 @@ app.get('/metrics', async (req, res) => {
     const stateRecovery = byName['billing.state_recovery'];
     const stateRecoverySuppressed = byName['billing.state_recovery_suppressed'];
     const recoveryOutcome = byName['billing.recovery_outcome'];
+    const recoveryRuntimeMissing = byName['billing.recovery_runtime_missing'];
+    const billingRuntimeMissingRateMetric = byName['billing.runtime_missing_rate'];
+    const deferredCallEndAge = byName['billing.deferred_call_end_age_ms'];
+    const deferredCallEndAgeLegacy = byName['billing.deferred_call_end_age'];
+    const deferredCallEndQueued = byName['billing.deferred_call_end_queued'];
+    const deferredCallEndFlushed = byName['billing.deferred_call_end_flushed'];
+    const creatorCanonicalMissingRate =
+      byName['call.presence.creator_batch_canonical_missing_rate'];
+    const creatorFallbackRate = byName['call.presence.creator_batch_fallback_rate'];
+    const creatorCanonicalMissingRateMetric =
+      byName['call.creator_presence_canonical_missing_rate'];
+    const creatorFallbackRateMetric = byName['call.creator_presence_fallback_rate'];
     const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
     const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
     const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
@@ -347,6 +336,11 @@ app.get('/metrics', async (req, res) => {
     let rollingRedisPipelineSuccess = 0;
     let rollingRedisPipelineFailure = 0;
     let rollingRedisPipelineFailureRate = 0;
+    let rollingRecoveryRuntimeMissing = 0;
+    let rollingDeferredCallEndsQueued = 0;
+    let rollingDeferredCallEndsFlushed = 0;
+    let rollingCreatorCanonicalMissingRate = 0;
+    let rollingCreatorFallbackRate = 0;
 
     if (isRedisConfigured()) {
       const redis = getRedis();
@@ -361,7 +355,18 @@ app.get('/metrics', async (req, res) => {
           ? rollingForceTerminateFailed / rollingForceTerminateRequested
           : 0;
 
-      const [lagSampleRaw, reconSampleRaw, redisOpsRaw, pipelineSuccess5m, pipelineFailure5m] = await Promise.all([
+      const [
+        lagSampleRaw,
+        reconSampleRaw,
+        redisOpsRaw,
+        pipelineSuccess5m,
+        pipelineFailure5m,
+        recoveryRuntimeMissing5m,
+        deferredQueued5m,
+        deferredFlushed5m,
+        creatorCanonicalMissingRaw,
+        creatorFallbackRaw,
+      ] = await Promise.all([
         redis.zrevrangebyscore(
           metricsKey('billing.bullmq_queue_lag_ms'),
           now,
@@ -388,6 +393,25 @@ app.get('/metrics', async (req, res) => {
         ),
         redis.zcount(metricsKey('billing.redis_pipeline_success'), fromTs, now),
         redis.zcount(metricsKey('billing.redis_pipeline_failure'), fromTs, now),
+        redis.zcount(metricsKey('billing.recovery_runtime_missing'), fromTs, now),
+        redis.zcount(metricsKey('billing.deferred_call_end_queued'), fromTs, now),
+        redis.zcount(metricsKey('billing.deferred_call_end_flushed'), fromTs, now),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_batch_canonical_missing_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_batch_fallback_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
       ]);
 
       const parseMetricSampleStats = (raw: string[]): { avg: number; sum: number; count: number } => {
@@ -421,6 +445,13 @@ app.get('/metrics', async (req, res) => {
       rollingRedisOpsPerSec = redisOpsStats.sum / (rollingWindowMs / 1000);
       rollingRedisPipelineSuccess = Number(pipelineSuccess5m || 0);
       rollingRedisPipelineFailure = Number(pipelineFailure5m || 0);
+      rollingRecoveryRuntimeMissing = Number(recoveryRuntimeMissing5m || 0);
+      rollingDeferredCallEndsQueued = Number(deferredQueued5m || 0);
+      rollingDeferredCallEndsFlushed = Number(deferredFlushed5m || 0);
+      const creatorCanonicalMissingStats = parseMetricSampleStats(creatorCanonicalMissingRaw);
+      const creatorFallbackStats = parseMetricSampleStats(creatorFallbackRaw);
+      rollingCreatorCanonicalMissingRate = creatorCanonicalMissingStats.avg;
+      rollingCreatorFallbackRate = creatorFallbackStats.avg;
       const totalPipelines = rollingRedisPipelineSuccess + rollingRedisPipelineFailure;
       rollingRedisPipelineFailureRate =
         totalPipelines > 0 ? rollingRedisPipelineFailure / totalPipelines : 0;
@@ -459,6 +490,18 @@ app.get('/metrics', async (req, res) => {
     if (rollingReconRunAvgMs > 0 && rollingReconRunAvgMs > 0.8 * 5 * 60 * 1000) {
       metricsAlerts.push('billing_reconciliation_runtime_high_5m');
     }
+    if (rollingRecoveryRuntimeMissing >= 5) {
+      metricsAlerts.push('billing_runtime_missing_detected_5m');
+    }
+    if (rollingDeferredCallEndsQueued > 0 && rollingDeferredCallEndsFlushed < rollingDeferredCallEndsQueued) {
+      metricsAlerts.push('billing_deferred_call_end_backlog_5m');
+    }
+    if (rollingCreatorCanonicalMissingRate > 0.05) {
+      metricsAlerts.push('creator_presence_canonical_missing_high_5m');
+    }
+    if (rollingCreatorFallbackRate > 0.05) {
+      metricsAlerts.push('creator_presence_fallback_high_5m');
+    }
     res.status(200).json({
       mongo: {
         activeConnections: mongoStats.checkedOut,
@@ -496,6 +539,34 @@ app.get('/metrics', async (req, res) => {
           stateRecoverySuppressedSamples: stateRecoverySuppressed?.count ?? 0,
           stateRecoverySuppressedSum: recoverySuppressed,
           recoveryOutcomeSamples: recoveryOutcome?.count ?? 0,
+          runtimeMissingSamples: recoveryRuntimeMissing?.count ?? 0,
+          runtimeMissingRateSamples: billingRuntimeMissingRateMetric?.count ?? 0,
+          rolling5mRuntimeMissingSamples: rollingRecoveryRuntimeMissing,
+          billing_runtime_missing_rate:
+            Math.round((rollingRecoveryRuntimeMissing / (rollingWindowMs / 1000)) * 1000) / 1000,
+        },
+        deferredCallEnd: {
+          queuedSamples: deferredCallEndQueued?.count ?? 0,
+          flushedSamples: deferredCallEndFlushed?.count ?? 0,
+          ageMs: deferredCallEndAge
+            ? {
+                samples: deferredCallEndAge.count,
+                avgMs: Math.round(deferredCallEndAge.avg * 100) / 100,
+                p95Ms: Math.round(deferredCallEndAge.p95 * 100) / 100,
+                p99Ms: Math.round(deferredCallEndAge.p99 * 100) / 100,
+                maxMs: Math.round(deferredCallEndAge.max * 100) / 100,
+              }
+            : null,
+          deferred_call_end_age: deferredCallEndAgeLegacy
+            ? {
+                samples: deferredCallEndAgeLegacy.count,
+                avg: Math.round(deferredCallEndAgeLegacy.avg * 100) / 100,
+              }
+            : null,
+          rolling5m: {
+            queued: rollingDeferredCallEndsQueued,
+            flushed: rollingDeferredCallEndsFlushed,
+          },
         },
         tickDriftMs: tickDrift
           ? {
@@ -601,6 +672,40 @@ app.get('/metrics', async (req, res) => {
               p95Ms: Math.round(creatorStatusPropagation.p95 * 100) / 100,
               p99Ms: Math.round(creatorStatusPropagation.p99 * 100) / 100,
               maxMs: Math.round(creatorStatusPropagation.max * 100) / 100,
+            }
+          : null,
+        creatorCanonicalMissingRate: creatorCanonicalMissingRate
+          ? {
+              samples: creatorCanonicalMissingRate.count,
+              avgRate: Math.round(creatorCanonicalMissingRate.avg * 10000) / 10000,
+              p95Rate: Math.round(creatorCanonicalMissingRate.p95 * 10000) / 10000,
+              p99Rate: Math.round(creatorCanonicalMissingRate.p99 * 10000) / 10000,
+              maxRate: Math.round(creatorCanonicalMissingRate.max * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorCanonicalMissingRate * 10000) / 10000,
+            }
+          : null,
+        creator_presence_canonical_missing_rate: creatorCanonicalMissingRateMetric
+          ? {
+              samples: creatorCanonicalMissingRateMetric.count,
+              avgRate: Math.round(creatorCanonicalMissingRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorCanonicalMissingRate * 10000) / 10000,
+            }
+          : null,
+        creatorFallbackRate: creatorFallbackRate
+          ? {
+              samples: creatorFallbackRate.count,
+              avgRate: Math.round(creatorFallbackRate.avg * 10000) / 10000,
+              p95Rate: Math.round(creatorFallbackRate.p95 * 10000) / 10000,
+              p99Rate: Math.round(creatorFallbackRate.p99 * 10000) / 10000,
+              maxRate: Math.round(creatorFallbackRate.max * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorFallbackRate * 10000) / 10000,
+            }
+          : null,
+        creator_presence_fallback_rate: creatorFallbackRateMetric
+          ? {
+              samples: creatorFallbackRateMetric.count,
+              avgRate: Math.round(creatorFallbackRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorFallbackRate * 10000) / 10000,
             }
           : null,
       },
@@ -946,13 +1051,8 @@ const startServer = async () => {
     logInfo('Socket.IO availability gateway ready');
     logInfo('creator_presence_runtime_config', {
       redisEndpointMode: getRedisEndpointMode(),
-      presenceV2Enabled: featureFlags.presenceV2Enabled,
-      legacyFallbackReadEnabled: featureFlags.creatorPresenceLegacyFallbackReadEnabled,
-      legacyDualWriteEnabled: featureFlags.creatorPresenceLegacyDualWriteEnabled,
-      missingWarnRate: process.env.CREATOR_PRESENCE_MISSING_WARN_RATE || '0.05',
-      runBackfillOnBoot: process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT || 'false',
-      runBackfillOnBootUids: process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT_UIDS ? 'configured' : 'unset',
-      runBackfillOnBootProgressEvery: process.env.RUN_CREATOR_PRESENCE_BACKFILL_PROGRESS_EVERY || '100',
+      userModelEnabled: featureFlags.creatorPresenceUserModelEnabled,
+      userModelShadowCompareEnabled: featureFlags.creatorPresenceUserModelShadowCompareEnabled,
     });
 
     setupBillingGateway(io);
@@ -1028,39 +1128,6 @@ const startServer = async () => {
       });
       if (process.env.NODE_ENV === 'production') {
         throw new Error('Redis is required in production (assertProductionRedis should have failed)');
-      }
-    }
-
-    if (isEnvFlagEnabled(process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT)) {
-      const scopedUids = parseCsvEnv(process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT_UIDS);
-      const progressEvery = parsePositiveIntEnv(
-        process.env.RUN_CREATOR_PRESENCE_BACKFILL_PROGRESS_EVERY,
-        100
-      );
-      logInfo('creator_presence_v2_backfill_on_boot_start', {
-        redisEndpointMode: getRedisEndpointMode(),
-        scoped: scopedUids.length > 0,
-        scopedCount: scopedUids.length,
-        progressEvery,
-      });
-      try {
-        const result = await backfillCreatorPresenceV2({
-          uids: scopedUids.length > 0 ? scopedUids : undefined,
-          source: 'boot-backfill-creator-presence-v2',
-          logProgress: true,
-          progressEvery,
-        });
-        logInfo('creator_presence_v2_backfill_on_boot_done', {
-          ...result,
-          redisEndpointMode: getRedisEndpointMode(),
-          disableFlagHint: 'Set RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT=false after successful run',
-        });
-      } catch (err) {
-        logError('creator_presence_v2_backfill_on_boot_failed', err, {
-          redisEndpointMode: getRedisEndpointMode(),
-          scoped: scopedUids.length > 0,
-          scopedCount: scopedUids.length,
-        });
       }
     }
 

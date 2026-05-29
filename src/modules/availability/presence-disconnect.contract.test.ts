@@ -9,6 +9,12 @@ test('creator disconnect marks busy on last socket', () => {
   assert.ok(src.includes("'DISCONNECTED'"));
 });
 
+test('creator disconnect uses grace timer before busy transition', () => {
+  const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  assert.ok(src.includes('CREATOR_DISCONNECT_GRACE_MS'));
+  assert.ok(src.includes('scheduleCreatorDisconnectTransition'));
+});
+
 test('creator:offline ignored when sockets still connected', () => {
   const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
   assert.ok(src.includes('Ignoring creator:offline'));
@@ -17,10 +23,10 @@ test('creator:offline ignored when sockets still connected', () => {
 test('DISCONNECTED presence resolves to busy', () => {
   const src = readFileSync(join(__dirname, 'presence.service.ts'), 'utf8');
   assert.ok(src.includes("case 'DISCONNECTED':"));
-  assert.ok(src.match(/DISCONNECTED[\s\S]*return 'busy'/));
+  assert.ok(src.match(/DISCONNECTED[\s\S]*return 'offline'/));
 });
 
-test('canonical-missing batch logs high-rate warning', () => {
+test('presence metadata key is used for monotonic versioning', () => {
   const src = readFileSync(join(__dirname, 'presence.service.ts'), 'utf8');
-  assert.ok(src.includes('creator_presence_batch_canonical_missing_high'));
+  assert.ok(src.includes('creator:presence:meta:'));
 });

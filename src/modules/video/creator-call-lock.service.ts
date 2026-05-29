@@ -7,6 +7,7 @@ import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 import { getIO } from '../../config/socket';
 import { transitionCreatorPresence } from '../availability/presence.service';
+import { featureFlags } from '../../config/feature-flags';
 
 /**
  * Centralised helper for creator call locking and availability updates.
@@ -151,7 +152,7 @@ export async function markCreatorBusyForCall(
     await redis.set(activeCallByUserKey(creatorFirebaseUid), callId, 'EX', PRECALL_SNAPSHOT_TTL_SECONDS);
 
     const current = await getAvailability(creatorFirebaseUid);
-    if (shouldEnforceAvailabilityWrites() && current !== 'busy') {
+    if (shouldEnforceAvailabilityWrites() && (featureFlags.creatorPresenceUserModelEnabled || current !== 'busy')) {
       await transitionCreatorPresence(
         getIO(),
         creatorFirebaseUid,
@@ -245,10 +246,16 @@ export async function updateCreatorAvailabilityAfterCall(
     const isAvailableToggleOn = creator.isOnline === true;
     const newStatus = isAvailableToggleOn ? 'online' : 'busy';
 
+    const restoreEvent =
+      newStatus === 'online'
+        ? featureFlags.creatorPresenceUserModelEnabled
+          ? 'CONNECTED'
+          : 'CALL_ENDED'
+        : 'DISCONNECTED';
     await transitionCreatorPresence(
       getIO(),
       creatorFirebaseUid,
-      newStatus === 'online' ? 'CALL_ENDED' : 'DISCONNECTED',
+      restoreEvent,
       'creator-call-lock.updateCreatorAvailabilityAfterCall'
     );
 
@@ -323,10 +330,16 @@ export async function finalizeCreatorAvailabilityForCall(
       : 'online') as CreatorAvailability;
 
     if (shouldEnforceAvailabilityWrites()) {
+      const restoreEvent =
+        restoredStatus === 'online'
+          ? featureFlags.creatorPresenceUserModelEnabled
+            ? 'CONNECTED'
+            : 'CALL_ENDED'
+          : 'DISCONNECTED';
       await transitionCreatorPresence(
         getIO(),
         creatorFirebaseUid,
-        restoredStatus === 'online' ? 'CALL_ENDED' : 'DISCONNECTED',
+        restoreEvent,
         'creator-call-lock.finalizeCreatorAvailabilityForCall'
       );
     }

@@ -241,7 +241,10 @@ export const settledCallKey = (callId: string): string =>
 
 // TTLs for state maps
 export const ACTIVE_CALL_BY_USER_TTL = 7200; // 2 hours (same as call session)
-export const PENDING_CALL_END_TTL = 60; // 60 seconds
+export const PENDING_CALL_END_TTL = Math.min(
+  3600,
+  Math.max(60, parseInt(process.env.BILLING_PENDING_CALL_END_TTL_SECONDS || '600', 10) || 600)
+); // defaults to 10 minutes
 export const SETTLED_CALL_TTL = 300; // 5 minutes
 
 // Settlement orchestration (finalizeCallSession)

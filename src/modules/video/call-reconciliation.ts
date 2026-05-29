@@ -11,7 +11,10 @@ import {
   getRedis,
   CALL_RECONCILIATION_LOCK_KEY,
   RECONCILIATION_LOCK_TTL_MS,
+  activeCallByUserKey,
+  ACTIVE_CALL_BY_USER_TTL,
 } from '../../config/redis';
+import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
@@ -137,6 +140,15 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
             const currentStatus = await getAvailability(creatorUser.firebaseUid);
 
             if (currentStatus !== 'busy') {
+              if (featureFlags.creatorPresenceUserModelEnabled) {
+                const redis = getRedis();
+                await redis.set(
+                  activeCallByUserKey(creatorUser.firebaseUid),
+                  call.callId,
+                  'EX',
+                  ACTIVE_CALL_BY_USER_TTL
+                );
+              }
               await transitionCreatorPresence(
                 getIO(),
                 creatorUser.firebaseUid,

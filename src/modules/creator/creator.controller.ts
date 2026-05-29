@@ -11,7 +11,6 @@ import { getIO } from '../../config/socket';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
-import { getBatchAvailability } from '../availability/availability.service';
 import { getBatchCreatorPresence } from '../availability/presence.service';
 import {
   getRedis,
@@ -486,8 +485,8 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
       return;
     }
 
-    const availabilityMap = await getBatchAvailability([uidRaw]);
-    const availability = availabilityMap[uidRaw] ?? 'busy';
+    const presenceMap = await getBatchCreatorPresence([uidRaw]);
+    const availability = presenceMap[uidRaw]?.state === 'online' ? 'online' : 'busy';
     const images = serializeCreatorImages(creator as unknown as ICreator);
     const legacyPhoto =
       (creator as unknown as { photo?: string | null }).photo ?? null;
@@ -588,13 +587,13 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
       const cached = await safeRedisGet<Record<string, unknown>>(detailKey);
       if (cached && typeof cached.id === 'string' && cached.id === id) {
         const firebaseUid = cached.firebaseUid as string | null | undefined;
-        const availabilityMap =
+        const presenceMap =
           firebaseUid && typeof firebaseUid === 'string'
-            ? await getBatchAvailability([firebaseUid])
+            ? await getBatchCreatorPresence([firebaseUid])
             : {};
         const availability =
           firebaseUid && typeof firebaseUid === 'string'
-            ? (availabilityMap[firebaseUid] ?? 'busy')
+            ? (presenceMap[firebaseUid]?.state === 'online' ? 'online' : 'busy')
             : 'busy';
         const galleryRaw = cached.galleryImages;
         const galleryImages = Array.isArray(galleryRaw)
@@ -646,13 +645,13 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
       firebaseUid = firebaseUid.trim();
     }
 
-    const availabilityMap =
+    const presenceMap =
       firebaseUid && typeof firebaseUid === 'string'
-        ? await getBatchAvailability([firebaseUid])
+        ? await getBatchCreatorPresence([firebaseUid])
         : {};
     const availability =
       firebaseUid && typeof firebaseUid === 'string'
-        ? (availabilityMap[firebaseUid] ?? 'busy')
+        ? (presenceMap[firebaseUid]?.state === 'online' ? 'online' : 'busy')
         : 'busy';
 
     const images = serializeCreatorImages(creator);

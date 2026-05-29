@@ -15,6 +15,7 @@ import {
   ACTIVE_CALL_BY_USER_TTL,
   billingStartOrchestratorKey,
   billingStartReplayGuardKey,
+  pendingCallEndKey,
 } from '../../config/redis';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -137,15 +138,117 @@ async function tryClearOrphanActiveCallSlots(
   ] as const) {
     const v = await redis.get(key);
     if (!v) continue;
-    const hasSession = await redis.get(callSessionKey(String(v)));
-    if (!hasSession) {
+    const sessionRaw = await redis.get(callSessionKey(String(v)));
+    if (!sessionRaw) {
       await redis.del(key).catch(() => {});
       recordBillingMetric('session_start_active_slot_orphan_recovered', 1, {
         staleCallId: v,
         roomUid,
       });
+      continue;
+    }
+    try {
+      const session = JSON.parse(sessionRaw) as { lifecycleState?: string };
+      const lifecycle = String(session.lifecycleState || '').toUpperCase();
+      if (lifecycle === 'SETTLED' || lifecycle === 'FAILED') {
+        await redis.del(key).catch(() => {});
+        recordBillingMetric('session_start_active_slot_terminal_recovered', 1, {
+          staleCallId: v,
+          roomUid,
+          lifecycle,
+        });
+      } else if (lifecycle === 'STARTING') {
+        const startTime = Number((session as { startTime?: number }).startTime);
+        const ageMs = Number.isFinite(startTime) && startTime > 0 ? Math.max(0, Date.now() - startTime) : 0;
+        if (ageMs > 120_000) {
+          await redis.del(key).catch(() => {});
+          recordBillingMetric('session_start_active_slot_starting_recovered', 1, {
+            staleCallId: v,
+            roomUid,
+            lifecycle,
+          });
+          logWarning('Recovered stale STARTING active call slot', {
+            staleCallId: v,
+            roomUid,
+            ageMs,
+          });
+        }
+      }
+    } catch {
+      // Preserve slot on parse error; regular reconciliation paths will handle invalid sessions.
     }
   }
+}
+
+async function consumePendingCallEndIfAny(
+  io: Server,
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  source: string
+): Promise<boolean> {
+  const key = pendingCallEndKey(callId);
+  const pending = await redis.get(key);
+  if (!pending) {
+    return false;
+  }
+  let deferredAgeMs = 0;
+  try {
+    const parsed = JSON.parse(pending) as { requestedAtMs?: number } | null;
+    const requestedAtMs = Number(parsed?.requestedAtMs);
+    if (Number.isFinite(requestedAtMs) && requestedAtMs > 0) {
+      deferredAgeMs = Math.max(0, Date.now() - requestedAtMs);
+    }
+  } catch {
+    // Legacy payloads used a plain sentinel value.
+  }
+  await redis.del(key).catch(() => {});
+  const { finalizeCallSession } = await import('./billing-session-finalization.service');
+  await finalizeCallSession(io, {
+    callId,
+    reason: 'explicit_end',
+    source: 'deferred_pending_end',
+  });
+  logInfo('Deferred settlement for call after session promotion', {
+    callId,
+    source,
+    deferredAgeMs,
+  });
+  recordBillingMetric('deferred_call_end_age_ms', deferredAgeMs, {
+    callId,
+    source,
+  });
+  recordBillingMetric('deferred_call_end_age', deferredAgeMs, {
+    callId,
+    source,
+  });
+  recordBillingMetric('deferred_call_end_flushed', 1, {
+    callId,
+    source,
+  });
+  return true;
+}
+
+async function waitForSessionSnapshot(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  opts?: { timeoutMs?: number; intervalMs?: number }
+): Promise<CallSession | null> {
+  const timeoutMs = Math.max(100, opts?.timeoutMs ?? 2000);
+  const intervalMs = Math.max(25, opts?.intervalMs ?? 100);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const raw = await redis.get(callSessionKey(callId));
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as CallSession;
+        return parsed;
+      } catch {
+        // Keep polling for a valid session payload.
+      }
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
 }
 
 async function tryReserveActiveCallSlotsWithOrphanRetry(
@@ -882,11 +985,29 @@ export class BillingService {
           'NX'
         );
         if (retryClaim !== 'OK') {
+          const delayedSession = await waitForSessionSnapshot(redis, callId);
+          if (delayedSession && !isBootstrappingSession(delayedSession)) {
+            normalizeV4SessionFields(delayedSession);
+            await replayBillingStartedFromRedisSession(io, redis, callId, delayedSession, source, {
+              startCorrelationId,
+              startIngress,
+              replayReason: 'suppressed_retry_waited_session',
+            });
+            recordBillingMetric('session_start_suppressed_waited_session', 1, {
+              source,
+              callIdPrefix,
+            });
+            return;
+          }
           await ensureBillingStartedReplayFreshness(io, callId, source, {
             startCorrelationId,
             startIngress,
             replayReason: 'suppressed_retry_failed',
           }).catch(() => {});
+          recordBillingMetric('session_start_suppressed_retry_failed', 1, {
+            source,
+            callIdPrefix,
+          });
           return;
         }
       } else {
@@ -1316,6 +1437,30 @@ export class BillingService {
       });
       recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
 
+      try {
+        await upsertBillingCheckpointSnapshot({
+          callId,
+          userMongoId: session.userMongoId,
+          creatorMongoId: session.creatorMongoId,
+          userFirebaseUid: session.userFirebaseUid,
+          creatorFirebaseUid: session.creatorFirebaseUid,
+          startTimeMs: session.startTime,
+          lastProcessedAtMs: session.lastProcessedAt,
+          remainingUserBalanceMicros: spendableMicros,
+          pricePerSecondMicros: session.pricePerSecondMicros,
+          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+          totalDeductedMicros: session.totalDeductedMicros,
+          totalEarnedMicros: session.totalEarnedMicros,
+          billingSequence: session.billingSequence,
+          lifecycleState: session.lifecycleState,
+          status: 'active',
+        });
+      } catch (cpErr) {
+        logError('Early checkpoint snapshot after session seed failed (non-fatal)', cpErr, {
+          callId,
+        });
+      }
+
       logInfo('Billing session started - Redis keys seeded', {
         ...billingLifecycleLogContext({
           callId,
@@ -1409,6 +1554,17 @@ export class BillingService {
     ).next;
     session.billingSequence = 1;
     await persistCallSession(redis, callId, session);
+
+    const settledFromPendingEnd = await consumePendingCallEndIfAny(
+      io,
+      redis,
+      callId,
+      'billing.startBillingSession.promote_active'
+    );
+    if (settledFromPendingEnd) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      return;
+    }
 
     emitBillingStartedFromSnapshot(
       io,
@@ -1809,6 +1965,16 @@ export class BillingService {
       }
 
       const activeSpendMicros = introPromoBilling ? introMicros : walletMicros;
+
+      const settledFromPendingEnd = await consumePendingCallEndIfAny(
+        io,
+        redis,
+        callId,
+        'billing.processTick'
+      );
+      if (settledFromPendingEnd) {
+        return 'stop_needs_settlement';
+      }
 
       const potentialDeduct = Math.floor((deltaMs * pricePerSecondMicros) / 1000);
       const actualDeduct = Math.min(potentialDeduct, activeSpendMicros);

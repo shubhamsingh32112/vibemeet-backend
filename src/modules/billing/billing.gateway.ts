@@ -7,8 +7,8 @@ import {
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
 import { billingService, type BillingSessionStartSource } from './billing.service';
-import { finalizeCallSession } from './billing-session-finalization.service';
 import { logInfo, logDebug } from '../../utils/logger';
+import { recordBillingMetric } from '../../utils/monitoring';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
 import { closeTerminationRetryQueue } from './billing-termination.queue';
 import { isCallActive } from './billing-active-call.service';
@@ -80,19 +80,6 @@ export async function handleCallStartedHttp(
     startCorrelationId,
     startIngress: opts?.startIngress ?? 'http',
   });
-
-  const redis = getRedis();
-  const pendingEndKey = pendingCallEndKey(data.callId);
-  const hasPendingEnd = await redis.get(pendingEndKey);
-  if (hasPendingEnd) {
-    await redis.del(pendingEndKey);
-    logInfo('Deferred settlement (HTTP)', { callId: data.callId });
-    await finalizeCallSession(io, {
-      callId: data.callId,
-      reason: 'explicit_end',
-      source: 'deferred_pending_end',
-    });
-  }
 }
 
 /**
@@ -126,8 +113,22 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
   });
 
   if (!active) {
-    await redis.setex(pendingCallEndKey(callId), PENDING_CALL_END_TTL, '1');
-    logInfo('Deferring call:ended (HTTP, session not ready)', { callId });
+    await redis.setex(
+      pendingCallEndKey(callId),
+      PENDING_CALL_END_TTL,
+      JSON.stringify({
+        requestedAtMs: Date.now(),
+        source: 'http_settle_call',
+      })
+    );
+    logInfo('Deferring call:ended (HTTP, session not ready)', {
+      callId,
+      source: 'http_settle_call',
+    });
+    recordBillingMetric('deferred_call_end_queued', 1, {
+      callId,
+      source: 'http_settle_call',
+    });
     return;
   }
 
