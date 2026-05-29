@@ -502,6 +502,12 @@ app.get('/metrics', async (req, res) => {
     if (rollingCreatorFallbackRate > 0.05) {
       metricsAlerts.push('creator_presence_fallback_high_5m');
     }
+    const hardBlockerAlertKeys = new Set([
+      'billing_runtime_missing_detected_5m',
+      'billing_deferred_call_end_backlog_5m',
+    ]);
+    const hardBlockerAlerts = metricsAlerts.filter((alert) => hardBlockerAlertKeys.has(alert));
+
     res.status(200).json({
       mongo: {
         activeConnections: mongoStats.checkedOut,
@@ -711,6 +717,7 @@ app.get('/metrics', async (req, res) => {
       },
       alerts: {
         active: metricsAlerts,
+        blockers: hardBlockerAlerts,
       },
       timestamp: new Date().toISOString(),
     });
