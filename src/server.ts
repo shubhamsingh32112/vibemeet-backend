@@ -25,6 +25,7 @@ import { featureFlags } from './config/feature-flags';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
+import { backfillCreatorPresenceV2 } from './modules/availability/presence-backfill.service';
 import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
 import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
@@ -127,6 +128,28 @@ function buildCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
   if (parts.length === 0) return '*';
   if (parts.length === 1) return parts[0];
   return parts;
+}
+
+function isEnvFlagEnabled(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function parseCsvEnv(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  const floored = Math.floor(value);
+  return floored > 0 ? floored : fallback;
 }
 
 app.use(
@@ -927,6 +950,9 @@ const startServer = async () => {
       legacyFallbackReadEnabled: featureFlags.creatorPresenceLegacyFallbackReadEnabled,
       legacyDualWriteEnabled: featureFlags.creatorPresenceLegacyDualWriteEnabled,
       missingWarnRate: process.env.CREATOR_PRESENCE_MISSING_WARN_RATE || '0.05',
+      runBackfillOnBoot: process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT || 'false',
+      runBackfillOnBootUids: process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT_UIDS ? 'configured' : 'unset',
+      runBackfillOnBootProgressEvery: process.env.RUN_CREATOR_PRESENCE_BACKFILL_PROGRESS_EVERY || '100',
     });
 
     setupBillingGateway(io);
@@ -1002,6 +1028,39 @@ const startServer = async () => {
       });
       if (process.env.NODE_ENV === 'production') {
         throw new Error('Redis is required in production (assertProductionRedis should have failed)');
+      }
+    }
+
+    if (isEnvFlagEnabled(process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT)) {
+      const scopedUids = parseCsvEnv(process.env.RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT_UIDS);
+      const progressEvery = parsePositiveIntEnv(
+        process.env.RUN_CREATOR_PRESENCE_BACKFILL_PROGRESS_EVERY,
+        100
+      );
+      logInfo('creator_presence_v2_backfill_on_boot_start', {
+        redisEndpointMode: getRedisEndpointMode(),
+        scoped: scopedUids.length > 0,
+        scopedCount: scopedUids.length,
+        progressEvery,
+      });
+      try {
+        const result = await backfillCreatorPresenceV2({
+          uids: scopedUids.length > 0 ? scopedUids : undefined,
+          source: 'boot-backfill-creator-presence-v2',
+          logProgress: true,
+          progressEvery,
+        });
+        logInfo('creator_presence_v2_backfill_on_boot_done', {
+          ...result,
+          redisEndpointMode: getRedisEndpointMode(),
+          disableFlagHint: 'Set RUN_CREATOR_PRESENCE_BACKFILL_ON_BOOT=false after successful run',
+        });
+      } catch (err) {
+        logError('creator_presence_v2_backfill_on_boot_failed', err, {
+          redisEndpointMode: getRedisEndpointMode(),
+          scoped: scopedUids.length > 0,
+          scopedCount: scopedUids.length,
+        });
       }
     }
 
