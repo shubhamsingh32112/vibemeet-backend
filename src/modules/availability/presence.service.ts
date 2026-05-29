@@ -1,6 +1,7 @@
 import { Server } from 'socket.io';
 import {
   getRedis,
+  getRedisEndpointMode,
   availabilityKey,
   creatorPresenceKey,
   activeCallByUserKey,
@@ -312,6 +313,7 @@ export async function transitionCreatorPresence(
       firebaseUid,
       eventType,
       source,
+      redisEndpointMode: getRedisEndpointMode(),
       fromState: current.state,
       toState: nextRecord.state,
       version: nextRecord.version,

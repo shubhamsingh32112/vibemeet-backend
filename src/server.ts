@@ -17,9 +17,11 @@ import { initializeFirebase } from './config/firebase';
 import {
   isRedisConfigured,
   getRedis,
+  getRedisEndpointMode,
   metricsKey,
   attachRedisClientMonitoring,
 } from './config/redis';
+import { featureFlags } from './config/feature-flags';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
@@ -919,6 +921,13 @@ const startServer = async () => {
     // Set up Socket.IO gateways
     setupAvailabilityGateway(io);
     logInfo('Socket.IO availability gateway ready');
+    logInfo('creator_presence_runtime_config', {
+      redisEndpointMode: getRedisEndpointMode(),
+      presenceV2Enabled: featureFlags.presenceV2Enabled,
+      legacyFallbackReadEnabled: featureFlags.creatorPresenceLegacyFallbackReadEnabled,
+      legacyDualWriteEnabled: featureFlags.creatorPresenceLegacyDualWriteEnabled,
+      missingWarnRate: process.env.CREATOR_PRESENCE_MISSING_WARN_RATE || '0.05',
+    });
 
     setupBillingGateway(io);
     logInfo('Socket.IO billing gateway ready');
