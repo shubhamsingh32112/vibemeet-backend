@@ -70,18 +70,6 @@ function parseUidFromKey(key: string, prefix: string): string | null {
   return uid.length > 0 ? uid : null;
 }
 
-function countConnectedCreatorSockets(io: Server | undefined): number {
-  if (!io) return 0;
-  const uids = new Set<string>();
-  for (const [, socket] of io.sockets.sockets) {
-    if (!socket.connected) continue;
-    const uid = socket.data.firebaseUid as string | undefined;
-    if (!uid || !socket.data.isCreator) continue;
-    uids.add(uid);
-  }
-  return uids.size;
-}
-
 function connectedCreatorUidSet(io: Server | undefined): Set<string> {
   const uids = new Set<string>();
   if (!io) return uids;

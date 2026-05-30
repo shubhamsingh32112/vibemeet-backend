@@ -296,12 +296,14 @@ export function setupAvailabilityGateway(io: Server): void {
     const firebaseUid = socket.data.firebaseUid as string | undefined;
     let isCreator = false;
     let isUser = false;
+    let resolvedRole: string | null = null;
 
     if (firebaseUid) {
       try {
         const user = await User.findOne({ firebaseUid }).select('role').lean();
-        isCreator = user?.role === 'creator' || user?.role === 'admin';
-        isUser = user?.role === 'user' || !user?.role || user?.role === null;
+        resolvedRole = user?.role ?? null;
+        isCreator = resolvedRole === 'creator' || resolvedRole === 'admin';
+        isUser = resolvedRole === 'user' || !resolvedRole;
       } catch (err) {
         logError('Failed to resolve user role for socket', err, { firebaseUid, socketId: socket.id });
         // Fail open: join consumers so global broadcasts (like app updates) still reach the client.
@@ -320,6 +322,10 @@ export function setupAvailabilityGateway(io: Server): void {
     if (firebaseUid && isCreator) {
       // 🔥 SCALABILITY: Join creators room for targeted creator-side broadcasts
       socket.join('creators');
+      // Admins testing the user home feed must also receive fan-facing creator:status events.
+      if (resolvedRole === 'admin') {
+        socket.join('consumers');
+      }
       
       const currentCount = creatorSocketCounts.get(firebaseUid) ?? 0;
       creatorSocketCounts.set(firebaseUid, currentCount + 1);

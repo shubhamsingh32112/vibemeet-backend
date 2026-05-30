@@ -525,19 +525,34 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
           }
 
           const baseAvailability = await redis.get(availabilityKey(creatorFirebaseUid));
+          const currentStatus = await getAvailability(creatorFirebaseUid);
           if (baseAvailability !== 'online') {
-            recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
-              reason: 'base_offline',
-            });
-            logInfo('Reconciliation skipped settled restore (creator base offline)', {
-              callId: call.callId,
-              creatorFirebaseUid,
-              baseAvailability: baseAvailability || 'offline',
-            });
+            // Ghost on_call: toggle/base is offline but effective status still on_call (stale meta).
+            if (currentStatus === 'on_call') {
+              await transitionCreatorPresence(
+                getIO(),
+                creatorFirebaseUid,
+                'DISCONNECTED',
+                'call-reconciliation.clear_ghost_on_call_offline_base'
+              );
+              fixed += 1;
+              logInfo('Reconciliation cleared ghost on_call (creator base offline)', {
+                callId: call.callId,
+                creatorFirebaseUid,
+                baseAvailability: baseAvailability || 'offline',
+              });
+            } else {
+              recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
+                reason: 'base_offline',
+              });
+              logInfo('Reconciliation skipped settled restore (creator base offline)', {
+                callId: call.callId,
+                creatorFirebaseUid,
+                baseAvailability: baseAvailability || 'offline',
+              });
+            }
             continue;
           }
-
-          const currentStatus = await getAvailability(creatorFirebaseUid);
           if (currentStatus !== 'on_call') {
             recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
               reason: 'status_not_on_call',
@@ -587,6 +602,63 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
     recordCallMetric('call_reconciliation.settled_busy_fixed', fixed, {});
   } catch (err) {
     logError('Error in cleanupSettledCreatorBusyDrift', err);
+  }
+}
+
+/**
+ * Clear Redis active-call slots that have no live billing session (forces effective offline/on_call fix).
+ */
+async function cleanupOrphanActiveCallSlots(): Promise<void> {
+  const redis = getRedis();
+  const passStarted = Date.now();
+  let cursor = '0';
+  let scanned = 0;
+  let cleared = 0;
+
+  try {
+    do {
+      const [next, keys] = await redis.scan(
+        cursor,
+        'MATCH',
+        `${ACTIVE_CALL_BY_USER_PREFIX}*`,
+        'COUNT',
+        '100'
+      );
+      cursor = next;
+      for (const key of keys) {
+        if (Date.now() - passStarted > RECON_MAX_MS_PER_TICK) {
+          return;
+        }
+        scanned += 1;
+        const firebaseUid = key.slice(ACTIVE_CALL_BY_USER_PREFIX.length).trim();
+        if (!firebaseUid) continue;
+        const slotCallId = await redis.get(key);
+        if (!slotCallId) continue;
+        const sessionForSlot = await redis.get(callSessionKey(slotCallId));
+        if (sessionForSlot) continue;
+
+        await redis.del(key).catch(() => {});
+        const currentStatus = await getAvailability(firebaseUid);
+        if (currentStatus === 'on_call') {
+          await transitionCreatorPresence(
+            getIO(),
+            firebaseUid,
+            'RECONCILED',
+            'call-reconciliation.cleanupOrphanActiveCallSlots'
+          );
+        }
+        cleared += 1;
+        logInfo('Reconciliation cleared orphan active call slot', {
+          creatorFirebaseUid: firebaseUid,
+          slotCallId,
+          previousStatus: currentStatus,
+        });
+      }
+    } while (cursor !== '0');
+    recordCallMetric('call_reconciliation.orphan_slot_scan', scanned, {});
+    recordCallMetric('call_reconciliation.orphan_slot_cleared', cleared, {});
+  } catch (err) {
+    logError('Error in cleanupOrphanActiveCallSlots', err);
   }
 }
 
@@ -746,6 +818,7 @@ async function reconcileActiveCalls(): Promise<void> {
   try {
     const runStartedAt = Date.now();
     await ensureCreatorsWithActiveCallsAreBusy();
+    await cleanupOrphanActiveCallSlots();
     await cleanupSettledCreatorBusyDrift();
     await repairMissingCanonicalPresenceMeta();
 
