@@ -72,6 +72,7 @@ import {
   emitBillingStartedFromSnapshot,
   emitBillingUpdateFromSnapshot,
 } from './billing-emitter.service';
+import { getBillingInstanceId } from './billing-instance-id';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
@@ -86,7 +87,6 @@ const BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS = Math.min(
   300,
   Math.max(30, parseInt(process.env.BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS || '120', 10) || 120)
 );
-const BILLING_RUNTIME_INSTANCE_ID = process.env.BILLING_INSTANCE_ID || `${process.pid}`;
 function billingCycleLockKey(callId: string): string {
   return `${BILLING_CYCLE_LOCK_PREFIX}${callId}`;
 }
@@ -135,7 +135,7 @@ async function ensureRuntimeOwnership(
 ): Promise<boolean> {
   const ownerLockKey = session.leaderLock || `${BILLING_RUNTIME_OWNER_LOCK_PREFIX}${callId}`;
   const runtimeEpoch = Math.max(1, Number(session.runtimeEpoch) || 1);
-  const ownerValue = `${BILLING_RUNTIME_INSTANCE_ID}:${runtimeEpoch}`;
+  const ownerValue = `${getBillingInstanceId()}:${runtimeEpoch}`;
   const existing = await redis.get(ownerLockKey);
   if (!existing) {
     const claimed = await redis.set(
@@ -146,7 +146,7 @@ async function ensureRuntimeOwnership(
       'NX'
     );
     if (claimed === 'OK') {
-      session.instanceId = BILLING_RUNTIME_INSTANCE_ID;
+      session.instanceId = getBillingInstanceId();
       session.runtimeEpoch = runtimeEpoch;
       session.leaderLock = ownerLockKey;
       return true;
@@ -161,14 +161,14 @@ async function ensureRuntimeOwnership(
     recordBillingMetric('billing_runtime_epoch_reject_stale_worker', 1, {
       callId,
       currentOwner: current,
-      workerInstanceId: BILLING_RUNTIME_INSTANCE_ID,
+      workerInstanceId: getBillingInstanceId(),
     });
     return false;
   }
   await redis
     .set(ownerLockKey, ownerValue, 'EX', BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS, 'XX')
     .catch(() => {});
-  session.instanceId = BILLING_RUNTIME_INSTANCE_ID;
+  session.instanceId = getBillingInstanceId();
   session.runtimeEpoch = runtimeEpoch;
   session.leaderLock = ownerLockKey;
   return true;
@@ -1003,7 +1003,7 @@ function buildSessionFromCheckpoint(
     lastSocketEmitAt: Number(checkpoint.lastCheckpointAtMs) || lastProcessedAtMs,
     lastSequenceAdvanceAt: lastProcessedAtMs,
     expectedNextTickAtMs: lastProcessedAtMs + BILLING_PROCESS_INTERVAL_MS,
-    instanceId: BILLING_RUNTIME_INSTANCE_ID,
+    instanceId: getBillingInstanceId(),
     runtimeEpoch: Math.max(1, Number(checkpoint.version) || 1),
     leaderLock: `runtime:${callId}`,
   };
@@ -1060,7 +1060,7 @@ export class BillingService {
       source,
       startIngress,
       startCorrelationId,
-      instanceId: `${process.pid}`,
+      instanceId: getBillingInstanceId(),
       firstSeenAt: Date.now(),
     });
     const orchestratorClaim = await redis.set(
@@ -1351,7 +1351,7 @@ export class BillingService {
         lastSocketEmitAt: seedStartTime,
         lastSequenceAdvanceAt: seedStartTime,
         expectedNextTickAtMs: seedStartTime + BILLING_PROCESS_INTERVAL_MS,
-        instanceId: BILLING_RUNTIME_INSTANCE_ID,
+        instanceId: getBillingInstanceId(),
         runtimeEpoch: 1,
         leaderLock: `runtime:${callId}`,
       };
@@ -1510,7 +1510,7 @@ export class BillingService {
       lastSocketEmitAt: startTime,
       lastSequenceAdvanceAt: startTime,
       expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
-      instanceId: BILLING_RUNTIME_INSTANCE_ID,
+      instanceId: getBillingInstanceId(),
       runtimeEpoch: 1,
       leaderLock: `runtime:${callId}`,
     };
@@ -2045,7 +2045,7 @@ export class BillingService {
           billingSequence: session.billingSequence,
           runtimeEpoch: session.runtimeEpoch,
           ownerInstanceId: session.instanceId,
-          workerInstanceId: BILLING_RUNTIME_INSTANCE_ID,
+          workerInstanceId: getBillingInstanceId(),
         });
         return 'tick_ok';
       }

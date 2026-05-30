@@ -13,6 +13,7 @@ import { getBillingCheckpoint } from './billing-checkpoint.service';
 import { BILLING_PROCESS_INTERVAL_MS, BILLING_SESSION_SCHEMA_VERSION } from './billing.constants';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { BillingLifecycleState } from './billing-lifecycle.machine';
+import { getBillingInstanceId } from './billing-instance-id';
 import { logInfo, logWarning, logDebug } from '../../utils/logger';
 
 export interface BillingRuntimeSession {
@@ -116,7 +117,7 @@ function buildSessionFromCheckpoint(
     lastHealthyTickAt: lastProcessedAtMs,
     lastSocketEmitAt: Number(checkpoint.lastCheckpointAtMs) || lastProcessedAtMs,
     lastSequenceAdvanceAt: lastProcessedAtMs,
-    instanceId: String(process.env.BILLING_INSTANCE_ID || process.pid),
+    instanceId: getBillingInstanceId(),
     runtimeEpoch: Math.max(1, Number(checkpoint.version) || 1),
     leaderLock: `billing:runtime:owner:${callId}`,
   };

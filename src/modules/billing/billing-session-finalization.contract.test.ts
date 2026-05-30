@@ -95,6 +95,7 @@ test('finalizer writes terminal tombstone and blocks stale worker settle on ACTI
   assert.ok(src.includes('BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS'));
   assert.ok(src.includes('billing_finalize_rejected_stale_worker'));
   assert.ok(src.includes('billing_runtime_epoch_reject_stale_worker'));
+  assert.ok(src.includes('billingInstanceIdsMatch'));
 });
 
 test('finalizer convergence path retries and reconstructs from checkpoint before dead-letter', () => {

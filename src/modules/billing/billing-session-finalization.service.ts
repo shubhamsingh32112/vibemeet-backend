@@ -4,7 +4,10 @@
 
 import { Server } from 'socket.io';
 import crypto from 'crypto';
-import os from 'os';
+import {
+  billingInstanceIdsMatch,
+  getBillingInstanceId,
+} from './billing-instance-id';
 import {
   getRedis,
   callSessionKey,
@@ -141,15 +144,8 @@ const FINALIZE_CONVERGENCE_BACKOFF_MS = Math.max(
   Math.min(1000, parseInt(process.env.BILLING_FINALIZE_CONVERGENCE_BACKOFF_MS || '80', 10) || 80)
 );
 
-function billingInstanceId(): string {
-  return (
-    process.env.BILLING_INSTANCE_ID?.trim() ||
-    `${os.hostname()}:${process.pid}`
-  );
-}
-
 export function getRecoveryOwnerInstanceId(): string {
-  return billingInstanceId();
+  return getBillingInstanceId();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -231,7 +227,7 @@ export async function moveCallToRecoveryDeadLetter(
   metadata?: Record<string, unknown>
 ): Promise<void> {
   const redis = getRedis();
-  const recoveryOwnerInstanceId = billingInstanceId();
+  const recoveryOwnerInstanceId = getBillingInstanceId();
   const now = Date.now();
   const deadLetterKey = billingRecoveryDeadLetterKey(callId);
   await redis.setex(
@@ -401,7 +397,7 @@ export async function enqueueSettlementRetry(
   const attempt = (params.attempt ?? 0) + 1;
   const enqueuedAt = (params as { enqueuedAt?: number }).enqueuedAt ?? now;
   const ageMs = Math.max(0, now - enqueuedAt);
-  const recoveryOwnerInstanceId = billingInstanceId();
+  const recoveryOwnerInstanceId = getBillingInstanceId();
 
   if (ageMs > RETRY_MAX_AGE_MS) {
     await moveCallToRecoveryDeadLetter(params.callId, 'retry_age_exhausted', params.source);
@@ -518,7 +514,7 @@ async function tryStaleSettlingTakeover(callId: string): Promise<boolean> {
 
   const newVersion = (call.settlement.version ?? 0) + 1;
   const ownerToken = crypto.randomUUID();
-  const ownerInstanceId = billingInstanceId();
+  const ownerInstanceId = getBillingInstanceId();
 
   await Call.updateOne(
     { callId },
@@ -870,7 +866,7 @@ export async function finalizeCallSession(
 ): Promise<FinalizeResult> {
   const { callId, reason, source } = params;
   const finalizeAttemptId = crypto.randomUUID();
-  const recoveryOwnerInstanceId = billingInstanceId();
+  const recoveryOwnerInstanceId = getBillingInstanceId();
   const reconciliationWorkerId =
     source === 'reconciliation_worker' ? recoveryOwnerInstanceId : undefined;
 
@@ -959,7 +955,7 @@ export async function finalizeCallSession(
       if (
         lifecycleState === 'ACTIVE' &&
         ownerInstanceId &&
-        ownerInstanceId !== recoveryOwnerInstanceId &&
+        !billingInstanceIdsMatch(ownerInstanceId, recoveryOwnerInstanceId) &&
         sequenceAdvancedRecently
       ) {
         recordBillingMetric('billing_runtime_epoch_reject_stale_worker', 1, {
@@ -1009,7 +1005,7 @@ export async function finalizeCallSession(
   await tryStaleSettlingTakeover(callId);
 
   const ownerToken = crypto.randomUUID();
-  const ownerInstanceId = billingInstanceId();
+  const ownerInstanceId = getBillingInstanceId();
   const claimPayload = JSON.stringify({
     token: ownerToken,
     instanceId: ownerInstanceId,
