@@ -260,9 +260,9 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     const tAvail = Date.now();
     const firebaseUids = baseRows.map((c) => c.firebaseUid).filter((uid): uid is string => uid !== null);
     const presenceMap = firebaseUids.length > 0 ? await getBatchCreatorPresence(firebaseUids) : {};
-    const availabilityMap: Record<string, 'online' | 'busy'> = {};
+    const availabilityMap: Record<string, 'online' | 'on_call' | 'offline'> = {};
     Object.entries(presenceMap).forEach(([uid, record]) => {
-      availabilityMap[uid] = record.state === 'online' ? 'online' : 'busy';
+      availabilityMap[uid] = record.state;
     });
     availabilityMs = Date.now() - tAvail;
 
@@ -271,7 +271,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
       about: '',
       galleryImages: [] as unknown[],
       isFavorite: favoriteSet.has(c.id),
-      availability: c.firebaseUid ? (availabilityMap[c.firebaseUid] ?? 'busy') : 'busy',
+      availability: c.firebaseUid ? (availabilityMap[c.firebaseUid] ?? 'offline') : 'offline',
     }));
 
     logInfo('creator.feed.timing', {
@@ -295,7 +295,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
           creatorId: creator.id,
           firebaseUid,
           presenceSource: record?.source ?? 'missing',
-          availability: availabilityMap[firebaseUid] ?? 'busy',
+          availability: availabilityMap[firebaseUid] ?? 'offline',
           cacheHit,
           presenceAgeMs: Math.max(0, Date.now() - updatedAt),
         };
@@ -486,7 +486,7 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
     }
 
     const presenceMap = await getBatchCreatorPresence([uidRaw]);
-    const availability = presenceMap[uidRaw]?.state === 'online' ? 'online' : 'busy';
+    const availability = presenceMap[uidRaw]?.state ?? 'offline';
     const images = serializeCreatorImages(creator as unknown as ICreator);
     const legacyPhoto =
       (creator as unknown as { photo?: string | null }).photo ?? null;
@@ -593,8 +593,8 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
             : {};
         const availability =
           firebaseUid && typeof firebaseUid === 'string'
-            ? (presenceMap[firebaseUid]?.state === 'online' ? 'online' : 'busy')
-            : 'busy';
+            ? (presenceMap[firebaseUid]?.state ?? 'offline')
+            : 'offline';
         const galleryRaw = cached.galleryImages;
         const galleryImages = Array.isArray(galleryRaw)
           ? serializeCreatorGallery(
@@ -651,8 +651,8 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
         : {};
     const availability =
       firebaseUid && typeof firebaseUid === 'string'
-        ? (presenceMap[firebaseUid]?.state === 'online' ? 'online' : 'busy')
-        : 'busy';
+        ? (presenceMap[firebaseUid]?.state ?? 'offline')
+        : 'offline';
 
     const images = serializeCreatorImages(creator);
     const responseCreator = {
@@ -1299,10 +1299,10 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
       await setCreatorAvailability(
         io,
         currentUser.firebaseUid,
-        isOnline ? 'online' : 'busy'
+        isOnline ? 'online' : 'offline'
       );
       console.log(
-        `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'busy'}`
+        `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'offline'}`
       );
     } catch (availabilityError) {
       // Don't fail the request if Redis/Socket broadcast fails

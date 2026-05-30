@@ -45,7 +45,7 @@ test('creator availability finalization verifies active-call key deletion', () =
 
 test('pre-call snapshot restoration preserves offline creators after call end', () => {
   const src = readFileSync(join(__dirname, 'creator-call-lock.service.ts'), 'utf8');
-  assert.ok(src.includes("snapshot === 'online' || snapshot === 'busy'"));
+  assert.ok(src.includes("snapshot === 'online' || snapshot === 'offline' || snapshot === 'on_call'"));
   assert.ok(src.includes(": 'DISCONNECTED'"));
 });
 

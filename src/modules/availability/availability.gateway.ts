@@ -91,7 +91,7 @@ function scheduleCreatorDisconnectTransition(
     }
     try {
       await transitionCreatorPresence(io, firebaseUid, 'DISCONNECTED', source);
-      logInfo('Creator disconnect grace elapsed - set to busy', {
+      logInfo('Creator disconnect grace elapsed - set to offline', {
         firebaseUid,
         source,
         graceMs: CREATOR_DISCONNECT_GRACE_MS,
@@ -183,7 +183,7 @@ function cleanupStaleSocketTracking(io: Server): void {
           'DISCONNECTED',
           'availability.gateway.cleanup_stale'
         ).catch((err) => {
-          logError('Failed to force creator busy during stale cleanup', err, { firebaseUid });
+          logError('Failed to force creator offline during stale cleanup', err, { firebaseUid });
         });
       }
 
@@ -223,7 +223,7 @@ function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefin
  *     availability:get  { creatorIds: string[] }   – batch-fetch current statuses
  *
  *   Server → Client:
- *     availability:batch  { [firebaseUid]: "online"|"busy" }  – response to availability:get
+ *     availability:batch  { [firebaseUid]: "online"|"on_call"|"offline" }  – response to availability:get
  *     creator:status       { creatorId, status }               – real-time incremental update
  */
 export function setupAvailabilityGateway(io: Server): void {
@@ -486,12 +486,12 @@ export function setupAvailabilityGateway(io: Server): void {
           const result: Record<string, string> = {};
           const resultV2: Record<
             string,
-            { status: 'online' | 'busy'; version: number; updatedAt: number; source: string }
+            { status: 'online' | 'on_call' | 'offline'; version: number; updatedAt: number; source: string }
           > = {};
           const records = await getBatchCreatorPresence(creatorIds);
           for (const creatorId of creatorIds) {
             const rec = records[creatorId];
-            const state = rec?.state ?? 'busy';
+            const state = rec?.state ?? 'offline';
             result[creatorId] = state;
             resultV2[creatorId] = {
               status: state,
@@ -734,7 +734,7 @@ export function setupAvailabilityGateway(io: Server): void {
 export async function setCreatorAvailability(
   io: Server,
   creatorFirebaseUid: string,
-  status: 'online' | 'busy'
+  status: 'online' | 'offline'
 ): Promise<void> {
   if (status === 'online') {
     clearCreatorDisconnectTimer(creatorFirebaseUid);
@@ -773,8 +773,8 @@ async function sweepStaleHeartbeats(io: Server): Promise<void> {
     lastCreatorHeartbeatAtMs.delete(uid);
     activeSocketsByCreator.delete(uid);
     creatorSocketCounts.delete(uid);
-    recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'creator', status: 'busy' });
-    logWarning('Applied creator TTL fallback to busy', { firebaseUid: uid });
+    recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'creator', status: 'offline' });
+    logWarning('Applied creator TTL fallback to offline', { firebaseUid: uid });
   }
 
   for (const [uid, lastAt] of lastUserHeartbeatAtMs.entries()) {

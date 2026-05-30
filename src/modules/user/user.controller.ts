@@ -276,7 +276,7 @@ export const getFavoriteCreatorProfiles = async (
             age: creator.age,
             location: creator.location,
             isOnline: creator.isOnline,
-            availability: firebaseUid ? (availabilityMap[firebaseUid] ?? 'busy') : 'busy',
+            availability: firebaseUid ? (availabilityMap[firebaseUid] ?? 'offline') : 'offline',
             isFavorite: true,
             createdAt: creator.createdAt,
             updatedAt: creator.updatedAt,

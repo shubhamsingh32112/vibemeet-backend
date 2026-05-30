@@ -100,7 +100,7 @@ export async function getOnlineTodaySecondsLive(
 
   const sinceRaw = await redis.get(creatorAvailOnlineSinceKey(creatorFirebaseUid));
   const presenceRaw = await redis.get(creatorPresenceKey(creatorFirebaseUid));
-  let avail: 'online' | 'busy' = 'busy';
+  let avail: 'online' | 'on_call' | 'offline' = 'offline';
   if (presenceRaw) {
     try {
       const parsed = JSON.parse(presenceRaw) as { state?: string } | null;

@@ -1687,7 +1687,7 @@ export const forceCreatorOffline = async (req: Request, res: Response): Promise<
 
     try {
       const io = getIO();
-      await setCreatorAvailability(io, creatorUser.firebaseUid, 'busy');
+      await setCreatorAvailability(io, creatorUser.firebaseUid, 'offline');
     } catch (socketErr) {
       console.warn('⚠️ [ADMIN] Failed to broadcast availability:', socketErr);
     }

@@ -16,7 +16,7 @@ import {
 import { recordCallMetric } from '../../utils/monitoring';
 import { logInfo, logWarning, logError, logDebug } from '../../utils/logger';
 
-export type CreatorPresenceState = 'online' | 'busy';
+export type CreatorPresenceState = 'online' | 'on_call' | 'offline';
 type CreatorBaseAvailability = 'online' | 'offline';
 export type PresenceTransitionEventType =
   | 'CONNECTED'
@@ -107,9 +107,10 @@ function resolveTargetBaseAvailability(
       return 'offline';
     case 'CONNECTED':
     case 'RECOVERED':
-    case 'RECONCILED':
     case 'CALL_ENDED':
       return 'online';
+    case 'RECONCILED':
+      return currentBase;
     case 'CALL_STARTED':
     case 'HEARTBEAT':
     default:
@@ -121,8 +122,8 @@ function derivePresenceState(
   base: CreatorBaseAvailability,
   hasActiveCallState: boolean
 ): CreatorPresenceState {
-  if (hasActiveCallState) return 'busy';
-  return base === 'online' ? 'online' : 'busy';
+  if (hasActiveCallState) return 'on_call';
+  return base === 'online' ? 'online' : 'offline';
 }
 
 function deriveRecordSource(
@@ -141,10 +142,11 @@ function resolveLegacyTargetState(
   switch (eventType) {
     case 'FORCE_OFFLINE':
     case 'DISCONNECTED':
+      return 'offline';
     case 'CALL_STARTED':
-      return 'busy';
+      return 'on_call';
     default:
-      return hasActiveCallState ? 'busy' : 'online';
+      return hasActiveCallState ? 'on_call' : 'online';
   }
 }
 
@@ -432,8 +434,8 @@ export async function transitionCreatorPresence(
     });
   }
 
-  if (nextRecord.state === 'busy' && !activeCallId && nextBase === 'online') {
-    logWarning('creator_presence_busy_without_active_call', {
+  if (nextRecord.state === 'on_call' && !activeCallId) {
+    logWarning('creator_presence_on_call_without_active_call', {
       firebaseUid,
       eventType,
       source,

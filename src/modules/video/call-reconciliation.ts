@@ -14,6 +14,7 @@ import {
   activeCallByUserKey,
   ACTIVE_CALL_BY_USER_TTL,
   callSessionKey,
+  availabilityKey,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError } from '../../utils/logger';
@@ -147,8 +148,24 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
             continue;
           }
 
+          const baseAvailability = await redis.get(availabilityKey(creatorFirebaseUid));
+          if (baseAvailability !== 'online') {
+            recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
+              reason: 'base_offline',
+            });
+            logInfo('Reconciliation skipped settled restore (creator base offline)', {
+              callId: call.callId,
+              creatorFirebaseUid,
+              baseAvailability: baseAvailability || 'offline',
+            });
+            continue;
+          }
+
           const currentStatus = await getAvailability(creatorFirebaseUid);
-          if (currentStatus !== 'busy') {
+          if (currentStatus !== 'on_call') {
+            recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
+              reason: 'status_not_on_call',
+            });
             continue;
           }
 
@@ -167,7 +184,7 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
             'call-reconciliation.cleanupSettledCreatorBusyDrift'
           );
           fixed += 1;
-          logInfo('Reconciliation restored creator online after settled call', {
+          logInfo('Reconciliation restored creator status after settled call', {
             callId: call.callId,
             creatorFirebaseUid,
             settlementAgeMs,
@@ -244,8 +261,8 @@ export function stopCallReconciliationJob(): void {
 }
 
 /**
- * 🔥 FIX: Ensure creators with active calls are marked busy
- * This is a safety net to catch any cases where creators weren't marked busy
+ * 🔥 FIX: Ensure creators with active calls are marked on_call
+ * This is a safety net to catch any cases where creators weren't marked on_call
  */
 async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
   try {
@@ -265,7 +282,7 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
           if (creatorUser?.firebaseUid) {
             const currentStatus = await getAvailability(creatorUser.firebaseUid);
 
-            if (currentStatus !== 'busy') {
+            if (currentStatus !== 'on_call') {
               if (featureFlags.creatorPresenceUserModelEnabled) {
                 const redis = getRedis();
                 await redis.set(
@@ -281,7 +298,7 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
                 'CALL_STARTED',
                 'call-reconciliation.ensureCreatorsWithActiveCallsAreBusy'
               );
-              logInfo('Reconciliation: Fixed creator busy status', {
+              logInfo('Reconciliation: Fixed creator on_call status', {
                 callId: call.callId,
                 creatorFirebaseUid: creatorUser.firebaseUid,
                 previousStatus: currentStatus,

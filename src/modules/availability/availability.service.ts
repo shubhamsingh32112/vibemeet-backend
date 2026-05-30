@@ -10,9 +10,9 @@
  * 
  * Status semantics:
  * - Base state (`creator:availability:*`): 'online' | 'offline'
- * - Effective API state: 'online' | 'busy' (`busy` = active call or offline)
- * 
- * Rule: Missing/unknown creators are ALWAYS 'busy'
+ * - Effective API state: 'online' | 'on_call' | 'offline'
+ *
+ * Rule: Missing/unknown creators are ALWAYS 'offline'
  * 
  * Redis key design:
  *   creator:availability:{creatorId} → "online" | "offline"
@@ -37,19 +37,21 @@ import {
 import { logError } from '../../utils/logger';
 import { getBatchCreatorPresence, readCreatorPresenceState } from './presence.service';
 
-export type CreatorAvailability = 'online' | 'busy';
+export type CreatorAvailability = 'online' | 'on_call' | 'offline';
 type CreatorBaseAvailability = 'online' | 'offline';
 
 const CREATOR_BASE_TTL_SECONDS = 120;
 
 function parsePresenceState(raw: string | null): CreatorAvailability | null {
-  return raw === 'online' ? 'online' : 'busy';
+  if (raw === 'online') return 'online';
+  if (raw === 'on_call') return 'on_call';
+  return 'offline';
 }
 
 /**
  * Set a creator's availability status
  * @param creatorId - The creator's Firebase UID
- * @param status - 'online' or 'busy'
+ * @param status - 'online' or 'offline'
  */
 export async function setAvailability(
   creatorId: string,
@@ -76,19 +78,19 @@ export async function setCreatorBaseAvailability(
 /**
  * Get a creator's availability status
  * @param creatorId - The creator's Firebase UID
- * @returns 'online' or 'busy' (defaults to 'busy' if unknown)
+ * @returns 'online' | 'on_call' | 'offline' (defaults to 'offline' if unknown)
  */
 export async function getAvailability(creatorId: string): Promise<CreatorAvailability> {
   if (!isRedisConfigured()) {
-    return 'busy'; // Unknown = Busy (always safe)
+    return 'offline'; // Unknown = offline
   }
 
   try {
     const record = await readCreatorPresenceState(creatorId);
-    return record.state === 'online' ? 'online' : 'busy';
+    return record.state;
   } catch (err) {
-    logError('creator_availability_get_failed', err, { creatorId, failSafe: 'busy' });
-    return 'busy'; // Error = Busy (fail safe)
+    logError('creator_availability_get_failed', err, { creatorId, failSafe: 'offline' });
+    return 'offline'; // Error = offline (fail safe)
   }
 }
 
@@ -199,9 +201,9 @@ export async function getBatchAvailability(
   creatorIds: string[]
 ): Promise<Record<string, CreatorAvailability>> {
   if (!isRedisConfigured() || creatorIds.length === 0) {
-    // Return all as busy
+    // Return all as offline
     const result: Record<string, CreatorAvailability> = {};
-    creatorIds.forEach(id => { result[id] = 'busy'; });
+    creatorIds.forEach(id => { result[id] = 'offline'; });
     return result;
   }
 
@@ -210,12 +212,12 @@ export async function getBatchAvailability(
     const presence = await getBatchCreatorPresence(creatorIds);
     creatorIds.forEach((id) => {
       const record = presence[id];
-      result[id] = record?.state === 'online' ? 'online' : 'busy';
+      result[id] = record?.state ?? 'offline';
     });
 
     creatorIds.forEach((id) => {
       if (result[id] == null) {
-        result[id] = 'busy';
+        result[id] = 'offline';
       }
     });
 
@@ -224,11 +226,11 @@ export async function getBatchAvailability(
     logError('creator_availability_batch_get_failed', err, {
       creatorCount: creatorIds.length,
       alert: true,
-      failSafe: 'all_busy',
+      failSafe: 'all_offline',
     });
-    // Return all as busy on error
+    // Return all as offline on error
     const result: Record<string, CreatorAvailability> = {};
-    creatorIds.forEach(id => { result[id] = 'busy'; });
+    creatorIds.forEach(id => { result[id] = 'offline'; });
     return result;
   }
 }

@@ -16,7 +16,7 @@ import { featureFlags } from '../../config/feature-flags';
  * - Creator.currentCallId
  * - Creator.isOnline (as it relates to video calls)
  * - Redis availability + Socket.IO presence
- * - Stream Chat "busy" flag
+ * - Stream Chat "busy" flag (legacy Stream presence)
  *
  * should go through this module so invariants like
  * "a creator cannot be in two active calls" remain easy to reason about.
@@ -53,7 +53,7 @@ export async function acquireCreatorCallLock(
 
     const creatorFirebaseUid = creatorUser.firebaseUid;
 
-    // Backend-authoritative availability: mark busy in Redis + Socket.IO.
+    // Backend-authoritative availability: mark on_call in Redis + Socket.IO.
     await transitionCreatorPresence(
       getIO(),
       creatorFirebaseUid,
@@ -162,7 +162,7 @@ export async function markCreatorBusyForCall(
     await redis.set(activeCallByUserKey(creatorFirebaseUid), callId, 'EX', PRECALL_SNAPSHOT_TTL_SECONDS);
 
     const current = await getAvailability(creatorFirebaseUid);
-    if (shouldEnforceAvailabilityWrites() && (featureFlags.creatorPresenceUserModelEnabled || current !== 'busy')) {
+    if (shouldEnforceAvailabilityWrites() && (featureFlags.creatorPresenceUserModelEnabled || current !== 'on_call')) {
       await transitionCreatorPresence(
         getIO(),
         creatorFirebaseUid,
@@ -226,7 +226,7 @@ export async function releaseCreatorCallLock(creatorUserId: string): Promise<voi
  * Behaviour:
  * - Reads the creator's profile to determine whether their toggle is ON (isOnline).
  * - If toggle is ON → mark Redis + sockets "online".
- * - If toggle is OFF → keep them "busy" until they explicitly go online again.
+ * - If toggle is OFF → keep them "offline" until they explicitly go online again.
  * - Always clears Stream Chat "busy" flag.
  */
 export async function updateCreatorAvailabilityAfterCall(
@@ -254,7 +254,7 @@ export async function updateCreatorAvailabilityAfterCall(
     const creatorFirebaseUid = creatorUser.firebaseUid;
 
     const isAvailableToggleOn = creator.isOnline === true;
-    const newStatus = isAvailableToggleOn ? 'online' : 'busy';
+    const newStatus = isAvailableToggleOn ? 'online' : 'offline';
 
     const restoreEvent =
       newStatus === 'online'
@@ -343,9 +343,9 @@ export async function finalizeCreatorAvailabilityForCall(
     }
 
     const snapshot = await redis.get(precallSnapshotKey(callId, creatorFirebaseUid));
-    const restoredStatus = (snapshot === 'online' || snapshot === 'busy'
+    const restoredStatus = (snapshot === 'online' || snapshot === 'offline' || snapshot === 'on_call'
       ? snapshot
-      : 'online') as CreatorAvailability;
+      : 'offline') as CreatorAvailability;
 
     if (shouldEnforceAvailabilityWrites()) {
       const restoreEvent =
@@ -353,6 +353,8 @@ export async function finalizeCreatorAvailabilityForCall(
           ? featureFlags.creatorPresenceUserModelEnabled
             ? 'CONNECTED'
             : 'CALL_ENDED'
+        : restoredStatus === 'on_call'
+          ? 'CALL_STARTED'
           : 'DISCONNECTED';
       await transitionCreatorPresence(
         getIO(),
@@ -381,7 +383,7 @@ export async function finalizeCreatorAvailabilityForCall(
         const streamClient = getStreamClient();
         await streamClient.partialUpdateUser({
           id: creatorFirebaseUid,
-          set: { busy: restoredStatus === 'busy' },
+          set: { busy: restoredStatus === 'on_call' },
         });
       } catch (streamError) {
         logError('Failed to clear Stream Chat busy state after call (non-critical)', streamError, {

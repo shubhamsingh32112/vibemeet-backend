@@ -841,9 +841,10 @@ function mapAggDocToAgentCreatorJson(
   const uid = c.userId.toString();
   const u = c.u;
   const fUid = u?.firebaseUid || '';
-  const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+  const avail = (fUid ? (availabilityMap[fUid] ?? 'offline') : 'offline') as
     | 'online'
-    | 'busy';
+    | 'on_call'
+    | 'offline';
   const pw = pendingByUserId.get(uid);
   const pts = c.periodTalkSeconds;
   const ats = c.allTimeTalkSeconds;
@@ -968,9 +969,10 @@ export const getAgencyCreators = async (req: Request, res: Response): Promise<vo
         const uid = c.userId.toString();
         const u = userMap.get(uid);
         const fUid = u?.firebaseUid || '';
-        const avail = (fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy') as
+        const avail = (fUid ? (availabilityMap[fUid] ?? 'offline') : 'offline') as
           | 'online'
-          | 'busy';
+          | 'on_call'
+          | 'offline';
         const p = periodStats.get(uid) ?? {
           talkSeconds: 0,
           periodCoinsEarned: 0,
@@ -1113,7 +1115,7 @@ export const getAgencyCreatorDetail = async (req: Request, res: Response): Promi
 
     const fUid = user.firebaseUid || '';
     const availabilityMap = fUid ? await getBatchAvailability([fUid]) : {};
-    const availability = fUid && availabilityMap[fUid] === 'online' ? 'online' : 'busy';
+    const availability = fUid ? (availabilityMap[fUid] ?? 'offline') : 'offline';
 
     res.json({
       success: true,

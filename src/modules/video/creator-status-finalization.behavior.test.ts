@@ -150,7 +150,7 @@ test('behavioral: finalizeCallEnd clears active slot and emits online creator:st
   setIO(socket.io as any);
   await transitionCreatorPresence(socket.io as any, creatorFirebaseUid, 'CONNECTED', 'behavior.pre_finalize');
   const before = await readCreatorPresenceState(creatorFirebaseUid);
-  assert.equal(before.state, 'busy', 'active slot must force busy before finalization');
+  assert.equal(before.state, 'on_call', 'active slot must force on_call before finalization');
 
   let fakeCallSaved = false;
   setCallFinalizationHooksForTests({
