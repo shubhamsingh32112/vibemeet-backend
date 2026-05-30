@@ -19,6 +19,7 @@ export { isBullmqBillingEnabled };
 
 const QUEUE_NAME = 'billing-cycle';
 const BILLING_CYCLE_HEARTBEAT_PREFIX = 'billing:cycle:heartbeat:';
+const BILLING_CYCLE_SCHEDULE_GATE_PREFIX = 'billing:cycle:scheduled:';
 const BILLING_CYCLE_HEARTBEAT_TTL_SECONDS = Math.min(
   600,
   Math.max(30, parseInt(process.env.BILLING_CYCLE_HEARTBEAT_TTL_SECONDS || '120', 10) || 120)
@@ -63,6 +64,23 @@ function readBackpressureDelayCapMs(): number {
     return 30000;
   }
   return Math.min(120_000, Math.max(BILLING_PROCESS_INTERVAL_MS, raw));
+}
+
+function readCycleHealthWindowMs(): number {
+  const fallback = Math.max(5000, BILLING_PROCESS_INTERVAL_MS * 6);
+  const raw = parseInt(process.env.BILLING_CYCLE_HEALTH_WINDOW_MS || String(fallback), 10);
+  if (!Number.isFinite(raw) || raw < 1000) {
+    return fallback;
+  }
+  return Math.min(120_000, raw);
+}
+
+function readCycleQueueScanLimit(): number {
+  const raw = parseInt(process.env.BILLING_CYCLE_QUEUE_SCAN_LIMIT || '500', 10);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 500;
+  }
+  return Math.min(5000, raw);
 }
 
 async function computeNextCycleDelayMs(
@@ -118,6 +136,14 @@ export function billingCycleJobId(callId: string): string {
   return `billing-${normalizeBullmqJobIdComponent(callId)}`;
 }
 
+function buildCycleInstanceJobId(callId: string): string {
+  return `${billingCycleJobId(callId)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function billingCycleScheduleGateKey(callId: string): string {
+  return `${BILLING_CYCLE_SCHEDULE_GATE_PREFIX}${callId}`;
+}
+
 async function touchBillingCycleHeartbeat(callId: string): Promise<void> {
   await getRedis()
     .setex(
@@ -128,33 +154,79 @@ async function touchBillingCycleHeartbeat(callId: string): Promise<void> {
     .catch(() => {});
 }
 
+async function hasHealthyQueuedCycleJob(
+  q: Queue,
+  callId: string
+): Promise<{ healthy: boolean; state?: 'active' | 'waiting' | 'delayed'; delayMs?: number }> {
+  const scanLimit = readCycleQueueScanLimit();
+  for (const state of ['active', 'waiting', 'delayed'] as const) {
+    const jobs = await q.getJobs([state], 0, scanLimit, true);
+    const match = jobs.find((job) => (job.data as { callId?: string } | undefined)?.callId === callId);
+    if (!match) {
+      continue;
+    }
+    if (state === 'delayed') {
+      return {
+        healthy: true,
+        state,
+        delayMs: Math.max(0, Number(match.delay || 0)),
+      };
+    }
+    return { healthy: true, state };
+  }
+  return { healthy: false };
+}
+
 /**
  * True when no healthy delayed/waiting/active cycle job exists for this call (e.g. lost after crash).
  */
 export async function needsBillingCycleReschedule(callId: string): Promise<boolean> {
+  const redis = getRedis();
   const q = getQueue();
-  const job = await q.getJob(billingCycleJobId(callId));
-  if (!job) {
-    recordBillingMetric('billing_cycle_missing_recreated', 1, { callId });
-    return true;
+  const gateKey = billingCycleScheduleGateKey(callId);
+  const [gateRaw, heartbeatRaw] = await Promise.all([
+    redis.get(gateKey),
+    redis.get(`${BILLING_CYCLE_HEARTBEAT_PREFIX}${callId}`),
+  ]);
+
+  if (gateRaw) {
+    recordBillingMetric('billing_cycle_exists_healthy', 1, {
+      callId,
+      state: 'scheduled_gate',
+    });
+    return false;
   }
-  const state = await job.getState();
-  const isHealthyState = state === 'delayed' || state === 'waiting' || state === 'active';
-  if (isHealthyState) {
-    recordBillingMetric('billing_cycle_exists_healthy', 1, { callId, state });
-    if (state === 'delayed') {
-      const delay = Number(job.delay || 0);
-      if (delay > BILLING_PROCESS_INTERVAL_MS * 5) {
-        recordBillingMetric('billing_cycle_exists_but_stale', 1, {
-          callId,
-          state,
-          delayMs: String(delay),
-        });
-      }
+
+  const healthWindowMs = readCycleHealthWindowMs();
+  const heartbeatAt = Number(heartbeatRaw) || 0;
+  if (heartbeatAt > 0 && Date.now() - heartbeatAt <= healthWindowMs) {
+    recordBillingMetric('billing_cycle_exists_healthy', 1, {
+      callId,
+      state: 'recent_heartbeat',
+    });
+    return false;
+  }
+
+  const queueHealth = await hasHealthyQueuedCycleJob(q, callId);
+  if (queueHealth.healthy) {
+    recordBillingMetric('billing_cycle_exists_healthy', 1, {
+      callId,
+      state: queueHealth.state || 'unknown',
+    });
+    if (
+      queueHealth.state === 'delayed' &&
+      Number(queueHealth.delayMs || 0) > BILLING_PROCESS_INTERVAL_MS * 5
+    ) {
+      recordBillingMetric('billing_cycle_exists_but_stale', 1, {
+        callId,
+        state: 'delayed',
+        delayMs: String(queueHealth.delayMs),
+      });
     }
     return false;
   }
-  recordBillingMetric('billing_cycle_exists_but_stale', 1, { callId, state });
+
+  recordBillingMetric('billing_cycle_missing_recreated', 1, { callId });
   return true;
 }
 
@@ -205,48 +277,53 @@ function assertBullmqRuntimeSafety(): void {
 /**
  * Schedule the next billing cycle for a call (chain of delayed jobs).
  * Relies on per-call `billing:cycle_lock:` + idempotent ticks in `processBillingTick` (MAX_BILLING_DELTA_MS).
- * Default: single `add` with stable jobId (no get/remove race). Set `BILLING_CYCLE_EMERGENCY_REMOVE_DEDUPE=true`
- * to restore the previous remove-before-add behavior if needed.
+ * Uses unique BullMQ job ids plus a Redis schedule gate to guarantee successor scheduling
+ * while preventing duplicate in-flight enqueue storms.
  */
 export async function scheduleBillingJob(
   callId: string,
   delayMs: number = BILLING_PROCESS_INTERVAL_MS
 ): Promise<void> {
   assertBullmqRuntimeSafety();
+  const redis = getRedis();
   const q = getQueue();
-  const jobId = billingCycleJobId(callId);
+  const gateKey = billingCycleScheduleGateKey(callId);
+  const ttlSeconds = Math.max(2, Math.ceil((Math.max(0, delayMs) + BILLING_PROCESS_INTERVAL_MS * 2) / 1000));
+  const gateSet = await redis
+    .set(gateKey, String(Date.now() + Math.max(0, delayMs)), 'EX', ttlSeconds, 'NX')
+    .catch(() => null);
   recordBillingMetric('bullmq_cycle_enqueue_attempted', 1, { callId });
-
-  if (process.env.BILLING_CYCLE_EMERGENCY_REMOVE_DEDUPE === 'true') {
-    const existing = await q.getJob(jobId);
-    if (existing) {
-      const state = await existing.getState();
-      if (state === 'active') {
-        recordBillingMetric('bullmq_cycle_enqueue_deduped', 1, { callId, state });
-        return;
-      }
-      if (state === 'waiting' || state === 'delayed') {
-        await existing.remove().catch(() => {});
-        recordBillingMetric('bullmq_cycle_enqueue_deduped', 1, { callId, state });
-      }
-    }
+  if (gateSet !== 'OK') {
+    recordBillingMetric('bullmq_cycle_enqueue_result', 1, {
+      callId,
+      result: 'duplicate_active',
+    });
+    return;
   }
 
   try {
+    const jobId = buildCycleInstanceJobId(callId);
     await q.add(
       'cycle',
       { callId },
       {
         jobId,
         delay: delayMs,
-        removeOnComplete: false,
-        removeOnFail: false,
+        removeOnComplete: 200,
+        removeOnFail: 200,
       }
     );
     await touchBillingCycleHeartbeat(callId);
+    recordBillingMetric('bullmq_cycle_enqueue_result', 1, {
+      callId,
+      result: 'created',
+      delayBucketMs: String(Math.max(0, delayMs)),
+    });
   } catch (err) {
     recordBillingMetric('bullmq_cycle_enqueue_failed', 1, { callId });
-    logError('BullMQ cycle add failed', err, { callId, jobId });
+    recordBillingMetric('bullmq_cycle_enqueue_result', 1, { callId, result: 'failed' });
+    await redis.del(gateKey).catch(() => 0);
+    logError('BullMQ cycle add failed', err, { callId, gateKey });
     throw err;
   }
 
@@ -269,11 +346,25 @@ export async function scheduleBillingJob(
 
 export async function cancelBillingCycleJob(callId: string): Promise<void> {
   assertBullmqRuntimeSafety();
+  const redis = getRedis();
   const q = getQueue();
-  const job = await q.getJob(billingCycleJobId(callId));
-  if (!job) return;
-  await job.remove().catch(() => {});
-  recordBillingMetric('bullmq_cycle_cancelled', 1, { callId });
+  const scanLimit = readCycleQueueScanLimit();
+  let removed = 0;
+  for (const state of ['waiting', 'delayed'] as const) {
+    const jobs = await q.getJobs([state], 0, scanLimit, true);
+    for (const job of jobs) {
+      if ((job.data as { callId?: string } | undefined)?.callId !== callId) {
+        continue;
+      }
+      await job.remove().catch(() => {});
+      removed += 1;
+    }
+  }
+  await Promise.all([
+    redis.del(billingCycleScheduleGateKey(callId)).catch(() => 0),
+    redis.del(`${BILLING_CYCLE_HEARTBEAT_PREFIX}${callId}`).catch(() => 0),
+  ]);
+  recordBillingMetric('bullmq_cycle_cancelled', 1, { callId, removedCount: String(removed) });
 }
 
 export function startBillingBullWorker(): Worker {
@@ -290,6 +381,8 @@ export function startBillingBullWorker(): Worker {
     async (job) => {
       const { callId } = job.data as { callId: string };
       const io = getIO();
+      const redis = getRedis();
+      await redis.del(billingCycleScheduleGateKey(callId)).catch(() => 0);
       const queueLagMs = Math.max(0, Date.now() - (job.timestamp + (job.opts.delay || 0)));
       recordBillingMetric('bullmq_queue_lag_ms', queueLagMs, { callId });
       await touchBillingCycleHeartbeat(callId);
@@ -300,7 +393,6 @@ export function startBillingBullWorker(): Worker {
       } catch (err) {
         logError('BullMQ billing job threw', err, { callId });
         try {
-          const redis = getRedis();
           const exists = await redis.exists(callSessionKey(callId));
           if (exists === 1) {
             const base = BILLING_PROCESS_INTERVAL_MS * 2;

@@ -1,4 +1,4 @@
-import { logWarning } from '../../utils/logger';
+import { logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { BillingLifecycleTransition } from './billing-lifecycle-transition.model';
 
@@ -68,13 +68,33 @@ export function transitionBillingState(req: TransitionRequest): TransitionResult
     return { next: req.to, changed: true, valid: true };
   }
 
-  logWarning('Invalid billing lifecycle transition rejected', {
-    callId: req.callId,
-    from: req.from,
-    to: req.to,
-    source: req.source,
-    reason: req.reason,
-  });
+  const isConvergenceContention =
+    req.reason.startsWith('checkpoint_') &&
+    (req.from === 'SETTLING' || req.from === 'SETTLED' || req.from === 'FAILED_RECOVERY_SETTLEMENT');
+  if (isConvergenceContention) {
+    logInfo('Billing lifecycle convergence contention (idempotent reject)', {
+      callId: req.callId,
+      from: req.from,
+      to: req.to,
+      source: req.source,
+      reason: req.reason,
+    });
+    recordBillingMetric('billing_lifecycle_convergence_contention', 1, {
+      callId: req.callId,
+      from: req.from,
+      to: req.to,
+      source: req.source,
+      reason: req.reason,
+    });
+  } else {
+    logWarning('Invalid billing lifecycle transition rejected', {
+      callId: req.callId,
+      from: req.from,
+      to: req.to,
+      source: req.source,
+      reason: req.reason,
+    });
+  }
   recordBillingMetric('billing_lifecycle_invalid_transition', 1, {
     callId: req.callId,
     from: req.from,

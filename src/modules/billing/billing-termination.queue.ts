@@ -179,10 +179,20 @@ export function startTerminationRetryWorker(): Worker | null {
       }
 
       try {
-        await markStreamCallEnded(callId, reason);
+        const streamResult = await markStreamCallEnded(callId, reason);
         await setCallEndedMarker(callId);
         await releaseMarkEndedLease(callId);
-        recordBillingMetric('force_terminate_retry_success', 1, { callId, reason });
+        recordBillingMetric('force_terminate_retry_success', 1, {
+          callId,
+          reason,
+          streamResult: streamResult.outcome,
+        });
+        if (streamResult.outcome === 'not_found') {
+          recordBillingMetric('force_terminate_retry_not_found_idempotent', 1, {
+            callId,
+            reason,
+          });
+        }
         return 'retry_success';
       } catch (err) {
         await releaseMarkEndedLease(callId);

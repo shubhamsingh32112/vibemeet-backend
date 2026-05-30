@@ -667,7 +667,16 @@ export class CallLifecycleService {
     });
 
     try {
-      await markStreamCallEnded(callId, 'overlap_active_call_conflict');
+      const streamResult = await markStreamCallEnded(callId, 'overlap_active_call_conflict');
+      if (streamResult.outcome === 'not_found') {
+        logInfo('call_overlap_mark_ended_idempotent_not_found', {
+          callId,
+          conflictingActiveCallId,
+        });
+        recordCallMetric('call_overlap_mark_ended_not_found_idempotent', 1, {
+          webhookType: payload.type || 'unknown',
+        });
+      }
     } catch (error) {
       logError('call_overlap_mark_ended_failed', error, {
         callId,

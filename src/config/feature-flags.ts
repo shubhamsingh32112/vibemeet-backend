@@ -59,6 +59,21 @@ export const featureFlags = {
    */
   billingWatchdogEnabled: process.env.BILLING_WATCHDOG_ENABLED !== 'false',
   /**
+   * Treat Stream mark_ended 404 as idempotent (already ended/missing).
+   */
+  billingTermination404IdempotentEnabled:
+    process.env.BILLING_TERMINATION_404_IDEMPOTENT_ENABLED !== 'false',
+  /**
+   * Retry lifecycle checkpoint convergence before dead-lettering.
+   */
+  billingFinalizeConvergenceRetryEnabled:
+    process.env.BILLING_FINALIZE_CONVERGENCE_RETRY_ENABLED !== 'false',
+  /**
+   * Enable reconciliation job to auto-repair user/ledger mismatches.
+   */
+  billingBalanceMismatchAutoRepairEnabled:
+    process.env.BILLING_BALANCE_MISMATCH_AUTO_REPAIR_ENABLED !== 'false',
+  /**
    * Onboarding strict mode rollout:
    * - log-only: log invalid transitions, allow
    * - soft-enforce: ignore invalid transitions

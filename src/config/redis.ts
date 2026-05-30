@@ -279,12 +279,17 @@ export const SETTLEMENT_CLAIM_TTL_SECONDS = Math.min(
 );
 
 export const BILLING_SETTLEMENT_RETRY_KEY = 'billing:settlement-retry';
+export const BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY = 'billing:balance:mismatch:repair:zset';
+export const BILLING_BALANCE_MISMATCH_REPAIR_PAYLOAD_PREFIX =
+  'billing:balance:mismatch:repair:payload:';
 export const BILLING_SETTLEMENT_RETRY_PAYLOAD_PREFIX = 'billing:settlement-retry:payload:';
 export const BILLING_SETTLEMENT_RETRY_DEDUP_PREFIX = 'billing:settlement-retry:dedup:';
 export const billingSettlementRetryPayloadKey = (callId: string): string =>
   `${BILLING_SETTLEMENT_RETRY_PAYLOAD_PREFIX}${callId}`;
 export const billingSettlementRetryDedupKey = (callId: string): string =>
   `${BILLING_SETTLEMENT_RETRY_DEDUP_PREFIX}${callId}`;
+export const billingBalanceMismatchRepairPayloadKey = (userId: string): string =>
+  `${BILLING_BALANCE_MISMATCH_REPAIR_PAYLOAD_PREFIX}${userId}`;
 
 export const FINALIZE_INFLIGHT_PREFIX = 'billing:finalize:inflight:';
 export const finalizeInflightKey = (callId: string): string =>

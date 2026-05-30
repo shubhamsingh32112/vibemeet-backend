@@ -83,6 +83,10 @@ test('watchdog recovery path includes cooldown and attempt cap guards', () => {
   assert.ok(src.includes('WATCHDOG_ATTEMPT_CAP'));
   assert.ok(src.includes('billingWatchdogCooldownKey(callId)'));
   assert.ok(src.includes('moveCallToRecoveryDeadLetter'));
+  assert.ok(src.includes("reason: 'recovering_transition_blocked'"));
+  assert.ok(src.includes("session.lifecycleState = transitioned.next"));
+  assert.ok(src.includes('billing_watchdog_scheduler_chain_missing'));
+  assert.ok(src.includes('scheduler_chain_missing_recovered'));
 });
 
 test('finalizer writes terminal tombstone and blocks stale worker settle on ACTIVE', () => {
@@ -91,4 +95,18 @@ test('finalizer writes terminal tombstone and blocks stale worker settle on ACTI
   assert.ok(src.includes('BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS'));
   assert.ok(src.includes('billing_finalize_rejected_stale_worker'));
   assert.ok(src.includes('billing_runtime_epoch_reject_stale_worker'));
+});
+
+test('finalizer convergence path retries and reconstructs from checkpoint before dead-letter', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('FINALIZE_CONVERGENCE_MAX_ATTEMPTS'));
+  assert.ok(src.includes("billing_finalize_convergence_retry_total"));
+  assert.ok(src.includes('billing_lifecycle_checkpoint_reconstructed_from_checkpoint'));
+  assert.ok(src.includes('billing_finalize_convergence_deferred_runtime_missing'));
+});
+
+test('post-settlement cleanup detects residual runtime keys', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('billing_finalize_residual_runtime_after_cleanup'));
+  assert.ok(src.includes("await redis.del(callSessionKey(callId)).catch(() => 0)"));
 });

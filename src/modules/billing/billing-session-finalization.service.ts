@@ -45,6 +45,7 @@ import { recordBillingMetric } from '../../utils/monitoring';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
 import { cancelBillingCycleJob } from './billing.queue';
+import { featureFlags } from '../../config/feature-flags';
 
 export type SettlementReason =
   | 'insufficient_coins'
@@ -129,6 +130,15 @@ const DEAD_LETTER_LIFECYCLE_STATE = 'FAILED_RECOVERY_SETTLEMENT' as const;
 const ACTIVE_RUNTIME_FINALIZE_GUARD_MS = Math.min(
   120_000,
   Math.max(5_000, parseInt(process.env.BILLING_ACTIVE_RUNTIME_FINALIZE_GUARD_MS || '45000', 10) || 45_000)
+);
+const FINALIZE_CONVERGENCE_RETRY_ENABLED = featureFlags.billingFinalizeConvergenceRetryEnabled;
+const FINALIZE_CONVERGENCE_MAX_ATTEMPTS = Math.max(
+  1,
+  Math.min(5, parseInt(process.env.BILLING_FINALIZE_CONVERGENCE_MAX_ATTEMPTS || '3', 10) || 3)
+);
+const FINALIZE_CONVERGENCE_BACKOFF_MS = Math.max(
+  10,
+  Math.min(1000, parseInt(process.env.BILLING_FINALIZE_CONVERGENCE_BACKOFF_MS || '80', 10) || 80)
 );
 
 function billingInstanceId(): string {
@@ -217,7 +227,8 @@ type DeadLetterReason =
 export async function moveCallToRecoveryDeadLetter(
   callId: string,
   reason: DeadLetterReason,
-  source: SettlementSource
+  source: SettlementSource,
+  metadata?: Record<string, unknown>
 ): Promise<void> {
   const redis = getRedis();
   const recoveryOwnerInstanceId = billingInstanceId();
@@ -226,7 +237,7 @@ export async function moveCallToRecoveryDeadLetter(
   await redis.setex(
     deadLetterKey,
     Math.max(300, BILLING_MAX_SETTLING_MS / 1000),
-    JSON.stringify({ reason, source, at: now, recoveryOwnerInstanceId })
+    JSON.stringify({ reason, source, at: now, recoveryOwnerInstanceId, metadata })
   );
 
   try {
@@ -290,6 +301,7 @@ export async function moveCallToRecoveryDeadLetter(
     reason,
     source,
     recoveryOwnerInstanceId,
+    metadata,
     alert: true,
   });
 }
@@ -615,6 +627,19 @@ async function runPostPersistRedisCleanup(
       result.userFirebaseUid,
       result.creatorFirebaseUid
     );
+    const residualSessionExists = (await redis.exists(callSessionKey(callId)).catch(() => 0)) === 1;
+    if (residualSessionExists) {
+      recordBillingMetric('billing_finalize_residual_runtime_after_cleanup', 1, {
+        callId,
+        source,
+      });
+      logWarning('billing_finalize_residual_runtime_after_cleanup', {
+        callId,
+        source,
+        reason,
+      });
+      await redis.del(callSessionKey(callId)).catch(() => 0);
+    }
     await redis.setex(settledCallKey(callId), SETTLED_CALL_TTL, '1');
     await redis.del(settlementClaimKey(callId));
   } catch (e) {
@@ -627,110 +652,212 @@ async function checkpointLifecycleState(
   targetState: 'SETTLING' | 'SETTLED' | 'FAILED' | 'FAILED_RECOVERY_SETTLEMENT',
   status: 'settling' | 'settled' | 'failed'
 ): Promise<boolean> {
-  try {
-    const redis = getRedis();
-    const sessionRaw = await redis.get(callSessionKey(callId));
-    if (!sessionRaw) return false;
-    const session = JSON.parse(sessionRaw) as {
-      userMongoId?: string;
-      creatorMongoId?: string;
-      userFirebaseUid?: string;
-      creatorFirebaseUid?: string;
-      startTime?: number;
-      lastProcessedAt?: number;
-      pricePerSecondMicros?: number;
-      creatorEarningsPerSecondMicros?: number;
-      totalDeductedMicros?: number;
-      totalEarnedMicros?: number;
-      billingSequence?: number;
-      lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING' | 'FAILED_RECOVERY_SETTLEMENT';
-    };
-    if (
-      !session.userMongoId ||
-      !session.creatorMongoId ||
-      !session.userFirebaseUid ||
-      !session.creatorFirebaseUid
-    ) {
-      return false;
-    }
-    const [introRaw, walletRaw] = await Promise.all([
-      redis.get(callUserIntroMicrosKey(callId)),
-      redis.get(callUserWalletMicrosKey(callId)),
-    ]);
-    const remainingUserBalanceMicros =
-      Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0) +
-      Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+  const redis = getRedis();
+  const maxAttempts = FINALIZE_CONVERGENCE_RETRY_ENABLED ? FINALIZE_CONVERGENCE_MAX_ATTEMPTS : 1;
+  const reachedOrBeyondSettling = (state: string): boolean =>
+    state === 'SETTLING' || state === 'SETTLED' || state === 'FAILED_RECOVERY_SETTLEMENT';
 
-    const currentState = (session.lifecycleState || 'ACTIVE') as
-      | 'INIT'
-      | 'STARTING'
-      | 'ACTIVE'
-      | 'ENDING'
-      | 'SETTLING'
-      | 'SETTLED'
-      | 'FAILED'
-      | 'RECOVERING'
-      | 'FAILED_RECOVERY_SETTLEMENT';
-    const transitionPlan: Array<
-      'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'FAILED_RECOVERY_SETTLEMENT'
-    > = [];
-    if (targetState === 'SETTLING' && (currentState === 'ACTIVE' || currentState === 'RECOVERING')) {
-      transitionPlan.push('ENDING', 'SETTLING');
-    } else if (targetState === 'SETTLING') {
-      transitionPlan.push('SETTLING');
-    } else {
-      transitionPlan.push(targetState);
-    }
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      let sessionRaw = await redis.get(callSessionKey(callId));
+      if (!sessionRaw) {
+        const checkpoint = (await getBillingCheckpoint(callId)) as Record<string, unknown> | null;
+        if (checkpoint) {
+          const reconstructedSession = {
+            callId,
+            schemaVersion: 1,
+            userMongoId: String(checkpoint.userMongoId || ''),
+            creatorMongoId: String(checkpoint.creatorMongoId || ''),
+            userFirebaseUid: String(checkpoint.userFirebaseUid || ''),
+            creatorFirebaseUid: String(checkpoint.creatorFirebaseUid || ''),
+            startTime: Number(checkpoint.startTimeMs) || Date.now(),
+            lastProcessedAt: Number(checkpoint.lastProcessedAtMs) || Date.now(),
+            pricePerSecondMicros: Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0),
+            creatorEarningsPerSecondMicros: Math.max(
+              0,
+              Number(checkpoint.creatorEarningsPerSecondMicros) || 0
+            ),
+            totalDeductedMicros: Math.max(0, Number(checkpoint.totalDeductedMicros) || 0),
+            totalEarnedMicros: Math.max(0, Number(checkpoint.totalEarnedMicros) || 0),
+            billingSequence: Math.max(0, Number(checkpoint.billingSequence) || 0),
+            lifecycleState: String(checkpoint.lifecycleState || 'RECOVERING'),
+            version: Math.max(1, Number(checkpoint.version) || 1),
+          };
+          if (
+            reconstructedSession.userMongoId &&
+            reconstructedSession.creatorMongoId &&
+            reconstructedSession.userFirebaseUid &&
+            reconstructedSession.creatorFirebaseUid
+          ) {
+            await redis.setex(callSessionKey(callId), 7200, JSON.stringify(reconstructedSession));
+            sessionRaw = JSON.stringify(reconstructedSession);
+            recordBillingMetric('billing_finalize_convergence_retry_total', 1, {
+              callId,
+              reason: 'reconstructed_from_checkpoint',
+              attempt: String(attempt),
+            });
+            logWarning('billing_lifecycle_checkpoint_reconstructed_from_checkpoint', {
+              callId,
+              attempt,
+              targetState,
+              status,
+            });
+          }
+        }
+      }
+      if (!sessionRaw) {
+        if (attempt < maxAttempts) {
+          recordBillingMetric('billing_finalize_convergence_retry_total', 1, {
+            callId,
+            reason: 'missing_session',
+            attempt: String(attempt),
+          });
+          await sleep(FINALIZE_CONVERGENCE_BACKOFF_MS * attempt);
+          continue;
+        }
+        return false;
+      }
 
-    let nextState = currentState;
-    for (const nextTarget of transitionPlan) {
-      const transition = await transitionBillingStateWithAudit({
-        callId,
-        from: nextState,
-        to: nextTarget,
-        source: 'billing.finalization.checkpoint',
-        reason: `checkpoint_${status}`,
-      });
-      if (!transition.valid) {
-        logWarning('billing_lifecycle_checkpoint_transition_blocked', {
+      const session = JSON.parse(sessionRaw) as {
+        userMongoId?: string;
+        creatorMongoId?: string;
+        userFirebaseUid?: string;
+        creatorFirebaseUid?: string;
+        startTime?: number;
+        lastProcessedAt?: number;
+        pricePerSecondMicros?: number;
+        creatorEarningsPerSecondMicros?: number;
+        totalDeductedMicros?: number;
+        totalEarnedMicros?: number;
+        billingSequence?: number;
+        lifecycleState?: 'INIT' | 'STARTING' | 'ACTIVE' | 'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'RECOVERING' | 'FAILED_RECOVERY_SETTLEMENT';
+      };
+      if (
+        !session.userMongoId ||
+        !session.creatorMongoId ||
+        !session.userFirebaseUid ||
+        !session.creatorFirebaseUid
+      ) {
+        if (attempt < maxAttempts) {
+          recordBillingMetric('billing_finalize_convergence_retry_total', 1, {
+            callId,
+            reason: 'session_missing_parties',
+            attempt: String(attempt),
+          });
+          await sleep(FINALIZE_CONVERGENCE_BACKOFF_MS * attempt);
+          continue;
+        }
+        return false;
+      }
+      const [introRaw, walletRaw] = await Promise.all([
+        redis.get(callUserIntroMicrosKey(callId)),
+        redis.get(callUserWalletMicrosKey(callId)),
+      ]);
+      const remainingUserBalanceMicros =
+        Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0) +
+        Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+
+      const currentState = (session.lifecycleState || 'ACTIVE') as
+        | 'INIT'
+        | 'STARTING'
+        | 'ACTIVE'
+        | 'ENDING'
+        | 'SETTLING'
+        | 'SETTLED'
+        | 'FAILED'
+        | 'RECOVERING'
+        | 'FAILED_RECOVERY_SETTLEMENT';
+      const transitionPlan: Array<
+        'ENDING' | 'SETTLING' | 'SETTLED' | 'FAILED' | 'FAILED_RECOVERY_SETTLEMENT'
+      > = [];
+      if (
+        targetState === 'SETTLING' &&
+        (currentState === 'ACTIVE' || currentState === 'RECOVERING' || currentState === 'STARTING')
+      ) {
+        transitionPlan.push('ENDING', 'SETTLING');
+      } else if (targetState === 'SETTLING') {
+        transitionPlan.push('SETTLING');
+      } else {
+        transitionPlan.push(targetState);
+      }
+
+      let nextState = currentState;
+      let shouldRetryConvergence = false;
+      for (const nextTarget of transitionPlan) {
+        const transition = await transitionBillingStateWithAudit({
           callId,
           from: nextState,
-          requestedTo: nextTarget,
-          targetState,
-          status,
+          to: nextTarget,
+          source: 'billing.finalization.checkpoint',
+          reason: `checkpoint_${status}`,
         });
-        break;
+        if (!transition.valid) {
+          if (targetState === 'SETTLING' && reachedOrBeyondSettling(nextState)) {
+            break;
+          }
+          logWarning('billing_lifecycle_checkpoint_transition_blocked', {
+            callId,
+            attempt,
+            from: nextState,
+            requestedTo: nextTarget,
+            targetState,
+            status,
+          });
+          if (attempt < maxAttempts) {
+            recordBillingMetric('billing_finalize_convergence_retry_total', 1, {
+              callId,
+              reason: 'transition_blocked',
+              attempt: String(attempt),
+            });
+            shouldRetryConvergence = true;
+            break;
+          }
+          return false;
+        }
+        nextState = transition.next;
       }
-      nextState = transition.next;
-    }
-    session.lifecycleState = nextState;
-    await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
+      if (shouldRetryConvergence) {
+        await sleep(FINALIZE_CONVERGENCE_BACKOFF_MS * attempt);
+        continue;
+      }
+      session.lifecycleState = nextState;
+      await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
 
-    await upsertBillingCheckpointSnapshot({
-      callId,
-      userMongoId: session.userMongoId,
-      creatorMongoId: session.creatorMongoId,
-      userFirebaseUid: session.userFirebaseUid,
-      creatorFirebaseUid: session.creatorFirebaseUid,
-      startTimeMs: Number(session.startTime) || Date.now(),
-      lastProcessedAtMs: Number(session.lastProcessedAt) || Date.now(),
-      remainingUserBalanceMicros,
-      pricePerSecondMicros: Math.max(0, Number(session.pricePerSecondMicros) || 0),
-      creatorEarningsPerSecondMicros: Math.max(
-        0,
-        Number(session.creatorEarningsPerSecondMicros) || 0
-      ),
-      totalDeductedMicros: Math.max(0, Number(session.totalDeductedMicros) || 0),
-      totalEarnedMicros: Math.max(0, Number(session.totalEarnedMicros) || 0),
-      billingSequence: Math.max(0, Number(session.billingSequence) || 0),
-      lifecycleState: nextState,
-      status,
-    });
-    return nextState === targetState;
-  } catch (error) {
-    logError('Failed lifecycle checkpoint upsert', error, { callId, targetState });
-    return false;
+      await upsertBillingCheckpointSnapshot({
+        callId,
+        userMongoId: session.userMongoId,
+        creatorMongoId: session.creatorMongoId,
+        userFirebaseUid: session.userFirebaseUid,
+        creatorFirebaseUid: session.creatorFirebaseUid,
+        startTimeMs: Number(session.startTime) || Date.now(),
+        lastProcessedAtMs: Number(session.lastProcessedAt) || Date.now(),
+        remainingUserBalanceMicros,
+        pricePerSecondMicros: Math.max(0, Number(session.pricePerSecondMicros) || 0),
+        creatorEarningsPerSecondMicros: Math.max(
+          0,
+          Number(session.creatorEarningsPerSecondMicros) || 0
+        ),
+        totalDeductedMicros: Math.max(0, Number(session.totalDeductedMicros) || 0),
+        totalEarnedMicros: Math.max(0, Number(session.totalEarnedMicros) || 0),
+        billingSequence: Math.max(0, Number(session.billingSequence) || 0),
+        lifecycleState: nextState,
+        status,
+      });
+      return targetState === 'SETTLING' ? reachedOrBeyondSettling(nextState) : nextState === targetState;
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        logError('Failed lifecycle checkpoint upsert', error, { callId, targetState, attempt });
+        return false;
+      }
+      recordBillingMetric('billing_finalize_convergence_retry_total', 1, {
+        callId,
+        reason: 'exception',
+        attempt: String(attempt),
+      });
+      await sleep(FINALIZE_CONVERGENCE_BACKOFF_MS * attempt);
+    }
   }
+  return false;
 }
 
 /**
@@ -964,7 +1091,28 @@ export async function finalizeCallSession(
     settlementVersion = await markCallSettling(callId, source, reason, ownerToken, ownerInstanceId);
     const checkpointOk = await checkpointLifecycleState(callId, 'SETTLING', 'settling');
     if (!checkpointOk) {
-      await moveCallToRecoveryDeadLetter(callId, 'convergence_impossible', source);
+      if (snapshotMeta.recoverySource === 'missing') {
+        recordBillingMetric('billing_finalize_convergence_deferred', 1, {
+          callId,
+          source,
+          reason: 'runtime_missing',
+        });
+        logWarning('billing_finalize_convergence_deferred_runtime_missing', {
+          callId,
+          source,
+          reason,
+          finalizeAttemptId,
+          recoveryOwnerInstanceId,
+        });
+        await enqueueSettlementRetry(params);
+        return { status: 'pending_retry', callId };
+      }
+      await moveCallToRecoveryDeadLetter(callId, 'convergence_impossible', source, {
+        finalizer: 'finalizeCallSession',
+        checkpointTargetState: 'SETTLING',
+        checkpointStatus: 'settling',
+        maxAttempts: FINALIZE_CONVERGENCE_RETRY_ENABLED ? FINALIZE_CONVERGENCE_MAX_ATTEMPTS : 1,
+      });
       return { status: 'dead_lettered', callId };
     }
 

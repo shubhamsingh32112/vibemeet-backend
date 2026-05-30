@@ -442,6 +442,16 @@ export async function settleCall(
   let mongoTransactionCommitted = false;
   let settlementBdId: string | undefined;
   let settlementAgencyId: string | undefined;
+  const settlementIntegritySnapshot: {
+    userCoinsBefore?: number;
+    userCoinsAfter?: number;
+    userDebitDelta?: number;
+    expectedUserCoinsAfter?: number;
+    creatorCoinsBefore?: number;
+    creatorCoinsAfter?: number;
+    creatorCreditDelta?: number;
+    expectedCreatorCoinsAfter?: number;
+  } = {};
 
   try {
     const user = await User.findById(session.userMongoId).session(dbSession);
@@ -457,6 +467,10 @@ export async function settleCall(
     }).session(dbSession);
     const alreadyDebited = Math.max(0, existingUserDebitTxn?.coins || 0);
     const userDebitDelta = Math.max(0, targetWalletDebitWhole - alreadyDebited);
+    const userCoinsBefore = Number(user.coins) || 0;
+    settlementIntegritySnapshot.userCoinsBefore = userCoinsBefore;
+    settlementIntegritySnapshot.userDebitDelta = userDebitDelta;
+    settlementIntegritySnapshot.expectedUserCoinsAfter = Math.max(0, userCoinsBefore - userDebitDelta);
 
     let updatedUserCoins = user.coins || 0;
     if (userDebitDelta > 0) {
@@ -481,6 +495,7 @@ export async function settleCall(
       }
       updatedUserCoins = updatedUser.coins || 0;
     }
+    settlementIntegritySnapshot.userCoinsAfter = Number(updatedUserCoins) || 0;
 
     if (targetWalletDebitWhole > 0) {
       await CoinTransaction.findOneAndUpdate(
@@ -517,6 +532,7 @@ export async function settleCall(
     }
 
     let creatorUser: (mongoose.Document<unknown, object, IUser> & IUser) | null = null;
+    let creatorCreditDeltaApplied = 0;
     if (totalEarnedCreator > 0) {
       // Settlement safety rule: do not hard-fail settlement if creator docs are missing.
       // We settle conservatively (user debit) and alert via logs/metrics for reconciliation.
@@ -545,8 +561,11 @@ export async function settleCall(
             const alreadyCredited = Math.max(0, existingCreatorCreditTxn?.coins || 0);
             const targetCreatorCredit = Math.max(0, totalEarnedCreator);
             const creatorCreditDelta = Math.max(0, targetCreatorCredit - alreadyCredited);
+            creatorCreditDeltaApplied = creatorCreditDelta;
+            settlementIntegritySnapshot.creatorCreditDelta = creatorCreditDelta;
 
             let creatorCoinsBefore = creatorUser.coins || 0;
+            settlementIntegritySnapshot.creatorCoinsBefore = Number(creatorCoinsBefore) || 0;
             if (creatorCreditDelta > 0) {
               const updatedCreatorUser = await User.findByIdAndUpdate(
                 creatorUser._id,
@@ -566,6 +585,12 @@ export async function settleCall(
                 );
                 creatorUser = updatedCreatorUser;
               }
+            }
+            if (creatorUser) {
+              settlementIntegritySnapshot.creatorCoinsAfter = Number(creatorUser.coins) || 0;
+              settlementIntegritySnapshot.expectedCreatorCoinsAfter =
+                Math.max(0, Number(settlementIntegritySnapshot.creatorCoinsBefore) || 0) +
+                creatorCreditDeltaApplied;
             }
 
             if (totalEarnedCreator > 0) {
@@ -772,6 +797,29 @@ export async function settleCall(
         },
         { upsert: true, new: true, session: dbSession }
       );
+    }
+
+    const userIntegrityMismatch =
+      settlementIntegritySnapshot.expectedUserCoinsAfter != null &&
+      settlementIntegritySnapshot.userCoinsAfter != null &&
+      settlementIntegritySnapshot.expectedUserCoinsAfter !== settlementIntegritySnapshot.userCoinsAfter;
+    const creatorIntegrityMismatch =
+      settlementIntegritySnapshot.creatorCreditDelta != null &&
+      settlementIntegritySnapshot.expectedCreatorCoinsAfter != null &&
+      settlementIntegritySnapshot.creatorCoinsAfter != null &&
+      settlementIntegritySnapshot.expectedCreatorCoinsAfter !== settlementIntegritySnapshot.creatorCoinsAfter;
+    if (userIntegrityMismatch || creatorIntegrityMismatch) {
+      recordBillingMetric('settlement_integrity_violation_total', 1, {
+        callId,
+        userMismatch: String(userIntegrityMismatch),
+        creatorMismatch: String(creatorIntegrityMismatch),
+      });
+      logWarning('settlement_integrity_violation_detected', {
+        callId,
+        userMongoId: session.userMongoId,
+        creatorMongoId: session.creatorMongoId,
+        ...settlementIntegritySnapshot,
+      });
     }
 
     const txnStartedAt = Date.now();

@@ -142,13 +142,21 @@ export async function processTerminationRedisRetries(
     }
 
     try {
-      await markStreamCallEnded(callId, payload.reason);
+      const streamResult = await markStreamCallEnded(callId, payload.reason);
       await setCallEndedMarker(callId);
       await releaseMarkEndedLease(callId);
       await redis.del(payloadKey(callId)).catch(() => {});
       await redis.zrem(TERMINATION_REDIS_RETRY_ZSET, callId).catch(() => {});
-      recordBillingMetric('termination_redis_retry_success', 1, { callId });
-      logInfo('Termination redis retry: mark_ended succeeded', { callId });
+      recordBillingMetric('termination_redis_retry_success', 1, {
+        callId,
+        streamResult: streamResult.outcome,
+      });
+      if (streamResult.outcome === 'not_found') {
+        recordBillingMetric('termination_redis_retry_not_found_idempotent', 1, { callId });
+        logInfo('Termination redis retry: mark_ended idempotent not_found', { callId });
+      } else {
+        logInfo('Termination redis retry: mark_ended succeeded', { callId });
+      }
     } catch (err) {
       await releaseMarkEndedLease(callId);
       payload.attempt += 1;

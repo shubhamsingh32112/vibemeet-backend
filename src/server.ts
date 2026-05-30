@@ -645,6 +645,15 @@ app.get('/metrics', async (req, res) => {
           billing_runtime_missing_rate:
             Math.round((rollingRecoveryRuntimeMissing / (rollingWindowMs / 1000)) * 1000) / 1000,
         },
+        integrity: {
+          balanceMismatchSamples: byName['billing.balance_mismatch_total']?.count ?? 0,
+          balanceMismatchRepairEnqueued:
+            byName['billing.balance_mismatch_repair_enqueued_total']?.count ?? 0,
+          balanceMismatchRepairApplied:
+            byName['billing.balance_mismatch_repair_applied_total']?.count ?? 0,
+          finalizeConvergenceRetries:
+            byName['billing.billing_finalize_convergence_retry_total']?.count ?? 0,
+        },
         deferredCallEnd: {
           queuedSamples: deferredCallEndQueued?.count ?? 0,
           flushedSamples: deferredCallEndFlushed?.count ?? 0,
@@ -696,6 +705,9 @@ app.get('/metrics', async (req, res) => {
             failureRate:
               Math.round(rollingForceTerminateFailureRate * 10000) / 10000,
           },
+        },
+        streamMarkEnded: {
+          samples: byName['billing.stream_mark_ended_result_total']?.count ?? 0,
         },
         bullmq: {
           queueLagAvgMs: Math.round(bullLagAvgMs * 100) / 100,

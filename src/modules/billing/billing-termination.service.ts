@@ -84,11 +84,22 @@ export async function forceTerminateCall(
   recordBillingMetric('force_terminate_settlement_triggered', 1, { callId, reason });
 
   try {
-    await markStreamCallEnded(callId, reason);
+    const streamResult = await markStreamCallEnded(callId, reason);
     await setCallEndedMarker(callId);
     await releaseMarkEndedLease(callId);
-    recordBillingMetric('force_terminate_stream_success', 1, { callId, reason });
-    logInfo('Server-side Stream mark_ended sent', { callId, reason });
+    recordBillingMetric('force_terminate_stream_success', 1, {
+      callId,
+      reason,
+      streamResult: streamResult.outcome,
+    });
+    if (streamResult.outcome === 'not_found') {
+      logInfo('Server-side Stream mark_ended treated as idempotent not_found', {
+        callId,
+        reason,
+      });
+    } else {
+      logInfo('Server-side Stream mark_ended sent', { callId, reason });
+    }
   } catch (error) {
     await releaseMarkEndedLease(callId);
     recordBillingMetric('force_terminate_stream_failed', 1, { callId, reason });

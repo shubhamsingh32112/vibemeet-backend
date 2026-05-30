@@ -1,6 +1,13 @@
 import { User } from '../modules/user/user.model';
 import { CoinTransaction } from '../modules/user/coin-transaction.model';
 import mongoose from 'mongoose';
+import {
+  BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY,
+  billingBalanceMismatchRepairPayloadKey,
+  getRedis,
+} from '../config/redis';
+import { recordBillingMetric } from './monitoring';
+import { logError, logWarning } from './logger';
 
 /**
  * 🔒 BALANCE INTEGRITY CHECK
@@ -26,6 +33,50 @@ export interface BalanceCheckResult {
   expectedBalance: number;
   mismatch: boolean;
   discrepancy: number;
+}
+
+const MISMATCH_LOG_THROTTLE_MS = Math.max(
+  5_000,
+  parseInt(process.env.BILLING_BALANCE_MISMATCH_LOG_THROTTLE_MS || '60000', 10) || 60_000
+);
+const mismatchLogCache = new Map<string, number>();
+
+function classifyMismatch(discrepancy: number): 'wallet_over' | 'wallet_under' | 'balanced' {
+  if (discrepancy > 0) return 'wallet_over';
+  if (discrepancy < 0) return 'wallet_under';
+  return 'balanced';
+}
+
+async function enqueueBalanceMismatchRepairTask(
+  userId: string,
+  actualBalance: number,
+  expectedBalance: number,
+  discrepancy: number
+): Promise<void> {
+  try {
+    const redis = getRedis();
+    const now = Date.now();
+    const payload = {
+      userId,
+      actualBalance,
+      expectedBalance,
+      discrepancy,
+      mismatchClass: classifyMismatch(discrepancy),
+      enqueuedAt: now,
+    };
+    await redis.setex(
+      billingBalanceMismatchRepairPayloadKey(userId),
+      24 * 60 * 60,
+      JSON.stringify(payload)
+    );
+    await redis.zadd(BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY, now, userId);
+    recordBillingMetric('balance_mismatch_repair_enqueued_total', 1, {
+      userId,
+      class: payload.mismatchClass,
+    });
+  } catch {
+    recordBillingMetric('balance_mismatch_repair_enqueue_failed_total', 1, { userId });
+  }
 }
 
 export async function verifyUserBalance(
@@ -65,12 +116,29 @@ export async function verifyUserBalance(
     const discrepancy = actualBalance - expectedBalance;
     const mismatch = Math.abs(discrepancy) > 1; // allow ±1 for rounding
 
+    const mismatchClass = classifyMismatch(discrepancy);
+    recordBillingMetric('balance_mismatch_total', mismatch ? 1 : 0, {
+      userId: userId.toString(),
+      class: mismatchClass,
+    });
+
     if (mismatch) {
-      console.error(
-        `🚨 BALANCE MISMATCH for user ${userId}: ` +
-          `actual=${actualBalance}, expected=${expectedBalance}, ` +
-          `discrepancy=${discrepancy}`
-      );
+      const userIdStr = userId.toString();
+      const now = Date.now();
+      const cacheKey = `${userIdStr}:${mismatchClass}`;
+      const lastLogAt = mismatchLogCache.get(cacheKey) || 0;
+      const shouldLog = now - lastLogAt >= MISMATCH_LOG_THROTTLE_MS;
+      if (shouldLog) {
+        mismatchLogCache.set(cacheKey, now);
+        logWarning('BALANCE MISMATCH detected', {
+          userId: userIdStr,
+          actualBalance,
+          expectedBalance,
+          discrepancy,
+          mismatchClass,
+        });
+      }
+      await enqueueBalanceMismatchRepairTask(userIdStr, actualBalance, expectedBalance, discrepancy);
     }
 
     return {
@@ -81,7 +149,9 @@ export async function verifyUserBalance(
       discrepancy,
     };
   } catch (err) {
-    console.error(`⚠️ [BALANCE CHECK] Error checking user ${userId}:`, err);
+    logError('BALANCE CHECK failed', err, {
+      userId: userId.toString(),
+    });
     return {
       userId: userId.toString(),
       actualBalance: 0,

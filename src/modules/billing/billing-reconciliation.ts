@@ -17,6 +17,8 @@ import {
   BILLING_RECONCILIATION_LOCK_KEY,
   RECONCILIATION_LOCK_TTL_MS,
   CALL_SESSION_PREFIX,
+  BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY,
+  billingBalanceMismatchRepairPayloadKey,
 } from '../../config/redis';
 import { billingService } from './billing.service';
 import {
@@ -36,6 +38,10 @@ import { processTerminationRedisRetries } from './billing-termination-redis-retr
 import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
 import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
+import { featureFlags } from '../../config/feature-flags';
+import { User } from '../user/user.model';
+import { CoinTransaction } from '../user/coin-transaction.model';
+import mongoose from 'mongoose';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;
 const RELEASE_LOCK_LUA = `
@@ -172,6 +178,7 @@ export function startReconciliationJob(io: Server): void {
       const startedAt = Date.now();
       await processSettlementRetryQueue(io, 40);
       await runSettlementOrphanRepair(io, startedAt);
+      await processBalanceMismatchRepairs(startedAt);
       await processDLQ(io, startedAt);
       await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
       await runBullmqBillingWatchdog(startedAt);
@@ -184,6 +191,93 @@ export function startReconciliationJob(io: Server): void {
   run();
 
   reconciliationInterval = setInterval(run, RECONCILIATION_INTERVAL_MS);
+}
+
+async function processBalanceMismatchRepairs(startedAt: number): Promise<void> {
+  const redis = getRedis();
+  const now = Date.now();
+  const maxItems = readNumber(process.env.BILLING_BALANCE_MISMATCH_REPAIR_BATCH_SIZE, 40, 1, 200);
+  const userIds = await redis.zrangebyscore(
+    BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY,
+    0,
+    now,
+    'LIMIT',
+    0,
+    maxItems
+  );
+  if (userIds.length === 0) {
+    return;
+  }
+
+  for (const userId of userIds) {
+    if (Date.now() - startedAt > RUN_BUDGET_MS) {
+      recordBillingMetric('balance_mismatch_repair_budget_capped', 1, {});
+      break;
+    }
+    await redis.zrem(BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY, userId).catch(() => 0);
+    const payloadKey = billingBalanceMismatchRepairPayloadKey(userId);
+    const payloadRaw = await redis.get(payloadKey);
+    await redis.del(payloadKey).catch(() => 0);
+
+    try {
+      const user = await User.findById(userId).select('_id coins').lean();
+      if (!user) {
+        recordBillingMetric('balance_mismatch_repair_skipped_total', 1, {
+          reason: 'user_missing',
+        });
+        continue;
+      }
+      const agg = await CoinTransaction.aggregate([
+        {
+          $match: {
+            userId: new mongoose.Types.ObjectId(String(userId)),
+            status: 'completed',
+          },
+        },
+        { $group: { _id: '$type', total: { $sum: '$coins' } } },
+      ]);
+      const credits = agg.find((a: any) => a._id === 'credit')?.total || 0;
+      const debits = agg.find((a: any) => a._id === 'debit')?.total || 0;
+      const expectedBalance = credits - debits;
+      const actualBalance = Number(user.coins) || 0;
+      const discrepancy = actualBalance - expectedBalance;
+      if (Math.abs(discrepancy) <= 1) {
+        recordBillingMetric('balance_mismatch_repair_skipped_total', 1, {
+          reason: 'already_converged',
+        });
+        continue;
+      }
+      if (!featureFlags.billingBalanceMismatchAutoRepairEnabled) {
+        recordBillingMetric('balance_mismatch_repair_skipped_total', 1, {
+          reason: 'auto_repair_disabled',
+        });
+        continue;
+      }
+      await User.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            coins: expectedBalance,
+          },
+        }
+      );
+      recordBillingMetric('balance_mismatch_repair_applied_total', 1, {
+        userId: String(userId),
+      });
+      logWarning('billing_balance_mismatch_repair_applied', {
+        userId,
+        actualBalance,
+        expectedBalance,
+        discrepancy,
+        queuedPayloadPresent: Boolean(payloadRaw),
+      });
+    } catch (error) {
+      logError('billing_balance_mismatch_repair_failed', error, { userId });
+      recordBillingMetric('balance_mismatch_repair_failed_total', 1, {
+        userId: String(userId),
+      });
+    }
+  }
 }
 
 /**

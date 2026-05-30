@@ -18,6 +18,7 @@ import {
 import { featureFlags } from '../../config/feature-flags';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
 import { randomUUID } from 'crypto';
+import { isBullmqBillingEnabled, needsBillingCycleReschedule } from './billing.queue';
 
 let watchdogTimer: NodeJS.Timeout | null = null;
 
@@ -45,6 +46,12 @@ const WATCHDOG_ATTEMPT_TTL_SECONDS = readInt(
   3600,
   60,
   86400
+);
+const CHAIN_HEAL_STALL_MS = readInt(
+  'BILLING_WATCHDOG_CHAIN_HEAL_STALL_MS',
+  7000,
+  1500,
+  120000
 );
 
 type BillingWatchdogSession = {
@@ -105,9 +112,38 @@ async function runWatchdogPass(io: Server): Promise<void> {
       if (!sessionRaw) continue;
       const session = JSON.parse(sessionRaw) as BillingWatchdogSession;
       const lifecycleState = String(session.lifecycleState || 'ACTIVE');
+      if (lifecycleState === 'SETTLED' || lifecycleState === 'FAILED_RECOVERY_SETTLEMENT') {
+        recordBillingMetric('billing_watchdog_terminal_short_circuit', 1, {
+          callId,
+          lifecycleState,
+        });
+        continue;
+      }
       const lastProcessedAt = Number(session.lastProcessedAt) || 0;
       const stalledForMs = lastProcessedAt > 0 ? Math.max(0, now - lastProcessedAt) : 0;
       const healthyRecently = hasRecentHealthyEvidence(session, now);
+      const lastSequenceAdvanceAt = Number(session.lastSequenceAdvanceAt) || 0;
+      const sequenceStalledForMs =
+        lastSequenceAdvanceAt > 0 ? Math.max(0, now - lastSequenceAdvanceAt) : stalledForMs;
+
+      if (
+        lifecycleState === 'ACTIVE' &&
+        isBullmqBillingEnabled() &&
+        sequenceStalledForMs > CHAIN_HEAL_STALL_MS
+      ) {
+        const chainMissing = await needsBillingCycleReschedule(callId).catch(() => false);
+        if (chainMissing) {
+          const recovered = await recoverBillingScheduleForCall(callId, 'reconciliation');
+          recordBillingMetric('billing_watchdog_scheduler_chain_missing', 1, {
+            callId,
+            phase: 'active_fast_heal',
+            recovered: recovered ? 'true' : 'false',
+          });
+          if (recovered) {
+            continue;
+          }
+        }
+      }
 
       if (lifecycleState === 'ACTIVE' && stalledForMs > STALLED_ACTIVE_MS) {
         if (healthyRecently) {
@@ -116,6 +152,25 @@ async function runWatchdogPass(io: Server): Promise<void> {
             lifecycleState: 'ACTIVE',
           });
           continue;
+        }
+        if (isBullmqBillingEnabled()) {
+          const chainMissing = await needsBillingCycleReschedule(callId).catch(() => false);
+          if (chainMissing) {
+            const recovered = await recoverBillingScheduleForCall(callId, 'reconciliation');
+            recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+              callId,
+              reason: recovered ? 'scheduler_chain_missing_recovered' : 'scheduler_chain_missing_unrecovered',
+            });
+            if (recovered) {
+              logWarning('Watchdog detected scheduler chain gap on ACTIVE session', {
+                callId,
+                stalledForMs,
+                watchdogPassId,
+                recoveryOwnerInstanceId,
+              });
+              continue;
+            }
+          }
         }
         const transitioned = await transitionBillingStateWithAudit({
           callId,
@@ -194,6 +249,21 @@ async function runWatchdogPass(io: Server): Promise<void> {
           });
           continue;
         }
+        if (isBullmqBillingEnabled()) {
+          const chainMissing = await needsBillingCycleReschedule(callId).catch(() => false);
+          if (chainMissing) {
+            const recovered = await recoverBillingScheduleForCall(callId, 'reconciliation');
+            recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+              callId,
+              reason: recovered
+                ? 'recovering_scheduler_chain_missing_recovered'
+                : 'recovering_scheduler_chain_missing_unrecovered',
+            });
+            if (recovered) {
+              continue;
+            }
+          }
+        }
         if (await redis.get(billingRecoveryDeadLetterKey(callId))) {
           continue;
         }
@@ -219,13 +289,24 @@ async function runWatchdogPass(io: Server): Promise<void> {
           WATCHDOG_COOLDOWN_SECONDS,
           JSON.stringify({ attempt, watchdogPassId, recoveryOwnerInstanceId, at: now })
         );
-        await transitionBillingStateWithAudit({
+        const transitioned = await transitionBillingStateWithAudit({
           callId,
           from: 'RECOVERING',
           to: 'ENDING',
           source: 'billing.watchdog',
           reason: 'stalled_recovering_detected',
         });
+        if (!transitioned.valid) {
+          recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+            callId,
+            reason: 'recovering_transition_blocked',
+          });
+          continue;
+        }
+        if (transitioned.changed) {
+          session.lifecycleState = transitioned.next;
+          await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL');
+        }
         recordBillingMetric('billing_watchdog_stalled_recovering', 1, { callId });
         logWarning('Watchdog detected stalled RECOVERING billing session', {
           callId,
