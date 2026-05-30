@@ -12,6 +12,7 @@ import {
   CALL_RECONCILIATION_LOCK_KEY,
   RECONCILIATION_LOCK_TTL_MS,
   activeCallByUserKey,
+  ACTIVE_CALL_BY_USER_PREFIX,
   ACTIVE_CALL_BY_USER_TTL,
   callSessionKey,
   availabilityKey,
@@ -21,6 +22,7 @@ import { logInfo, logError } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { getIO } from '../../config/socket';
+import { resolveBillingRuntimeState } from '../billing/billing-runtime-resolver.service';
 
 let reconciliationTimer: NodeJS.Timeout | null = null;
 
@@ -37,6 +39,20 @@ const RECON_BATCH_PAUSE_MS =
   Math.min(1000, Math.max(0, parseInt(process.env.CALL_RECONCILIATION_BATCH_PAUSE_MS || '100', 10))) || 100;
 const RECON_SETTLED_RESTORE_AGE_MS =
   Math.max(30_000, parseInt(process.env.CALL_RECONCILIATION_SETTLED_RESTORE_AGE_MS || '30000', 10) || 30_000);
+const PRESENCE_STARTUP_REPAIR_ENABLED = process.env.PRESENCE_STARTUP_REPAIR_ENABLED !== 'false';
+const PRESENCE_STARTUP_REPAIR_DRY_RUN = process.env.PRESENCE_STARTUP_REPAIR_DRY_RUN === 'true';
+const PRESENCE_STARTUP_REPAIR_SCAN_LIMIT = Math.min(
+  20_000,
+  Math.max(1, parseInt(process.env.PRESENCE_STARTUP_REPAIR_SCAN_LIMIT || '2000', 10) || 2000)
+);
+const PRESENCE_STARTUP_REPAIR_TIMEOUT_MS = Math.min(
+  120_000,
+  Math.max(5_000, parseInt(process.env.PRESENCE_STARTUP_REPAIR_TIMEOUT_MS || '45000', 10) || 45_000)
+);
+const PRESENCE_STARTUP_REPAIR_SCAN_COUNT = Math.min(
+  1000,
+  Math.max(50, parseInt(process.env.PRESENCE_STARTUP_REPAIR_SCAN_COUNT || '200', 10) || 200)
+);
 const RELEASE_LOCK_LUA = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
@@ -48,6 +64,181 @@ return 0
 const RECON_UNSETTLED_LOOKBACK_MS =
   parseInt(process.env.CALL_RECON_UNSETTLED_LOOKBACK_MS || String(7 * 24 * 60 * 60 * 1000), 10) ||
   7 * 24 * 60 * 60 * 1000;
+
+function isTerminalLifecycleState(state: string | undefined): boolean {
+  return state === 'SETTLED' || state === 'FAILED' || state === 'FAILED_RECOVERY_SETTLEMENT';
+}
+
+function parseUidFromActiveSlotKey(key: string): string | null {
+  if (!key.startsWith(ACTIVE_CALL_BY_USER_PREFIX)) return null;
+  const uid = key.slice(ACTIVE_CALL_BY_USER_PREFIX.length).trim();
+  return uid.length > 0 ? uid : null;
+}
+
+export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
+  if (!PRESENCE_STARTUP_REPAIR_ENABLED) {
+    logInfo('Startup active-call slot repair disabled', {
+      enabled: false,
+      dryRun: PRESENCE_STARTUP_REPAIR_DRY_RUN,
+    });
+    return;
+  }
+
+  const redis = getRedis();
+  const startedAt = Date.now();
+  let cursor = '0';
+  let scanned = 0;
+  let healthy = 0;
+  let staleDetected = 0;
+  let cleared = 0;
+  let dryRunMarked = 0;
+  let recomputed = 0;
+  let recomputeFailed = 0;
+  let skippedInvalidKey = 0;
+  let scanComplete = false;
+
+  logInfo('Startup active-call slot repair started', {
+    enabled: PRESENCE_STARTUP_REPAIR_ENABLED,
+    dryRun: PRESENCE_STARTUP_REPAIR_DRY_RUN,
+    scanLimit: PRESENCE_STARTUP_REPAIR_SCAN_LIMIT,
+    timeoutMs: PRESENCE_STARTUP_REPAIR_TIMEOUT_MS,
+    scanCount: PRESENCE_STARTUP_REPAIR_SCAN_COUNT,
+  });
+
+  while (Date.now() - startedAt < PRESENCE_STARTUP_REPAIR_TIMEOUT_MS) {
+    if (scanned >= PRESENCE_STARTUP_REPAIR_SCAN_LIMIT) break;
+
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      'MATCH',
+      `${ACTIVE_CALL_BY_USER_PREFIX}*`,
+      'COUNT',
+      String(PRESENCE_STARTUP_REPAIR_SCAN_COUNT)
+    );
+    cursor = nextCursor;
+
+    for (const key of keys || []) {
+      if (Date.now() - startedAt >= PRESENCE_STARTUP_REPAIR_TIMEOUT_MS) break;
+      if (scanned >= PRESENCE_STARTUP_REPAIR_SCAN_LIMIT) break;
+      scanned += 1;
+
+      const firebaseUid = parseUidFromActiveSlotKey(key);
+      if (!firebaseUid) {
+        skippedInvalidKey += 1;
+        continue;
+      }
+
+      const slotCallId = await redis.get(key);
+      if (!slotCallId) {
+        healthy += 1;
+        continue;
+      }
+
+      let stale = false;
+      let runtimeSource: string | undefined;
+      let lifecycleState: string | undefined;
+      try {
+        const runtime = await resolveBillingRuntimeState(slotCallId);
+        runtimeSource = runtime.source;
+        lifecycleState = runtime.session?.lifecycleState;
+        stale =
+          runtime.source === 'missing' ||
+          Boolean(runtime.terminalSnapshot) ||
+          !runtime.session ||
+          isTerminalLifecycleState(runtime.session.lifecycleState);
+      } catch (err) {
+        logError('Startup slot repair runtime resolution failed; treating as stale', err, {
+          firebaseUid,
+          slotCallId,
+        });
+        stale = true;
+      }
+
+      if (!stale) {
+        healthy += 1;
+        continue;
+      }
+
+      staleDetected += 1;
+      recordCallMetric('presence_startup_slot_stale_detected', 1, {
+        runtimeSource: runtimeSource || 'unknown',
+        lifecycleState: lifecycleState || 'none',
+      });
+
+      if (PRESENCE_STARTUP_REPAIR_DRY_RUN) {
+        dryRunMarked += 1;
+        logInfo('Startup slot repair dry-run detected stale slot', {
+          firebaseUid,
+          slotCallId,
+          runtimeSource: runtimeSource || 'unknown',
+          lifecycleState: lifecycleState || 'none',
+        });
+        continue;
+      }
+
+      await redis.del(key).catch(() => {});
+      const keyStillExists = Boolean(await redis.get(key));
+      if (keyStillExists) {
+        logInfo('Startup slot repair could not delete stale slot key', {
+          firebaseUid,
+          slotCallId,
+        });
+        continue;
+      }
+
+      cleared += 1;
+      recordCallMetric('presence_startup_slot_cleared', 1, {
+        runtimeSource: runtimeSource || 'unknown',
+        lifecycleState: lifecycleState || 'none',
+      });
+      logInfo('Startup slot repair cleared stale slot key', {
+        firebaseUid,
+        slotCallId,
+        runtimeSource: runtimeSource || 'unknown',
+        lifecycleState: lifecycleState || 'none',
+      });
+
+      try {
+        await transitionCreatorPresence(
+          getIO(),
+          firebaseUid,
+          'RECONCILED',
+          'startup.presence_slot_repair'
+        );
+        recomputed += 1;
+      } catch (err) {
+        recomputeFailed += 1;
+        recordCallMetric('presence_startup_recompute_failed', 1, {});
+        logError('Startup slot repair failed to recompute presence', err, {
+          firebaseUid,
+          slotCallId,
+        });
+      }
+    }
+
+    if (cursor === '0') {
+      scanComplete = true;
+      break;
+    }
+  }
+
+  recordCallMetric('presence_startup_slot_scan', scanned, {
+    dryRun: PRESENCE_STARTUP_REPAIR_DRY_RUN ? '1' : '0',
+  });
+  logInfo('Startup active-call slot repair completed', {
+    scanComplete,
+    scanned,
+    healthy,
+    staleDetected,
+    cleared,
+    dryRunMarked,
+    recomputed,
+    recomputeFailed,
+    skippedInvalidKey,
+    durationMs: Date.now() - startedAt,
+    timedOut: Date.now() - startedAt >= PRESENCE_STARTUP_REPAIR_TIMEOUT_MS,
+  });
+}
 
 function activeCallFilterAfter(
   lastId: mongoose.Types.ObjectId | null

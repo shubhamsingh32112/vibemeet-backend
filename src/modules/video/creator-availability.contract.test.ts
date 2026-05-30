@@ -62,3 +62,27 @@ test('startup reconciliation run includes settled busy-drift cleanup pass', () =
   assert.ok(src.includes('reconcileActiveCallsWithLock().catch'));
   assert.ok(src.includes('await cleanupSettledCreatorBusyDrift();'));
 });
+
+test('startup slot repair scans active-call keys and clears stale slots', () => {
+  const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('repairStaleActiveCallSlotsOnStartup'));
+  assert.ok(src.includes('ACTIVE_CALL_BY_USER_PREFIX'));
+  assert.ok(src.includes('await redis.scan('));
+  assert.ok(src.includes('resolveBillingRuntimeState(slotCallId)'));
+  assert.ok(src.includes("await redis.del(key).catch(() => {});"));
+  assert.ok(src.includes("'startup.presence_slot_repair'"));
+});
+
+test('startup slot repair supports dry-run and bounded scan controls', () => {
+  const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_DRY_RUN'));
+  assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_SCAN_LIMIT'));
+  assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_TIMEOUT_MS'));
+  assert.ok(src.includes("recordCallMetric('presence_startup_slot_scan'"));
+});
+
+test('server boot wires startup slot repair pass', () => {
+  const src = readFileSync(join(__dirname, '../../server.ts'), 'utf8');
+  assert.ok(src.includes('repairStaleActiveCallSlotsOnStartup'));
+  assert.ok(src.includes("logError('Startup active-call slot repair failed'"));
+});

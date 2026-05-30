@@ -42,7 +42,11 @@ import { verifyStartupRecovery } from './modules/billing/billing-recovery';
 import { setupAdminGateway } from './modules/admin/admin.gateway';
 import routes from './routes';
 import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
-import { startCallReconciliationJob, stopCallReconciliationJob } from './modules/video/call-reconciliation';
+import {
+  startCallReconciliationJob,
+  stopCallReconciliationJob,
+  repairStaleActiveCallSlotsOnStartup,
+} from './modules/video/call-reconciliation';
 import {
   startPaymentWebhookRetryWorker,
   stopPaymentWebhookRetryWorker,
@@ -1078,6 +1082,9 @@ const startServer = async () => {
     // 🔥 FIX: Verify startup recovery for active calls
     verifyStartupRecovery(io).catch((err) => {
       logError('Startup recovery verification failed', err);
+    });
+    repairStaleActiveCallSlotsOnStartup().catch((err) => {
+      logError('Startup active-call slot repair failed', err);
     });
 
     // 🔥 NEW: Start periodic call reconciliation against Stream
