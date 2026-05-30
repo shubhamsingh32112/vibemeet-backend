@@ -1,19 +1,26 @@
 import { Server, Socket } from 'socket.io';
 import { getFirebaseAdmin } from '../../config/firebase';
-import { transitionCreatorPresence, getBatchCreatorPresence } from './presence.service';
+import { transitionCreatorPresence, getBatchCreatorPresence, normalizeFirebaseUids } from './presence.service';
 import { User } from '../user/user.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
+import { featureFlags } from '../../config/feature-flags';
 import {
   setUserAvailability,
   refreshUserAvailability,
   getBatchUserAvailability,
 } from './user-availability.service';
-// Keep this aligned with the availability service TTL.
-const AVAILABILITY_TTL_SECONDS = 120;
+// Keep this aligned with the availability service TTL (default 180s).
+const AVAILABILITY_TTL_SECONDS = Math.min(
+  600,
+  Math.max(90, parseInt(process.env.CREATOR_PRESENCE_TTL_SECONDS || '180', 10) || 180)
+);
 
-// Heartbeat interval (in ms) - must be less than TTL (120s)
-const HEARTBEAT_INTERVAL = 60000; // 60 seconds
+// Heartbeat interval (in ms) - intentionally below TTL with a larger safety margin.
+const HEARTBEAT_INTERVAL = Math.min(
+  Math.max(20_000, AVAILABILITY_TTL_SECONDS * 1000 - 15_000),
+  Math.max(20_000, parseInt(process.env.CREATOR_HEARTBEAT_INTERVAL_MS || '45000', 10) || 45_000)
+);
 
 // Track how many active sockets each creator currently has.
 // This prevents marking a creator "busy" when one tab/device disconnects
@@ -199,7 +206,9 @@ function cleanupStaleSocketTracking(io: Server): void {
   }
 }
 
-function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefined): string[] {
+function normalizeCreatorIds(
+  data: { creatorIds: string[] } | string[] | undefined
+): { firebaseUids: string[]; invalidUids: string[] } {
   const sanitize = (ids: unknown[]): string[] =>
     ids
       .filter((id): id is string => typeof id === 'string')
@@ -207,12 +216,12 @@ function normalizeCreatorIds(data: { creatorIds: string[] } | string[] | undefin
       .filter((id) => id.length > 0);
 
   if (Array.isArray(data)) {
-    return sanitize(data);
+    return normalizeFirebaseUids(sanitize(data));
   }
   if (data && Array.isArray(data.creatorIds)) {
-    return sanitize(data.creatorIds);
+    return normalizeFirebaseUids(sanitize(data.creatorIds));
   }
-  return [];
+  return { firebaseUids: [], invalidUids: [] };
 }
 
 /**
@@ -373,7 +382,13 @@ export function setupAvailabilityGateway(io: Server): void {
               return;
             }
             
-            lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
+            const nowMs = Date.now();
+            const lastHeartbeat = lastCreatorHeartbeatAtMs.get(firebaseUid) || nowMs;
+            const driftMs = Math.max(0, nowMs - lastHeartbeat - HEARTBEAT_INTERVAL);
+            recordCallMetric('presence.creator_heartbeat_drift_ms', driftMs, {
+              role: 'creator',
+            });
+            lastCreatorHeartbeatAtMs.set(firebaseUid, nowMs);
             await transitionCreatorPresence(
               io,
               firebaseUid,
@@ -452,7 +467,13 @@ export function setupAvailabilityGateway(io: Server): void {
             }
             
             await refreshUserAvailability(firebaseUid);
-            lastUserHeartbeatAtMs.set(firebaseUid, Date.now());
+            const nowMs = Date.now();
+            const lastHeartbeat = lastUserHeartbeatAtMs.get(firebaseUid) || nowMs;
+            const driftMs = Math.max(0, nowMs - lastHeartbeat - HEARTBEAT_INTERVAL);
+            recordCallMetric('presence.creator_heartbeat_drift_ms', driftMs, {
+              role: 'user',
+            });
+            lastUserHeartbeatAtMs.set(firebaseUid, nowMs);
             logDebug('User heartbeat refreshed TTL', { firebaseUid });
           } catch (err) {
             logError('User heartbeat failed', err, { firebaseUid });
@@ -476,10 +497,54 @@ export function setupAvailabilityGateway(io: Server): void {
       'availability:get',
       async (data: { creatorIds: string[] } | string[]) => {
         try {
-          const creatorIds = normalizeCreatorIds(data);
-          if (creatorIds.length === 0) {
+          const normalized = normalizeCreatorIds(data);
+          const firebaseUids = normalized.firebaseUids;
+          const processedCount = firebaseUids.length;
+          if (normalized.invalidUids.length > 0) {
+            const totalInput = firebaseUids.length + normalized.invalidUids.length;
+            recordCallMetric('presence.creator_uid_contract_violation', normalized.invalidUids.length, {
+              context: 'availability:get',
+              mode: featureFlags.creatorPresenceUidContractEnforced ? 'enforce' : 'warn',
+            });
+            recordCallMetric(
+              'presence.creator_uid_contract_violation_rate',
+              normalized.invalidUids.length / Math.max(totalInput, 1),
+              {
+                context: 'availability:get',
+                mode: featureFlags.creatorPresenceUidContractEnforced ? 'enforce' : 'warn',
+              }
+            );
+            recordCallMetric('presence.creator_uid_contract_input_size', totalInput, {
+              context: 'availability:get',
+              mode: featureFlags.creatorPresenceUidContractEnforced ? 'enforce' : 'warn',
+            });
+            logWarning('availability_get_uid_contract_violation', {
+              socketId: socket.id,
+              invalidCount: normalized.invalidUids.length,
+              validCount: firebaseUids.length,
+              processedCount,
+              sample: normalized.invalidUids.slice(0, 3),
+              enforce: featureFlags.creatorPresenceUidContractEnforced,
+            });
+            if (featureFlags.creatorPresenceUidContractEnforced && firebaseUids.length === 0) {
+              logWarning('availability_get_uid_contract_all_invalid_enforced', {
+                socketId: socket.id,
+                invalidCount: normalized.invalidUids.length,
+                validCount: firebaseUids.length,
+                processedCount,
+              });
+              recordCallMetric('presence.creator_uid_contract_enforced_block', 1, {
+                context: 'availability:get',
+              });
+              socket.emit('availability:batch', {});
+              socket.emit('availability:batch:v2', {});
+              return;
+            }
+          }
+          if (firebaseUids.length === 0) {
             logWarning('Invalid availability:get payload', { socketId: socket.id });
             socket.emit('availability:batch', {});
+            socket.emit('availability:batch:v2', {});
             return;
           }
 
@@ -488,12 +553,12 @@ export function setupAvailabilityGateway(io: Server): void {
             string,
             { status: 'online' | 'on_call' | 'offline'; version: number; updatedAt: number; source: string }
           > = {};
-          const records = await getBatchCreatorPresence(creatorIds);
-          for (const creatorId of creatorIds) {
-            const rec = records[creatorId];
+          const records = await getBatchCreatorPresence(firebaseUids);
+          for (const firebaseUid of firebaseUids) {
+            const rec = records[firebaseUid];
             const state = rec?.state ?? 'offline';
-            result[creatorId] = state;
-            resultV2[creatorId] = {
+            result[firebaseUid] = state;
+            resultV2[firebaseUid] = {
               status: state,
               version: Math.max(0, Number(rec?.version) || 0),
               updatedAt: Math.max(0, Number(rec?.updatedAt) || Date.now()),

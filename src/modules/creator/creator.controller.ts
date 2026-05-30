@@ -11,7 +11,7 @@ import { getIO } from '../../config/socket';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { setCreatorAvailability } from '../availability/availability.gateway';
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
-import { getBatchCreatorPresence } from '../availability/presence.service';
+import { getBatchCreatorPresence, normalizeFirebaseUids } from '../availability/presence.service';
 import {
   getRedis,
   creatorDashboardKey,
@@ -43,7 +43,8 @@ import {
   CREATOR_GALLERY_MAX_IMAGES,
   CREATOR_GALLERY_MIN_IMAGES,
 } from './creator-gallery.constants';
-import { logError, logInfo } from '../../utils/logger';
+import { logError, logInfo, logWarning } from '../../utils/logger';
+import { recordCallMetric } from '../../utils/monitoring';
 import { ensureCreatorPromotionBonusReversalEntry } from './creator-starter.service';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
@@ -258,7 +259,28 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     }
 
     const tAvail = Date.now();
-    const firebaseUids = baseRows.map((c) => c.firebaseUid).filter((uid): uid is string => uid !== null);
+    const normalizedFeedUids = normalizeFirebaseUids(
+      baseRows.map((c) => c.firebaseUid).filter((uid): uid is string => uid !== null)
+    );
+    if (normalizedFeedUids.invalidUids.length > 0) {
+      const validCount = normalizedFeedUids.firebaseUids.length;
+      const totalInput = validCount + normalizedFeedUids.invalidUids.length;
+      logWarning('creator.feed.uid_contract_violation', {
+        count: normalizedFeedUids.invalidUids.length,
+        validCount,
+        sample: normalizedFeedUids.invalidUids.slice(0, 3),
+      });
+      recordCallMetric('presence.creator_uid_contract_violation', normalizedFeedUids.invalidUids.length, {
+        context: 'creator_feed',
+      });
+      recordCallMetric(
+        'presence.creator_uid_contract_violation_rate',
+        normalizedFeedUids.invalidUids.length / Math.max(totalInput, 1),
+        { context: 'creator_feed' }
+      );
+      recordCallMetric('presence.creator_uid_contract_input_size', totalInput, { context: 'creator_feed' });
+    }
+    const firebaseUids = normalizedFeedUids.firebaseUids;
     const presenceMap = firebaseUids.length > 0 ? await getBatchCreatorPresence(firebaseUids) : {};
     const availabilityMap: Record<string, 'online' | 'on_call' | 'offline'> = {};
     Object.entries(presenceMap).forEach(([uid, record]) => {

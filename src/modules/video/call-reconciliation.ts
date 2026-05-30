@@ -16,6 +16,7 @@ import {
   ACTIVE_CALL_BY_USER_TTL,
   callSessionKey,
   availabilityKey,
+  AVAILABILITY_KEY_PREFIX,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError } from '../../utils/logger';
@@ -23,6 +24,7 @@ import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { getIO } from '../../config/socket';
 import { resolveBillingRuntimeState } from '../billing/billing-runtime-resolver.service';
+import { creatorPresenceMetaKey } from '../availability/presence.service';
 
 let reconciliationTimer: NodeJS.Timeout | null = null;
 
@@ -53,6 +55,22 @@ const PRESENCE_STARTUP_REPAIR_SCAN_COUNT = Math.min(
   1000,
   Math.max(50, parseInt(process.env.PRESENCE_STARTUP_REPAIR_SCAN_COUNT || '200', 10) || 200)
 );
+const PRESENCE_CANONICAL_BACKFILL_SCAN_LIMIT = Math.min(
+  5000,
+  Math.max(50, parseInt(process.env.PRESENCE_CANONICAL_BACKFILL_SCAN_LIMIT || '500', 10) || 500)
+);
+const PRESENCE_CANONICAL_BACKFILL_SCAN_COUNT = Math.min(
+  500,
+  Math.max(50, parseInt(process.env.PRESENCE_CANONICAL_BACKFILL_SCAN_COUNT || '200', 10) || 200)
+);
+const PRESENCE_CANONICAL_BACKFILL_MAX_REPAIRS = Math.min(
+  500,
+  Math.max(1, parseInt(process.env.PRESENCE_CANONICAL_BACKFILL_MAX_REPAIRS || '80', 10) || 80)
+);
+const PRESENCE_CANONICAL_BACKFILL_TIMEOUT_MS = Math.min(
+  120_000,
+  Math.max(3_000, parseInt(process.env.PRESENCE_CANONICAL_BACKFILL_TIMEOUT_MS || '15000', 10) || 15_000)
+);
 const PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS = Math.min(
   24 * 60 * 60 * 1000,
   Math.max(
@@ -80,6 +98,109 @@ function parseUidFromActiveSlotKey(key: string): string | null {
   if (!key.startsWith(ACTIVE_CALL_BY_USER_PREFIX)) return null;
   const uid = key.slice(ACTIVE_CALL_BY_USER_PREFIX.length).trim();
   return uid.length > 0 ? uid : null;
+}
+
+function parseUidFromAvailabilityKey(key: string): string | null {
+  if (!key.startsWith(AVAILABILITY_KEY_PREFIX)) return null;
+  const uid = key.slice(AVAILABILITY_KEY_PREFIX.length).trim();
+  return uid.length > 0 ? uid : null;
+}
+
+async function repairMissingCanonicalPresenceMeta(): Promise<void> {
+  if (!featureFlags.creatorPresenceBackfillEnabled) {
+    return;
+  }
+  const redis = getRedis();
+  const startedAt = Date.now();
+  const dryRun = featureFlags.creatorPresenceBackfillDryRun;
+  let cursor = '0';
+  let scanned = 0;
+  let missingMeta = 0;
+  let repaired = 0;
+  let failed = 0;
+  let parseFailures = 0;
+
+  while (Date.now() - startedAt < PRESENCE_CANONICAL_BACKFILL_TIMEOUT_MS) {
+    if (scanned >= PRESENCE_CANONICAL_BACKFILL_SCAN_LIMIT) break;
+    if (!dryRun && repaired >= PRESENCE_CANONICAL_BACKFILL_MAX_REPAIRS) break;
+
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      'MATCH',
+      `${AVAILABILITY_KEY_PREFIX}*`,
+      'COUNT',
+      String(PRESENCE_CANONICAL_BACKFILL_SCAN_COUNT)
+    );
+    cursor = nextCursor;
+    if (!keys || keys.length === 0) {
+      if (cursor === '0') break;
+      continue;
+    }
+
+    for (const key of keys) {
+      if (Date.now() - startedAt >= PRESENCE_CANONICAL_BACKFILL_TIMEOUT_MS) break;
+      if (scanned >= PRESENCE_CANONICAL_BACKFILL_SCAN_LIMIT) break;
+      if (!dryRun && repaired >= PRESENCE_CANONICAL_BACKFILL_MAX_REPAIRS) break;
+
+      scanned += 1;
+      const firebaseUid = parseUidFromAvailabilityKey(key);
+      if (!firebaseUid) {
+        parseFailures += 1;
+        continue;
+      }
+      const [baseRaw, metaRaw] = await redis.mget(key, creatorPresenceMetaKey(firebaseUid));
+      if (baseRaw == null || metaRaw != null) {
+        continue;
+      }
+      missingMeta += 1;
+      if (dryRun) {
+        continue;
+      }
+      try {
+        await transitionCreatorPresence(
+          getIO(),
+          firebaseUid,
+          'RECONCILED',
+          'presence.backfill.reconciliation'
+        );
+        repaired += 1;
+      } catch (err) {
+        failed += 1;
+        logError('presence_backfill_repair_failed', err, {
+          firebaseUid,
+          source: 'call-reconciliation',
+        });
+      }
+    }
+    if (cursor === '0') break;
+  }
+
+  recordCallMetric('presence.backfill_scan', scanned, {
+    dryRun: dryRun ? '1' : '0',
+  });
+  recordCallMetric('presence.backfill_would_repair_count', missingMeta, {
+    dryRun: dryRun ? '1' : '0',
+  });
+  recordCallMetric('presence.backfill_repaired_count', repaired, {
+    dryRun: dryRun ? '1' : '0',
+  });
+  recordCallMetric('presence.backfill_failed_count', failed, {
+    dryRun: dryRun ? '1' : '0',
+  });
+  if (parseFailures > 0) {
+    recordCallMetric('presence.backfill_key_parse_failures', parseFailures, {
+      dryRun: dryRun ? '1' : '0',
+    });
+  }
+  logInfo('Presence canonical backfill pass completed', {
+    dryRun,
+    scanned,
+    missingMeta,
+    repaired,
+    failed,
+    parseFailures,
+    durationMs: Date.now() - startedAt,
+  });
 }
 
 function runtimeSessionAgeMs(
@@ -626,6 +747,7 @@ async function reconcileActiveCalls(): Promise<void> {
     const runStartedAt = Date.now();
     await ensureCreatorsWithActiveCallsAreBusy();
     await cleanupSettledCreatorBusyDrift();
+    await repairMissingCanonicalPresenceMeta();
 
     const apiKey = process.env.STREAM_API_KEY;
     const baseUrl = 'https://video.stream-io-api.com';

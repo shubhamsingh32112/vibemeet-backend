@@ -48,5 +48,26 @@ test('batch presence records canonical-missing and fallback rates', () => {
   assert.ok(src.includes('presence.creator_batch_canonical_missing_rate'));
   assert.ok(src.includes('presence.creator_batch_fallback_rate'));
   assert.ok(src.includes('creator_presence_batch_canonical_missing_high'));
+  assert.ok(src.includes('expectedCanonicalCount'));
+  assert.ok(src.includes('presence.creator_meta_missing_any_rate'));
+  assert.ok(src.includes('presence.creator_meta_missing_expected_rate'));
+  assert.ok(src.includes('presence.creator_expected_canonical_coverage_rate'));
+  assert.ok(src.includes('presence.creator_meta_parse_failure_rate'));
+  assert.ok(src.includes('presence.creator_uid_contract_violation_rate'));
+  assert.ok(src.includes('presence.creator_transition_retry_count'));
+});
+
+test('uid contract rate metrics are emitted as ratios at ingress', () => {
+  const gatewaySrc = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  const controllerSrc = readFileSync(join(__dirname, '../creator/creator.controller.ts'), 'utf8');
+  assert.ok(gatewaySrc.includes("invalidUids.length / Math.max(totalInput, 1)"));
+  assert.ok(controllerSrc.includes("invalidUids.length / Math.max(totalInput, 1)"));
+});
+
+test('gateway enforce mode only blocks when all IDs invalid', () => {
+  const gatewaySrc = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  assert.ok(gatewaySrc.includes('featureFlags.creatorPresenceUidContractEnforced && firebaseUids.length === 0'));
+  assert.ok(gatewaySrc.includes('availability_get_uid_contract_all_invalid_enforced'));
+  assert.ok(gatewaySrc.includes("recordCallMetric('presence.creator_uid_contract_enforced_block'"));
 });
 

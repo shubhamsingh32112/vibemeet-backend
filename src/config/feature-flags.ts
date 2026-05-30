@@ -29,6 +29,32 @@ export const featureFlags = {
   creatorPresenceUserModelShadowCompareEnabled:
     process.env.CREATOR_PRESENCE_USER_MODEL_SHADOW_COMPARE_ENABLED !== 'false',
   /**
+   * Enable bounded retries for canonical creator presence Redis writes.
+   */
+  creatorPresenceWriterRetryEnabled:
+    process.env.CREATOR_PRESENCE_WRITER_RETRY_ENABLED !== 'false',
+  /**
+   * Enforce firebaseUid-only contract for creator presence batch lookups.
+   * When false, invalid ids are dropped with warning-only telemetry.
+   */
+  creatorPresenceUidContractEnforced:
+    process.env.CREATOR_PRESENCE_UID_CONTRACT_ENFORCED === 'true',
+  /**
+   * Allow read-path self-heal when base availability exists but canonical meta is missing.
+   */
+  creatorPresenceMetaSelfHealEnabled:
+    process.env.CREATOR_PRESENCE_META_SELF_HEAL_ENABLED !== 'false',
+  /**
+   * Enable canonical meta repair sweep inside reconciliation.
+   */
+  creatorPresenceBackfillEnabled:
+    process.env.CREATOR_PRESENCE_BACKFILL_ENABLED === 'true',
+  /**
+   * Dry-run mode for canonical meta repair sweep.
+   */
+  creatorPresenceBackfillDryRun:
+    process.env.CREATOR_PRESENCE_BACKFILL_DRY_RUN !== 'false',
+  /**
    * Watchdog that auto-recovers stalled active/settling sessions.
    */
   billingWatchdogEnabled: process.env.BILLING_WATCHDOG_ENABLED !== 'false',

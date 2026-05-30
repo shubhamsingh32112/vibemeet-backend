@@ -312,6 +312,15 @@ app.get('/metrics', async (req, res) => {
     const creatorCanonicalMissingRateMetric =
       byName['call.creator_presence_canonical_missing_rate'];
     const creatorFallbackRateMetric = byName['call.creator_presence_fallback_rate'];
+    const creatorMetaMissingRateMetric = byName['call.presence.creator_meta_missing_rate'];
+    const creatorMetaMissingAnyRateMetric = byName['call.presence.creator_meta_missing_any_rate'];
+    const creatorMetaMissingExpectedRateMetric = byName['call.presence.creator_meta_missing_expected_rate'];
+    const creatorExpectedCanonicalCoverageRateMetric =
+      byName['call.presence.creator_expected_canonical_coverage_rate'];
+    const creatorMetaParseFailureRateMetric = byName['call.presence.creator_meta_parse_failure_rate'];
+    const creatorUidContractViolationRateMetric =
+      byName['call.presence.creator_uid_contract_violation_rate'];
+    const creatorTransitionRetryMetric = byName['call.presence.creator_transition_retry_count'];
     const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
     const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
     const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
@@ -345,6 +354,12 @@ app.get('/metrics', async (req, res) => {
     let rollingDeferredCallEndsFlushed = 0;
     let rollingCreatorCanonicalMissingRate = 0;
     let rollingCreatorFallbackRate = 0;
+    let rollingCreatorMetaMissingRate = 0;
+    let rollingCreatorMetaMissingAnyRate = 0;
+    let rollingCreatorMetaMissingExpectedRate = 0;
+    let rollingCreatorExpectedCanonicalCoverageRate = 0;
+    let rollingCreatorMetaParseFailureRate = 0;
+    let rollingCreatorUidContractViolationRate = 0;
 
     if (isRedisConfigured()) {
       const redis = getRedis();
@@ -370,6 +385,12 @@ app.get('/metrics', async (req, res) => {
         deferredFlushed5m,
         creatorCanonicalMissingRaw,
         creatorFallbackRaw,
+        creatorMetaMissingRaw,
+        creatorMetaMissingAnyRaw,
+        creatorMetaMissingExpectedRaw,
+        creatorExpectedCoverageRaw,
+        creatorMetaParseFailureRaw,
+        creatorUidViolationRaw,
       ] = await Promise.all([
         redis.zrevrangebyscore(
           metricsKey('billing.bullmq_queue_lag_ms'),
@@ -416,6 +437,54 @@ app.get('/metrics', async (req, res) => {
           0,
           rollingSampleLimit
         ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_meta_missing_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_meta_missing_any_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_meta_missing_expected_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_expected_canonical_coverage_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_meta_parse_failure_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
+        redis.zrevrangebyscore(
+          metricsKey('call.presence.creator_uid_contract_violation_rate'),
+          now,
+          fromTs,
+          'LIMIT',
+          0,
+          rollingSampleLimit
+        ),
       ]);
 
       const parseMetricSampleStats = (raw: string[]): { avg: number; sum: number; count: number } => {
@@ -454,8 +523,20 @@ app.get('/metrics', async (req, res) => {
       rollingDeferredCallEndsFlushed = Number(deferredFlushed5m || 0);
       const creatorCanonicalMissingStats = parseMetricSampleStats(creatorCanonicalMissingRaw);
       const creatorFallbackStats = parseMetricSampleStats(creatorFallbackRaw);
+      const creatorMetaMissingStats = parseMetricSampleStats(creatorMetaMissingRaw);
+      const creatorMetaMissingAnyStats = parseMetricSampleStats(creatorMetaMissingAnyRaw);
+      const creatorMetaMissingExpectedStats = parseMetricSampleStats(creatorMetaMissingExpectedRaw);
+      const creatorExpectedCoverageStats = parseMetricSampleStats(creatorExpectedCoverageRaw);
+      const creatorMetaParseFailureStats = parseMetricSampleStats(creatorMetaParseFailureRaw);
+      const creatorUidViolationStats = parseMetricSampleStats(creatorUidViolationRaw);
       rollingCreatorCanonicalMissingRate = creatorCanonicalMissingStats.avg;
       rollingCreatorFallbackRate = creatorFallbackStats.avg;
+      rollingCreatorMetaMissingRate = creatorMetaMissingStats.avg;
+      rollingCreatorMetaMissingAnyRate = creatorMetaMissingAnyStats.avg;
+      rollingCreatorMetaMissingExpectedRate = creatorMetaMissingExpectedStats.avg;
+      rollingCreatorExpectedCanonicalCoverageRate = creatorExpectedCoverageStats.avg;
+      rollingCreatorMetaParseFailureRate = creatorMetaParseFailureStats.avg;
+      rollingCreatorUidContractViolationRate = creatorUidViolationStats.avg;
       const totalPipelines = rollingRedisPipelineSuccess + rollingRedisPipelineFailure;
       rollingRedisPipelineFailureRate =
         totalPipelines > 0 ? rollingRedisPipelineFailure / totalPipelines : 0;
@@ -505,6 +586,15 @@ app.get('/metrics', async (req, res) => {
     }
     if (rollingCreatorFallbackRate > 0.05) {
       metricsAlerts.push('creator_presence_fallback_high_5m');
+    }
+    if (rollingCreatorMetaMissingRate > 0.05) {
+      metricsAlerts.push('creator_presence_meta_missing_high_5m');
+    }
+    if (rollingCreatorMetaParseFailureRate > 0.01) {
+      metricsAlerts.push('creator_presence_meta_parse_failure_high_5m');
+    }
+    if (rollingCreatorUidContractViolationRate > 0.005) {
+      metricsAlerts.push('creator_presence_uid_contract_violation_high_5m');
     }
     const hardBlockerAlertKeys = new Set([
       'billing_runtime_missing_detected_5m',
@@ -716,6 +806,55 @@ app.get('/metrics', async (req, res) => {
               samples: creatorFallbackRateMetric.count,
               avgRate: Math.round(creatorFallbackRateMetric.avg * 10000) / 10000,
               rolling5mAvgRate: Math.round(rollingCreatorFallbackRate * 10000) / 10000,
+            }
+          : null,
+        creatorMetaMissingRate: creatorMetaMissingRateMetric
+          ? {
+              samples: creatorMetaMissingRateMetric.count,
+              avgRate: Math.round(creatorMetaMissingRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingRate * 10000) / 10000,
+            }
+          : null,
+        creatorMetaMissingAnyRate: creatorMetaMissingAnyRateMetric
+          ? {
+              samples: creatorMetaMissingAnyRateMetric.count,
+              avgRate: Math.round(creatorMetaMissingAnyRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingAnyRate * 10000) / 10000,
+            }
+          : null,
+        creatorMetaMissingExpectedRate: creatorMetaMissingExpectedRateMetric
+          ? {
+              samples: creatorMetaMissingExpectedRateMetric.count,
+              avgRate: Math.round(creatorMetaMissingExpectedRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingExpectedRate * 10000) / 10000,
+            }
+          : null,
+        creatorExpectedCanonicalCoverageRate: creatorExpectedCanonicalCoverageRateMetric
+          ? {
+              samples: creatorExpectedCanonicalCoverageRateMetric.count,
+              avgRate: Math.round(creatorExpectedCanonicalCoverageRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorExpectedCanonicalCoverageRate * 10000) / 10000,
+            }
+          : null,
+        creatorMetaParseFailureRate: creatorMetaParseFailureRateMetric
+          ? {
+              samples: creatorMetaParseFailureRateMetric.count,
+              avgRate: Math.round(creatorMetaParseFailureRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorMetaParseFailureRate * 10000) / 10000,
+            }
+          : null,
+        creatorUidContractViolationRate: creatorUidContractViolationRateMetric
+          ? {
+              samples: creatorUidContractViolationRateMetric.count,
+              avgRate: Math.round(creatorUidContractViolationRateMetric.avg * 10000) / 10000,
+              rolling5mAvgRate: Math.round(rollingCreatorUidContractViolationRate * 10000) / 10000,
+            }
+          : null,
+        creatorTransitionRetryCount: creatorTransitionRetryMetric
+          ? {
+              samples: creatorTransitionRetryMetric.count,
+              avgRetries: Math.round(creatorTransitionRetryMetric.avg * 100) / 100,
+              maxRetries: Math.round(creatorTransitionRetryMetric.max * 100) / 100,
             }
           : null,
       },
