@@ -78,6 +78,8 @@ test('startup slot repair supports dry-run and bounded scan controls', () => {
   assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_DRY_RUN'));
   assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_SCAN_LIMIT'));
   assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_TIMEOUT_MS'));
+  assert.ok(src.includes('PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS'));
+  assert.ok(src.includes('shouldTreatStartingAsStale('));
   assert.ok(src.includes("recordCallMetric('presence_startup_slot_scan'"));
 });
 

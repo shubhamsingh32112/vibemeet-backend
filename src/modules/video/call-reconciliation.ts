@@ -53,6 +53,13 @@ const PRESENCE_STARTUP_REPAIR_SCAN_COUNT = Math.min(
   1000,
   Math.max(50, parseInt(process.env.PRESENCE_STARTUP_REPAIR_SCAN_COUNT || '200', 10) || 200)
 );
+const PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS = Math.min(
+  24 * 60 * 60 * 1000,
+  Math.max(
+    60_000,
+    parseInt(process.env.PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS || '180000', 10) || 180_000
+  )
+);
 const RELEASE_LOCK_LUA = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
@@ -73,6 +80,53 @@ function parseUidFromActiveSlotKey(key: string): string | null {
   if (!key.startsWith(ACTIVE_CALL_BY_USER_PREFIX)) return null;
   const uid = key.slice(ACTIVE_CALL_BY_USER_PREFIX.length).trim();
   return uid.length > 0 ? uid : null;
+}
+
+function runtimeSessionAgeMs(
+  session: { startTime?: number; lastProcessedAt?: number },
+  callId: string
+): number {
+  const baseTs = Number(session?.startTime) || Number(session?.lastProcessedAt) || 0;
+  if (Number.isFinite(baseTs) && baseTs > 0) {
+    return Math.max(0, Date.now() - baseTs);
+  }
+  const match = String(callId || '').match(/_(\d{10})$/);
+  if (!match) return 0;
+  const epochSeconds = Number(match[1]);
+  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return 0;
+  return Math.max(0, Date.now() - epochSeconds * 1000);
+}
+
+function isLikelyBootstrappingStartingSession(
+  session: { billingSequence?: number; elapsedSeconds?: number }
+): boolean {
+  const seq = Number(session?.billingSequence || 0);
+  const elapsed = Number(session?.elapsedSeconds || 0);
+  return seq <= 0 && elapsed <= 0;
+}
+
+function shouldTreatStartingAsStale(
+  session: {
+    lifecycleState?: string;
+    startTime?: number;
+    lastProcessedAt?: number;
+    billingSequence?: number;
+    elapsedSeconds?: number;
+  },
+  callId: string
+): { stale: boolean; ageMs: number } {
+  if (session?.lifecycleState !== 'STARTING') {
+    return { stale: false, ageMs: 0 };
+  }
+  const ageMs = runtimeSessionAgeMs(session, callId);
+  if (ageMs <= PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS) {
+    return { stale: false, ageMs };
+  }
+  // Only force-clear when we still look pre-tick; avoid touching active progressing sessions.
+  if (!isLikelyBootstrappingStartingSession(session)) {
+    return { stale: false, ageMs };
+  }
+  return { stale: true, ageMs };
 }
 
 export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
@@ -103,6 +157,7 @@ export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
     scanLimit: PRESENCE_STARTUP_REPAIR_SCAN_LIMIT,
     timeoutMs: PRESENCE_STARTUP_REPAIR_TIMEOUT_MS,
     scanCount: PRESENCE_STARTUP_REPAIR_SCAN_COUNT,
+    startingMaxAgeMs: PRESENCE_STARTUP_REPAIR_STARTING_MAX_AGE_MS,
   });
 
   while (Date.now() - startedAt < PRESENCE_STARTUP_REPAIR_TIMEOUT_MS) {
@@ -137,15 +192,22 @@ export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
       let stale = false;
       let runtimeSource: string | undefined;
       let lifecycleState: string | undefined;
+      let runtimeAgeMs: number | undefined;
       try {
         const runtime = await resolveBillingRuntimeState(slotCallId);
         runtimeSource = runtime.source;
         lifecycleState = runtime.session?.lifecycleState;
+        const staleStartingDecision = runtime.session
+          ? shouldTreatStartingAsStale(runtime.session, slotCallId)
+          : { stale: false, ageMs: 0 };
+        runtimeAgeMs = staleStartingDecision.ageMs;
+        const staleStarting = staleStartingDecision.stale;
         stale =
           runtime.source === 'missing' ||
           Boolean(runtime.terminalSnapshot) ||
           !runtime.session ||
-          isTerminalLifecycleState(runtime.session.lifecycleState);
+          isTerminalLifecycleState(runtime.session.lifecycleState) ||
+          staleStarting;
       } catch (err) {
         logError('Startup slot repair runtime resolution failed; treating as stale', err, {
           firebaseUid,
@@ -172,6 +234,7 @@ export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
           slotCallId,
           runtimeSource: runtimeSource || 'unknown',
           lifecycleState: lifecycleState || 'none',
+          runtimeAgeMs: runtimeAgeMs || 0,
         });
         continue;
       }
@@ -196,6 +259,7 @@ export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
         slotCallId,
         runtimeSource: runtimeSource || 'unknown',
         lifecycleState: lifecycleState || 'none',
+        runtimeAgeMs: runtimeAgeMs || 0,
       });
 
       try {

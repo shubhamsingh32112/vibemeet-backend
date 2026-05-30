@@ -110,8 +110,12 @@ export async function scheduleNextBillingCycleAfterTickOk(
   await scheduleBillingJob(callId, delay);
 }
 
+function normalizeBullmqJobIdComponent(value: string): string {
+  return String(value || '').replace(/:/g, '__');
+}
+
 export function billingCycleJobId(callId: string): string {
-  return `billing:${callId}`;
+  return `billing-${normalizeBullmqJobIdComponent(callId)}`;
 }
 
 async function touchBillingCycleHeartbeat(callId: string): Promise<void> {

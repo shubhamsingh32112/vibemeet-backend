@@ -8,8 +8,13 @@ import { join } from 'node:path';
 import { billingCycleJobId } from './billing.queue';
 
 test('billingCycleJobId matches BullMQ jobId used for deduplication', () => {
-  assert.equal(billingCycleJobId('call-xyz'), 'billing:call-xyz');
-  assert.ok(billingCycleJobId('call-xyz').startsWith('billing:'));
+  assert.equal(billingCycleJobId('call-xyz'), 'billing-call-xyz');
+  assert.ok(billingCycleJobId('call-xyz').startsWith('billing-'));
+  assert.equal(
+    billingCycleJobId('call:terminal:abc'),
+    'billing-call__terminal__abc'
+  );
+  assert.ok(!billingCycleJobId('call:terminal:abc').includes(':'));
 });
 
 test('billing cycle jobs persist completion/failure history', () => {
