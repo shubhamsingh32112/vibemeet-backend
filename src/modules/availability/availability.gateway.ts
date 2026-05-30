@@ -3,6 +3,7 @@ import { getFirebaseAdmin } from '../../config/firebase';
 import { transitionCreatorPresence, getBatchCreatorPresence, normalizeFirebaseUids } from './presence.service';
 import { User } from '../user/user.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
+import { logCreatorPresenceSweepSummary } from './creator-presence-audit.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { featureFlags } from '../../config/feature-flags';
 import {
@@ -98,6 +99,14 @@ function scheduleCreatorDisconnectTransition(
     }
     try {
       await transitionCreatorPresence(io, firebaseUid, 'DISCONNECTED', source);
+      logInfo('creator_status_change', {
+        firebaseUid,
+        from: 'online_or_on_call',
+        to: 'offline',
+        eventType: 'DISCONNECTED',
+        source,
+        graceMs: CREATOR_DISCONNECT_GRACE_MS,
+      });
       logInfo('Creator disconnect grace elapsed - set to offline', {
         firebaseUid,
         source,
@@ -198,12 +207,10 @@ function cleanupStaleSocketTracking(io: Server): void {
     }
   }
   
-  if (cleanedUsers > 0 || cleanedCreators > 0) {
-    logInfo('Cleaned up stale socket tracking entries', {
-      cleanedUsers,
-      cleanedCreators,
-    });
-  }
+  logCreatorPresenceSweepSummary('availability.gateway.cleanup_stale_socket_tracking', {
+    creatorsForcedOffline: cleanedCreators,
+    usersForcedOffline: cleanedUsers,
+  });
 }
 
 function normalizeCreatorIds(
@@ -331,6 +338,11 @@ export function setupAvailabilityGateway(io: Server): void {
         clearCreatorDisconnectTimer(firebaseUid);
         lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
         await setCreatorAvailability(io, firebaseUid, 'online');
+        logInfo('creator_status_connect', {
+          firebaseUid,
+          to: 'online',
+          socketCount: currentCount + 1,
+        });
         logInfo('Creator automatically set to online on connect', { firebaseUid });
         
         // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
@@ -596,6 +608,12 @@ export function setupAvailabilityGateway(io: Server): void {
         'CONNECTED',
         'availability.gateway.creator_online_event'
       );
+      logInfo('creator_status_change', {
+        firebaseUid: uid,
+        to: 'online',
+        eventType: 'CONNECTED',
+        source: 'availability.gateway.creator_online_event',
+      });
       logInfo('Creator set to online', { firebaseUid: uid });
     });
 
@@ -618,6 +636,12 @@ export function setupAvailabilityGateway(io: Server): void {
         'availability.gateway.creator_offline_event'
       );
       lastCreatorHeartbeatAtMs.set(uid, Date.now());
+      logInfo('creator_status_change', {
+        firebaseUid: uid,
+        to: 'offline',
+        eventType: 'DISCONNECTED',
+        source: 'availability.gateway.creator_offline_event',
+      });
       logInfo('Creator set to offline', { firebaseUid: uid });
     });
 
@@ -822,6 +846,8 @@ export async function setCreatorAvailability(
 async function sweepStaleHeartbeats(io: Server): Promise<void> {
   const staleAfterMs = AVAILABILITY_TTL_SECONDS * 1000;
   const now = Date.now();
+  let creatorHeartbeatStale = 0;
+  let userHeartbeatStale = 0;
 
   for (const [uid, lastAt] of lastCreatorHeartbeatAtMs.entries()) {
     if (now - lastAt <= staleAfterMs) continue;
@@ -838,8 +864,16 @@ async function sweepStaleHeartbeats(io: Server): Promise<void> {
     lastCreatorHeartbeatAtMs.delete(uid);
     activeSocketsByCreator.delete(uid);
     creatorSocketCounts.delete(uid);
+    creatorHeartbeatStale += 1;
     recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'creator', status: 'offline' });
-    logWarning('Applied creator TTL fallback to offline', { firebaseUid: uid });
+    logWarning('creator_status_stale_ttl_fallback', {
+      firebaseUid: uid,
+      role: 'creator',
+      from: 'online_or_on_call',
+      to: 'offline',
+      lastHeartbeatAgeMs: now - lastAt,
+      staleAfterMs,
+    });
   }
 
   for (const [uid, lastAt] of lastUserHeartbeatAtMs.entries()) {
@@ -857,7 +891,19 @@ async function sweepStaleHeartbeats(io: Server): Promise<void> {
     lastUserHeartbeatAtMs.delete(uid);
     activeSocketsByUser.delete(uid);
     userSocketCounts.delete(uid);
+    userHeartbeatStale += 1;
     recordCallMetric('presence.ttl_fallback_applied', 1, { role: 'user', status: 'offline' });
-    logWarning('Applied user TTL fallback to offline', { firebaseUid: uid });
+    logWarning('creator_presence_user_ttl_fallback', {
+      firebaseUid: uid,
+      role: 'user',
+      to: 'offline',
+      lastHeartbeatAgeMs: now - lastAt,
+      staleAfterMs,
+    });
   }
+
+  logCreatorPresenceSweepSummary('availability.gateway.heartbeat_sweep', {
+    creatorHeartbeatStale,
+    userHeartbeatStale,
+  });
 }

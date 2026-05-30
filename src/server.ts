@@ -25,6 +25,7 @@ import { featureFlags } from './config/feature-flags';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
+import { auditCreatorPresenceOnStartup } from './modules/availability/creator-presence-audit.service';
 import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
 import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
@@ -1211,6 +1212,9 @@ const startServer = async () => {
     // Set up Socket.IO gateways
     setupAvailabilityGateway(io);
     logInfo('Socket.IO availability gateway ready');
+    auditCreatorPresenceOnStartup(io, 'server.startup').catch((err) => {
+      logError('Creator presence startup audit failed', err);
+    });
     logInfo('creator_presence_runtime_config', {
       redisEndpointMode: getRedisEndpointMode(),
       userModelEnabled: featureFlags.creatorPresenceUserModelEnabled,

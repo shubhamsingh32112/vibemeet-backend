@@ -673,7 +673,7 @@ export async function transitionCreatorPresence(
     status: nextRecord.state,
     changed: statusChanged ? '1' : '0',
   });
-  logInfo('creator_presence_transition_eval', {
+  logDebug('creator_presence_transition_eval', {
     firebaseUid,
     eventType,
     source: safeSource,
@@ -703,6 +703,20 @@ export async function transitionCreatorPresence(
   }
 
   if (statusChanged || eventType === 'RECOVERED' || eventType === 'RECONCILED') {
+    logInfo('creator_status_change', {
+      firebaseUid,
+      from: current.state,
+      to: nextRecord.state,
+      fromBase: current.base,
+      toBase: nextBase,
+      eventType,
+      source: safeSource,
+      redisEndpointMode: getRedisEndpointMode(),
+      version: nextRecord.version,
+      statusChanged,
+      activeCallId: activeCallId || null,
+      previousSource: current.source,
+    });
     logInfo('creator_presence_transition', {
       firebaseUid,
       eventType,
