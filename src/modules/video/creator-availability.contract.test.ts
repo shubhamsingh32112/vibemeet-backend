@@ -45,8 +45,31 @@ test('creator availability finalization verifies active-call key deletion', () =
 
 test('pre-call snapshot restoration preserves offline creators after call end', () => {
   const src = readFileSync(join(__dirname, 'creator-call-lock.service.ts'), 'utf8');
-  assert.ok(src.includes("snapshot === 'online' || snapshot === 'offline' || snapshot === 'on_call'"));
+  assert.ok(src.includes("snapshot === 'online' ? 'online' : 'offline'"));
   assert.ok(src.includes(": 'DISCONNECTED'"));
+  assert.ok(src.includes('Never restore on_call after call end'));
+  assert.ok(!src.includes("restoredStatus === 'on_call'"));
+  assert.ok(src.includes('clearCreatorActiveCallSlotIfStale'));
+});
+
+test('presence layer clears stale active-call slots on read and terminal transitions', () => {
+  const presenceSrc = readFileSync(
+    join(__dirname, '../availability/presence.service.ts'),
+    'utf8'
+  );
+  const slotSrc = readFileSync(
+    join(__dirname, '../availability/creator-active-call-slot.service.ts'),
+    'utf8'
+  );
+  assert.ok(presenceSrc.includes('clearCreatorActiveCallSlotIfStale'));
+  assert.ok(presenceSrc.includes('presence.read_creator_presence_snapshot'));
+  assert.ok(slotSrc.includes('isCreatorActiveCallSlotLive'));
+});
+
+test('call finalizer repairs presence when deduped or lock busy', () => {
+  const src = readFileSync(join(__dirname, 'call-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('repairCreatorPresenceAfterCallEnd'));
+  assert.ok(src.includes('Call finalization dedupe presence repair failed'));
 });
 
 test('reconciliation includes reverse cleanup with settled-age threshold guard', () => {

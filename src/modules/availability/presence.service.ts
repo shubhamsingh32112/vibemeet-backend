@@ -15,6 +15,7 @@ import {
 } from './creator-daily-online.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { logInfo, logWarning, logError, logDebug } from '../../utils/logger';
+import { clearCreatorActiveCallSlotIfStale } from './creator-active-call-slot.service';
 
 export type CreatorPresenceState = 'online' | 'on_call' | 'offline';
 type CreatorBaseAvailability = 'online' | 'offline';
@@ -214,7 +215,7 @@ function resolveLegacyTargetState(
 
 async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<CreatorPresenceSnapshot> {
   const redis = getRedis();
-  const [baseRaw, metaRaw, activeCallId] = await redis.mget(
+  const [baseRaw, metaRaw, activeCallIdRaw] = await redis.mget(
     availabilityKey(firebaseUid),
     creatorPresenceMetaKey(firebaseUid),
     activeCallByUserKey(firebaseUid)
@@ -222,7 +223,20 @@ async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<Creator
   const base = parseBaseAvailability(baseRaw);
   const parsedMeta = parsePresenceMeta(metaRaw);
   const meta = parsedMeta.meta;
-  const hasActiveCallState = Boolean(activeCallId);
+  let activeCallId = activeCallIdRaw;
+  let hasActiveCallState = Boolean(activeCallId);
+  if (hasActiveCallState && activeCallId) {
+    const slotClear = await clearCreatorActiveCallSlotIfStale(firebaseUid, {
+      source: 'presence.read_creator_presence_snapshot',
+    });
+    if (slotClear.cleared) {
+      activeCallId = null;
+      hasActiveCallState = false;
+      recordCallMetric('presence.read_path_stale_slot_cleared', 1, {
+        reason: slotClear.reason,
+      });
+    }
+  }
   const updatedAt = meta?.updatedAt ?? Date.now();
   const source = deriveRecordSource(base, hasActiveCallState, sanitizePresenceSource(meta?.source || ONLINE_SOURCE));
   const version = meta?.version ?? syntheticFallbackVersion(updatedAt);
@@ -524,6 +538,20 @@ export async function transitionCreatorPresence(
   const safeSource = sanitizePresenceSource(source);
   const current = await readCreatorPresenceSnapshot(firebaseUid);
   const nextBase = resolveTargetBaseAvailability(current.base, eventType);
+
+  const shouldReconcileActiveCallSlot =
+    eventType === 'CALL_ENDED' ||
+    eventType === 'DISCONNECTED' ||
+    eventType === 'FORCE_OFFLINE' ||
+    eventType === 'RECONCILED' ||
+    eventType === 'CONNECTED';
+  if (shouldReconcileActiveCallSlot) {
+    await clearCreatorActiveCallSlotIfStale(firebaseUid, {
+      source: safeSource,
+      force: eventType === 'FORCE_OFFLINE',
+    });
+  }
+
   const activeCallId = await redis.get(activeCallByUserKey(firebaseUid));
   const hasActiveCallState = Boolean(activeCallId);
   const nextState = derivePresenceState(nextBase, hasActiveCallState);

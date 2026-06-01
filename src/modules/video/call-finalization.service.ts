@@ -4,6 +4,9 @@ import { getRedis } from '../../config/redis';
 import { finalizeCallSession } from '../billing/billing-session-finalization.service';
 import { finalizeCreatorAvailabilityForCall, releaseCreatorCallLock } from './creator-call-lock.service';
 import { transitionCallStatus } from './call-state.service';
+import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
+import { transitionCreatorPresence } from '../availability/presence.service';
+import { resolveBillingRuntimeState } from '../billing/billing-runtime-resolver.service';
 import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 
@@ -33,6 +36,42 @@ let releaseCreatorCallLockForTests: ((creatorUserId: string) => Promise<void>) |
 let finalizeCreatorAvailabilityForCallForTests:
   | ((callId: string, creatorUserId: string) => Promise<void>)
   | null = null;
+
+async function repairCreatorPresenceAfterCallEnd(
+  io: Server,
+  callId: string,
+  source: string
+): Promise<void> {
+  const call = loadCallForFinalizationForTests
+    ? await loadCallForFinalizationForTests(callId)
+    : await Call.findOne({ callId });
+  const releaseFn = releaseCreatorCallLockForTests ?? releaseCreatorCallLock;
+  const finalizeAvailabilityFn =
+    finalizeCreatorAvailabilityForCallForTests ?? finalizeCreatorAvailabilityForCall;
+
+  if (call) {
+    await releaseFn(call.creatorUserId.toString());
+    await finalizeAvailabilityFn(callId, call.creatorUserId.toString());
+    return;
+  }
+
+  const runtime = await resolveBillingRuntimeState(callId);
+  const creatorFirebaseUid = runtime.session?.creatorFirebaseUid;
+  if (!creatorFirebaseUid) {
+    return;
+  }
+
+  await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+    endingCallId: callId,
+    source: `call.finalizer.${source}.repair_no_call_record`,
+  });
+  await transitionCreatorPresence(
+    io,
+    creatorFirebaseUid,
+    'CALL_ENDED',
+    `call.finalizer.${source}.repair_no_call_record`
+  );
+}
 
 export function setCallFinalizationHooksForTests(hooks: {
   loadCallForFinalization?: ((callId: string) => Promise<CallRecordLike>) | null;
@@ -64,12 +103,22 @@ export async function finalizeCallEnd(
   const alreadyDone = await redis.get(doneKey);
   if (alreadyDone) {
     recordCallMetric('call.finalize.deduped', 1, { source });
+    try {
+      await repairCreatorPresenceAfterCallEnd(io, callId, source);
+    } catch (repairErr) {
+      logError('Call finalization dedupe presence repair failed', repairErr, { callId, source });
+    }
     return { finalized: false, deduped: true };
   }
 
   const lockResult = await redis.set(lockKey, source, 'EX', FINALIZE_LOCK_TTL_SECONDS, 'NX');
   if (lockResult !== 'OK') {
     recordCallMetric('call.finalize.lock_busy', 1, { source });
+    try {
+      await repairCreatorPresenceAfterCallEnd(io, callId, source);
+    } catch (repairErr) {
+      logError('Call finalization lock_busy presence repair failed', repairErr, { callId, source });
+    }
     return { finalized: false, deduped: true };
   }
 

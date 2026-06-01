@@ -9,6 +9,7 @@ import {
   setRedisForTests,
 } from '../../config/redis';
 import { readCreatorPresenceState, transitionCreatorPresence } from '../availability/presence.service';
+import { setIsCreatorActiveCallSlotLiveResolverForTests } from '../availability/creator-active-call-slot.service';
 import { finalizeCreatorAvailabilityForCall, setCreatorFirebaseUidResolverForTests } from './creator-call-lock.service';
 import { finalizeCallEnd, setCallFinalizationHooksForTests } from './call-finalization.service';
 import { setIO } from '../../config/socket';
@@ -148,7 +149,8 @@ test('behavioral: finalizeCallEnd clears active slot and emits online creator:st
 
   const socket = createMockIo();
   setIO(socket.io as any);
-  await transitionCreatorPresence(socket.io as any, creatorFirebaseUid, 'CONNECTED', 'behavior.pre_finalize');
+  setIsCreatorActiveCallSlotLiveResolverForTests(async (slotId) => slotId === callId);
+  await transitionCreatorPresence(socket.io as any, creatorFirebaseUid, 'CALL_STARTED', 'behavior.pre_finalize');
   const before = await readCreatorPresenceState(creatorFirebaseUid);
   assert.equal(before.state, 'on_call', 'active slot must force on_call before finalization');
 
@@ -200,5 +202,6 @@ test('behavioral: finalizeCallEnd clears active slot and emits online creator:st
 
   setCallFinalizationHooksForTests({});
   setCreatorFirebaseUidResolverForTests(null);
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
   resetRedisForTests();
 });

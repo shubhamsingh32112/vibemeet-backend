@@ -30,6 +30,7 @@ import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
 import { emitToAdmin } from './admin.gateway';
 import { setCreatorAvailability } from '../availability/availability.gateway';
+import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
@@ -1778,6 +1779,10 @@ export const forceCreatorOffline = async (req: Request, res: Response): Promise<
 
     try {
       const io = getIO();
+      await clearCreatorActiveCallSlotIfStale(creatorUser.firebaseUid, {
+        force: true,
+        source: 'admin.forceCreatorOffline',
+      });
       await setCreatorAvailability(io, creatorUser.firebaseUid, 'offline');
     } catch (socketErr) {
       console.warn('⚠️ [ADMIN] Failed to broadcast availability:', socketErr);

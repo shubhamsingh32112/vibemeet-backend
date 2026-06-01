@@ -7,6 +7,7 @@ import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
 import { getIO } from '../../config/socket';
 import { transitionCreatorPresence } from '../availability/presence.service';
+import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
 import { featureFlags } from '../../config/feature-flags';
 
 /**
@@ -321,40 +322,46 @@ export async function finalizeCreatorAvailabilityForCall(
 
     const redis = getRedis();
     const activeCallKey = activeCallByUserKey(creatorFirebaseUid);
-    const activeCallId = await redis.get(activeCallKey);
+    const slotBeforeClear = await redis.get(activeCallKey);
     let activeCallKeyDeleted = false;
     let activeCallKeyExistsAfterDelete = false;
 
-    if (activeCallId && activeCallId !== callId) {
+    const slotClear = await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+      endingCallId: callId,
+      source: 'creator-call-lock.finalizeCreatorAvailabilityForCall',
+    });
+    activeCallKeyDeleted = slotClear.cleared;
+    if (slotClear.hadSlot) {
+      activeCallKeyExistsAfterDelete = Boolean(await redis.get(activeCallKey));
+    }
+
+    if (
+      slotBeforeClear &&
+      slotBeforeClear !== callId &&
+      !slotClear.cleared &&
+      slotClear.reason === 'slot_still_live'
+    ) {
       logInfo('Skipping availability restore due to newer active call', {
         callId,
         creatorUserId,
         creatorFirebaseUid,
-        activeCallId,
+        activeCallId: slotBeforeClear,
       });
       recordCallMetric('creator.restore.skipped_newer_call', 1, { callId });
       return;
     }
 
-    if (activeCallId === callId) {
-      await redis.del(activeCallKey);
-      activeCallKeyDeleted = true;
-      activeCallKeyExistsAfterDelete = Boolean(await redis.get(activeCallKey));
-    }
-
     const snapshot = await redis.get(precallSnapshotKey(callId, creatorFirebaseUid));
-    const restoredStatus = (snapshot === 'online' || snapshot === 'offline' || snapshot === 'on_call'
-      ? snapshot
-      : 'offline') as CreatorAvailability;
+    // Never restore on_call after call end — a stale snapshot would re-lock the creator as busy.
+    const restoredBase: CreatorAvailability =
+      snapshot === 'online' ? 'online' : 'offline';
 
     if (shouldEnforceAvailabilityWrites()) {
       const restoreEvent =
-        restoredStatus === 'online'
+        restoredBase === 'online'
           ? featureFlags.creatorPresenceUserModelEnabled
             ? 'CONNECTED'
             : 'CALL_ENDED'
-        : restoredStatus === 'on_call'
-          ? 'CALL_STARTED'
           : 'DISCONNECTED';
       await transitionCreatorPresence(
         getIO(),
@@ -365,17 +372,18 @@ export async function finalizeCreatorAvailabilityForCall(
       logInfo('Creator availability restore transition emitted', {
         callId,
         creatorUid: creatorFirebaseUid,
-        activeCallId,
+        activeCallId: slotBeforeClear,
         activeCallKeyDeleted,
         activeCallKeyExistsAfterDelete,
         snapshotStatus: snapshot,
         restoreEvent,
+        restoredBase,
       });
     }
     await redis.del(precallSnapshotKey(callId, creatorFirebaseUid));
     recordCallMetric(snapshot != null ? 'creator.restore.snapshot_used' : 'creator.restore.snapshot_missing', 1, {
       callId,
-      restoredStatus,
+      restoredStatus: restoredBase,
     });
 
     if (shouldEnforceAvailabilityWrites()) {
@@ -383,13 +391,13 @@ export async function finalizeCreatorAvailabilityForCall(
         const streamClient = getStreamClient();
         await streamClient.partialUpdateUser({
           id: creatorFirebaseUid,
-          set: { busy: restoredStatus === 'on_call' },
+          set: { busy: false },
         });
       } catch (streamError) {
         logError('Failed to clear Stream Chat busy state after call (non-critical)', streamError, {
           callId,
           creatorFirebaseUid,
-          restoredStatus,
+          restoredBase,
         });
       }
     }
@@ -398,11 +406,11 @@ export async function finalizeCreatorAvailabilityForCall(
       callId,
       creatorUserId,
       creatorFirebaseUid,
-      activeCallId,
+      activeCallId: slotBeforeClear,
       activeCallKeyDeleted,
       activeCallKeyExistsAfterDelete,
       snapshotStatus: snapshot,
-      restoredStatus,
+      restoredStatus: restoredBase,
       snapshotUsed: snapshot != null,
       mode: ORCHESTRATOR_MODE,
     });
