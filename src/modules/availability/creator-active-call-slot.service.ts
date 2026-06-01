@@ -72,14 +72,14 @@ export async function isCreatorActiveCallSlotLive(
 
 /**
  * Remove `active:call:user:{uid}` when it does not represent a live call.
- * Used at call end, presence transitions, admin force-offline, and read-path self-heal.
+ * Used at call end, presence transitions, admin reset-presence, and read-path self-heal.
  */
 export async function clearCreatorActiveCallSlotIfStale(
   creatorFirebaseUid: string,
   options: {
     source: string;
     endingCallId?: string;
-    /** Always delete the slot (admin force-offline). */
+    /** Always delete the slot (admin reset-presence). */
     force?: boolean;
   }
 ): Promise<ClearCreatorActiveCallSlotResult> {

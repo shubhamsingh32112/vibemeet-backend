@@ -29,8 +29,10 @@ import {
 import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
 import { emitToAdmin } from './admin.gateway';
-import { setCreatorAvailability } from '../availability/availability.gateway';
 import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
+import { readCreatorPresenceState, transitionCreatorPresence } from '../availability/presence.service';
+import { releaseCreatorCallLock } from '../video/creator-call-lock.service';
+import { getStreamClient } from '../../config/stream';
 import { AdminActionLog } from './admin-action-log.model';
 import { bumpCreatorProfileRevisionForAdmin, notifyCreatorProfileChannels } from '../creator/creator.controller';
 import { serializeCreatorGallery } from '../images/creator-image-helpers';
@@ -1755,9 +1757,12 @@ export const adjustUserCoins = async (req: Request, res: Response): Promise<void
 };
 
 /**
- * POST /admin/creators/:id/force-offline
+ * POST /admin/creators/:id/reset-presence
+ *
+ * Clears stale on-call locks and re-broadcasts presence from the creator's availability toggle.
+ * Does not change Mongo `isOnline` — use this when a host is stuck "On call" after a call ended.
  */
-export const forceCreatorOffline = async (req: Request, res: Response): Promise<void> => {
+export const resetCreatorPresence = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
@@ -1769,40 +1774,63 @@ export const forceCreatorOffline = async (req: Request, res: Response): Promise<
     }
 
     const creatorUser = await User.findById(creator.userId);
-    if (!creatorUser) {
+    if (!creatorUser?.firebaseUid) {
       res.status(404).json({ success: false, error: 'Creator user not found' });
       return;
     }
 
-    creator.isOnline = false;
-    await creator.save();
+    const creatorFirebaseUid = creatorUser.firebaseUid;
+    const io = getIO();
+
+    await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+      force: true,
+      source: 'admin.resetCreatorPresence',
+    });
+    await releaseCreatorCallLock(creator.userId.toString());
+
+    const restoreEvent = creator.isOnline === true ? 'RECONCILED' : 'DISCONNECTED';
+    await transitionCreatorPresence(io, creatorFirebaseUid, restoreEvent, 'admin.resetCreatorPresence');
 
     try {
-      const io = getIO();
-      await clearCreatorActiveCallSlotIfStale(creatorUser.firebaseUid, {
-        force: true,
-        source: 'admin.forceCreatorOffline',
+      const streamClient = getStreamClient();
+      await streamClient.partialUpdateUser({
+        id: creatorFirebaseUid,
+        set: { busy: false },
       });
-      await setCreatorAvailability(io, creatorUser.firebaseUid, 'offline');
-    } catch (socketErr) {
-      console.warn('⚠️ [ADMIN] Failed to broadcast availability:', socketErr);
+    } catch (streamErr) {
+      console.warn('⚠️ [ADMIN] Failed to clear Stream busy (non-critical):', streamErr);
     }
 
-    const adminUser = await getAdminUser(req);
-    await logAdminAction(adminUser, 'FORCE_OFFLINE', 'creator', creator._id.toString(), 'Admin forced creator offline', {
-      creatorName: creator.name,
-      creatorUserId: creator.userId.toString(),
-    });
+    const presence = await readCreatorPresenceState(creatorFirebaseUid);
 
-    // Invalidate caches
+    const adminUser = await getAdminUser(req);
+    await logAdminAction(
+      adminUser,
+      'RESET_PRESENCE',
+      'creator',
+      creator._id.toString(),
+      'Admin reset creator presence after stuck on-call',
+      {
+        creatorName: creator.name,
+        creatorUserId: creator.userId.toString(),
+        toggleOnline: creator.isOnline,
+        presenceStatus: presence.state,
+      }
+    );
+
     await invalidateAdminCaches('overview', 'creators_performance');
 
     res.json({
       success: true,
-      data: { creatorId: creator._id.toString(), name: creator.name, isOnline: false },
+      data: {
+        creatorId: creator._id.toString(),
+        name: creator.name,
+        isOnline: creator.isOnline === true,
+        presenceStatus: presence.state,
+      },
     });
   } catch (error) {
-    console.error('❌ [ADMIN] Force offline error:', error);
+    console.error('❌ [ADMIN] Reset presence error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

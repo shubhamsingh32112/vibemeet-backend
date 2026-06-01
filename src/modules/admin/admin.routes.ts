@@ -43,7 +43,7 @@ import {
   getCallsAdmin,
   getSystemHealth,
   adjustUserCoins,
-  forceCreatorOffline,
+  resetCreatorPresence,
   refundCall,
   getRefundPreview,
   getAdminActionLog,
@@ -164,7 +164,7 @@ router.patch('/support/:id/assign', assignTicket);
 
 // ── Admin Actions ───────────────────────────────────────────────────────
 router.post('/users/:id/adjust-coins', adjustUserCoins);
-router.post('/creators/:id/force-offline', forceCreatorOffline);
+router.post('/creators/:id/reset-presence', resetCreatorPresence);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
 router.post('/creators/:id/transfer-agency', postAdminTransferCreatorToAgency);
 router.post('/creators/:id/avatar/commit', adminCreatorAvatarCommit);
