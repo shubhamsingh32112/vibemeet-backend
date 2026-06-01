@@ -270,3 +270,30 @@ export const BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS = Math.min(
 export function isUnifiedBillingFinalizerEnabled(): boolean {
   return process.env.BILLING_UNIFIED_FINALIZER_ENABLED !== 'false';
 }
+
+/** Aligns with billing watchdog chain-heal: sequence stall without a healthy tick. */
+export function getBillingChainHealStallMs(): number {
+  const raw = process.env.BILLING_WATCHDOG_CHAIN_HEAL_STALL_MS;
+  if (raw === undefined || raw === '') return 7000;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 7000;
+  return Math.min(120_000, Math.max(1500, n));
+}
+
+/** Short reschedule when cycle lock or runtime ownership defers a tick. */
+export function getBillingCycleLockDeferMs(): number {
+  const raw = process.env.BILLING_CYCLE_LOCK_DEFER_MS;
+  if (raw === undefined || raw === '') return 150;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 150;
+  return Math.min(2000, Math.max(50, n));
+}
+
+/** Minimum interval between mandatory billing:update keepalives during ACTIVE sessions. */
+export function getBillingEmitKeepaliveMs(): number {
+  const raw = process.env.BILLING_EMIT_KEEPALIVE_MS;
+  if (raw === undefined || raw === '') return 2500;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 2500;
+  return Math.min(30_000, Math.max(1000, n));
+}

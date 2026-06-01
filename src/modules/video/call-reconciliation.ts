@@ -14,12 +14,12 @@ import {
   activeCallByUserKey,
   ACTIVE_CALL_BY_USER_PREFIX,
   ACTIVE_CALL_BY_USER_TTL,
-  callSessionKey,
   availabilityKey,
   AVAILABILITY_KEY_PREFIX,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
-import { logInfo, logError } from '../../utils/logger';
+import { logInfo, logError, logDebug } from '../../utils/logger';
+import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { getIO } from '../../config/socket';
@@ -92,6 +92,10 @@ const RECON_UNSETTLED_LOOKBACK_MS =
 
 function isTerminalLifecycleState(state: string | undefined): boolean {
   return state === 'SETTLED' || state === 'FAILED' || state === 'FAILED_RECOVERY_SETTLEMENT';
+}
+
+function isCallDbRecordStillLive(status: string): boolean {
+  return status === 'ringing' || status === 'accepted';
 }
 
 function parseUidFromActiveSlotKey(key: string): string | null {
@@ -428,13 +432,9 @@ export async function repairStaleActiveCallSlotsOnStartup(): Promise<void> {
 function activeCallFilterAfter(
   lastId: mongoose.Types.ObjectId | null
 ): mongoose.FilterQuery<typeof Call> {
-  const recentCutoff = new Date(Date.now() - RECON_UNSETTLED_LOOKBACK_MS);
-  const unsettledRecent = {
-    isSettled: { $ne: true },
-    updatedAt: { $gte: recentCutoff },
-  };
+  // Only ringing/accepted are live calls. Ended-but-unsettled rows must not re-mark creators on_call.
   const base: mongoose.FilterQuery<typeof Call> = {
-    $or: [{ status: { $in: ['ringing', 'accepted'] } }, unsettledRecent],
+    status: { $in: ['ringing', 'accepted'] },
   };
   if (!lastId) {
     return base;
@@ -496,15 +496,17 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
           }
           const creatorFirebaseUid = creatorUser.firebaseUid;
           const slotKey = activeCallByUserKey(creatorFirebaseUid);
-          const slotCallId = await redis.get(slotKey);
-          const sessionForSlot = slotCallId ? await redis.get(callSessionKey(slotCallId)) : null;
-
-          if (slotCallId === call.callId && !sessionForSlot) {
-            await redis.del(slotKey).catch(() => {});
+          const slotClear = await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+            endingCallId: call.callId,
+            source: 'call-reconciliation.cleanupSettledCreatorBusyDrift',
+          });
+          if (slotClear.cleared) {
             const keyStillExists = Boolean(await redis.get(slotKey));
             logInfo('Reconciliation cleared stale active call slot for settled call', {
               callId: call.callId,
               creatorFirebaseUid,
+              slotCallId: slotClear.slotCallId,
+              clearReason: slotClear.reason,
               activeCallKeyDeleted: true,
               activeCallKeyExistsAfterDelete: keyStillExists,
             });
@@ -518,7 +520,7 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
           const hasOtherLiveCall = await Call.exists({
             creatorUserId: call.creatorUserId,
             _id: { $ne: call._id },
-            $or: [{ status: { $in: ['ringing', 'accepted'] } }, { isSettled: { $ne: true } }],
+            status: { $in: ['ringing', 'accepted'] },
           });
           if (hasOtherLiveCall) {
             continue;
@@ -545,7 +547,7 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
               recordCallMetric('call_reconciliation.settled_restore_skipped', 1, {
                 reason: 'base_offline',
               });
-              logInfo('Reconciliation skipped settled restore (creator base offline)', {
+              logDebug('Reconciliation skipped settled restore (creator base offline)', {
                 callId: call.callId,
                 creatorFirebaseUid,
                 baseAvailability: baseAvailability || 'offline',
@@ -634,10 +636,14 @@ async function cleanupOrphanActiveCallSlots(): Promise<void> {
         if (!firebaseUid) continue;
         const slotCallId = await redis.get(key);
         if (!slotCallId) continue;
-        const sessionForSlot = await redis.get(callSessionKey(slotCallId));
-        if (sessionForSlot) continue;
 
-        await redis.del(key).catch(() => {});
+        const slotClear = await clearCreatorActiveCallSlotIfStale(firebaseUid, {
+          source: 'call-reconciliation.cleanupOrphanActiveCallSlots',
+        });
+        if (!slotClear.cleared) {
+          continue;
+        }
+
         const currentStatus = await getAvailability(firebaseUid);
         if (currentStatus === 'on_call') {
           await transitionCreatorPresence(
@@ -650,7 +656,8 @@ async function cleanupOrphanActiveCallSlots(): Promise<void> {
         cleared += 1;
         logInfo('Reconciliation cleared orphan active call slot', {
           creatorFirebaseUid: firebaseUid,
-          slotCallId,
+          slotCallId: slotClear.slotCallId,
+          clearReason: slotClear.reason,
           previousStatus: currentStatus,
         });
       }
@@ -726,6 +733,9 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
 
       for (const call of activeCalls) {
         try {
+          if (!isCallDbRecordStillLive(call.status)) {
+            continue;
+          }
           const creatorUser = await User.findById(call.creatorUserId);
           if (creatorUser?.firebaseUid) {
             const currentStatus = await getAvailability(creatorUser.firebaseUid);
@@ -817,9 +827,10 @@ async function reconcileActiveCallsWithLock(): Promise<void> {
 async function reconcileActiveCalls(): Promise<void> {
   try {
     const runStartedAt = Date.now();
-    await ensureCreatorsWithActiveCallsAreBusy();
+    // Clear stale slots and settled busy drift before re-marking creators on_call for live calls.
     await cleanupOrphanActiveCallSlots();
     await cleanupSettledCreatorBusyDrift();
+    await ensureCreatorsWithActiveCallsAreBusy();
     await repairMissingCanonicalPresenceMeta();
 
     const apiKey = process.env.STREAM_API_KEY;

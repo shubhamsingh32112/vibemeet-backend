@@ -17,7 +17,10 @@ import {
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
-import { finalizeCallEnd } from '../video/call-finalization.service';
+import {
+  finalizeCallEnd,
+  restoreCreatorPresenceForEndedCall,
+} from '../video/call-finalization.service';
 import {
   resolveActiveRuntimeStateForUser,
   resolveBillingRuntimeState,
@@ -326,6 +329,18 @@ export function setupBillingGateway(io: Server): void {
             callId: data.callId,
             source: 'socket_call_ended',
           });
+          try {
+            await restoreCreatorPresenceForEndedCall(
+              io,
+              data.callId,
+              'socket_call_ended.deferred_presence'
+            );
+          } catch (presenceErr) {
+            logError('Deferred call:ended presence restore failed', presenceErr, {
+              callId: data.callId,
+              firebaseUid,
+            });
+          }
           return;
         }
 
@@ -804,6 +819,13 @@ export function setupBillingGateway(io: Server): void {
               callId,
               firebaseUid,
               phase,
+            });
+            const { recoverBillingScheduleForCall } = await import('./billing-recovery');
+            await recoverBillingScheduleForCall(callId, 'reconciliation').catch((recoverErr) => {
+              logError('billing_sync_autoheal schedule recovery failed', recoverErr, { callId });
+            });
+            await billingService.processBillingTick(io, callId).catch((tickErr) => {
+              logError('billing_sync_autoheal process tick failed', tickErr, { callId });
             });
             const replayed = await ensureBillingStartedReplayFreshness(io, callId, 'sync_warning_autoheal', {
               force: true,

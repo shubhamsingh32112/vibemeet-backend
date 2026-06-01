@@ -7,13 +7,16 @@ import {
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
 import { billingService, type BillingSessionStartSource } from './billing.service';
-import { logInfo, logDebug } from '../../utils/logger';
+import { logInfo, logDebug, logError } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
 import { closeTerminationRetryQueue } from './billing-termination.queue';
 import { isCallActive } from './billing-active-call.service';
 import { setupBillingGateway } from './billing-socket.gateway';
-import { finalizeCallEnd } from '../video/call-finalization.service';
+import {
+  finalizeCallEnd,
+  restoreCreatorPresenceForEndedCall,
+} from '../video/call-finalization.service';
 import {
   startGlobalBillingProcessor,
   stopGlobalBillingProcessor,
@@ -129,6 +132,11 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
       callId,
       source: 'http_settle_call',
     });
+    try {
+      await restoreCreatorPresenceForEndedCall(io, callId, 'http_settle_call.deferred_presence');
+    } catch (presenceErr) {
+      logError('Deferred HTTP call-ended presence restore failed', presenceErr, { callId });
+    }
     return;
   }
 

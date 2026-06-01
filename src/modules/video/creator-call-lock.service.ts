@@ -93,6 +93,38 @@ const lifecycleDedupeKey = (callId: string, phase: string): string =>
 const precallSnapshotKey = (callId: string, creatorFirebaseUid: string): string =>
   `${PRECALL_SNAPSHOT_PREFIX}${callId}:${creatorFirebaseUid}`;
 
+type CreatorBaseAvailability = 'online' | 'offline';
+
+/**
+ * Map pre-call snapshot (+ Mongo availability toggle) to post-call base availability.
+ * Never restore on_call after call end — only online or offline base.
+ */
+async function resolveRestoredBaseAfterCall(
+  snapshot: string | null,
+  creatorUserId: string
+): Promise<CreatorBaseAvailability> {
+  if (snapshot === 'offline') {
+    return 'offline';
+  }
+  if (snapshot === 'online' || snapshot === 'on_call') {
+    return 'online';
+  }
+
+  try {
+    const creator = await Creator.findOne({ userId: creatorUserId });
+    if (creator?.isOnline === true) {
+      logInfo('Post-call restore using Mongo availability toggle (snapshot missing)', {
+        creatorUserId,
+        toggleOnline: true,
+      });
+      return 'online';
+    }
+  } catch {
+    // Fall through to offline default.
+  }
+  return 'offline';
+}
+
 let resolveCreatorFirebaseUidForTests:
   | ((creatorUserId: string) => Promise<string | null>)
   | null = null;
@@ -352,9 +384,7 @@ export async function finalizeCreatorAvailabilityForCall(
     }
 
     const snapshot = await redis.get(precallSnapshotKey(callId, creatorFirebaseUid));
-    // Never restore on_call after call end — a stale snapshot would re-lock the creator as busy.
-    const restoredBase: CreatorAvailability =
-      snapshot === 'online' ? 'online' : 'offline';
+    const restoredBase = await resolveRestoredBaseAfterCall(snapshot, creatorUserId);
 
     if (shouldEnforceAvailabilityWrites()) {
       const restoreEvent =

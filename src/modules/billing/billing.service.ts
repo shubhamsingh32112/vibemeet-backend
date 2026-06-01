@@ -48,6 +48,8 @@ import {
   getBillingCheckpointMinDeltaMicros,
   getBillingEmitIntervalMs,
   getBillingRedisBackpressureMs,
+  getBillingChainHealStallMs,
+  getBillingEmitKeepaliveMs,
 } from './billing.constants';
 import {
   advanceBillingCheckpointCursor,
@@ -72,7 +74,7 @@ import {
   emitBillingStartedFromSnapshot,
   emitBillingUpdateFromSnapshot,
 } from './billing-emitter.service';
-import { getBillingInstanceId } from './billing-instance-id';
+import { billingInstanceIdsMatch, getBillingInstanceId } from './billing-instance-id';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
@@ -128,14 +130,41 @@ async function releaseBillingCycleLock(
   }
 }
 
+function parseRuntimeOwnerLockValue(lockValue: string): { instanceId: string; epoch: number } | null {
+  const trimmed = String(lockValue || '').trim();
+  if (!trimmed) return null;
+  const lastColon = trimmed.lastIndexOf(':');
+  if (lastColon <= 0) return null;
+  const epoch = parseInt(trimmed.slice(lastColon + 1), 10);
+  if (!Number.isFinite(epoch) || epoch < 1) return null;
+  return { instanceId: trimmed.slice(0, lastColon), epoch };
+}
+
+function billingSequenceStallMs(session: CallSession, nowMs: number): number {
+  const lastAdvance = Math.max(
+    Number(session.lastSequenceAdvanceAt) || 0,
+    Number(session.lastHealthyTickAt) || 0
+  );
+  if (lastAdvance > 0) {
+    return Math.max(0, nowMs - lastAdvance);
+  }
+  const startTime = Number(session.startTime) || 0;
+  if (startTime > 0) {
+    return Math.max(0, nowMs - startTime);
+  }
+  return 0;
+}
+
 async function ensureRuntimeOwnership(
   redis: ReturnType<typeof getRedis>,
   session: CallSession,
-  callId: string
+  callId: string,
+  nowMs: number = Date.now()
 ): Promise<boolean> {
   const ownerLockKey = session.leaderLock || `${BILLING_RUNTIME_OWNER_LOCK_PREFIX}${callId}`;
   const runtimeEpoch = Math.max(1, Number(session.runtimeEpoch) || 1);
-  const ownerValue = `${getBillingInstanceId()}:${runtimeEpoch}`;
+  const workerInstanceId = getBillingInstanceId();
+  const ownerValue = `${workerInstanceId}:${runtimeEpoch}`;
   const existing = await redis.get(ownerLockKey);
   if (!existing) {
     const claimed = await redis.set(
@@ -146,7 +175,7 @@ async function ensureRuntimeOwnership(
       'NX'
     );
     if (claimed === 'OK') {
-      session.instanceId = getBillingInstanceId();
+      session.instanceId = workerInstanceId;
       session.runtimeEpoch = runtimeEpoch;
       session.leaderLock = ownerLockKey;
       return true;
@@ -158,19 +187,113 @@ async function ensureRuntimeOwnership(
     return false;
   }
   if (current !== ownerValue) {
+    const stallMs = billingSequenceStallMs(session, nowMs);
+    const chainHealStallMs = getBillingChainHealStallMs();
+    const parsedOwner = parseRuntimeOwnerLockValue(current);
+    const ownerInstanceMismatch =
+      parsedOwner != null && !billingInstanceIdsMatch(parsedOwner.instanceId, workerInstanceId);
+
+    if (stallMs > chainHealStallMs || ownerInstanceMismatch) {
+      const nextEpoch = Math.max(runtimeEpoch, (parsedOwner?.epoch ?? runtimeEpoch) + 1);
+      await redis.del(ownerLockKey).catch(() => 0);
+      session.runtimeEpoch = nextEpoch;
+      const takeoverValue = `${workerInstanceId}:${nextEpoch}`;
+      const claimed = await redis.set(
+        ownerLockKey,
+        takeoverValue,
+        'EX',
+        BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS,
+        'NX'
+      );
+      if (claimed === 'OK') {
+        session.instanceId = workerInstanceId;
+        session.leaderLock = ownerLockKey;
+        recordBillingMetric('billing_runtime_owner_takeover', 1, {
+          callId,
+          previousOwner: current,
+          workerInstanceId,
+          stallMs: String(stallMs),
+        });
+        logWarning('billing_runtime_owner_takeover', {
+          callId,
+          previousOwner: current,
+          workerInstanceId,
+          stallMs,
+          nextEpoch,
+        });
+        return true;
+      }
+    }
+
     recordBillingMetric('billing_runtime_epoch_reject_stale_worker', 1, {
       callId,
       currentOwner: current,
-      workerInstanceId: getBillingInstanceId(),
+      workerInstanceId,
     });
     return false;
   }
   await redis
     .set(ownerLockKey, ownerValue, 'EX', BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS, 'XX')
     .catch(() => {});
-  session.instanceId = getBillingInstanceId();
+  session.instanceId = workerInstanceId;
   session.runtimeEpoch = runtimeEpoch;
   session.leaderLock = ownerLockKey;
+  return true;
+}
+
+/**
+ * After deploy/restart: reclaim runtime owner lock when it still references a dead process.
+ */
+export async function reclaimStaleRuntimeOwnershipOnStartup(
+  callId: string,
+  session: CallSession
+): Promise<boolean> {
+  const redis = getRedis();
+  const ownerLockKey = session.leaderLock || `${BILLING_RUNTIME_OWNER_LOCK_PREFIX}${callId}`;
+  const current = await redis.get(ownerLockKey);
+  if (!current) {
+    return false;
+  }
+  const parsed = parseRuntimeOwnerLockValue(current);
+  const workerInstanceId = getBillingInstanceId();
+  if (parsed && billingInstanceIdsMatch(parsed.instanceId, workerInstanceId)) {
+    return false;
+  }
+
+  const nextEpoch = Math.max(1, Number(session.runtimeEpoch) || 1, (parsed?.epoch ?? 0) + 1);
+  await redis.del(ownerLockKey).catch(() => 0);
+  session.runtimeEpoch = nextEpoch;
+  session.instanceId = workerInstanceId;
+  session.leaderLock = ownerLockKey;
+  const takeoverValue = `${workerInstanceId}:${nextEpoch}`;
+  const claimed = await redis.set(
+    ownerLockKey,
+    takeoverValue,
+    'EX',
+    BILLING_RUNTIME_OWNER_LOCK_TTL_SECONDS,
+    'NX'
+  );
+  if (claimed !== 'OK') {
+    return false;
+  }
+
+  await redis.set(callSessionKey(callId), JSON.stringify(session), 'KEEPTTL').catch(() => {});
+  recordBillingMetric('billing_runtime_owner_startup_reclaim', 1, {
+    callId,
+    previousOwner: current,
+    workerInstanceId,
+  });
+  logInfo('billing_runtime_owner_startup_reclaim', {
+    callId,
+    previousOwner: current,
+    workerInstanceId,
+    nextEpoch,
+  });
+
+  const { scheduleBillingJob } = await import('./billing.queue');
+  await scheduleBillingJob(callId, 0).catch((err) => {
+    logError('Startup runtime reclaim schedule failed', err, { callId });
+  });
   return true;
 }
 
@@ -476,6 +599,7 @@ export async function getBillingWallLagMs(callId: string): Promise<number | null
 
 export type BillingTickResult =
   | 'tick_ok'
+  | 'tick_deferred'
   | 'stop_no_session'
   | 'stop_needs_settlement';
 
@@ -1938,7 +2062,8 @@ export class BillingService {
     const lockToken = randomUUID();
     const lockOk = await redis.set(lockKey, lockToken, 'PX', BILLING_CYCLE_LOCK_TTL_MS, 'NX');
     if (lockOk !== 'OK') {
-      return 'tick_ok';
+      recordBillingMetric('billing_cycle_lock_deferred', 1, { callId });
+      return 'tick_deferred';
     }
 
     // Most ticks complete well before heartbeat interval. Start the interval lazily to avoid per-tick timer churn.
@@ -2037,7 +2162,8 @@ export class BillingService {
       let balanceMicros = introMicros + walletMicros;
       normalizeV4SessionFields(session);
       const introPromoBilling = session.introPromoActive === true;
-      const ownershipOk = await ensureRuntimeOwnership(redis, session, callId);
+      const now = Date.now();
+      const ownershipOk = await ensureRuntimeOwnership(redis, session, callId, now);
       if (!ownershipOk) {
         logWarning('billing_runtime_owner_rejected_tick', {
           callId,
@@ -2047,7 +2173,7 @@ export class BillingService {
           ownerInstanceId: session.instanceId,
           workerInstanceId: getBillingInstanceId(),
         });
-        return 'tick_ok';
+        return 'tick_deferred';
       }
 
       if (
@@ -2080,7 +2206,6 @@ export class BillingService {
         return 'stop_needs_settlement';
       }
 
-      const now = Date.now();
       if (session.expectedNextTickAtMs && Number.isFinite(session.expectedNextTickAtMs)) {
         const tickDriftMs = Math.max(0, now - session.expectedNextTickAtMs);
         recordBillingMetric('tick_drift_ms', tickDriftMs, { callId });
@@ -2441,6 +2566,49 @@ export class BillingService {
           callId,
           reason: activeStage >= 3 ? 'stage3_severe' : redisWriteMs > backpressureMs ? 'redis_backpressure' : 'throttled',
         });
+        const keepaliveIntervalMs = Math.max(emitIntervalMs, getBillingEmitKeepaliveMs());
+        const keepaliveDue =
+          session.lifecycleState === 'ACTIVE' &&
+          nowMs - (session.lastEmitAtMs || 0) >= keepaliveIntervalMs;
+        if (keepaliveDue) {
+          session.lastEmitAtMs = nowMs;
+          session.lastSocketEmitAt = nowMs;
+          recordBillingMetric('emit_update_keepalive', 1, { callId });
+          await persistCallSession(redis, callId, session);
+          await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
+          emitSoon(() => {
+            emitBillingUpdateFromSnapshot(
+              io,
+              session.userFirebaseUid,
+              session.creatorFirebaseUid,
+              {
+                callId: billingSnapshot.callId,
+                billingSequence: billingSnapshot.billingSequence,
+                lifecycleState: billingSnapshot.lifecycleState,
+                coins: billingSnapshot.coins,
+                coinsExact: billingSnapshot.coinsExact,
+                elapsedSeconds: billingSnapshot.elapsedSeconds,
+                remainingSeconds: billingSnapshot.remainingSeconds,
+                durationLimit: billingSnapshot.durationLimit,
+                serverTimestamp: nowMs,
+                callStartTime: session.startTime,
+                introPromoActive: billingSnapshot.introPromoActive,
+                pricePerSecondMicros: billingSnapshot.pricePerSecondMicros,
+              },
+              {
+                callId: billingSnapshot.callId,
+                billingSequence: billingSnapshot.billingSequence,
+                lifecycleState: billingSnapshot.lifecycleState,
+                earnings: billingSnapshot.earnings,
+                elapsedSeconds: billingSnapshot.elapsedSeconds,
+                durationLimit: billingSnapshot.durationLimit,
+                serverTimestamp: nowMs,
+                callStartTime: session.startTime,
+                pricePerSecondMicros: billingSnapshot.creatorEarningsPerSecondMicros,
+              }
+            );
+          });
+        }
       }
 
       if (activeRemain < pricePerSecondMicros) {

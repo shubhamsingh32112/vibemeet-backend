@@ -5,7 +5,11 @@
 
 import { Queue, Worker } from 'bullmq';
 import Redis from 'ioredis';
-import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
+import {
+  BILLING_PROCESS_INTERVAL_MS,
+  getBillingChainHealStallMs,
+  getBillingCycleLockDeferMs,
+} from './billing.constants';
 import { getIO } from '../../config/socket';
 import { billingService } from './billing.service';
 import { logError, logInfo, logWarning } from '../../utils/logger';
@@ -177,6 +181,38 @@ async function hasHealthyQueuedCycleJob(
   return { healthy: false };
 }
 
+async function isBillingSequenceStalled(callId: string): Promise<boolean> {
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) {
+    return false;
+  }
+  try {
+    const session = JSON.parse(sessionRaw) as {
+      lifecycleState?: string;
+      lastSequenceAdvanceAt?: number;
+      lastHealthyTickAt?: number;
+      startTime?: number;
+    };
+    const lifecycle = String(session.lifecycleState || 'ACTIVE');
+    if (lifecycle !== 'ACTIVE' && lifecycle !== 'RECOVERING' && lifecycle !== 'STARTING') {
+      return false;
+    }
+    const now = Date.now();
+    const lastAdvance = Math.max(
+      Number(session.lastSequenceAdvanceAt) || 0,
+      Number(session.lastHealthyTickAt) || 0
+    );
+    const stallMs =
+      lastAdvance > 0
+        ? Math.max(0, now - lastAdvance)
+        : Math.max(0, now - (Number(session.startTime) || now));
+    return stallMs > getBillingChainHealStallMs();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when no healthy delayed/waiting/active cycle job exists for this call (e.g. lost after crash).
  */
@@ -184,6 +220,17 @@ export async function needsBillingCycleReschedule(callId: string): Promise<boole
   const redis = getRedis();
   const q = getQueue();
   const gateKey = billingCycleScheduleGateKey(callId);
+
+  if (await isBillingSequenceStalled(callId)) {
+    await Promise.all([
+      redis.del(gateKey).catch(() => 0),
+      redis.del(`${BILLING_CYCLE_HEARTBEAT_PREFIX}${callId}`).catch(() => 0),
+    ]);
+    recordBillingMetric('billing_cycle_zombie_sequence_stall', 1, { callId });
+    recordBillingMetric('billing_cycle_missing_recreated', 1, { callId, reason: 'sequence_stall' });
+    return true;
+  }
+
   const [gateRaw, heartbeatRaw] = await Promise.all([
     redis.get(gateKey),
     redis.get(`${BILLING_CYCLE_HEARTBEAT_PREFIX}${callId}`),
@@ -385,7 +432,6 @@ export function startBillingBullWorker(): Worker {
       await redis.del(billingCycleScheduleGateKey(callId)).catch(() => 0);
       const queueLagMs = Math.max(0, Date.now() - (job.timestamp + (job.opts.delay || 0)));
       recordBillingMetric('bullmq_queue_lag_ms', queueLagMs, { callId });
-      await touchBillingCycleHeartbeat(callId);
       updateBackpressureStage({ queueLagMs });
       let result: Awaited<ReturnType<typeof billingService.processBillingTick>>;
       try {
@@ -410,6 +456,11 @@ export function startBillingBullWorker(): Worker {
         await touchBillingCycleHeartbeat(callId);
         await scheduleNextBillingCycleAfterTickOk(callId, queueLagMs).catch((e) =>
           logError('BullMQ schedule next failed', e, { callId })
+        );
+      } else if (result === 'tick_deferred') {
+        recordBillingMetric('bullmq_tick_deferred', 1, { callId });
+        await scheduleBillingJob(callId, getBillingCycleLockDeferMs()).catch((e) =>
+          logError('BullMQ schedule deferred tick failed', e, { callId })
         );
       } else if (result === 'stop_needs_settlement') {
         const { finalizeCallSession } = await import('./billing-session-finalization.service');

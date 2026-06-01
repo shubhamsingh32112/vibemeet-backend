@@ -23,6 +23,7 @@ import {
   billingSettlementRetryPayloadKey,
   billingSettlementRetryDedupKey,
   finalizeInflightKey,
+  isInvalidBillingCallId,
   billingWatchdogAttemptsKey,
   billingWatchdogCooldownKey,
   billingRecoveryDeadLetterKey,
@@ -865,6 +866,11 @@ export async function finalizeCallSession(
   params: FinalizeCallSessionParams
 ): Promise<FinalizeResult> {
   const { callId, reason, source } = params;
+  if (isInvalidBillingCallId(callId)) {
+    logWarning('billing_finalize_rejected_invalid_call_id', { callId, source, reason });
+    recordBillingMetric('billing_finalize_invalid_call_id', 1, { callId, source });
+    return { status: 'duplicate', callId };
+  }
   const finalizeAttemptId = crypto.randomUUID();
   const recoveryOwnerInstanceId = getBillingInstanceId();
   const reconciliationWorkerId =

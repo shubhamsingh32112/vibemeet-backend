@@ -19,6 +19,7 @@ import {
   activeCallByUserKey,
   settledCallKey,
   SETTLED_CALL_TTL,
+  isInvalidBillingCallId,
 } from '../../config/redis';
 import { User, IUser } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -219,6 +220,11 @@ export async function settleCall(
   opts?: SettleCallFromFinalizerOptions
 ): Promise<SettlePersistResult | void> {
   const fromFinalizer = opts?._fromFinalizer === true;
+  if (isInvalidBillingCallId(callId)) {
+    logWarning('settlement rejected invalid tombstone callId suffix', { callId });
+    recordBillingMetric('settlement_invalid_call_id', 1, { callId });
+    return;
+  }
   const redis = getRedis();
   const settleStartedAt = Date.now();
 

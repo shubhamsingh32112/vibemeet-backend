@@ -37,7 +37,11 @@ let finalizeCreatorAvailabilityForCallForTests:
   | ((callId: string, creatorUserId: string) => Promise<void>)
   | null = null;
 
-async function repairCreatorPresenceAfterCallEnd(
+/**
+ * Restore creator Redis/Socket presence after a call ends without running billing settlement.
+ * Used when call:ended is deferred (session not ready) and by finalizeCallEnd dedupe repair.
+ */
+export async function restoreCreatorPresenceForEndedCall(
   io: Server,
   callId: string,
   source: string
@@ -104,7 +108,7 @@ export async function finalizeCallEnd(
   if (alreadyDone) {
     recordCallMetric('call.finalize.deduped', 1, { source });
     try {
-      await repairCreatorPresenceAfterCallEnd(io, callId, source);
+      await restoreCreatorPresenceForEndedCall(io, callId, source);
     } catch (repairErr) {
       logError('Call finalization dedupe presence repair failed', repairErr, { callId, source });
     }
@@ -115,7 +119,7 @@ export async function finalizeCallEnd(
   if (lockResult !== 'OK') {
     recordCallMetric('call.finalize.lock_busy', 1, { source });
     try {
-      await repairCreatorPresenceAfterCallEnd(io, callId, source);
+      await restoreCreatorPresenceForEndedCall(io, callId, source);
     } catch (repairErr) {
       logError('Call finalization lock_busy presence repair failed', repairErr, { callId, source });
     }

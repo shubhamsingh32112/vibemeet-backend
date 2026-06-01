@@ -45,7 +45,10 @@ test('creator availability finalization verifies active-call key deletion', () =
 
 test('pre-call snapshot restoration preserves offline creators after call end', () => {
   const src = readFileSync(join(__dirname, 'creator-call-lock.service.ts'), 'utf8');
-  assert.ok(src.includes("snapshot === 'online' ? 'online' : 'offline'"));
+  assert.ok(src.includes('resolveRestoredBaseAfterCall'));
+  assert.ok(src.includes("snapshot === 'offline'"));
+  assert.ok(src.includes("snapshot === 'online' || snapshot === 'on_call'"));
+  assert.ok(src.includes('creator?.isOnline === true'));
   assert.ok(src.includes(": 'DISCONNECTED'"));
   assert.ok(src.includes('Never restore on_call after call end'));
   assert.ok(!src.includes("restoredStatus === 'on_call'"));
@@ -68,7 +71,7 @@ test('presence layer clears stale active-call slots on read and terminal transit
 
 test('call finalizer repairs presence when deduped or lock busy', () => {
   const src = readFileSync(join(__dirname, 'call-finalization.service.ts'), 'utf8');
-  assert.ok(src.includes('repairCreatorPresenceAfterCallEnd'));
+  assert.ok(src.includes('restoreCreatorPresenceForEndedCall'));
   assert.ok(src.includes('Call finalization dedupe presence repair failed'));
 });
 
@@ -84,6 +87,20 @@ test('startup reconciliation run includes settled busy-drift cleanup pass', () =
   const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
   assert.ok(src.includes('reconcileActiveCallsWithLock().catch'));
   assert.ok(src.includes('await cleanupSettledCreatorBusyDrift();'));
+});
+
+test('reconciliation does not re-busy creators for ended-but-unsettled calls', () => {
+  const src = readFileSync(join(__dirname, 'call-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('isCallDbRecordStillLive'));
+  assert.ok(src.includes("status: { $in: ['ringing', 'accepted'] }"));
+  assert.ok(
+    !src.includes("isSettled: { $ne: true }"),
+    'unsettled ended calls must not be treated as active for on_call reconciliation'
+  );
+  const reconcileIdx = src.indexOf('async function reconcileActiveCalls');
+  const ensureIdx = src.indexOf('await ensureCreatorsWithActiveCallsAreBusy');
+  const cleanupIdx = src.indexOf('await cleanupOrphanActiveCallSlots');
+  assert.ok(reconcileIdx >= 0 && ensureIdx > cleanupIdx, 'cleanup must run before ensureCreatorsWithActiveCallsAreBusy');
 });
 
 test('startup slot repair scans active-call keys and clears stale slots', () => {

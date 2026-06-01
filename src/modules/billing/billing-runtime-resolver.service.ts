@@ -3,6 +3,7 @@ import {
   CALL_SESSION_PREFIX,
   callSessionKey,
   callSessionTerminalKey,
+  parseCallIdFromSessionRedisKey,
   activeCallByUserKey,
   callUserIntroMicrosKey,
   callUserWalletMicrosKey,
@@ -336,7 +337,7 @@ export async function resolveActiveRuntimeStateForUser(
     for (const key of keys) {
       if (scanned >= scanLimit) break;
       scanned += 1;
-      const callId = key.replace(CALL_SESSION_PREFIX, '');
+      const callId = parseCallIdFromSessionRedisKey(key);
       if (!callId) continue;
       const runtime = await resolveBillingRuntimeState(callId);
       const session = runtime.session;

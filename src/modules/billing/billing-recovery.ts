@@ -6,7 +6,7 @@
  */
 
 import { Server } from 'socket.io';
-import { getRedis, CALL_SESSION_PREFIX } from '../../config/redis';
+import { getRedis, CALL_SESSION_PREFIX, parseCallIdFromSessionRedisKey } from '../../config/redis';
 import {
   isBullmqBillingEnabled,
   needsBillingCycleReschedule,
@@ -16,6 +16,10 @@ import { BILLING_PROCESS_INTERVAL_MS } from './billing.constants';
 import { logInfo, logError, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
+import {
+  reclaimStaleRuntimeOwnershipOnStartup,
+  type CallSession,
+} from './billing.service';
 
 function readStartupEnsureMax(): number {
   const raw = parseInt(process.env.BILLING_STARTUP_ENSURE_CYCLE_MAX || '200', 10);
@@ -77,7 +81,7 @@ export async function verifyStartupRecovery(_io: Server): Promise<void> {
       cursor = scanResult[0];
       const keys = scanResult[1] || [];
       for (const key of keys) {
-        const callId = key.replace(CALL_SESSION_PREFIX, '');
+        const callId = parseCallIdFromSessionRedisKey(key);
         if (callId) seen.add(callId);
       }
     } while (cursor !== '0' && seen.size < 2000);
@@ -109,7 +113,20 @@ export async function verifyStartupRecovery(_io: Server): Promise<void> {
         const resolved = await resolveBillingRuntimeState(callId);
         if (resolved.session) {
           validCalls++;
-          if (
+          const reclaimed = await reclaimStaleRuntimeOwnershipOnStartup(
+            callId,
+            resolved.session as CallSession
+          ).catch((err) => {
+            logError('Startup: runtime ownership reclaim failed', err, { callId });
+            return false;
+          });
+          if (reclaimed) {
+            bullmqCyclesEnsured++;
+            recordBillingMetric('recovery_bullmq_cycle_ensured', 1, {
+              callId,
+              reason: 'runtime_reclaim',
+            });
+          } else if (
             isBullmqBillingEnabled() &&
             bullmqCyclesEnsured < ensureMax &&
             (await needsBillingCycleReschedule(callId))

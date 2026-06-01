@@ -215,10 +215,40 @@ export const CALL_USER_INTRO_MICROS_PREFIX = 'call:user_intro_micros:';
 export const CALL_USER_WALLET_MICROS_PREFIX = 'call:user_wallet_micros:';
 export const CALL_CREATOR_EARNINGS_PREFIX = 'call:creator_earnings:';
 
+export const CALL_SESSION_TERMINAL_SUFFIX = ':terminal';
+
 export const callSessionKey = (callId: string): string =>
   `${CALL_SESSION_PREFIX}${callId}`;
 export const callSessionTerminalKey = (callId: string): string =>
-  `${callSessionKey(callId)}:terminal`;
+  `${callSessionKey(callId)}${CALL_SESSION_TERMINAL_SUFFIX}`;
+
+/** True for settled tombstone keys (`call:session:{callId}:terminal`), not live sessions. */
+export function isCallSessionTerminalRedisKey(redisKey: string): boolean {
+  return (
+    redisKey.startsWith(CALL_SESSION_PREFIX) &&
+    redisKey.endsWith(CALL_SESSION_TERMINAL_SUFFIX) &&
+    redisKey.length > CALL_SESSION_PREFIX.length + CALL_SESSION_TERMINAL_SUFFIX.length
+  );
+}
+
+/**
+ * Parse call id from a `call:session:*` Redis key. Returns null for tombstone keys.
+ */
+export function parseCallIdFromSessionRedisKey(redisKey: string): string | null {
+  if (!redisKey.startsWith(CALL_SESSION_PREFIX)) {
+    return null;
+  }
+  if (isCallSessionTerminalRedisKey(redisKey)) {
+    return null;
+  }
+  const callId = redisKey.slice(CALL_SESSION_PREFIX.length);
+  return callId.length > 0 ? callId : null;
+}
+
+/** Reject call ids accidentally derived from tombstone Redis keys. */
+export function isInvalidBillingCallId(callId: string): boolean {
+  return !callId || callId.endsWith(CALL_SESSION_TERMINAL_SUFFIX);
+}
 
 /** @deprecated Legacy merged balance; prefer callUserIntroMicrosKey + callUserWalletMicrosKey. */
 export const callUserCoinsKey = (callId: string): string =>

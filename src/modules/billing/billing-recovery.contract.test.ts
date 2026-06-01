@@ -72,6 +72,14 @@ test('deferred call end tracks queue and flush telemetry', () => {
   assert.ok(socketSrc.includes('requestedAtMs'));
 });
 
+test('deferred call:ended restores creator presence before billing session is ready', () => {
+  const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
+  const httpSrc = readFileSync(join(__dirname, 'billing.gateway.ts'), 'utf8');
+  assert.ok(socketSrc.includes('restoreCreatorPresenceForEndedCall'));
+  assert.ok(socketSrc.includes('socket_call_ended.deferred_presence'));
+  assert.ok(httpSrc.includes('http_settle_call.deferred_presence'));
+});
+
 test('runtime missing recover path emits dedicated metric', () => {
   const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
   assert.ok(socketSrc.includes('recovery_runtime_missing'));
@@ -103,4 +111,28 @@ test('billing runtime ownership and heartbeat fields are present for watchdog gu
   assert.ok(serviceSrc.includes('ensureRuntimeOwnership'));
   assert.ok(watchdogSrc.includes('hasRecentHealthyEvidence'));
   assert.ok(watchdogSrc.includes('billing_watchdog_skip_recent_sequence_advance'));
+});
+
+test('runtime ownership takeover and deferred ticks are implemented', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  const queueSrc = readFileSync(join(__dirname, 'billing.queue.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('billing_runtime_owner_takeover'));
+  assert.ok(serviceSrc.includes('reclaimStaleRuntimeOwnershipOnStartup'));
+  assert.ok(serviceSrc.includes("'tick_deferred'"));
+  assert.ok(serviceSrc.includes('billing_cycle_lock_deferred'));
+  assert.ok(serviceSrc.includes('emit_update_keepalive'));
+  assert.ok(queueSrc.includes('billing_cycle_zombie_sequence_stall'));
+  assert.ok(queueSrc.includes('isBillingSequenceStalled'));
+  assert.ok(queueSrc.includes("result === 'tick_deferred'"));
+});
+
+test('sync-warning autoheal reschedules billing ticks', () => {
+  const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
+  assert.ok(socketSrc.includes('recoverBillingScheduleForCall'));
+  assert.ok(socketSrc.includes('processBillingTick(io, callId)'));
+});
+
+test('startup recovery reclaims stale runtime ownership', () => {
+  const recoverySrc = readFileSync(join(__dirname, 'billing-recovery.ts'), 'utf8');
+  assert.ok(recoverySrc.includes('reclaimStaleRuntimeOwnershipOnStartup'));
 });

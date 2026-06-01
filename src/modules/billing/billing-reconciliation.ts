@@ -17,6 +17,7 @@ import {
   BILLING_RECONCILIATION_LOCK_KEY,
   RECONCILIATION_LOCK_TTL_MS,
   CALL_SESSION_PREFIX,
+  parseCallIdFromSessionRedisKey,
   BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY,
   billingBalanceMismatchRepairPayloadKey,
 } from '../../config/redis';
@@ -309,7 +310,7 @@ async function runBullmqBillingWatchdog(startedAt: number): Promise<void> {
     cursor = scanResult[0];
     const keys = scanResult[1] || [];
     for (const key of keys) {
-      const callId = key.replace(CALL_SESSION_PREFIX, '');
+      const callId = parseCallIdFromSessionRedisKey(key);
       if (callId) seen.add(callId);
       if (seen.size >= BULLMQ_STALE_MAX_KEYS) break;
     }
@@ -404,7 +405,7 @@ async function runSettlementOrphanRepair(io: Server, startedAt: number): Promise
     cursor = next;
     for (const key of keys) {
       if (Date.now() - startedAt > RUN_BUDGET_MS) break;
-      const callId = key.replace(CALL_SESSION_PREFIX, '');
+      const callId = parseCallIdFromSessionRedisKey(key);
       if (!callId) continue;
       scanned++;
       const hasHistory = await CallHistory.findOne({ callId, ownerRole: 'user' }).lean();
@@ -521,13 +522,21 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
         
         const tickResult = await billingService.processBillingTick(io, callId);
 
-        if (tickResult === 'tick_ok') {
+        if (tickResult === 'tick_ok' || tickResult === 'tick_deferred') {
           if (isBullmqBillingEnabled()) {
             const sessionStillThere = await redis.get(callSessionKey(callId));
             if (sessionStillThere) {
-              await scheduleNextBillingCycleAfterTickOk(callId, 0).catch((e) =>
-                logError('DLQ: schedule next BullMQ cycle failed', e, { callId })
-              );
+              if (tickResult === 'tick_ok') {
+                await scheduleNextBillingCycleAfterTickOk(callId, 0).catch((e) =>
+                  logError('DLQ: schedule next BullMQ cycle failed', e, { callId })
+                );
+              } else {
+                const { scheduleBillingJob } = await import('./billing.queue');
+                const { getBillingCycleLockDeferMs } = await import('./billing.constants');
+                await scheduleBillingJob(callId, getBillingCycleLockDeferMs()).catch((e) =>
+                  logError('DLQ: schedule deferred BullMQ cycle failed', e, { callId })
+                );
+              }
             }
           } else {
             const sessionRaw = await redis.get(callSessionKey(callId));
