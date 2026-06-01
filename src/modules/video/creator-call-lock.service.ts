@@ -1,7 +1,7 @@
 import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
 import { getStreamClient } from '../../config/stream';
-import { getAvailability, type CreatorAvailability } from '../availability/availability.service';
+import { getAvailability } from '../availability/availability.service';
 import { getRedis, activeCallByUserKey } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
