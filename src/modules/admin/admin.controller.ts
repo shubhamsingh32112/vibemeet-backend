@@ -14,6 +14,13 @@ import {
 import { getCurrentChatQuotaPeriodStart } from '../chat/chat-quota-period.util';
 import { CREATOR_TASKS, getDailyPeriodBounds } from '../creator/creator-tasks.config';
 import {
+  computeAvgEarningsPerMinute,
+  computeEarnDeviationPct,
+  CREATOR_BILLABLE_CALL_MATCH,
+  expectedCreatorEarningsPerMinute,
+  round2,
+} from '../creator/creator-earnings-stats';
+import {
   getRedis,
   adminCacheKey,
   ADMIN_CACHE_TTL,
@@ -474,6 +481,7 @@ export const getAdminCreatorDetail = async (req: Request, res: Response): Promis
 
 async function computeCreatorsPerformance() {
   const thirtyDaysAgo = daysAgo(30);
+  const { periodStart, periodEnd } = getDailyPeriodBounds();
 
   const creators = await Creator.find({}).lean();
   const userIds = creators.map((c) => c.userId);
@@ -507,9 +515,15 @@ async function computeCreatorsPerformance() {
     })
   );
 
-  // All-time call stats per creator
+  // All-time call stats per creator (billable calls only — matches creator dashboard)
   const callStatsPerCreator = await CallHistory.aggregate([
-    { $match: { ownerRole: 'creator', ownerUserId: { $in: userIds } } },
+    {
+      $match: {
+        ownerRole: 'creator',
+        ownerUserId: { $in: userIds },
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
     {
       $group: {
         _id: '$ownerUserId',
@@ -523,9 +537,16 @@ async function computeCreatorsPerformance() {
   ]);
   const callMap = new Map(callStatsPerCreator.map((c: any) => [c._id.toString(), c]));
 
-  // 30d call stats per creator
+  // 30d call stats per creator (billable only)
   const callStats30d = await CallHistory.aggregate([
-    { $match: { ownerRole: 'creator', ownerUserId: { $in: userIds }, createdAt: { $gte: thirtyDaysAgo } } },
+    {
+      $match: {
+        ownerRole: 'creator',
+        ownerUserId: { $in: userIds },
+        createdAt: { $gte: thirtyDaysAgo },
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
     {
       $group: {
         _id: '$ownerUserId',
@@ -537,18 +558,38 @@ async function computeCreatorsPerformance() {
   ]);
   const call30dMap = new Map(callStats30d.map((c: any) => [c._id.toString(), c]));
 
-  // Task progress per creator
-  const taskProgress = await CreatorTaskProgress.aggregate([
-    { $match: { creatorUserId: { $in: userIds } } },
+  // Task period minutes + claims (current daily period — matches creator tasks UI)
+  const periodMinutesAgg = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerRole: 'creator',
+        ownerUserId: { $in: userIds },
+        createdAt: { $gte: periodStart, $lt: periodEnd },
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
     {
       $group: {
-        _id: '$creatorUserId',
-        tasksCompleted: { $sum: { $cond: [{ $ne: ['$completedAt', null] }, 1, 0] } },
-        tasksClaimed: { $sum: { $cond: [{ $ne: ['$claimedAt', null] }, 1, 0] } },
+        _id: '$ownerUserId',
+        periodMinutes: { $sum: { $divide: ['$durationSeconds', 60] } },
       },
     },
   ]);
-  const taskMap = new Map(taskProgress.map((t: any) => [t._id.toString(), t]));
+  const periodMinutesMap = new Map(
+    periodMinutesAgg.map((r: any) => [r._id.toString(), r.periodMinutes as number])
+  );
+
+  const taskProgressCurrent = await CreatorTaskProgress.find({
+    creatorUserId: { $in: userIds },
+    periodStart,
+  }).lean();
+  const taskClaimedByCreator = new Map<string, Set<string>>();
+  for (const rec of taskProgressCurrent) {
+    const uid = rec.creatorUserId.toString();
+    if (!rec.claimedAt) continue;
+    if (!taskClaimedByCreator.has(uid)) taskClaimedByCreator.set(uid, new Set());
+    taskClaimedByCreator.get(uid)!.add(rec.taskKey);
+  }
 
   // ── Abuse signals (30d) ─────────────────────────────────────────────
   // Per-creator: short call %, refund count, forced-end count (user-side 0-duration)
@@ -558,7 +599,23 @@ async function computeCreatorsPerformance() {
       $group: {
         _id: '$ownerUserId',
         total: { $sum: 1 },
-        shortCalls: { $sum: { $cond: [{ $lt: ['$durationSeconds', 20] }, 1, 0] } },
+        billableCalls: {
+          $sum: { $cond: [{ $gt: ['$durationSeconds', 0] }, 1, 0] },
+        },
+        shortCalls: {
+          $sum: {
+            $cond: [
+              {
+                $and: [
+                  { $gt: ['$durationSeconds', 0] },
+                  { $lt: ['$durationSeconds', 20] },
+                ],
+              },
+              1,
+              0,
+            ],
+          },
+        },
         zeroDuration: { $sum: { $cond: [{ $eq: ['$durationSeconds', 0] }, 1, 0] } },
       },
     },
@@ -605,22 +662,38 @@ async function computeCreatorsPerformance() {
     const user = userMap.get(userId);
     const calls = callMap.get(userId) || { totalCalls: 0, totalDurationSec: 0, totalEarned: 0, avgDurationSec: 0, lastCallAt: null };
     const c30d = call30dMap.get(userId) || { calls30d: 0, minutes30d: 0, earned30d: 0 };
-    const tasks = taskMap.get(userId) || { tasksCompleted: 0, tasksClaimed: 0 };
-    const abuse = abuseMap.get(userId) || { total: 0, shortCalls: 0, zeroDuration: 0 };
+    const periodMinutes = periodMinutesMap.get(userId) ?? 0;
+    let tasksCompleted = 0;
+    let tasksClaimed = 0;
+    const claimedKeys = taskClaimedByCreator.get(userId);
+    for (const taskDef of CREATOR_TASKS) {
+      if (periodMinutes >= taskDef.thresholdMinutes) tasksCompleted += 1;
+      if (claimedKeys?.has(taskDef.key)) tasksClaimed += 1;
+    }
+    const abuse = abuseMap.get(userId) || {
+      total: 0,
+      billableCalls: 0,
+      shortCalls: 0,
+      zeroDuration: 0,
+    };
 
-    const shortCallPct = abuse.total > 0
-      ? Math.round((abuse.shortCalls / abuse.total) * 10000) / 100
+    const shortCallDenom = abuse.billableCalls > 0 ? abuse.billableCalls : 0;
+    const shortCallPct = shortCallDenom > 0
+      ? Math.round((abuse.shortCalls / shortCallDenom) * 10000) / 100
       : 0;
     const refundCount = refundCountByCreator.get(userId) || 0;
     const refundRate = abuse.total > 0
       ? Math.round((refundCount / abuse.total) * 10000) / 100
       : 0;
-    const earningsPerMinute = calls.totalDurationSec > 0
-      ? Math.round((calls.totalEarned / (calls.totalDurationSec / 60)) * 100) / 100
-      : 0;
-    const earnDeviation = creator.price > 0 && earningsPerMinute > 0
-      ? Math.round(((earningsPerMinute - creator.price) / creator.price) * 10000) / 100
-      : 0;
+    const avgEarningsPerMinute = computeAvgEarningsPerMinute(
+      calls.totalEarned,
+      calls.totalDurationSec
+    );
+    const currentEarningsPerMinute = expectedCreatorEarningsPerMinute(creator.price);
+    const earnDeviation = computeEarnDeviationPct(
+      avgEarningsPerMinute,
+      currentEarningsPerMinute
+    );
 
     // Flag if (shortCallPct > 30% AND refunds > 0) OR earnDeviation significantly off
     const isFlagged =
@@ -650,17 +723,20 @@ async function computeCreatorsPerformance() {
       coins: user?.coins ?? 0,
       createdAt: creator.createdAt,
       totalCalls: calls.totalCalls,
-      totalMinutes: Math.round((calls.totalDurationSec / 60) * 100) / 100,
+      totalMinutes: round2(calls.totalDurationSec / 60),
       totalEarned: calls.totalEarned,
-      avgCallDurationSec: Math.round((calls.avgDurationSec || 0) * 100) / 100,
+      avgCallDurationSec: round2(calls.avgDurationSec || 0),
       lastCallAt: calls.lastCallAt,
       calls30d: c30d.calls30d,
-      minutes30d: Math.round((c30d.minutes30d / 60) * 100) / 100,
+      minutes30d: round2(c30d.minutes30d / 60),
       earned30d: c30d.earned30d,
       tasksTotal: CREATOR_TASKS.length,
-      tasksCompleted: tasks.tasksCompleted,
-      tasksClaimed: tasks.tasksClaimed,
-      earningsPerMinute,
+      tasksCompleted,
+      tasksClaimed,
+      avgEarningsPerMinute,
+      currentEarningsPerMinute,
+      /** @deprecated Use avgEarningsPerMinute — kept for older admin builds */
+      earningsPerMinute: avgEarningsPerMinute,
       // ── Abuse signals ──
       abuseSignals: {
         shortCallPct,
@@ -1383,12 +1459,26 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
       : [];
     const refundedCallIds = new Set(existingRefunds.map((r) => r.callId));
 
+    const creatorSideRecords =
+      callIds.length > 0
+        ? await CallHistory.find({
+            callId: { $in: callIds },
+            ownerRole: 'creator',
+          })
+            .select('callId coinsEarned durationSeconds')
+            .lean()
+        : [];
+    const creatorEarnByCallId = new Map(
+      creatorSideRecords.map((r) => [r.callId, r.coinsEarned] as const)
+    );
+
     res.json({
       success: true,
       data: {
         calls: calls.map((c) => {
           const owner = userLookup.get(c.ownerUserId.toString());
           const other = userLookup.get(c.otherUserId.toString());
+          const creatorCoinsEarned = creatorEarnByCallId.get(c.callId) ?? 0;
           return {
             callId: c.callId,
             ownerUserId: c.ownerUserId.toString(),
@@ -1403,6 +1493,7 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
               : `${c.durationSeconds}s`,
             coinsDeducted: c.coinsDeducted,
             coinsEarned: c.coinsEarned,
+            creatorCoinsEarned,
             createdAt: c.createdAt,
             isZeroDuration: c.durationSeconds === 0,
             isVeryShort: c.durationSeconds > 0 && c.durationSeconds < 10,
