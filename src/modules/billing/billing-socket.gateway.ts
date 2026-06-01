@@ -31,6 +31,8 @@ import {
   emitBillingRecoverStateFromSnapshot,
   emitBillingRecoverStateResponse,
 } from './billing-emitter.service';
+import { healActiveCallBilling } from './billing-heal.service';
+import { logBillingHealth, logBillingHealthWarn } from './billing-health-log';
 import { randomUUID } from 'crypto';
 
 const RECOVERY_DEBOUNCE_MS = Math.min(
@@ -539,14 +541,39 @@ export function setupBillingGateway(io: Server): void {
         }
 
         const runtimeForRecovery = resolvedRuntime as ResolvedBillingRuntime;
-        if (runtimeForRecovery.terminalSnapshot) {
-          const terminalEntry = buildTerminalRecoverEntry(runtimeForRecovery.terminalSnapshot);
+        let runtimeToEmit = runtimeForRecovery;
+
+        if (runtimeToEmit.terminalSnapshot) {
+          const slotStillActive =
+            activeRuntime.source === 'slot' && activeRuntime.callId === callId;
+          let participantStillInCall = false;
+          if (callId) {
+            participantStillInCall = await isCallActiveForParticipant(redis, {
+              callId,
+              participantFirebaseUid: firebaseUid,
+            });
+          }
+          if (slotStillActive || participantStillInCall) {
+            logBillingHealthWarn('TERMINAL_BLOCKED_ACTIVE_SLOT', {
+              callId,
+              firebaseUid,
+              recoveryRequestId,
+              slotStillActive,
+              participantStillInCall,
+            });
+            await healActiveCallBilling(io, callId, 'recovery_terminal_active_call');
+            runtimeToEmit = await resolveBillingRuntimeState(callId);
+          }
+        }
+
+        if (runtimeToEmit.terminalSnapshot) {
+          const terminalEntry = buildTerminalRecoverEntry(runtimeToEmit.terminalSnapshot);
           logInfo('billing_state_recovery_terminal', {
             firebaseUid,
             recoveryRequestId,
             clientRecoveryRequestId,
             callId,
-            runtimeSource: runtimeForRecovery.source,
+            runtimeSource: runtimeToEmit.source,
           });
           emitBillingRecoverStateResponse(socket, {
             success: true,
@@ -554,7 +581,7 @@ export function setupBillingGateway(io: Server): void {
             recoveryRequestId,
             clientRecoveryRequestId,
             generatedAtMs: Date.now(),
-            runtimeSource: runtimeForRecovery.source,
+            runtimeSource: runtimeToEmit.source,
             status: 'terminal_settled',
             reason: 'resolved_from_terminal_tombstone',
             recoveryOutcome: 'recover_success',
@@ -562,7 +589,7 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const recoverySession = runtimeForRecovery.session;
+        const recoverySession = runtimeToEmit.session;
         const recoveryLifecycleState = String(recoverySession?.lifecycleState || 'ACTIVE');
         const isSessionParticipant =
           recoverySession != null &&
@@ -592,7 +619,7 @@ export function setupBillingGateway(io: Server): void {
             clientRecoveryRequestId,
             callId,
             lookupSource: activeRuntime.source,
-            runtimeSource: runtimeForRecovery.source,
+            runtimeSource: runtimeToEmit.source,
             lifecycleState: recoveryLifecycleState,
             reason,
           });
@@ -605,7 +632,7 @@ export function setupBillingGateway(io: Server): void {
             recoveryRequestId,
             clientRecoveryRequestId,
             generatedAtMs: Date.now(),
-            runtimeSource: runtimeForRecovery.source,
+            runtimeSource: runtimeToEmit.source,
             status: 'no_active_call',
             reason,
             recoveryOutcome: 'recover_empty',
@@ -613,9 +640,15 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        const runtime = runtimeForRecovery.session
-          ? runtimeForRecovery
-          : await resolveBillingRuntimeState(callId);
+        logBillingHealth('RECOVERY_HEAL_START', {
+          callId,
+          firebaseUid,
+          recoveryRequestId,
+          source: 'recovery_pre_emit',
+        });
+        await healActiveCallBilling(io, callId, 'recovery_pre_emit');
+
+        const runtime = await resolveBillingRuntimeState(callId);
         if (!runtime.session) {
           recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {
             reason: 'runtime_missing_after_resolve',
@@ -820,18 +853,19 @@ export function setupBillingGateway(io: Server): void {
               firebaseUid,
               phase,
             });
-            const { recoverBillingScheduleForCall } = await import('./billing-recovery');
-            await recoverBillingScheduleForCall(callId, 'reconciliation').catch((recoverErr) => {
-              logError('billing_sync_autoheal schedule recovery failed', recoverErr, { callId });
-            });
-            await billingService.processBillingTick(io, callId).catch((tickErr) => {
-              logError('billing_sync_autoheal process tick failed', tickErr, { callId });
-            });
-            const replayed = await ensureBillingStartedReplayFreshness(io, callId, 'sync_warning_autoheal', {
-              force: true,
-              startIngress: 'socket',
-              replayReason: `sync_warning_${phase}`,
-            });
+            const healResult = await healActiveCallBilling(io, callId, `sync_warning_${phase}`).catch(
+              (healErr) => {
+                logError('billing_sync_autoheal heal failed', healErr, { callId });
+                return { healed: false, hadSession: false };
+              }
+            );
+            const replayed = healResult.hadSession
+              ? await ensureBillingStartedReplayFreshness(io, callId, 'sync_warning_autoheal', {
+                  force: true,
+                  startIngress: 'socket',
+                  replayReason: `sync_warning_${phase}`,
+                })
+              : false;
             if (replayed) {
               recordBillingMetric('billing_sync_autoheal_success', 1, {
                 callId,

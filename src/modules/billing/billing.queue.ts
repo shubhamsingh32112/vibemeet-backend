@@ -18,6 +18,7 @@ import { getRedis, callSessionKey, isRedisConfigured } from '../../config/redis'
 import { isBullmqBillingEnabled } from './billing-driver';
 import { updateBackpressureStage } from './billing-backpressure';
 import { featureFlags } from '../../config/feature-flags';
+import { logBillingHealth } from './billing-health-log';
 
 export { isBullmqBillingEnabled };
 
@@ -459,6 +460,7 @@ export function startBillingBullWorker(): Worker {
         );
       } else if (result === 'tick_deferred') {
         recordBillingMetric('bullmq_tick_deferred', 1, { callId });
+        logBillingHealth('TICK_DEFERRED', { callId, source: 'bullmq_worker' });
         await scheduleBillingJob(callId, getBillingCycleLockDeferMs()).catch((e) =>
           logError('BullMQ schedule deferred tick failed', e, { callId })
         );

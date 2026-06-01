@@ -75,6 +75,11 @@ import {
   emitBillingUpdateFromSnapshot,
 } from './billing-emitter.service';
 import { billingInstanceIdsMatch, getBillingInstanceId } from './billing-instance-id';
+import {
+  billingHealthFieldsFromSession,
+  logBillingHealth,
+  logBillingHealthDebug,
+} from './billing-health-log';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
@@ -667,6 +672,83 @@ function emitSoon(fn: () => void): void {
       logError('billing emitSoon failed', e, {});
     }
   });
+}
+
+export async function maybeEmitBillingKeepaliveIfDue(
+  io: Server,
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  session: CallSession,
+  balanceMicros: number,
+  introPromoBilling: boolean,
+  earningsMicros: number,
+  trigger: 'short_delta' | 'zero_deduct' | 'recovery'
+): Promise<boolean> {
+  const lifecycle = String(session.lifecycleState || '');
+  if (lifecycle !== 'ACTIVE' && lifecycle !== 'RECOVERING' && lifecycle !== 'STARTING') {
+    return false;
+  }
+
+  const pricePerSecondMicros =
+    session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
+  const emitIntervalMs = getEmitIntervalForStage(getBillingEmitIntervalMs());
+  const keepaliveIntervalMs = Math.max(emitIntervalMs, getBillingEmitKeepaliveMs());
+  const nowMs = Date.now();
+  const lastEmit = Number(session.lastEmitAtMs ?? session.lastSocketEmitAt) || 0;
+  const emitStallMs = lastEmit > 0 ? Math.max(0, nowMs - lastEmit) : keepaliveIntervalMs;
+  if (emitStallMs < keepaliveIntervalMs) {
+    return false;
+  }
+
+  const effectiveLimit = session.effectiveDurationLimitSeconds;
+  const remainingSeconds =
+    pricePerSecondMicros > 0 ? Math.floor(balanceMicros / pricePerSecondMicros) : 0;
+  const roundedEarningsDisplay = Math.round((earningsMicros / COIN_MICROS) * 100) / 100;
+  const serverTimestamp = nowMs;
+
+  session.lastEmitAtMs = nowMs;
+  session.lastSocketEmitAt = nowMs;
+  recordBillingMetric('emit_update_keepalive', 1, { callId, trigger });
+  logBillingHealth('EMIT_KEEPALIVE', {
+    ...billingHealthFieldsFromSession(session),
+    trigger,
+    emitStallMs,
+  });
+  await persistCallSession(redis, callId, session);
+  await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
+  emitSoon(() => {
+    emitBillingUpdateFromSnapshot(
+      io,
+      session.userFirebaseUid,
+      session.creatorFirebaseUid,
+      {
+        callId,
+        billingSequence: session.billingSequence,
+        lifecycleState: session.lifecycleState,
+        coins: microsToWholeCoinsFloor(balanceMicros),
+        coinsExact: balanceMicros / COIN_MICROS,
+        elapsedSeconds: session.elapsedSeconds,
+        remainingSeconds,
+        durationLimit: effectiveLimit,
+        serverTimestamp,
+        callStartTime: session.startTime,
+        introPromoActive: introPromoBilling,
+        pricePerSecondMicros: session.pricePerSecondMicros,
+      },
+      {
+        callId,
+        billingSequence: session.billingSequence,
+        lifecycleState: session.lifecycleState,
+        earnings: roundedEarningsDisplay,
+        elapsedSeconds: session.elapsedSeconds,
+        durationLimit: effectiveLimit,
+        serverTimestamp,
+        callStartTime: session.startTime,
+        pricePerSecondMicros: session.creatorEarningsPerSecondMicros,
+      }
+    );
+  });
+  return true;
 }
 
 export function normalizeV4SessionFields(session: CallSession): void {
@@ -2220,6 +2302,20 @@ export class BillingService {
       const deltaMs = Math.min(rawWallLagMs, MAX_BILLING_DELTA_MS);
 
       if (deltaMs < MIN_BILLING_DELTA_MS) {
+        await maybeEmitBillingKeepaliveIfDue(
+          io,
+          redis,
+          callId,
+          session,
+          balanceMicros,
+          introPromoBilling,
+          earningsMicros,
+          'short_delta'
+        );
+        logBillingHealthDebug('TICK_SHORT_DELTA', {
+          ...billingHealthFieldsFromSession(session),
+          deltaMs,
+        });
         return 'tick_ok';
       }
 
@@ -2266,6 +2362,16 @@ export class BillingService {
           });
           return 'stop_needs_settlement';
         }
+        await maybeEmitBillingKeepaliveIfDue(
+          io,
+          redis,
+          callId,
+          session,
+          balanceMicros,
+          introPromoBilling,
+          earningsMicros,
+          'zero_deduct'
+        );
         return 'tick_ok';
       }
 
@@ -2560,55 +2666,34 @@ export class BillingService {
             }
           );
         });
+        logBillingHealth('EMIT_SENT', {
+          ...billingHealthFieldsFromSession(session),
+          trigger: 'deduct_path',
+        });
         recordBillingMetric('emit_update_sent', 1, { callId });
       } else {
+        const suppressReason =
+          activeStage >= 3 ? 'stage3_severe' : redisWriteMs > backpressureMs ? 'redis_backpressure' : 'throttled';
         recordBillingMetric('emit_update_suppressed', 1, {
           callId,
-          reason: activeStage >= 3 ? 'stage3_severe' : redisWriteMs > backpressureMs ? 'redis_backpressure' : 'throttled',
+          reason: suppressReason,
         });
-        const keepaliveIntervalMs = Math.max(emitIntervalMs, getBillingEmitKeepaliveMs());
-        const keepaliveDue =
-          session.lifecycleState === 'ACTIVE' &&
-          nowMs - (session.lastEmitAtMs || 0) >= keepaliveIntervalMs;
-        if (keepaliveDue) {
-          session.lastEmitAtMs = nowMs;
-          session.lastSocketEmitAt = nowMs;
-          recordBillingMetric('emit_update_keepalive', 1, { callId });
-          await persistCallSession(redis, callId, session);
-          await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
-          emitSoon(() => {
-            emitBillingUpdateFromSnapshot(
-              io,
-              session.userFirebaseUid,
-              session.creatorFirebaseUid,
-              {
-                callId: billingSnapshot.callId,
-                billingSequence: billingSnapshot.billingSequence,
-                lifecycleState: billingSnapshot.lifecycleState,
-                coins: billingSnapshot.coins,
-                coinsExact: billingSnapshot.coinsExact,
-                elapsedSeconds: billingSnapshot.elapsedSeconds,
-                remainingSeconds: billingSnapshot.remainingSeconds,
-                durationLimit: billingSnapshot.durationLimit,
-                serverTimestamp: nowMs,
-                callStartTime: session.startTime,
-                introPromoActive: billingSnapshot.introPromoActive,
-                pricePerSecondMicros: billingSnapshot.pricePerSecondMicros,
-              },
-              {
-                callId: billingSnapshot.callId,
-                billingSequence: billingSnapshot.billingSequence,
-                lifecycleState: billingSnapshot.lifecycleState,
-                earnings: billingSnapshot.earnings,
-                elapsedSeconds: billingSnapshot.elapsedSeconds,
-                durationLimit: billingSnapshot.durationLimit,
-                serverTimestamp: nowMs,
-                callStartTime: session.startTime,
-                pricePerSecondMicros: billingSnapshot.creatorEarningsPerSecondMicros,
-              }
-            );
-          });
-        }
+        logBillingHealthDebug('EMIT_STALLED', {
+          ...billingHealthFieldsFromSession(session),
+          suppressReason,
+          redisWriteMs,
+          activeStage,
+        });
+        await maybeEmitBillingKeepaliveIfDue(
+          io,
+          redis,
+          callId,
+          session,
+          balanceMicros,
+          introPromoBilling,
+          earningsMicros,
+          'recovery'
+        );
       }
 
       if (activeRemain < pricePerSecondMicros) {

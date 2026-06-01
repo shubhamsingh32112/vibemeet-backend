@@ -16,6 +16,7 @@ import { recordBillingMetric } from '../../utils/monitoring';
 import { BillingLifecycleState } from './billing-lifecycle.machine';
 import { getBillingInstanceId } from './billing-instance-id';
 import { logInfo, logWarning, logDebug } from '../../utils/logger';
+import { logBillingHealthWarn } from './billing-health-log';
 
 export interface BillingRuntimeSession {
   schemaVersion?: number;
@@ -144,7 +145,7 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
     const earningsMicros = Math.max(0, parseInt(String(earningsRaw ?? '0'), 10) || 0);
     recordBillingMetric('billing_recovery_source', 1, { source: 'redis', callId });
     recordBillingMetric('billing_reconnect_replay_count', 1, { source: 'redis', callId });
-    logInfo('billing_runtime_resolved', {
+    logDebug('billing_runtime_resolved', {
       callId,
       source: 'redis',
       lifecycleState: session.lifecycleState,
@@ -279,6 +280,27 @@ export async function resolveActiveRuntimeStateForUser(
   if (slotCallId) {
     const runtime = await resolveBillingRuntimeState(slotCallId);
     if (runtime.terminalSnapshot) {
+      logBillingHealthWarn('TERMINAL_BLOCKED_ACTIVE_SLOT', {
+        firebaseUid,
+        callId: slotCallId,
+        source: 'active_slot',
+      });
+      const { healActiveCallBillingWithDefaultIo } = await import('./billing-heal.service');
+      await healActiveCallBillingWithDefaultIo(slotCallId, 'active_slot_terminal_conflict');
+      const healedRuntime = await resolveBillingRuntimeState(slotCallId);
+      if (healedRuntime.session) {
+        logInfo('billing_active_slot_healed_from_terminal', {
+          firebaseUid,
+          callId: slotCallId,
+          runtimeSource: healedRuntime.source,
+          billingSequence: healedRuntime.session.billingSequence,
+        });
+        return {
+          callId: slotCallId,
+          runtime: healedRuntime,
+          source: 'slot',
+        };
+      }
       await redis.del(activeCallByUserKey(firebaseUid)).catch(() => {});
       const staleSlotStillExists = Boolean(await redis.get(activeCallByUserKey(firebaseUid)));
       logInfo('billing_active_call_slot_terminal_tombstone_cleanup', {

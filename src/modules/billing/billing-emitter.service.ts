@@ -151,9 +151,13 @@ export function emitBillingRecoverStateResponse(
     recoveryOutcome?: string;
   }
 ): void {
-  logInfo('billing_emit_recover_state', {
+  logInfo('📡 billing_emit_recover_state', {
     success: payload.success,
     activeCallCount: payload.activeCalls.length,
+    callId:
+      payload.activeCalls.length > 0
+        ? String((payload.activeCalls[0] as { callId?: string }).callId ?? '')
+        : undefined,
     recoveryRequestId: payload.recoveryRequestId,
     clientRecoveryRequestId: payload.clientRecoveryRequestId,
     runtimeSource: payload.runtimeSource,
