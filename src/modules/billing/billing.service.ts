@@ -437,7 +437,7 @@ async function tryClearStaleCallpairLock(
         await releasePair('stale_starting');
         recordBillingMetric('session_start_callpair_starting_recovered', 1, {
           staleCallId: existingCallId,
-          ageMs,
+          ageMs: String(ageMs),
         });
         return { cleared: true, staleCallId: existingCallId, reason: 'stale_starting' };
       }
