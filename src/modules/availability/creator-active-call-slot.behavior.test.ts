@@ -4,12 +4,15 @@ import { test } from 'node:test';
 import {
   activeCallByUserKey,
   availabilityKey,
+  callSessionKey,
+  callSessionTerminalKey,
   resetRedisForTests,
   setRedisForTests,
 } from '../../config/redis';
 import { readCreatorPresenceState, transitionCreatorPresence } from './presence.service';
 import {
   clearCreatorActiveCallSlotIfStale,
+  isCreatorActiveCallSlotLive,
   setIsCreatorActiveCallSlotLiveResolverForTests,
 } from './creator-active-call-slot.service';
 import { setIO } from '../../config/socket';
@@ -149,6 +152,91 @@ test('behavioral: FORCE_OFFLINE transition clears active-call slot', async () =>
   assert.equal(slot, null);
   const state = await readCreatorPresenceState(creatorFirebaseUid);
   assert.equal(state.state, 'offline');
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: active-call slot is live when slot owner matches payer (userFirebaseUid)', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+
+  const callId = 'call-live-1';
+  const payerUid = 'payer-uid-1';
+  const creatorUid = 'creator-uid-1';
+  await redis.setex(
+    callSessionKey(callId),
+    7200,
+    JSON.stringify({
+      userFirebaseUid: payerUid,
+      creatorFirebaseUid: creatorUid,
+      lifecycleState: 'ACTIVE',
+      totalDeductedMicros: 123,
+    })
+  );
+
+  const live = await isCreatorActiveCallSlotLive(callId, payerUid);
+  assert.equal(live, true);
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: active-call slot is live when slot owner matches creator (creatorFirebaseUid)', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+
+  const callId = 'call-live-2';
+  const payerUid = 'payer-uid-2';
+  const creatorUid = 'creator-uid-2';
+  await redis.setex(
+    callSessionKey(callId),
+    7200,
+    JSON.stringify({
+      userFirebaseUid: payerUid,
+      creatorFirebaseUid: creatorUid,
+      lifecycleState: 'ACTIVE',
+    })
+  );
+
+  const live = await isCreatorActiveCallSlotLive(callId, creatorUid);
+  assert.equal(live, true);
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: active-call slot is not live when slot owner matches neither party', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+
+  const callId = 'call-live-3';
+  await redis.setex(
+    callSessionKey(callId),
+    7200,
+    JSON.stringify({
+      userFirebaseUid: 'payer-uid-3',
+      creatorFirebaseUid: 'creator-uid-3',
+      lifecycleState: 'ACTIVE',
+    })
+  );
+
+  const live = await isCreatorActiveCallSlotLive(callId, 'random-other-uid');
+  assert.equal(live, false);
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: active-call slot is not live when terminal marker exists', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+
+  const callId = 'call-live-4';
+  await redis.setex(callSessionTerminalKey(callId), 7200, '1');
+
+  const live = await isCreatorActiveCallSlotLive(callId, 'any-uid');
+  assert.equal(live, false);
 
   setIsCreatorActiveCallSlotLiveResolverForTests(null);
   resetRedisForTests();

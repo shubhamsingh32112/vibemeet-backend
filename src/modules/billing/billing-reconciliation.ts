@@ -43,6 +43,7 @@ import { featureFlags } from '../../config/feature-flags';
 import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import mongoose from 'mongoose';
+import { shouldFinalizeSessionNoHistory } from './billing-reconciliation.guards';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;
 const RELEASE_LOCK_LUA = `
@@ -413,8 +414,27 @@ async function runSettlementOrphanRepair(io: Server, startedAt: number): Promise
       const sessionRaw = await redis.get(callSessionKey(callId));
       if (!sessionRaw) continue;
       try {
-        const sess = JSON.parse(sessionRaw) as { totalDeductedMicros?: number };
-        if ((sess.totalDeductedMicros ?? 0) <= 0) continue;
+        const sess = JSON.parse(sessionRaw) as {
+          totalDeductedMicros?: number;
+          lifecycleState?: string;
+          lastProcessedAt?: number;
+          lastEmitAtMs?: number;
+        };
+        const minAgeMs = readNumber(
+          process.env.BILLING_RECON_SESSION_NO_HISTORY_MIN_AGE_MS,
+          10 * 60_000,
+          60_000,
+          24 * 60 * 60_000
+        );
+        const decision = shouldFinalizeSessionNoHistory(sess, Date.now(), minAgeMs);
+        if (!decision.shouldFinalize) {
+          // keep metric cardinality bounded; emit only reasons we explicitly handle
+          recordBillingMetric('billing_reconciliation_skips_total', 1, {
+            callId,
+            reason: String(decision.skipReason || 'skip'),
+          });
+          continue;
+        }
       } catch {
         continue;
       }

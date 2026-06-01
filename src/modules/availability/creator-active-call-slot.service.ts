@@ -41,13 +41,18 @@ export async function isCreatorActiveCallSlotLive(
   if (sessionRaw) {
     try {
       const session = JSON.parse(sessionRaw) as {
+        userFirebaseUid?: string;
         creatorFirebaseUid?: string;
         lifecycleState?: string;
       };
-      if (session.creatorFirebaseUid && session.creatorFirebaseUid !== creatorFirebaseUid) {
+      // The slot may belong to either party (payer or creator), but it must match one of them.
+      const ownerMatchesSessionParty =
+        (session.creatorFirebaseUid && session.creatorFirebaseUid === creatorFirebaseUid) ||
+        (session.userFirebaseUid && session.userFirebaseUid === creatorFirebaseUid);
+      if (!ownerMatchesSessionParty) {
         return false;
       }
-      const lifecycle = String(session.lifecycleState || 'ACTIVE');
+      const lifecycle = String(session.lifecycleState || 'ACTIVE').toUpperCase();
       return lifecycle !== 'SETTLED' && lifecycle !== 'FAILED';
     } catch {
       return false;
