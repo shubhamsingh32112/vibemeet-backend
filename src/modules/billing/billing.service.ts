@@ -27,7 +27,7 @@ import {
   MIN_COINS_TO_CALL,
 } from '../../config/pricing.config';
 import { recordBillingMetric, monitoring } from '../../utils/monitoring';
-import { logWarning, logInfo, logError } from '../../utils/logger';
+import { logWarning, logInfo, logError, logDebug } from '../../utils/logger';
 import { retryWithBackoff } from '../../utils/retry';
 import { dlqBillingKey, DLQ_BILLING_TTL } from '../../config/redis';
 import { addToDLQSet } from './billing-reconciliation';
@@ -557,15 +557,20 @@ async function refreshActiveCallSlotsTtl(
   ]);
 }
 
-export function isBootstrappingSession(session: Partial<CallSession>): boolean {
+export function needsFullSessionBootstrap(session: Partial<CallSession>): boolean {
   const version = Number(session.version ?? 0);
-  const ppsMicros = Number(session.pricePerSecondMicros ?? 0);
   return (
     version <= 0 ||
     !String(session.userMongoId || '').trim() ||
-    !String(session.creatorMongoId || '').trim() ||
-    ppsMicros <= 0
+    !String(session.creatorMongoId || '').trim()
   );
+}
+
+export function isBootstrappingSession(session: Partial<CallSession>): boolean {
+  const ppsMicros = Number(
+    session.billingPricePerSecondMicros ?? session.pricePerSecondMicros ?? 0
+  );
+  return needsFullSessionBootstrap(session) || ppsMicros <= 0;
 }
 
 export type PromoteBootstrapResult =
@@ -599,6 +604,7 @@ export async function promoteBootstrappingSession(
   opts?: {
     terminateOnFailure?: boolean;
     preserveStartTime?: boolean;
+    preserveRuntimeBalances?: boolean;
     initiatedByFirebaseUid?: string;
     initiatedByRole?: 'user' | 'creator' | 'admin';
     seedStartTime?: number;
@@ -623,7 +629,13 @@ export async function promoteBootstrappingSession(
     }
   }
 
-  const user = await User.findOne({ firebaseUid: userFirebaseUid });
+  let user = await User.findOne({ firebaseUid: userFirebaseUid });
+  if (!user) {
+    const userMongoId = String(existingSession.userMongoId || '').trim();
+    if (userMongoId) {
+      user = await User.findById(userMongoId);
+    }
+  }
   if (!user) {
     return { ok: false, reason: 'user_not_found' };
   }
@@ -680,13 +692,38 @@ export async function promoteBootstrappingSession(
 
   const introCreditsLive = Number((user as { introFreeCallCredits?: number }).introFreeCallCredits) || 0;
   const consumedAt = (user as { welcomeFreeCallConsumedAt?: Date | null }).welcomeFreeCallConsumedAt;
-  const introPromoActive =
+  let introPromoActive =
     user.role === 'user' && !consumedAt && introCreditsLive > 0;
-  const initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
-  const initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
+  let initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
+  let initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
+
+  const hasRuntimeActivity =
+    Number(existingSession.billingSequence ?? 0) > 0 ||
+    Number(existingSession.totalDeductedMicros ?? 0) > 0;
+  const preserveRuntimeBalances =
+    opts?.preserveRuntimeBalances === true ||
+    (opts?.preserveStartTime === true && hasRuntimeActivity);
+
+  if (preserveRuntimeBalances) {
+    const [introRaw, walletRaw] = await Promise.all([
+      redis.get(callUserIntroMicrosKey(callId)),
+      redis.get(callUserWalletMicrosKey(callId)),
+    ]);
+    if (introRaw !== null || walletRaw !== null) {
+      initialIntroMicros = Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0);
+      initialWalletMicros = Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+      introPromoActive =
+        existingSession.introPromoActive === true ||
+        (initialIntroMicros > 0 && initialWalletMicros === 0);
+    }
+  }
+
   const spendableMicros = initialIntroMicros + initialWalletMicros;
   const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
-  if (spendableMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
+  if (
+    !preserveRuntimeBalances &&
+    spendableMicros < Math.max(pricePerSecondMicros, minEntryMicros)
+  ) {
     if (terminateOnFailure) {
       await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
       void forceTerminateCall(io, {
@@ -785,13 +822,17 @@ export async function promoteBootstrappingSession(
 
   try {
     recordBillingMetric('redis_ops', 5, { callId, path: 'session_seed' });
-    await redis
-      .multi()
-      .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
-      .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(initialIntroMicros))
-      .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
-      .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
-      .exec();
+    if (preserveRuntimeBalances) {
+      await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
+    } else {
+      await redis
+        .multi()
+        .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
+        .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(initialIntroMicros))
+        .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
+        .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
+        .exec();
+    }
     logInfo('billing_session_promoted_full', {
       ...billingLifecycleLogContext({
         callId,
@@ -1438,10 +1479,10 @@ function migrateSession(
   return { session, earningsMicros };
 }
 
-function buildSessionFromCheckpoint(
+async function buildSessionFromCheckpoint(
   checkpoint: Record<string, unknown>,
   callId: string
-): { session: CallSession; balanceMicros: number; earningsMicros: number } | null {
+): Promise<{ session: CallSession; balanceMicros: number; earningsMicros: number } | null> {
   const userMongoId = String(checkpoint.userMongoId || '');
   const creatorMongoId = String(checkpoint.creatorMongoId || '');
   const userFirebaseUid = String(checkpoint.userFirebaseUid || '');
@@ -1451,11 +1492,27 @@ function buildSessionFromCheckpoint(
   }
   const startTimeMs = Number(checkpoint.startTimeMs) || Date.now();
   const lastProcessedAtMs = Number(checkpoint.lastProcessedAtMs) || startTimeMs;
-  const pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
-  const creatorEarningsPerSecondMicros = Math.max(
+  let pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
+  let creatorEarningsPerSecondMicros = Math.max(
     0,
     Number(checkpoint.creatorEarningsPerSecondMicros) || 0
   );
+  if (pricePerSecondMicros <= 0 && creatorMongoId) {
+    try {
+      const pricing = await pricingService.snapshotForCreatorCached(creatorMongoId);
+      if (pricing.pricePerSecondMicros > 0) {
+        pricePerSecondMicros = pricing.pricePerSecondMicros;
+        creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
+        logDebug('billing_checkpoint_pricing_backfilled', {
+          callId,
+          creatorMongoId,
+          pricePerSecondMicros,
+        });
+      }
+    } catch {
+      /* keep zero — repair path may fix later */
+    }
+  }
   const totalDeductedMicros = Math.max(0, Number(checkpoint.totalDeductedMicros) || 0);
   const totalEarnedMicros = Math.max(0, Number(checkpoint.totalEarnedMicros) || 0);
   const remainingUserBalanceMicros = Math.max(
@@ -2284,7 +2341,7 @@ export class BillingService {
           logWarning('Session/checkpoint not found for billing tick', { callId });
           return 'stop_no_session';
         }
-        const reconstructed = buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId);
+        const reconstructed = await buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId);
         if (!reconstructed) {
           logWarning('Failed to reconstruct session from checkpoint', { callId });
           return 'stop_no_session';
@@ -2327,7 +2384,7 @@ export class BillingService {
         ) {
           const checkpoint = await getBillingCheckpoint(callId);
           const reconstructed = checkpoint
-            ? buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId)
+            ? await buildSessionFromCheckpoint(checkpoint as Record<string, unknown>, callId)
             : null;
           if (reconstructed) {
             const rem = reconstructed.balanceMicros;

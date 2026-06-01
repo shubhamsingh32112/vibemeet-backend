@@ -10,7 +10,7 @@ import { upsertBillingCheckpointSnapshot } from './billing-checkpoint.service';
 import {
   CallSession,
   ensureBillingStartedReplayFreshness,
-  isBootstrappingSession,
+  needsFullSessionBootstrap,
   normalizeV4SessionFields,
   promoteBootstrappingSession,
 } from './billing.service';
@@ -132,7 +132,7 @@ export async function repairSessionPricingIfNeeded(
   source: string
 ): Promise<SessionPricingRepairResult> {
   const currentPrice = sessionPricePerSecondMicros(session);
-  if (!isBootstrappingSession(session) && currentPrice > 0) {
+  if (currentPrice > 0 && !needsFullSessionBootstrap(session)) {
     return {
       repaired: false,
       reason: 'already_valid',
@@ -147,9 +147,10 @@ export async function repairSessionPricingIfNeeded(
     billingSequence: session.billingSequence,
     version: session.version,
     pricePerSecondMicros: currentPrice,
+    needsFullBootstrap: needsFullSessionBootstrap(session),
   });
 
-  if (isBootstrappingSession(session)) {
+  if (needsFullSessionBootstrap(session)) {
     const redis = getRedis();
     const promoteResult = await promoteBootstrappingSession(
       io,
@@ -160,6 +161,7 @@ export async function repairSessionPricingIfNeeded(
       {
         terminateOnFailure: false,
         preserveStartTime: true,
+        preserveRuntimeBalances: true,
         initiatedByFirebaseUid: session.initiatedByFirebaseUid,
         initiatedByRole: session.initiatedByRole,
       }

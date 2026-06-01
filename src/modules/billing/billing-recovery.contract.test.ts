@@ -147,9 +147,29 @@ test('zero-price sessions use pricing repair before tick abort', () => {
   );
   assert.ok(repairSrc.includes('repairSessionPricingIfNeeded'));
   assert.ok(repairSrc.includes('promoteBootstrappingSession'));
+  assert.ok(repairSrc.includes('patchSessionPricingOnly'));
+  assert.ok(repairSrc.includes('needsFullSessionBootstrap'));
   assert.ok(serviceSrc.includes('repairSessionPricingIfNeeded'));
   assert.ok(serviceSrc.includes("return 'tick_deferred'"));
   assert.ok(!serviceSrc.includes("Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });\n        return 'stop_needs_settlement'"));
+});
+
+test('pricing repair uses patch path when participants exist but price is zero', () => {
+  const repairSrc = readFileSync(
+    join(__dirname, 'billing-session-pricing-repair.service.ts'),
+    'utf8'
+  );
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('needsFullSessionBootstrap'));
+  assert.ok(repairSrc.includes('if (needsFullSessionBootstrap(session))'));
+  assert.ok(repairSrc.includes('return patchSessionPricingOnly(callId, session, source)'));
+});
+
+test('mid-call promote repair preserves runtime balances', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('preserveRuntimeBalances'));
+  assert.ok(serviceSrc.includes('preserveRuntimeBalances === true'));
+  assert.ok(serviceSrc.includes('User.findById(userMongoId)'));
 });
 
 test('healing repairs pricing before rescheduling tick chain', () => {
@@ -170,7 +190,10 @@ test('pricing repair health events are defined', () => {
 
 test('checkpoint reconstruction backfills zero pricing from creator', () => {
   const resolverSrc = readFileSync(join(__dirname, 'billing-runtime-resolver.service.ts'), 'utf8');
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
   assert.ok(resolverSrc.includes('snapshotForCreatorCached'));
   assert.ok(resolverSrc.includes('billing_checkpoint_pricing_backfilled'));
   assert.ok(resolverSrc.includes('async function buildSessionFromCheckpoint'));
+  assert.ok(serviceSrc.includes('billing_checkpoint_pricing_backfilled'));
+  assert.ok(serviceSrc.includes('async function buildSessionFromCheckpoint'));
 });
