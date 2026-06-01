@@ -1,11 +1,15 @@
 import { Server } from 'socket.io';
 import { getRedis, callSessionKey, callSessionTerminalKey } from '../../config/redis';
 import { getIO } from '../../config/socket';
-import { billingService } from './billing.service';
+import { billingService, CallSession, normalizeV4SessionFields } from './billing.service';
 import { recoverBillingScheduleForCall } from './billing-recovery';
 import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
 import { getBillingChainHealStallMs } from './billing.constants';
 import { logBillingHealth, logBillingHealthWarn } from './billing-health-log';
+import {
+  hasValidSessionPricing,
+  repairSessionPricingIfNeeded,
+} from './billing-session-pricing-repair.service';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -43,6 +47,33 @@ export async function healActiveCallBilling(
     return { healed: false, hadSession: false };
   }
 
+  let session = JSON.parse(sessionRaw) as CallSession;
+  normalizeV4SessionFields(session);
+
+  const repairResult = await repairSessionPricingIfNeeded(io, callId, session, source);
+  const hadValidPricing = hasValidSessionPricing(repairResult, session);
+
+  if (!hadValidPricing) {
+    logBillingHealthWarn('RECOVERY_HEAL_DONE', {
+      callId,
+      source,
+      healed: false,
+      reason: 'pricing_unresolved',
+      repairReason: repairResult.reason,
+    });
+    return { healed: false, tickResult: 'pricing_unresolved', hadSession: true };
+  }
+
+  const refreshedRaw = await redis.get(callSessionKey(callId));
+  if (refreshedRaw) {
+    try {
+      session = JSON.parse(refreshedRaw) as CallSession;
+      normalizeV4SessionFields(session);
+    } catch {
+      /* use in-memory session */
+    }
+  }
+
   await recoverBillingScheduleForCall(callId, 'reconciliation');
   logBillingHealth('CHAIN_RESCHEDULED', { callId, source });
 
@@ -52,12 +83,15 @@ export async function healActiveCallBilling(
     tickResult = await billingService.processBillingTick(io, callId);
   }
 
-  const healed = tickResult === 'tick_ok' || tickResult === 'stop_needs_settlement';
+  const healed =
+    tickResult === 'tick_ok' ||
+    (tickResult === 'stop_needs_settlement' && hadValidPricing);
   logBillingHealth('RECOVERY_HEAL_DONE', {
     callId,
     source,
     healed,
     tickResult: tickResult ?? 'unknown',
+    repairReason: repairResult.reason,
   });
   return { healed, tickResult, hadSession: true };
 }

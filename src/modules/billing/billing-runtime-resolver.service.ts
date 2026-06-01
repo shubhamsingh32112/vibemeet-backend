@@ -11,12 +11,13 @@ import {
   callCreatorEarningsKey,
 } from '../../config/redis';
 import { getBillingCheckpoint } from './billing-checkpoint.service';
-import { BILLING_PROCESS_INTERVAL_MS, BILLING_SESSION_SCHEMA_VERSION } from './billing.constants';
+import { BILLING_PROCESS_INTERVAL_MS, BILLING_SESSION_SCHEMA_VERSION, COIN_MICROS } from './billing.constants';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { BillingLifecycleState } from './billing-lifecycle.machine';
 import { getBillingInstanceId } from './billing-instance-id';
 import { logInfo, logWarning, logDebug } from '../../utils/logger';
 import { logBillingHealthWarn } from './billing-health-log';
+import { pricingService } from '../video/pricing.service';
 
 export interface BillingRuntimeSession {
   schemaVersion?: number;
@@ -75,10 +76,10 @@ export interface ResolvedUserActiveRuntime {
   source: 'slot' | 'scan' | 'none';
 }
 
-function buildSessionFromCheckpoint(
+async function buildSessionFromCheckpoint(
   checkpoint: Record<string, unknown>,
   callId: string
-): BillingRuntimeSession | null {
+): Promise<BillingRuntimeSession | null> {
   const userMongoId = String(checkpoint.userMongoId || '');
   const creatorMongoId = String(checkpoint.creatorMongoId || '');
   const userFirebaseUid = String(checkpoint.userFirebaseUid || '');
@@ -88,7 +89,27 @@ function buildSessionFromCheckpoint(
   }
   const startTimeMs = Number(checkpoint.startTimeMs) || Date.now();
   const lastProcessedAtMs = Number(checkpoint.lastProcessedAtMs) || startTimeMs;
-  const pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
+  let pricePerSecondMicros = Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0);
+  let creatorEarningsPerSecondMicros = Math.max(
+    0,
+    Number(checkpoint.creatorEarningsPerSecondMicros) || 0
+  );
+  if (pricePerSecondMicros <= 0 && creatorMongoId) {
+    try {
+      const pricing = await pricingService.snapshotForCreatorCached(creatorMongoId);
+      if (pricing.pricePerSecondMicros > 0) {
+        pricePerSecondMicros = pricing.pricePerSecondMicros;
+        creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
+        logDebug('billing_checkpoint_pricing_backfilled', {
+          callId,
+          creatorMongoId,
+          pricePerSecondMicros,
+        });
+      }
+    } catch {
+      /* keep zero — repair path may fix later */
+    }
+  }
   const totalDeductedMicros = Math.max(0, Number(checkpoint.totalDeductedMicros) || 0);
   const elapsedSeconds =
     pricePerSecondMicros > 0 ? Math.floor(totalDeductedMicros / pricePerSecondMicros) : 0;
@@ -101,12 +122,9 @@ function buildSessionFromCheckpoint(
     userMongoId,
     creatorMongoId,
     pricePerMinute:
-      pricePerSecondMicros > 0 ? Math.round((pricePerSecondMicros * 60) / 1_000_000) : 0,
+      pricePerSecondMicros > 0 ? Math.round((pricePerSecondMicros * 60) / COIN_MICROS) : 0,
     pricePerSecondMicros,
-    creatorEarningsPerSecondMicros: Math.max(
-      0,
-      Number(checkpoint.creatorEarningsPerSecondMicros) || 0
-    ),
+    creatorEarningsPerSecondMicros,
     startTime: startTimeMs,
     lastProcessedAt: lastProcessedAtMs,
     totalDeductedMicros,
@@ -213,7 +231,7 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
     };
   }
 
-  const session = buildSessionFromCheckpoint(checkpoint, callId);
+  const session = await buildSessionFromCheckpoint(checkpoint, callId);
   if (!session) {
     logWarning('billing_runtime_missing', {
       callId,

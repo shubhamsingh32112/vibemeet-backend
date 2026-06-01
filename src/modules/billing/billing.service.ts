@@ -79,6 +79,7 @@ import {
   billingHealthFieldsFromSession,
   logBillingHealth,
   logBillingHealthDebug,
+  logBillingHealthWarn,
 } from './billing-health-log';
 
 const CALL_SESSION_TTL = 7200;
@@ -556,7 +557,7 @@ async function refreshActiveCallSlotsTtl(
   ]);
 }
 
-function isBootstrappingSession(session: Partial<CallSession>): boolean {
+export function isBootstrappingSession(session: Partial<CallSession>): boolean {
   const version = Number(session.version ?? 0);
   const ppsMicros = Number(session.pricePerSecondMicros ?? 0);
   return (
@@ -565,6 +566,288 @@ function isBootstrappingSession(session: Partial<CallSession>): boolean {
     !String(session.creatorMongoId || '').trim() ||
     ppsMicros <= 0
   );
+}
+
+export type PromoteBootstrapResult =
+  | {
+      ok: true;
+      session: CallSession;
+      spendableMicros: number;
+      initialIntroMicros: number;
+      initialWalletMicros: number;
+      introPromoActive: boolean;
+      pricePerSecondMicros: number;
+      creatorEarningsPerSecondMicros: number;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'user_not_found'
+        | 'creator_not_found'
+        | 'invalid_participants'
+        | 'insufficient_coins'
+        | 'concurrent_promote'
+        | 'redis_error';
+    };
+
+export async function promoteBootstrappingSession(
+  io: Server,
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  existingSession: CallSession,
+  source: string,
+  opts?: {
+    terminateOnFailure?: boolean;
+    preserveStartTime?: boolean;
+    initiatedByFirebaseUid?: string;
+    initiatedByRole?: 'user' | 'creator' | 'admin';
+    seedStartTime?: number;
+  }
+): Promise<PromoteBootstrapResult> {
+  const userFirebaseUid = existingSession.userFirebaseUid;
+  const creatorFirebaseUid = existingSession.creatorFirebaseUid;
+  const creatorMongoId = String(existingSession.creatorMongoId || '').trim();
+  const initiatedByFirebaseUid = opts?.initiatedByFirebaseUid ?? existingSession.initiatedByFirebaseUid;
+  const initiatedByRole = opts?.initiatedByRole ?? existingSession.initiatedByRole;
+  const terminateOnFailure = opts?.terminateOnFailure === true;
+
+  const liveRaw = await redis.get(callSessionKey(callId));
+  if (liveRaw) {
+    try {
+      const live = JSON.parse(liveRaw) as CallSession;
+      if (!isBootstrappingSession(live)) {
+        return { ok: false, reason: 'concurrent_promote' };
+      }
+    } catch {
+      /* proceed with promotion attempt */
+    }
+  }
+
+  const user = await User.findOne({ firebaseUid: userFirebaseUid });
+  if (!user) {
+    return { ok: false, reason: 'user_not_found' };
+  }
+  if (user.role !== 'user') {
+    if (terminateOnFailure) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: 'unknown',
+        creatorReason: 'unknown',
+        userPayload: { message: 'Invalid call participants.' },
+      }).catch(() => {});
+    }
+    return { ok: false, reason: 'invalid_participants' };
+  }
+
+  let creator = creatorMongoId ? await Creator.findById(creatorMongoId) : null;
+  if (!creator && creatorMongoId) {
+    creator = await Creator.findOne({ userId: creatorMongoId });
+  }
+  if (!creator) {
+    return { ok: false, reason: 'creator_not_found' };
+  }
+
+  const creatorUser = await User.findById(creator.userId).select('firebaseUid role').lean();
+  const creatorUserFirebaseUid = creatorUser?.firebaseUid || '';
+  const creatorUserRole = creatorUser?.role || null;
+  const creatorRoleOk = creatorUserRole === 'creator' || creatorUserRole === 'admin';
+  if (!creatorRoleOk || !creatorUserFirebaseUid || creatorUserFirebaseUid !== creatorFirebaseUid) {
+    if (terminateOnFailure) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: 'unknown',
+        creatorReason: 'unknown',
+        userPayload: { message: 'Invalid call participants.' },
+      }).catch(() => {});
+      recordBillingMetric('session_start_invalid_participants', 1, {
+        callIdPrefix: callId.length > 16 ? callId.slice(0, 16) : callId,
+        source,
+      });
+    }
+    return { ok: false, reason: 'invalid_participants' };
+  }
+
+  const pricing = pricingService.snapshotFromLoadedCreator(creator);
+  void pricingService.warmSnapshotCache(creator._id.toString(), pricing);
+  const pricePerSecondMicros = pricing.pricePerSecondMicros;
+  const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
+
+  const introCreditsLive = Number((user as { introFreeCallCredits?: number }).introFreeCallCredits) || 0;
+  const consumedAt = (user as { welcomeFreeCallConsumedAt?: Date | null }).welcomeFreeCallConsumedAt;
+  const introPromoActive =
+    user.role === 'user' && !consumedAt && introCreditsLive > 0;
+  const initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
+  const initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
+  const spendableMicros = initialIntroMicros + initialWalletMicros;
+  const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
+  if (spendableMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
+    if (terminateOnFailure) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: spendableMicros < minEntryMicros ? 'min_coins_not_met' : 'insufficient_coins',
+        creatorReason: 'user_out_of_coins',
+        userPayload: {
+          remainingCoins: microsToWholeCoinsFloor(spendableMicros),
+          minCoinsRequired: MIN_COINS_TO_CALL,
+        },
+      }).catch((err) => {
+        logError('Failed to trigger force termination at call start', err, {
+          callId,
+          userFirebaseUid,
+        });
+      });
+    }
+    return { ok: false, reason: 'insufficient_coins' };
+  }
+
+  const creatorLimit =
+    (creator as { maxCallDurationSeconds?: number }).maxCallDurationSeconds ??
+    DEFAULT_CREATOR_CALL_DURATION_SECONDS;
+  const userLimit =
+    (user as { maxCallDurationSeconds?: number }).maxCallDurationSeconds ??
+    DEFAULT_USER_CALL_DURATION_SECONDS;
+  const platformCapSeconds = Math.min(creatorLimit, userLimit, MAX_CALL_DURATION_SECONDS);
+  let effectiveDurationLimitSeconds = platformCapSeconds;
+  if (introPromoActive && pricePerSecondMicros > 0) {
+    const promoSeconds = Math.floor(initialIntroMicros / pricePerSecondMicros);
+    effectiveDurationLimitSeconds = Math.min(platformCapSeconds, promoSeconds);
+  }
+
+  const startTime =
+    opts?.preserveStartTime === true
+      ? Number(existingSession.startTime) || Date.now()
+      : Date.now();
+  const session: CallSession = {
+    ...existingSession,
+    schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+    billingVersion: 1,
+    initialIntroMicros,
+    initialWalletMicros,
+    billingPricePerSecondMicros: pricePerSecondMicros,
+    introPromoActive,
+    introPromoSessionId: callId,
+    totalIntroDeductedMicros: existingSession.totalIntroDeductedMicros ?? 0,
+    totalWalletDeductedMicros: existingSession.totalWalletDeductedMicros ?? 0,
+    callId,
+    userFirebaseUid,
+    creatorFirebaseUid,
+    userMongoId: user._id.toString(),
+    creatorMongoId: creator._id.toString(),
+    initiatedByFirebaseUid,
+    initiatedByRole,
+    pricePerMinute: pricing.pricePerMinute,
+    pricePerSecondMicros,
+    creatorEarningsPerSecondMicros,
+    creatorShareAtCallTime: pricing.creatorShareAtCallTime,
+    startTime,
+    lastProcessedAt: startTime,
+    version: 1,
+    billingSequence: existingSession.billingSequence ?? 0,
+    lifecycleState: existingSession.lifecycleState ?? 'STARTING',
+    totalDeductedMicros: existingSession.totalDeductedMicros ?? 0,
+    totalEarnedMicros: existingSession.totalEarnedMicros ?? 0,
+    elapsedSeconds: existingSession.elapsedSeconds ?? 0,
+    effectiveDurationLimitSeconds,
+    lastCheckpointAtMs: existingSession.lastCheckpointAtMs ?? 0,
+    lastHealthyTickAt: existingSession.lastHealthyTickAt ?? startTime,
+    lastSocketEmitAt: existingSession.lastSocketEmitAt ?? startTime,
+    lastSequenceAdvanceAt: existingSession.lastSequenceAdvanceAt ?? startTime,
+    expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
+    instanceId: existingSession.instanceId ?? getBillingInstanceId(),
+    runtimeEpoch: existingSession.runtimeEpoch ?? 1,
+    leaderLock: existingSession.leaderLock ?? `runtime:${callId}`,
+  };
+  normalizeV4SessionFields(session);
+
+  void Call.updateOne(
+    { callId },
+    {
+      $setOnInsert: {
+        callId,
+        callerUserId: user._id,
+        creatorUserId: creator.userId,
+        status: 'ringing',
+      },
+      ...(initiatedByFirebaseUid ? { $set: { initiatedByFirebaseUid } } : {}),
+      ...(initiatedByRole ? { $set: { initiatedByRole } } : {}),
+    },
+    { upsert: true }
+  ).catch(() => {});
+
+  try {
+    recordBillingMetric('redis_ops', 5, { callId, path: 'session_seed' });
+    await redis
+      .multi()
+      .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
+      .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(initialIntroMicros))
+      .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
+      .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
+      .exec();
+    logInfo('billing_session_promoted_full', {
+      ...billingLifecycleLogContext({
+        callId,
+        source,
+        payerFirebaseUid: userFirebaseUid,
+        creatorFirebaseUid,
+        initiatedByFirebaseUid,
+        initiatedByRole,
+      }),
+      promotedDelayMs: Math.max(0, Date.now() - (opts?.seedStartTime ?? startTime)),
+    });
+    recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
+
+    try {
+      await upsertBillingCheckpointSnapshot({
+        callId,
+        userMongoId: session.userMongoId,
+        creatorMongoId: session.creatorMongoId,
+        userFirebaseUid: session.userFirebaseUid,
+        creatorFirebaseUid: session.creatorFirebaseUid,
+        startTimeMs: session.startTime,
+        lastProcessedAtMs: session.lastProcessedAt,
+        remainingUserBalanceMicros: spendableMicros,
+        pricePerSecondMicros: session.pricePerSecondMicros,
+        creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+        totalDeductedMicros: session.totalDeductedMicros,
+        totalEarnedMicros: session.totalEarnedMicros,
+        billingSequence: session.billingSequence,
+        lifecycleState: session.lifecycleState,
+        status: 'active',
+      });
+    } catch (cpErr) {
+      logError('Early checkpoint snapshot after session seed failed (non-fatal)', cpErr, {
+        callId,
+      });
+    }
+  } catch (redisError) {
+    recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'session_seed' });
+    logError('CRITICAL: Failed to promote bootstrapping billing session in Redis', redisError, {
+      callId,
+      source,
+      alert: true,
+    });
+    return { ok: false, reason: 'redis_error' };
+  }
+
+  return {
+    ok: true,
+    session,
+    spendableMicros,
+    initialIntroMicros,
+    initialWalletMicros,
+    introPromoActive,
+    pricePerSecondMicros,
+    creatorEarningsPerSecondMicros,
+  };
 }
 
 async function clearCallSessionSeed(
@@ -1586,205 +1869,58 @@ export class BillingService {
         callIdPrefix,
       });
 
-      const user = await User.findOne({ firebaseUid: userFirebaseUid });
-      if (!user) throw new Error(`User not found: ${userFirebaseUid}`);
-      if (user.role !== 'user') {
-        await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
-        slotsToReleaseOnFailure = false;
-        void forceTerminateCall(io, {
-          callId,
-          userFirebaseUid,
-          creatorFirebaseUid,
-          reason: 'unknown',
-          creatorReason: 'unknown',
-          userPayload: { message: 'Invalid call participants.' },
-        }).catch(() => {});
+      const promoteResult = await promoteBootstrappingSession(
+        io,
+        redis,
+        callId,
+        earlySession,
+        source,
+        {
+          terminateOnFailure: true,
+          preserveStartTime: false,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+          seedStartTime,
+        }
+      );
+      if (!promoteResult.ok) {
+        if (
+          promoteResult.reason === 'invalid_participants' ||
+          promoteResult.reason === 'insufficient_coins'
+        ) {
+          slotsToReleaseOnFailure = false;
+        }
+        if (
+          promoteResult.reason === 'user_not_found' ||
+          promoteResult.reason === 'creator_not_found'
+        ) {
+          throw new Error(
+            promoteResult.reason === 'user_not_found'
+              ? `User not found: ${userFirebaseUid}`
+              : `Creator not found: ${creatorMongoId}`
+          );
+        }
         return;
       }
 
-      let creator = await Creator.findById(creatorMongoId);
-      if (!creator) {
-        creator = await Creator.findOne({ userId: creatorMongoId });
-      }
-      if (!creator) throw new Error(`Creator not found: ${creatorMongoId}`);
-
-    // Server-authoritative validation: creatorMongoId must belong to creatorFirebaseUid.
-    // Also prevents creator↔creator and spoofed payout attempts.
-    const creatorUser = await User.findById(creator.userId).select('firebaseUid role').lean();
-    const creatorUserFirebaseUid = creatorUser?.firebaseUid || '';
-    const creatorUserRole = creatorUser?.role || null;
-    const creatorRoleOk = creatorUserRole === 'creator' || creatorUserRole === 'admin';
-    if (!creatorRoleOk || !creatorUserFirebaseUid || creatorUserFirebaseUid !== creatorFirebaseUid) {
-      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
-      slotsToReleaseOnFailure = false;
-      void forceTerminateCall(io, {
-        callId,
-        userFirebaseUid,
-        creatorFirebaseUid,
-        reason: 'unknown',
-        creatorReason: 'unknown',
-        userPayload: { message: 'Invalid call participants.' },
-      }).catch(() => {});
-      recordBillingMetric('session_start_invalid_participants', 1, {
-        callIdPrefix,
-        source,
-      });
-      return;
-    }
-
-    const pricing = pricingService.snapshotFromLoadedCreator(creator);
-    void pricingService.warmSnapshotCache(creator._id.toString(), pricing);
-    const pricePerSecondMicros = pricing.pricePerSecondMicros;
-    const creatorEarningsPerSecondMicros = pricing.creatorEarningsPerSecondMicros;
-
-    const introCreditsLive = Number((user as { introFreeCallCredits?: number }).introFreeCallCredits) || 0;
-    const consumedAt = (user as { welcomeFreeCallConsumedAt?: Date | null }).welcomeFreeCallConsumedAt;
-    const introPromoActive =
-      user.role === 'user' && !consumedAt && introCreditsLive > 0;
-    const initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
-    const initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
-    const spendableMicros = initialIntroMicros + initialWalletMicros;
-    const minEntryMicros = coinsWholeToMicros(MIN_COINS_TO_CALL);
-    if (spendableMicros < Math.max(pricePerSecondMicros, minEntryMicros)) {
-      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
-      slotsToReleaseOnFailure = false;
-      void forceTerminateCall(io, {
-        callId,
-        userFirebaseUid,
-        creatorFirebaseUid,
-        reason: spendableMicros < minEntryMicros ? 'min_coins_not_met' : 'insufficient_coins',
-        creatorReason: 'user_out_of_coins',
-        userPayload: {
-          remainingCoins: microsToWholeCoinsFloor(spendableMicros),
-          minCoinsRequired: MIN_COINS_TO_CALL,
-        },
-      }).catch((err) => {
-        logError('Failed to trigger force termination at call start', err, {
-          callId,
-          userFirebaseUid,
-        });
-      });
-      return;
-    }
-
-    const creatorLimit =
-      (creator as { maxCallDurationSeconds?: number }).maxCallDurationSeconds ??
-      DEFAULT_CREATOR_CALL_DURATION_SECONDS;
-    const userLimit =
-      (user as { maxCallDurationSeconds?: number }).maxCallDurationSeconds ??
-      DEFAULT_USER_CALL_DURATION_SECONDS;
-    const platformCapSeconds = Math.min(creatorLimit, userLimit, MAX_CALL_DURATION_SECONDS);
-    let effectiveDurationLimitSeconds = platformCapSeconds;
-    if (introPromoActive && pricePerSecondMicros > 0) {
-      const promoSeconds = Math.floor(initialIntroMicros / pricePerSecondMicros);
-      effectiveDurationLimitSeconds = Math.min(platformCapSeconds, promoSeconds);
-    }
-
-    const startTime = Date.now();
-    const session: CallSession = {
-      schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
-      billingVersion: 1,
-      initialIntroMicros,
-      initialWalletMicros,
-      billingPricePerSecondMicros: pricePerSecondMicros,
-      introPromoActive,
-      introPromoSessionId: callId,
-      totalIntroDeductedMicros: 0,
-      totalWalletDeductedMicros: 0,
-      callId,
-      userFirebaseUid,
-      creatorFirebaseUid,
-      userMongoId: user._id.toString(),
-      creatorMongoId: creator._id.toString(),
-      initiatedByFirebaseUid,
-      initiatedByRole,
-      pricePerMinute: pricing.pricePerMinute,
-      pricePerSecondMicros,
-      creatorEarningsPerSecondMicros,
-      creatorShareAtCallTime: pricing.creatorShareAtCallTime,
-      startTime,
-      lastProcessedAt: startTime,
-      version: 1,
-      billingSequence: 0,
-      lifecycleState: 'STARTING',
-      totalDeductedMicros: 0,
-      totalEarnedMicros: 0,
-      elapsedSeconds: 0,
-      effectiveDurationLimitSeconds,
-      lastCheckpointAtMs: 0,
-      lastHealthyTickAt: startTime,
-      lastSocketEmitAt: startTime,
-      lastSequenceAdvanceAt: startTime,
-      expectedNextTickAtMs: startTime + BILLING_PROCESS_INTERVAL_MS,
-      instanceId: getBillingInstanceId(),
-      runtimeEpoch: 1,
-      leaderLock: `runtime:${callId}`,
-    };
-    normalizeV4SessionFields(session);
-
-    // Best-effort durable metadata: persist initiator into Mongo Call record for recovery/analytics.
-    // Do not block billing on this write.
-    void Call.updateOne(
-      { callId },
-      {
-        $setOnInsert: {
-          callId,
-          callerUserId: user._id,
-          creatorUserId: creator.userId,
-          status: 'ringing',
-        },
-        ...(initiatedByFirebaseUid ? { $set: { initiatedByFirebaseUid } } : {}),
-        ...(initiatedByRole ? { $set: { initiatedByRole } } : {}),
-      },
-      { upsert: true }
-    ).catch(() => {});
-
-    try {
-      recordBillingMetric('redis_ops', 5, { callId, path: 'session_seed' });
-      await redis
-        .multi()
-        .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
-        .setex(callUserIntroMicrosKey(callId), CALL_SESSION_TTL, String(initialIntroMicros))
-        .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
-        .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
-        .exec();
+      const {
+        session,
+        spendableMicros,
+        initialIntroMicros,
+        initialWalletMicros,
+        introPromoActive,
+        pricePerSecondMicros,
+        creatorEarningsPerSecondMicros,
+      } = promoteResult;
+      const effectiveDurationLimitSeconds = session.effectiveDurationLimitSeconds;
+      const pricing = {
+        pricePerMinute: session.pricePerMinute,
+        pricePerSecondMicros: session.pricePerSecondMicros,
+        creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
+        creatorShareAtCallTime: session.creatorShareAtCallTime,
+        pricePerSecond: session.pricePerSecondMicros / COIN_MICROS,
+      };
       finalSessionPersisted = true;
-      logInfo('billing_session_promoted_full', {
-        ...billingLifecycleLogContext({
-          callId,
-          source,
-          payerFirebaseUid: userFirebaseUid,
-          creatorFirebaseUid,
-          initiatedByFirebaseUid,
-          initiatedByRole,
-        }),
-        promotedDelayMs: Math.max(0, Date.now() - seedStartTime),
-      });
-      recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_seed' });
-
-      try {
-        await upsertBillingCheckpointSnapshot({
-          callId,
-          userMongoId: session.userMongoId,
-          creatorMongoId: session.creatorMongoId,
-          userFirebaseUid: session.userFirebaseUid,
-          creatorFirebaseUid: session.creatorFirebaseUid,
-          startTimeMs: session.startTime,
-          lastProcessedAtMs: session.lastProcessedAt,
-          remainingUserBalanceMicros: spendableMicros,
-          pricePerSecondMicros: session.pricePerSecondMicros,
-          creatorEarningsPerSecondMicros: session.creatorEarningsPerSecondMicros,
-          totalDeductedMicros: session.totalDeductedMicros,
-          totalEarnedMicros: session.totalEarnedMicros,
-          billingSequence: session.billingSequence,
-          lifecycleState: session.lifecycleState,
-          status: 'active',
-        });
-      } catch (cpErr) {
-        logError('Early checkpoint snapshot after session seed failed (non-fatal)', cpErr, {
-          callId,
-        });
-      }
 
       logInfo('Billing session started - Redis keys seeded', {
         ...billingLifecycleLogContext({
@@ -1808,40 +1944,6 @@ export class BillingService {
         initiatedByFirebaseUid,
         initiatedByRole,
       }));
-    } catch (redisError) {
-      recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'session_seed' });
-      logError('CRITICAL: Failed to start billing session in Redis', redisError, {
-        ...billingLifecycleLogContext({
-          callId,
-          source,
-          payerFirebaseUid: userFirebaseUid,
-          creatorFirebaseUid,
-          initiatedByFirebaseUid,
-          initiatedByRole,
-        }),
-        redisPath: 'session_seed',
-        redisOpCount: 8,
-        alert: true,
-      });
-      logError(
-        'billing_lifecycle_seed_redis_failed',
-        redisError,
-        billingLifecycleLogContext({
-          callId,
-          source,
-          payerFirebaseUid: userFirebaseUid,
-          creatorFirebaseUid,
-          initiatedByFirebaseUid,
-          initiatedByRole,
-        })
-      );
-      io.to(`user:${userFirebaseUid}`).emit('billing:error', {
-        callId,
-        error: 'REDIS_UNAVAILABLE',
-        message: 'Billing system unavailable. Please try again.',
-      });
-      throw redisError;
-    }
 
     slotsToReleaseOnFailure = false;
 
@@ -2276,16 +2378,35 @@ export class BillingService {
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'session_migration' });
       }
 
-      const pricePerSecondMicros =
+      let pricePerSecondMicros =
         session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
       const creatorEarningsPerSecondMicros = session.creatorEarningsPerSecondMicros;
       const previousDeductedMicros = session.totalDeductedMicros;
       const previousEarnedMicros = session.totalEarnedMicros;
       const previousElapsedSeconds = session.elapsedSeconds ?? 0;
 
-      if (pricePerSecondMicros <= 0) {
-        logWarning('Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });
-        return 'stop_needs_settlement';
+      if (Number(pricePerSecondMicros) <= 0) {
+        const { repairSessionPricingIfNeeded } = await import(
+          './billing-session-pricing-repair.service'
+        );
+        const repairResult = await repairSessionPricingIfNeeded(
+          io,
+          callId,
+          session,
+          'billing_tick'
+        );
+        pricePerSecondMicros =
+          session.billingPricePerSecondMicros ?? session.pricePerSecondMicros;
+        if (Number(pricePerSecondMicros) <= 0) {
+          logBillingHealthWarn('PRICING_REPAIR_FAILED', {
+            callId,
+            source: 'billing_tick',
+            reason: repairResult.reason,
+            pricePerSecondMicros: Number(pricePerSecondMicros) || 0,
+          });
+          logWarning('Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });
+          return 'tick_deferred';
+        }
       }
 
       if (session.expectedNextTickAtMs && Number.isFinite(session.expectedNextTickAtMs)) {

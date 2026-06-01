@@ -128,11 +128,49 @@ test('runtime ownership takeover and deferred ticks are implemented', () => {
 
 test('sync-warning autoheal reschedules billing ticks', () => {
   const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
-  assert.ok(socketSrc.includes('recoverBillingScheduleForCall'));
-  assert.ok(socketSrc.includes('processBillingTick(io, callId)'));
+  const healSrc = readFileSync(join(__dirname, 'billing-heal.service.ts'), 'utf8');
+  assert.ok(socketSrc.includes('healActiveCallBilling'));
+  assert.ok(healSrc.includes('recoverBillingScheduleForCall'));
+  assert.ok(healSrc.includes('processBillingTick(io, callId)'));
 });
 
 test('startup recovery reclaims stale runtime ownership', () => {
   const recoverySrc = readFileSync(join(__dirname, 'billing-recovery.ts'), 'utf8');
   assert.ok(recoverySrc.includes('reclaimStaleRuntimeOwnershipOnStartup'));
+});
+
+test('zero-price sessions use pricing repair before tick abort', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  const repairSrc = readFileSync(
+    join(__dirname, 'billing-session-pricing-repair.service.ts'),
+    'utf8'
+  );
+  assert.ok(repairSrc.includes('repairSessionPricingIfNeeded'));
+  assert.ok(repairSrc.includes('promoteBootstrappingSession'));
+  assert.ok(serviceSrc.includes('repairSessionPricingIfNeeded'));
+  assert.ok(serviceSrc.includes("return 'tick_deferred'"));
+  assert.ok(!serviceSrc.includes("Invalid pricePerSecondMicros', { callId, pricePerSecondMicros });\n        return 'stop_needs_settlement'"));
+});
+
+test('healing repairs pricing before rescheduling tick chain', () => {
+  const healSrc = readFileSync(join(__dirname, 'billing-heal.service.ts'), 'utf8');
+  assert.ok(healSrc.includes('repairSessionPricingIfNeeded'));
+  assert.ok(healSrc.includes('pricing_unresolved'));
+  assert.ok(healSrc.includes('hasValidSessionPricing'));
+  assert.ok(healSrc.includes('tickResult === \'tick_ok\''));
+  assert.ok(healSrc.includes('stop_needs_settlement') && healSrc.includes('hadValidPricing'));
+});
+
+test('pricing repair health events are defined', () => {
+  const healthSrc = readFileSync(join(__dirname, 'billing-health-log.ts'), 'utf8');
+  assert.ok(healthSrc.includes('PRICING_REPAIR_START'));
+  assert.ok(healthSrc.includes('PRICING_REPAIR_DONE'));
+  assert.ok(healthSrc.includes('PRICING_REPAIR_FAILED'));
+});
+
+test('checkpoint reconstruction backfills zero pricing from creator', () => {
+  const resolverSrc = readFileSync(join(__dirname, 'billing-runtime-resolver.service.ts'), 'utf8');
+  assert.ok(resolverSrc.includes('snapshotForCreatorCached'));
+  assert.ok(resolverSrc.includes('billing_checkpoint_pricing_backfilled'));
+  assert.ok(resolverSrc.includes('async function buildSessionFromCheckpoint'));
 });
