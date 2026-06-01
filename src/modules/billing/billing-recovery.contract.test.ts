@@ -197,3 +197,28 @@ test('checkpoint reconstruction backfills zero pricing from creator', () => {
   assert.ok(serviceSrc.includes('billing_checkpoint_pricing_backfilled'));
   assert.ok(serviceSrc.includes('async function buildSessionFromCheckpoint'));
 });
+
+test('start billing session logs explicit rejection reasons', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('billing_start_rejected_system_busy'));
+  assert.ok(serviceSrc.includes('billing_start_rejected_bootstrap_in_progress'));
+  assert.ok(serviceSrc.includes('billing_start_rejected_callpair_conflict'));
+  assert.ok(serviceSrc.includes('billing_start_rejected_active_slot_conflict'));
+  assert.ok(serviceSrc.includes('billing_start_rejected_promote_failed'));
+  assert.ok(serviceSrc.includes('billing_start_rejected_start_lock_busy'));
+});
+
+test('stale callpair locks are cleared before rejecting new session start', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('tryClearStaleCallpairLock'));
+  assert.ok(serviceSrc.includes('billing_start_callpair_orphan_recovered'));
+  assert.ok(serviceSrc.includes('session_start_callpair_orphan_recovered'));
+});
+
+test('promote repair reloads mongo balances when redis runtime is zero', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('billing_promote_balance_from_mongo'));
+  assert.ok(serviceSrc.includes("balanceSource: BalanceSource = 'mongo'"));
+  assert.ok(serviceSrc.includes("'redis_runtime'"));
+  assert.ok(serviceSrc.includes('writeRuntimeBalanceKeys'));
+});

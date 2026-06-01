@@ -60,6 +60,7 @@ import {
 import { forceTerminateCall } from './billing-termination.service';
 import {
   getEmitIntervalForStage,
+  getBillingBackpressureStage,
   isNewCallAdmissionBlocked,
   updateBackpressureStage,
 } from './billing-backpressure';
@@ -374,6 +375,78 @@ async function tryClearOrphanActiveCallSlots(
       // Preserve slot on parse error; regular reconciliation paths will handle invalid sessions.
     }
   }
+}
+
+const RELEASE_CALLPAIR_IF_MATCH_LUA = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`;
+
+async function tryClearStaleCallpairLock(
+  redis: ReturnType<typeof getRedis>,
+  userFirebaseUid: string,
+  creatorFirebaseUid: string
+): Promise<{ cleared: boolean; staleCallId?: string; reason?: string }> {
+  const pairKey = callpairKey(userFirebaseUid, creatorFirebaseUid);
+  const existingCallId = await redis.get(pairKey);
+  if (!existingCallId) {
+    return { cleared: false };
+  }
+
+  const releasePair = async (reason: string): Promise<void> => {
+    await redis.eval(RELEASE_CALLPAIR_IF_MATCH_LUA, 1, pairKey, existingCallId).catch(() => {});
+    const stillExists = Boolean(await redis.get(pairKey));
+    if (stillExists) {
+      await redis.del(pairKey).catch(() => {});
+    }
+    logInfo('Stale callpair lock cleared', {
+      pairKey,
+      staleCallId: existingCallId,
+      reason,
+      pairKeyExistsAfterDelete: Boolean(await redis.get(pairKey)),
+    });
+  };
+
+  const sessionRaw = await redis.get(callSessionKey(existingCallId));
+  if (!sessionRaw) {
+    await releasePair('missing_session');
+    recordBillingMetric('session_start_callpair_orphan_recovered', 1, {
+      staleCallId: existingCallId,
+    });
+    return { cleared: true, staleCallId: existingCallId, reason: 'missing_session' };
+  }
+
+  try {
+    const session = JSON.parse(sessionRaw) as { lifecycleState?: string; startTime?: number };
+    const lifecycle = String(session.lifecycleState || '').toUpperCase();
+    if (lifecycle === 'SETTLED' || lifecycle === 'FAILED') {
+      await releasePair('terminal_lifecycle');
+      recordBillingMetric('session_start_callpair_terminal_recovered', 1, {
+        staleCallId: existingCallId,
+        lifecycle,
+      });
+      return { cleared: true, staleCallId: existingCallId, reason: 'terminal_lifecycle' };
+    }
+    if (lifecycle === 'STARTING') {
+      const startTime = Number(session.startTime);
+      const ageMs =
+        Number.isFinite(startTime) && startTime > 0 ? Math.max(0, Date.now() - startTime) : 0;
+      if (ageMs > 120_000) {
+        await releasePair('stale_starting');
+        recordBillingMetric('session_start_callpair_starting_recovered', 1, {
+          staleCallId: existingCallId,
+          ageMs,
+        });
+        return { cleared: true, staleCallId: existingCallId, reason: 'stale_starting' };
+      }
+    }
+  } catch {
+    /* preserve lock on parse error */
+  }
+
+  return { cleared: false, staleCallId: existingCallId };
 }
 
 async function consumePendingCallEndIfAny(
@@ -700,21 +773,45 @@ export async function promoteBootstrappingSession(
   const hasRuntimeActivity =
     Number(existingSession.billingSequence ?? 0) > 0 ||
     Number(existingSession.totalDeductedMicros ?? 0) > 0;
+  const repairPreserveRequested = opts?.preserveRuntimeBalances === true;
   const preserveRuntimeBalances =
-    opts?.preserveRuntimeBalances === true ||
+    repairPreserveRequested ||
     (opts?.preserveStartTime === true && hasRuntimeActivity);
+
+  type BalanceSource = 'mongo' | 'redis_runtime';
+  let balanceSource: BalanceSource = 'mongo';
 
   if (preserveRuntimeBalances) {
     const [introRaw, walletRaw] = await Promise.all([
       redis.get(callUserIntroMicrosKey(callId)),
       redis.get(callUserWalletMicrosKey(callId)),
     ]);
-    if (introRaw !== null || walletRaw !== null) {
-      initialIntroMicros = Math.max(0, parseInt(String(introRaw ?? '0'), 10) || 0);
-      initialWalletMicros = Math.max(0, parseInt(String(walletRaw ?? '0'), 10) || 0);
+    const redisIntro =
+      introRaw !== null ? Math.max(0, parseInt(String(introRaw), 10) || 0) : null;
+    const redisWallet =
+      walletRaw !== null ? Math.max(0, parseInt(String(walletRaw), 10) || 0) : null;
+    const redisTotal = (redisIntro ?? 0) + (redisWallet ?? 0);
+    const canUseRedisRuntime =
+      hasRuntimeActivity && redisTotal > 0 && (introRaw !== null || walletRaw !== null);
+
+    if (canUseRedisRuntime) {
+      initialIntroMicros = redisIntro ?? 0;
+      initialWalletMicros = redisWallet ?? 0;
       introPromoActive =
         existingSession.introPromoActive === true ||
         (initialIntroMicros > 0 && initialWalletMicros === 0);
+      balanceSource = 'redis_runtime';
+    } else {
+      logDebug('billing_promote_balance_from_mongo', {
+        callId,
+        source,
+        repairPreserveRequested,
+        hasRuntimeActivity,
+        redisIntroMicros: redisIntro,
+        redisWalletMicros: redisWallet,
+        mongoIntroMicros: initialIntroMicros,
+        mongoWalletMicros: initialWalletMicros,
+      });
     }
   }
 
@@ -822,9 +919,8 @@ export async function promoteBootstrappingSession(
 
   try {
     recordBillingMetric('redis_ops', 5, { callId, path: 'session_seed' });
-    if (preserveRuntimeBalances) {
-      await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
-    } else {
+    const writeRuntimeBalanceKeys = balanceSource !== 'redis_runtime';
+    if (writeRuntimeBalanceKeys) {
       await redis
         .multi()
         .setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session))
@@ -832,6 +928,8 @@ export async function promoteBootstrappingSession(
         .setex(callUserWalletMicrosKey(callId), CALL_SESSION_TTL, String(initialWalletMicros))
         .setex(callCreatorEarningsKey(callId), CALL_SESSION_TTL, '0')
         .exec();
+    } else {
+      await redis.setex(callSessionKey(callId), CALL_SESSION_TTL, JSON.stringify(session));
     }
     logInfo('billing_session_promoted_full', {
       ...billingLifecycleLogContext({
@@ -1703,6 +1801,19 @@ export class BillingService {
       'NX'
     );
     if (startLock !== 'OK') {
+      logWarning('billing_start_rejected_start_lock_busy', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        attemptedSource: source,
+        startCorrelationId,
+        startIngress,
+      });
       logInfo('Billing session start lock busy (idempotent duplicate)', {
         ...billingLifecycleLogContext({
           callId,
@@ -1744,6 +1855,19 @@ export class BillingService {
     try {
     if (isNewCallAdmissionBlocked()) {
       recordBillingMetric('new_call_admission_rejected', 1, { source, callIdPrefix });
+      logWarning('billing_start_rejected_system_busy', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        startCorrelationId,
+        startIngress,
+        backpressureStage: getBillingBackpressureStage(),
+      });
       io.to(`user:${userFirebaseUid}`).emit('billing:error', {
         callId,
         error: 'SYSTEM_BUSY_TRY_AGAIN',
@@ -1767,6 +1891,20 @@ export class BillingService {
               source,
             });
           } else {
+            logWarning('billing_start_rejected_bootstrap_in_progress', {
+              ...billingLifecycleLogContext({
+                callId,
+                source,
+                payerFirebaseUid: userFirebaseUid,
+                creatorFirebaseUid,
+                initiatedByFirebaseUid,
+                initiatedByRole,
+              }),
+              ageMs,
+              attemptedSource: source,
+              startCorrelationId,
+              startIngress,
+            });
             logInfo('Billing session bootstrap in progress (idempotent duplicate)', {
               ...billingLifecycleLogContext({
                 callId,
@@ -1812,15 +1950,52 @@ export class BillingService {
         }
       } catch (replayErr) {
         logError('Failed to replay billing:started for existing session', replayErr, { callId });
+        logWarning('billing_start_rejected_existing_session_parse_error', {
+          callId,
+          source,
+          startCorrelationId,
+          startIngress,
+        });
         return;
       }
     }
 
     // Pair anti-race lock: prevents dual billing sessions for the same user↔creator pair.
     const pairKey = callpairKey(userFirebaseUid, creatorFirebaseUid);
-    const pairLock = await redis.set(pairKey, callId, 'EX', CALL_SESSION_TTL, 'NX');
+    let pairLock = await redis.set(pairKey, callId, 'EX', CALL_SESSION_TTL, 'NX');
     if (pairLock !== 'OK') {
+      const pairRecovery = await tryClearStaleCallpairLock(
+        redis,
+        userFirebaseUid,
+        creatorFirebaseUid
+      );
+      if (pairRecovery.cleared) {
+        logInfo('billing_start_callpair_orphan_recovered', {
+          callId,
+          source,
+          startCorrelationId,
+          staleCallId: pairRecovery.staleCallId,
+          reason: pairRecovery.reason,
+        });
+        pairLock = await redis.set(pairKey, callId, 'EX', CALL_SESSION_TTL, 'NX');
+      }
+    }
+    if (pairLock !== 'OK') {
+      const blockingCallId = await redis.get(pairKey);
       recordBillingMetric('session_start_callpair_conflict', 1, { source, callIdPrefix });
+      logWarning('billing_start_rejected_callpair_conflict', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        blockingCallId,
+        startCorrelationId,
+        startIngress,
+      });
       io.to(`user:${userFirebaseUid}`).emit('billing:error', {
         callId,
         error: 'CALLPAIR_CONFLICT',
@@ -1836,6 +2011,19 @@ export class BillingService {
       creatorFirebaseUid
     );
     if (slotReserve === 'conflict') {
+      logWarning('billing_start_rejected_active_slot_conflict', {
+        ...billingLifecycleLogContext({
+          callId,
+          source,
+          payerFirebaseUid: userFirebaseUid,
+          creatorFirebaseUid,
+          initiatedByFirebaseUid,
+          initiatedByRole,
+        }),
+        callIdPrefix,
+        startCorrelationId,
+        startIngress,
+      });
       logWarning('Active call slot conflict — rejecting billing session start', {
         ...billingLifecycleLogContext({
           callId,
@@ -1941,6 +2129,20 @@ export class BillingService {
         }
       );
       if (!promoteResult.ok) {
+        logWarning('billing_start_rejected_promote_failed', {
+          ...billingLifecycleLogContext({
+            callId,
+            source,
+            payerFirebaseUid: userFirebaseUid,
+            creatorFirebaseUid,
+            initiatedByFirebaseUid,
+            initiatedByRole,
+          }),
+          reason: promoteResult.reason,
+          startCorrelationId,
+          startIngress,
+          seededEarlySession,
+        });
         if (
           promoteResult.reason === 'invalid_participants' ||
           promoteResult.reason === 'insufficient_coins'
