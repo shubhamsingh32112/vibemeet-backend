@@ -1,7 +1,14 @@
 import { Server, Socket } from 'socket.io';
 import { getFirebaseAdmin } from '../../config/firebase';
-import { transitionCreatorPresence, getBatchCreatorPresence, normalizeFirebaseUids } from './presence.service';
+import {
+  transitionCreatorPresence,
+  getBatchCreatorPresence,
+  normalizeFirebaseUids,
+  getCreatorBaseAvailability,
+} from './presence.service';
+import { clearCreatorActiveCallSlotIfStale } from './creator-active-call-slot.service';
 import { User } from '../user/user.model';
+import { Creator } from '../creator/creator.model';
 import { logInfo, logError, logWarning, logDebug } from '../../utils/logger';
 import { logCreatorPresenceSweepSummary } from './creator-presence-audit.service';
 import { recordCallMetric } from '../../utils/monitoring';
@@ -80,6 +87,204 @@ function clearCreatorDisconnectTimer(firebaseUid: string): void {
   if (!timer) return;
   clearTimeout(timer);
   creatorDisconnectTimers.delete(firebaseUid);
+}
+
+function stopCreatorHeartbeat(firebaseUid: string): void {
+  const heartbeatInterval = creatorHeartbeatIntervals.get(firebaseUid);
+  if (!heartbeatInterval) return;
+  clearInterval(heartbeatInterval);
+  creatorHeartbeatIntervals.delete(firebaseUid);
+  logDebug('Creator heartbeat stopped', { firebaseUid });
+}
+
+function parseCreatorOnlinePayload(payload: unknown): { clearStuckCall: boolean } {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const raw = payload as Record<string, unknown>;
+    return { clearStuckCall: raw.clearStuckCall === true };
+  }
+  return { clearStuckCall: false };
+}
+
+function startCreatorHeartbeat(io: Server, firebaseUid: string): void {
+  if (creatorHeartbeatIntervals.has(firebaseUid)) {
+    return;
+  }
+  lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
+  const heartbeatInterval = setInterval(async () => {
+    try {
+      const activeSockets = activeSocketsByCreator.get(firebaseUid);
+      if (!activeSockets || activeSockets.size === 0) {
+        if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
+          return;
+        }
+        stopCreatorHeartbeat(firebaseUid);
+        await transitionCreatorPresence(
+          io,
+          firebaseUid,
+          'DISCONNECTED',
+          'availability.gateway.creator_heartbeat_no_sockets'
+        );
+        logWarning('Heartbeat stopped: no active sockets', { firebaseUid });
+        return;
+      }
+
+      let hasConnectedSocket = false;
+      for (const socketId of activeSockets) {
+        const socketInstance = io.sockets.sockets.get(socketId);
+        if (socketInstance && socketInstance.connected) {
+          hasConnectedSocket = true;
+          break;
+        }
+      }
+
+      if (!hasConnectedSocket) {
+        if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
+          return;
+        }
+        stopCreatorHeartbeat(firebaseUid);
+        activeSocketsByCreator.delete(firebaseUid);
+        await transitionCreatorPresence(
+          io,
+          firebaseUid,
+          'DISCONNECTED',
+          'availability.gateway.creator_heartbeat_disconnected'
+        );
+        logWarning('Heartbeat stopped: all sockets disconnected', { firebaseUid });
+        return;
+      }
+
+      const base = await getCreatorBaseAvailability(firebaseUid);
+      if (base === 'offline') {
+        stopCreatorHeartbeat(firebaseUid);
+        logDebug('Heartbeat stopped: creator base offline (toggle)', { firebaseUid });
+        return;
+      }
+
+      const nowMs = Date.now();
+      const lastHeartbeat = lastCreatorHeartbeatAtMs.get(firebaseUid) || nowMs;
+      const driftMs = Math.max(0, nowMs - lastHeartbeat - HEARTBEAT_INTERVAL);
+      recordCallMetric('presence.creator_heartbeat_drift_ms', driftMs, {
+        role: 'creator',
+      });
+      lastCreatorHeartbeatAtMs.set(firebaseUid, nowMs);
+      await transitionCreatorPresence(
+        io,
+        firebaseUid,
+        'HEARTBEAT',
+        'availability.gateway.creator_heartbeat'
+      );
+      logDebug('Heartbeat refreshed creator presence state', { firebaseUid });
+    } catch (err) {
+      logError('Heartbeat failed', err, { firebaseUid });
+    }
+  }, HEARTBEAT_INTERVAL);
+  creatorHeartbeatIntervals.set(firebaseUid, heartbeatInterval);
+}
+
+async function handleCreatorExplicitOnline(
+  io: Server,
+  firebaseUid: string,
+  source: string,
+  options?: { clearStuckCall?: boolean }
+): Promise<void> {
+  clearCreatorDisconnectTimer(firebaseUid);
+  lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
+  if (options?.clearStuckCall) {
+    const clearResult = await clearCreatorActiveCallSlotIfStale(firebaseUid, {
+      source: `${source}.clear_stuck_call`,
+    });
+    if (!clearResult.cleared && clearResult.reason === 'slot_still_live') {
+      recordCallMetric('presence.clear_stuck_call_blocked_live', 1, {
+        creatorFirebaseUid: firebaseUid,
+        source,
+      });
+      logInfo('presence.clear_stuck_call_blocked_live', {
+        firebaseUid,
+        source,
+        slotCallId: clearResult.slotCallId,
+        timestamp: Date.now(),
+      });
+    }
+  }
+  await transitionCreatorPresence(io, firebaseUid, 'CONNECTED', source);
+  startCreatorHeartbeat(io, firebaseUid);
+  logInfo('creator_status_change', {
+    firebaseUid,
+    to: 'online',
+    eventType: 'CONNECTED',
+    source,
+    clearStuckCall: options?.clearStuckCall === true,
+  });
+  logInfo('Creator set to online', { firebaseUid, source });
+}
+
+async function handleCreatorExplicitOffline(
+  io: Server,
+  firebaseUid: string,
+  source: string
+): Promise<void> {
+  clearCreatorDisconnectTimer(firebaseUid);
+  stopCreatorHeartbeat(firebaseUid);
+  await transitionCreatorPresence(io, firebaseUid, 'FORCE_OFFLINE', source);
+  lastCreatorHeartbeatAtMs.delete(firebaseUid);
+  logInfo('creator_status_change', {
+    firebaseUid,
+    to: 'offline',
+    eventType: 'FORCE_OFFLINE',
+    source,
+  });
+  logInfo('Creator set to offline', { firebaseUid, source });
+}
+
+/**
+ * Apply runtime presence from creator availability intent (Redis + broadcast).
+ * Mongo isOnline must be updated separately (REST toggle / logout).
+ */
+export async function applyCreatorAvailabilityIntent(
+  io: Server,
+  firebaseUid: string,
+  isOnline: boolean,
+  source: string,
+  options?: { clearStuckCall?: boolean }
+): Promise<void> {
+  if (isOnline) {
+    await handleCreatorExplicitOnline(io, firebaseUid, source, options);
+  } else {
+    await handleCreatorExplicitOffline(io, firebaseUid, source);
+  }
+}
+
+/**
+ * Restore Redis runtime from Mongo Creator.isOnline (intent) after connect / Redis loss.
+ */
+export async function restoreCreatorRuntimeFromIntent(
+  io: Server,
+  firebaseUid: string,
+  source: string
+): Promise<boolean> {
+  const user = await User.findOne({ firebaseUid }).select('_id').lean();
+  if (!user) {
+    return false;
+  }
+  const creator = await Creator.findOne({ userId: user._id }).select('isOnline').lean();
+  if (creator?.isOnline !== true) {
+    logDebug('Creator toggle mode: Mongo intent offline — no runtime restore', {
+      firebaseUid,
+      source,
+    });
+    return false;
+  }
+  await handleCreatorExplicitOnline(io, firebaseUid, source, { clearStuckCall: false });
+  recordCallMetric('presence.restore_from_mongo', 1, {
+    creatorFirebaseUid: firebaseUid,
+    source,
+  });
+  logInfo('presence.restore_from_mongo', {
+    firebaseUid,
+    source,
+    timestamp: Date.now(),
+  });
+  return true;
 }
 
 function scheduleCreatorDisconnectTransition(
@@ -336,91 +541,17 @@ export function setupAvailabilityGateway(io: Server): void {
       }
       activeSocketsByCreator.get(firebaseUid)!.add(socket.id);
       
-      // 🔥 FIX: Automatically set creator online when first device connects
-      // Product requirement: creators are automatically online when app opens
-      // Effective busy is derived from active call state, so base presence
-      // should still become online on first connection.
       if (currentCount === 0) {
         clearCreatorDisconnectTimer(firebaseUid);
-        lastCreatorHeartbeatAtMs.set(firebaseUid, Date.now());
-        await setCreatorAvailability(io, firebaseUid, 'online');
-        logInfo('creator_status_connect', {
-          firebaseUid,
-          to: 'online',
-          socketCount: currentCount + 1,
-        });
-        logInfo('Creator automatically set to online on connect', { firebaseUid });
-        
-        // 🔥 SCALABILITY: Start heartbeat to refresh TTL (prevents auto-expire while connected)
-        // Heartbeat runs every 60s, TTL is 120s - ensures status persists even with network hiccups
-        const heartbeatInterval = setInterval(async () => {
-          try {
-            // 🔥 CRITICAL FIX: Verify creator still has active sockets before refreshing
-            const activeSockets = activeSocketsByCreator.get(firebaseUid);
-            if (!activeSockets || activeSockets.size === 0) {
-              if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
-                return;
-              }
-              clearInterval(heartbeatInterval);
-              creatorHeartbeatIntervals.delete(firebaseUid);
-              await transitionCreatorPresence(
-                io,
-                firebaseUid,
-                'DISCONNECTED',
-                'availability.gateway.creator_heartbeat_no_sockets'
-              );
-              logWarning('Heartbeat stopped: no active sockets', { firebaseUid });
-              return;
-            }
-            
-            // Verify at least one socket is still connected
-            let hasConnectedSocket = false;
-            for (const socketId of activeSockets) {
-              const socketInstance = io.sockets.sockets.get(socketId);
-              if (socketInstance && socketInstance.connected) {
-                hasConnectedSocket = true;
-                break;
-              }
-            }
-            
-            if (!hasConnectedSocket) {
-              if (creatorHasAnyConnectedSocket(io, firebaseUid)) {
-                return;
-              }
-              clearInterval(heartbeatInterval);
-              creatorHeartbeatIntervals.delete(firebaseUid);
-              activeSocketsByCreator.delete(firebaseUid);
-              await transitionCreatorPresence(
-                io,
-                firebaseUid,
-                'DISCONNECTED',
-                'availability.gateway.creator_heartbeat_disconnected'
-              );
-              logWarning('Heartbeat stopped: all sockets disconnected', { firebaseUid });
-              return;
-            }
-            
-            const nowMs = Date.now();
-            const lastHeartbeat = lastCreatorHeartbeatAtMs.get(firebaseUid) || nowMs;
-            const driftMs = Math.max(0, nowMs - lastHeartbeat - HEARTBEAT_INTERVAL);
-            recordCallMetric('presence.creator_heartbeat_drift_ms', driftMs, {
-              role: 'creator',
-            });
-            lastCreatorHeartbeatAtMs.set(firebaseUid, nowMs);
-            await transitionCreatorPresence(
-              io,
-              firebaseUid,
-              'HEARTBEAT',
-              'availability.gateway.creator_heartbeat'
-            );
-            logDebug('Heartbeat refreshed creator presence state', { firebaseUid });
-          } catch (err) {
-            logError('Heartbeat failed', err, { firebaseUid });
-          }
-        }, HEARTBEAT_INTERVAL);
-        
-        // Store interval for cleanup
-        creatorHeartbeatIntervals.set(firebaseUid, heartbeatInterval);
+        try {
+          await restoreCreatorRuntimeFromIntent(
+            io,
+            firebaseUid,
+            'availability.gateway.connect_first_socket'
+          );
+        } catch (err) {
+          logError('Failed creator connect intent restore', err, { firebaseUid });
+        }
       }
     }
 
@@ -597,30 +728,25 @@ export function setupAvailabilityGateway(io: Server): void {
       }
     );
 
-    // Creator self-presence toggle (used by frontend AvailabilitySocketService).
-    socket.on('creator:online', async () => {
+    // Creator explicit availability toggle (production SocketService + REST).
+    socket.on('creator:online', async (payload: unknown) => {
       const uid = socket.data.firebaseUid as string | undefined;
       const creator = Boolean(socket.data.isCreator);
       if (!uid || !creator) {
         logWarning('Unauthorized creator:online request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
-      
-      clearCreatorDisconnectTimer(uid);
-      lastCreatorHeartbeatAtMs.set(uid, Date.now());
-      await transitionCreatorPresence(
-        io,
-        uid,
-        'CONNECTED',
-        'availability.gateway.creator_online_event'
-      );
-      logInfo('creator_status_change', {
-        firebaseUid: uid,
-        to: 'online',
-        eventType: 'CONNECTED',
-        source: 'availability.gateway.creator_online_event',
-      });
-      logInfo('Creator set to online', { firebaseUid: uid });
+      const { clearStuckCall } = parseCreatorOnlinePayload(payload);
+      try {
+        await handleCreatorExplicitOnline(
+          io,
+          uid,
+          'availability.gateway.creator_online_event',
+          { clearStuckCall }
+        );
+      } catch (err) {
+        logError('Failed creator:online handler', err, { firebaseUid: uid });
+      }
     });
 
     socket.on('creator:offline', async () => {
@@ -630,25 +756,11 @@ export function setupAvailabilityGateway(io: Server): void {
         logWarning('Unauthorized creator:offline request', { socketId: socket.id, firebaseUid: uid });
         return;
       }
-      if (creatorHasAnyConnectedSocket(io, uid)) {
-        logDebug('Ignoring creator:offline — sockets still connected', { firebaseUid: uid });
-        return;
+      try {
+        await handleCreatorExplicitOffline(io, uid, 'availability.gateway.creator_offline_event');
+      } catch (err) {
+        logError('Failed creator:offline handler', err, { firebaseUid: uid });
       }
-      clearCreatorDisconnectTimer(uid);
-      await transitionCreatorPresence(
-        io,
-        uid,
-        'DISCONNECTED',
-        'availability.gateway.creator_offline_event'
-      );
-      lastCreatorHeartbeatAtMs.set(uid, Date.now());
-      logInfo('creator_status_change', {
-        firebaseUid: uid,
-        to: 'offline',
-        eventType: 'DISCONNECTED',
-        source: 'availability.gateway.creator_offline_event',
-      });
-      logInfo('Creator set to offline', { firebaseUid: uid });
     });
 
     // User online handler
@@ -726,13 +838,8 @@ export function setupAvailabilityGateway(io: Server): void {
           creatorSocketCounts.delete(uid);
           lastCreatorHeartbeatAtMs.delete(uid);
           
-          // Stop heartbeat immediately (CRITICAL: must happen before status update)
-          const heartbeatInterval = creatorHeartbeatIntervals.get(uid);
-          if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-            creatorHeartbeatIntervals.delete(uid);
-            logDebug('Creator heartbeat stopped on disconnect', { firebaseUid: uid });
-          }
+          stopCreatorHeartbeat(uid);
+          logDebug('Creator heartbeat stopped on disconnect', { firebaseUid: uid });
           
           if (creatorHasAnyConnectedSocket(io, uid)) {
             logDebug('Creator disconnect ignored — other sockets still connected', {
@@ -833,6 +940,8 @@ export async function setCreatorAvailability(
 ): Promise<void> {
   if (status === 'online') {
     clearCreatorDisconnectTimer(creatorFirebaseUid);
+  } else {
+    stopCreatorHeartbeat(creatorFirebaseUid);
   }
   const startedAt = Date.now();
   const transition = await transitionCreatorPresence(
@@ -841,6 +950,11 @@ export async function setCreatorAvailability(
     status === 'online' ? 'CONNECTED' : 'FORCE_OFFLINE',
     'availability.gateway.setCreatorAvailability'
   );
+  if (status === 'online') {
+    startCreatorHeartbeat(io, creatorFirebaseUid);
+  } else {
+    lastCreatorHeartbeatAtMs.delete(creatorFirebaseUid);
+  }
   if (transition.state === status) {
     recordCallMetric('presence.creator_status_emit', 1, { status });
   } else {

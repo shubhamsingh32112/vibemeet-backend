@@ -272,6 +272,14 @@ async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<Creator
   };
 }
 
+/** Redis base availability (`online` | `offline`), not effective on_call. */
+export async function getCreatorBaseAvailability(
+  firebaseUid: string
+): Promise<CreatorBaseAvailability> {
+  const snapshot = await readCreatorPresenceSnapshot(firebaseUid);
+  return snapshot.base;
+}
+
 export async function readCreatorPresenceState(firebaseUid: string): Promise<CreatorPresenceRecord> {
   const snapshot = await readCreatorPresenceSnapshot(firebaseUid);
   return {

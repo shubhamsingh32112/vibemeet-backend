@@ -20,6 +20,10 @@ export const featureFlags = {
    * Switch creator presence to user-like base key model (`creator:availability:*`)
    * with busy derived from active call state.
    */
+  /**
+   * @deprecated Toggle mode is always on; env kept for ops dashboards only.
+   */
+  creatorAvailabilityToggleEnabled: true,
   creatorPresenceUserModelEnabled:
     process.env.CREATOR_PRESENCE_USER_MODEL_ENABLED === 'true',
   /**

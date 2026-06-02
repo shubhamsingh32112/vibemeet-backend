@@ -228,6 +228,28 @@ test('behavioral: active-call slot is not live when slot owner matches neither p
   resetRedisForTests();
 });
 
+test('behavioral: stale-only clear leaves live call slot intact', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+
+  const creatorFirebaseUid = 'creator-live-slot';
+  const liveCallId = 'call-live-toggle';
+  await redis.setex(activeCallByUserKey(creatorFirebaseUid), 7200, liveCallId);
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(async () => true);
+
+  const result = await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+    source: 'test.clear_stuck_call_live',
+  });
+  assert.equal(result.cleared, false);
+  assert.equal(result.reason, 'slot_still_live');
+  const slot = await redis.get(activeCallByUserKey(creatorFirebaseUid));
+  assert.equal(slot, liveCallId);
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
 test('behavioral: active-call slot is not live when terminal marker exists', async () => {
   const redis = new InMemoryRedis();
   setRedisForTests(redis as any);

@@ -9,7 +9,7 @@ import { CallHistory } from '../billing/call-history.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds } from './creator-tasks.config';
 import { getIO } from '../../config/socket';
 import { emitCreatorDataUpdated } from './creator-notify';
-import { setCreatorAvailability } from '../availability/availability.gateway';
+import { applyCreatorAvailabilityIntent } from '../availability/availability.gateway';
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
 import { getBatchCreatorPresence, normalizeFirebaseUids } from '../availability/presence.service';
 import {
@@ -1253,15 +1253,13 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
   }
 };
 
-// Set creator online status (DEPRECATED - Status is now automatic)
-// 🔥 NOTE: Creator status is now AUTOMATIC based on socket connection
-// - When creator opens app → socket connects → automatically online
-// - When creator closes app → socket disconnects → automatically offline
-// This endpoint is kept for backward compatibility but status is managed automatically
+// Set creator availability toggle (Mongo isOnline + Redis/socket broadcast).
+// When CREATOR_AVAILABILITY_TOGGLE_ENABLED=true, this is the primary persistence path
+// alongside creator:online / creator:offline socket events.
 export const setCreatorOnlineStatus = async (req: Request, res: Response): Promise<void> => {
   try {
     const { isOnline } = req.body;
-    console.log(`🔄 [CREATOR] Set online status request (DEPRECATED - status is automatic): ${isOnline}`);
+    console.log(`🔄 [CREATOR] Set availability toggle: ${isOnline}`);
     
     if (!req.auth) {
       res.status(401).json({
@@ -1309,19 +1307,21 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
       return;
     }
     
-    // Update MongoDB for legacy support (optional - not used for presence)
+    // Mongo = persistent availability intent (account-level).
     creator.isOnline = isOnline;
     await creator.save();
     
-    console.log(`✅ [CREATOR] Creator ${creator._id} availability set to: ${isOnline}`);
+    console.log(`✅ [CREATOR] Creator ${creator._id} availability intent set to: ${isOnline}`);
     
-    // Update Redis + broadcast via Socket.IO for instant real-time availability
+    // Redis + creator:status = runtime truth for fans.
     try {
       const io = getIO();
-      await setCreatorAvailability(
+      await applyCreatorAvailabilityIntent(
         io,
         currentUser.firebaseUid,
-        isOnline ? 'online' : 'offline'
+        isOnline,
+        'creator.controller.setCreatorOnlineStatus',
+        isOnline ? { clearStuckCall: false } : undefined
       );
       console.log(
         `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'offline'}`

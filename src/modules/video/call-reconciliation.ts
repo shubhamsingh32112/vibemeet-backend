@@ -90,12 +90,44 @@ const RECON_UNSETTLED_LOOKBACK_MS =
   parseInt(process.env.CALL_RECON_UNSETTLED_LOOKBACK_MS || String(7 * 24 * 60 * 60 * 1000), 10) ||
   7 * 24 * 60 * 60 * 1000;
 
+/**
+ * When Stream returns 404 for a call that we believe is active, treat it as transient
+ * for a short grace period if billing is still live/heartbeating.
+ *
+ * This prevents a single Stream read inconsistency from auto-ending a paid call.
+ */
+const RECON_STREAM_404_BILLING_GRACE_MS = Math.min(
+  10 * 60_000,
+  Math.max(15_000, parseInt(process.env.CALL_RECON_STREAM_404_BILLING_GRACE_MS || '120000', 10) || 120_000)
+);
+
 function isTerminalLifecycleState(state: string | undefined): boolean {
   return state === 'SETTLED' || state === 'FAILED' || state === 'FAILED_RECOVERY_SETTLEMENT';
 }
 
 function isCallDbRecordStillLive(status: string): boolean {
   return status === 'ringing' || status === 'accepted';
+}
+
+function isBillingRuntimeLikelyLive(runtime: {
+  source: string;
+  session: { lifecycleState?: string; lastProcessedAt?: number } | null;
+  terminalSnapshot?: unknown;
+}): { live: boolean; reason: string; ageMs: number } {
+  if (!runtime?.session) return { live: false, reason: 'no_session', ageMs: 0 };
+  if ((runtime as any).terminalSnapshot) return { live: false, reason: 'terminal_snapshot', ageMs: 0 };
+  const lifecycle = String(runtime.session.lifecycleState || 'ACTIVE');
+  if (isTerminalLifecycleState(lifecycle)) return { live: false, reason: 'terminal_lifecycle', ageMs: 0 };
+  const last = Number(runtime.session.lastProcessedAt || 0);
+  const ageMs = last > 0 ? Math.max(0, Date.now() - last) : 0;
+  if (last > 0 && ageMs <= RECON_STREAM_404_BILLING_GRACE_MS) {
+    return { live: true, reason: 'recent_heartbeat', ageMs };
+  }
+  // If we have a session but no heartbeat timestamp, be conservative: treat it as live.
+  if (last <= 0) {
+    return { live: true, reason: 'session_no_heartbeat', ageMs: 0 };
+  }
+  return { live: false, reason: 'stale_heartbeat', ageMs };
 }
 
 function parseUidFromActiveSlotKey(key: string): string | null {
@@ -910,6 +942,33 @@ async function reconcileActiveCalls(): Promise<void> {
         if (status === 404) {
           logInfo('Reconciling locally for call missing in Stream', { callId });
           if (call.status !== 'ended' || !call.isSettled) {
+            // Guard: if billing is still live/heartbeating, do NOT auto-end on a single Stream 404.
+            // This can happen due to transient Stream API/indexing inconsistencies.
+            try {
+              const runtime = await resolveBillingRuntimeState(callId);
+              const decision = isBillingRuntimeLikelyLive(runtime as any);
+              if (decision.live) {
+                recordCallMetric('call_reconciliation.stream_404_skipped', 1, {
+                  reason: decision.reason,
+                  runtimeSource: String((runtime as any).source || 'unknown'),
+                });
+                logInfo('Reconciliation skipped Stream 404 finalize (billing still live)', {
+                  callId,
+                  reason: decision.reason,
+                  heartbeatAgeMs: decision.ageMs,
+                  graceMs: RECON_STREAM_404_BILLING_GRACE_MS,
+                  runtimeSource: (runtime as any).source,
+                  lifecycleState: runtime.session?.lifecycleState,
+                });
+                return;
+              }
+            } catch (guardErr) {
+              // If guard fails, fall back to existing behavior (better to end than leak forever),
+              // but log so we can fix the guard path.
+              logError('Reconciliation Stream 404 billing-guard failed; proceeding to finalize', guardErr, {
+                callId,
+              });
+            }
             await finalizeCallEnd(getIO(), callId, 'reconciliation_stream_404');
           }
         } else {
