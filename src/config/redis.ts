@@ -472,8 +472,20 @@ export const CREATOR_DETAIL_TTL = 60;
 export const CREATOR_FEED_HIT_KEY = 'creator:feed:metrics:hits';
 export const CREATOR_FEED_MISS_KEY = 'creator:feed:metrics:misses';
 
-export const creatorFeedCacheKey = (page: number, limit: number): string =>
-  `${CREATOR_FEED_PREFIX}p${page}:l${limit}`;
+export type CreatorFeedSortMode = 'createdAt' | 'availability';
+
+export const creatorFeedCacheKey = (
+  page: number,
+  limit: number,
+  sort: CreatorFeedSortMode = 'createdAt',
+): string => `${CREATOR_FEED_PREFIX}p${page}:l${limit}:s:${sort}`;
+
+/** Lightweight card payload for creator:status fan insertion (TTL-backed). */
+export const CREATOR_CARD_PREFIX = 'creator:card:';
+export const CREATOR_CARD_TTL = 300;
+
+export const creatorCardCacheKey = (firebaseUid: string): string =>
+  `${CREATOR_CARD_PREFIX}${firebaseUid}`;
 
 export const creatorDetailCacheKey = (creatorId: string): string =>
   `${CREATOR_DETAIL_PREFIX}${creatorId}`;

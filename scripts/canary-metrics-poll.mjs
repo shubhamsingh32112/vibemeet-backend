@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Poll GET /metrics during canary and log alerts + billing health.
+ * Poll GET /metrics during canary and log alerts + billing/moments health.
  *
  * Usage:
  *   node scripts/canary-metrics-poll.mjs --url https://api.example.com --token SECRET
@@ -17,7 +17,7 @@ function getArg(name, fallback) {
 
 const baseUrl = (getArg('--url', process.env.API_URL || 'http://localhost:3000') || '').replace(
   /\/$/,
-  ''
+  '',
 );
 const token = getArg('--token', process.env.METRICS_TOKEN || '');
 const intervalSec = Number(getArg('--interval', '60'));
@@ -36,6 +36,7 @@ async function poll() {
 
   const alerts = body?.alerts?.active ?? [];
   const billing = body?.billing ?? {};
+  const moments = body?.moments ?? {};
   const line = {
     ts: new Date().toISOString(),
     alerts,
@@ -43,6 +44,14 @@ async function poll() {
     tickDriftP95: billing?.tickDriftMs?.p95Ms,
     bullmqLag: billing?.bullmq?.queueLagAvgMs,
     recovery: billing?.recovery,
+    momentsFanoutQueueDepth: moments?.fanout?.queueDepth,
+    momentsFanoutDurationP95: moments?.fanout?.durationMs?.p95Ms,
+    momentsFanoutFailed: moments?.fanout?.failedSum,
+    momentsWarmQueueDepth: moments?.warm?.queueDepth,
+    cfBreakerOpen: moments?.cloudflare?.breakerOpenSum,
+    playbackTokenRefreshFail: moments?.playback?.tokenRefreshFailSum,
+    playbackPlayerError: moments?.playback?.playerErrorSum,
+    playbackStartupP95: moments?.playback?.startupP95Ms,
   };
 
   console.log(JSON.stringify(line));

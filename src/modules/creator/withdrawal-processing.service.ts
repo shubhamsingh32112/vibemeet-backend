@@ -115,36 +115,10 @@ export async function processWithdrawalApproval(
       };
     }
 
-    const txId = `staff_withdrawal_${withdrawal._id}_${randomUUID()}`;
-    await new CoinTransaction({
-      transactionId: txId,
-      userId: staffUser._id,
-      type: 'debit',
-      coins: withdrawal.amount,
-      source: 'withdrawal',
-      description: `Staff withdrawal approved by ${actingUser.email || actingUser.role}${options.notes ? ': ' + options.notes.trim() : ''}`,
-      status: 'completed',
-    }).save();
-
-    staffUser.staffCoinsBalance = Math.max(0, bal - withdrawal.amount);
-    await staffUser.save();
-
-    await StaffWalletLedger.create({
-      staffUserId: staffUser._id,
-      direction: 'debit',
-      amountCoins: withdrawal.amount,
-      balanceAfter: staffUser.staffCoinsBalance,
-      sourceType: 'withdrawal_reserve',
-      withdrawalId: withdrawal._id,
-      description: `Staff withdrawal approved (balance deducted)`,
-      idempotencyKey: `staff_ledger_withdrawal_${withdrawal._id.toString()}_approve_debit`,
-    });
-
     withdrawal.status = 'approved';
     withdrawal.processedAt = new Date();
     withdrawal.adminUserId = actingUser._id;
     withdrawal.notes = options.notes?.trim() || undefined;
-    withdrawal.transactionId = txId;
     await withdrawal.save();
 
     await logStaffWithdrawalAction(
@@ -153,7 +127,6 @@ export async function processWithdrawalApproval(
       withdrawal._id.toString(),
       options.notes?.trim() || 'Staff withdrawal approved',
       {
-        transactionId: txId,
         staffUserId: staffUser._id.toString(),
         amount: withdrawal.amount,
         actorRole: actingUser.role,
@@ -166,28 +139,12 @@ export async function processWithdrawalApproval(
       status: 'approved',
     });
 
-    void persistDomainEvent({
-      eventType: 'WithdrawalCompletedEvent',
-      aggregateId: withdrawal._id.toString(),
-      idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
-      payload: {
-        eventKind: 'WithdrawalCompleted',
-        idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
-        occurredAt: new Date().toISOString(),
-        aggregateType: 'withdrawal',
-        aggregateId: withdrawal._id.toString(),
-        withdrawalId: withdrawal._id.toString(),
-        status: 'approved',
-      },
-    });
-
     return {
       ok: true,
       data: {
         withdrawalId: withdrawal._id.toString(),
         status: 'approved',
         amount: withdrawal.amount,
-        transactionId: txId,
       },
     };
   }
@@ -212,7 +169,6 @@ export async function processWithdrawalApproval(
     return { ok: false, status: 404, error: 'Creator user not found' };
   }
 
-  const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
   const availableBalance = creatorUser.coins;
   if (availableBalance < withdrawal.amount) {
     return {
@@ -222,71 +178,21 @@ export async function processWithdrawalApproval(
     };
   }
 
-  const txId = `withdrawal_${withdrawal._id}_${randomUUID()}`;
-  const oldCoins = creatorUser.coins;
-  const oldEarnings = creatorDoc?.earningsCoins ?? 0;
-
-  await new CoinTransaction({
-    transactionId: txId,
-    userId: creatorUser._id,
-    type: 'debit',
-    coins: withdrawal.amount,
-    source: 'withdrawal',
-    description: `Withdrawal approved by ${actingUser.email || actingUser.role}${options.notes ? ': ' + options.notes.trim() : ''}`,
-    status: 'completed',
-  }).save();
-
-  creatorUser.coins -= withdrawal.amount;
-  await creatorUser.save();
-
-  if (creatorDoc) {
-    creatorDoc.earningsCoins = Math.max(0, creatorDoc.earningsCoins - withdrawal.amount);
-    await creatorDoc.save();
-  }
-
   withdrawal.status = 'approved';
   withdrawal.processedAt = new Date();
   withdrawal.adminUserId = actingUser._id;
   withdrawal.notes = options.notes?.trim() || undefined;
-  withdrawal.transactionId = txId;
   if (!withdrawal.creatorUserId) {
     withdrawal.creatorUserId = creatorUser._id;
   }
   await withdrawal.save();
 
   await logStaffWithdrawalAction(actingUser, 'WITHDRAWAL_APPROVED', withdrawal._id.toString(), options.notes?.trim() || 'Withdrawal approved', {
-    transactionId: txId,
     creatorUserId: creatorUser._id.toString(),
     amount: withdrawal.amount,
-    oldBalance: oldCoins,
-    newBalance: creatorUser.coins,
-    oldEarnings,
-    newEarnings: creatorDoc?.earningsCoins ?? 0,
+    creatorBalance: creatorUser.coins,
     actorRole: actingUser.role,
   });
-
-  verifyUserBalance(creatorUser._id).catch(() => {});
-
-  try {
-    const io = getIO();
-    io.to(`user:${creatorUser.firebaseUid}`).emit('coins_updated', {
-      userId: creatorUser._id.toString(),
-      coins: creatorUser.coins,
-    });
-  } catch {
-    /* optional socket */
-  }
-
-  try {
-    emitCreatorDataUpdated(creatorUser.firebaseUid, {
-      reason: 'withdrawal_approved',
-      coins: creatorUser.coins,
-      withdrawalAmount: withdrawal.amount,
-      withdrawalId: withdrawal._id.toString(),
-    });
-  } catch {
-    /* optional */
-  }
 
   await invalidateAdminCaches('overview', 'coins', 'creators_performance');
   emitToAdmin('withdrawal:updated', {
@@ -300,9 +206,7 @@ export async function processWithdrawalApproval(
       withdrawalId: withdrawal._id.toString(),
       status: 'approved',
       amount: withdrawal.amount,
-      transactionId: txId,
-      creatorOldBalance: oldCoins,
-      creatorNewBalance: creatorUser.coins,
+      creatorBalance: creatorUser.coins,
     },
   };
 }
@@ -401,6 +305,51 @@ export async function processWithdrawalMarkPaid(
     if (!options.isAdmin || !isSuperAdminRole(actingUser.role)) {
       return { ok: false, status: 403, error: 'Staff withdrawals require super admin' };
     }
+
+    let txId = withdrawal.transactionId;
+    if (!txId) {
+      const staffUser = await User.findById(staffMarkPaidId);
+      if (!staffUser) {
+        return { ok: false, status: 404, error: 'Staff user not found' };
+      }
+
+      const bal = staffUser.staffCoinsBalance ?? 0;
+      if (bal < withdrawal.amount) {
+        return {
+          ok: false,
+          status: 400,
+          error: `Staff wallet balance (${bal}) is less than withdrawal amount (${withdrawal.amount}).`,
+        };
+      }
+
+      txId = `staff_withdrawal_${withdrawal._id}_${randomUUID()}`;
+      await new CoinTransaction({
+        transactionId: txId,
+        userId: staffUser._id,
+        type: 'debit',
+        coins: withdrawal.amount,
+        source: 'withdrawal',
+        description: `Staff withdrawal paid by ${actingUser.email || actingUser.role}${options.notes ? ': ' + options.notes.trim() : ''}`,
+        status: 'completed',
+      }).save();
+
+      staffUser.staffCoinsBalance = Math.max(0, bal - withdrawal.amount);
+      await staffUser.save();
+
+      await StaffWalletLedger.create({
+        staffUserId: staffUser._id,
+        direction: 'debit',
+        amountCoins: withdrawal.amount,
+        balanceAfter: staffUser.staffCoinsBalance,
+        sourceType: 'withdrawal_reserve',
+        withdrawalId: withdrawal._id,
+        description: 'Staff withdrawal paid (balance deducted)',
+        idempotencyKey: `staff_ledger_withdrawal_${withdrawal._id.toString()}_paid_debit`,
+      });
+
+      withdrawal.transactionId = txId;
+    }
+
     withdrawal.status = 'paid';
     withdrawal.processedAt = new Date();
     if (options.notes?.trim()) {
@@ -415,6 +364,7 @@ export async function processWithdrawalMarkPaid(
       withdrawal._id.toString(),
       options.notes?.trim() || 'Marked as paid',
       {
+        transactionId: txId,
         staffUserId: staffMarkPaidId.toString(),
         amount: withdrawal.amount,
         actorRole: actingUser.role,
@@ -427,14 +377,101 @@ export async function processWithdrawalMarkPaid(
       status: 'paid',
     });
 
+    void persistDomainEvent({
+      eventType: 'WithdrawalCompletedEvent',
+      aggregateId: withdrawal._id.toString(),
+      idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
+      payload: {
+        eventKind: 'WithdrawalCompleted',
+        idempotencyKey: `domain_evt_withdrawal_completed_${withdrawal._id}`,
+        occurredAt: new Date().toISOString(),
+        aggregateType: 'withdrawal',
+        aggregateId: withdrawal._id.toString(),
+        withdrawalId: withdrawal._id.toString(),
+        status: 'paid',
+      },
+    });
+
     return {
       ok: true,
       data: {
         withdrawalId: withdrawal._id.toString(),
         status: 'paid',
         amount: withdrawal.amount,
+        transactionId: txId,
       },
     };
+  }
+
+  const creatorUser = await resolveWithdrawalCreatorUser(withdrawal);
+  if (!creatorUser) {
+    return { ok: false, status: 404, error: 'Creator user not found' };
+  }
+
+  const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
+  let txId = withdrawal.transactionId;
+  let oldCoins: number | undefined;
+  let oldEarnings: number | undefined;
+
+  if (!txId) {
+    const availableBalance = creatorUser.coins;
+    if (availableBalance < withdrawal.amount) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Creator balance (${availableBalance}) is less than withdrawal amount (${withdrawal.amount}). Cannot mark as paid.`,
+      };
+    }
+
+    txId = `withdrawal_${withdrawal._id}_${randomUUID()}`;
+    oldCoins = creatorUser.coins;
+    oldEarnings = creatorDoc?.earningsCoins ?? 0;
+
+    await new CoinTransaction({
+      transactionId: txId,
+      userId: creatorUser._id,
+      type: 'debit',
+      coins: withdrawal.amount,
+      source: 'withdrawal',
+      description: `Withdrawal paid by ${actingUser.email || actingUser.role}${options.notes ? ': ' + options.notes.trim() : ''}`,
+      status: 'completed',
+    }).save();
+
+    creatorUser.coins -= withdrawal.amount;
+    await creatorUser.save();
+
+    if (creatorDoc) {
+      creatorDoc.earningsCoins = Math.max(0, creatorDoc.earningsCoins - withdrawal.amount);
+      await creatorDoc.save();
+    }
+
+    withdrawal.transactionId = txId;
+    if (!withdrawal.creatorUserId) {
+      withdrawal.creatorUserId = creatorUser._id;
+    }
+
+    verifyUserBalance(creatorUser._id).catch(() => {});
+
+    try {
+      const io = getIO();
+      io.to(`user:${creatorUser.firebaseUid}`).emit('coins_updated', {
+        userId: creatorUser._id.toString(),
+        coins: creatorUser.coins,
+      });
+    } catch {
+      /* optional socket */
+    }
+
+    try {
+      emitCreatorDataUpdated(creatorUser.firebaseUid, {
+        reason: 'withdrawal_paid',
+        coins: creatorUser.coins,
+        withdrawalAmount: withdrawal.amount,
+        withdrawalId: withdrawal._id.toString(),
+      });
+    } catch {
+      /* optional */
+    }
   }
 
   withdrawal.status = 'paid';
@@ -445,24 +482,14 @@ export async function processWithdrawalMarkPaid(
   }
   await withdrawal.save();
 
-  let creatorUser: InstanceType<typeof User> | null = null;
-  if (withdrawal.creatorUserId) {
-    creatorUser = await User.findById(withdrawal.creatorUserId);
-  } else {
-    const uid = (withdrawal as { creatorFirebaseUid?: string }).creatorFirebaseUid;
-    if (uid) creatorUser = await User.findOne({ firebaseUid: uid });
-  }
-  if (creatorUser) {
-    const creatorDoc = await Creator.findOne({ userId: creatorUser._id });
-    if (creatorDoc && creatorDoc.earningsCoins > 0) {
-      creatorDoc.earningsCoins = Math.max(0, creatorDoc.earningsCoins - withdrawal.amount);
-      await creatorDoc.save();
-    }
-  }
-
   await logStaffWithdrawalAction(actingUser, 'WITHDRAWAL_PAID', withdrawal._id.toString(), options.notes?.trim() || 'Marked as paid', {
-    creatorUserId: withdrawal.creatorUserId?.toString() || (withdrawal as { creatorFirebaseUid?: string }).creatorFirebaseUid || 'unknown',
+    transactionId: txId,
+    creatorUserId: creatorUser._id.toString(),
     amount: withdrawal.amount,
+    oldBalance: oldCoins,
+    newBalance: creatorUser.coins,
+    oldEarnings,
+    newEarnings: creatorDoc?.earningsCoins ?? 0,
     processedAt: withdrawal.processedAt.toISOString(),
     actorRole: actingUser.role,
   });
@@ -479,7 +506,11 @@ export async function processWithdrawalMarkPaid(
       withdrawalId: withdrawal._id.toString(),
       status: 'paid',
       amount: withdrawal.amount,
+      transactionId: txId,
       processedAt: withdrawal.processedAt.toISOString(),
+      ...(oldCoins !== undefined
+        ? { creatorOldBalance: oldCoins, creatorNewBalance: creatorUser.coins }
+        : {}),
     },
   };
 }

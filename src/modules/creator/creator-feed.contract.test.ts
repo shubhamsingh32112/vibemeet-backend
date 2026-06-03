@@ -40,6 +40,18 @@ test('getCreatorFeed enforces deterministic sort by createdAt desc', () => {
   assert.ok(block.includes('.sort({ createdAt: -1 })'));
 });
 
+test('getCreatorFeed supports sort=availability with presence rank', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes("parseCreatorFeedSort(req.query.sort)"));
+  assert.ok(block.includes("feedSort === 'availability'"));
+  assert.ok(block.includes('availabilityRank'));
+  assert.ok(block.includes('getBatchCreatorPresence'));
+});
+
 test('creator UID fallback join is env-gated for shadow/cutover', () => {
   const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
   assert.ok(src.includes("ENABLE_CREATOR_UID_FALLBACK_JOIN"));
@@ -88,4 +100,29 @@ test('getCreatorFeed response includes fields required by mobile CreatorModel', 
   assert.ok(block.includes('creators: creatorsOut'));
   assert.ok(block.includes('pagination:'));
   assert.ok(block.includes('CREATOR_FEED_CACHE_VERSION'));
+});
+
+test('creator feed cache key includes sort mode', () => {
+  const src = readFileSync(join(__dirname, '../../config/redis.ts'), 'utf8');
+  assert.ok(src.includes('CreatorFeedSortMode'));
+  assert.ok(src.includes(':s:${sort}'));
+});
+
+test('getCreatorFeed records availability sort feed metrics', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  const block = src.slice(start, end);
+  assert.ok(block.includes('recordFeedMetric'));
+  assert.ok(block.includes('creator_feed_availability_sort_ms'));
+  assert.ok(block.includes('creator.feed.availability_sort_large_catalog'));
+});
+
+test('presence service emits creator_status_events_sent metric', () => {
+  const src = readFileSync(
+    join(__dirname, '../availability/presence.service.ts'),
+    'utf8',
+  );
+  assert.ok(src.includes('creator_status_events_sent'));
+  assert.ok(src.includes("nextRecord.state === 'on_call'"));
 });

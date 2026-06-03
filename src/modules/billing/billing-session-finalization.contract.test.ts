@@ -111,3 +111,9 @@ test('post-settlement cleanup detects residual runtime keys', () => {
   assert.ok(src.includes('billing_finalize_residual_runtime_after_cleanup'));
   assert.ok(src.includes("await redis.del(callSessionKey(callId)).catch(() => 0)"));
 });
+
+test('duplicate finalize paths invoke terminal billing teardown', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('ensureTerminalBillingTeardown'));
+  assert.ok(src.includes('await ensureTerminalBillingTeardown(callId)'));
+});

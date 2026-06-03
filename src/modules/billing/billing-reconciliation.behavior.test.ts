@@ -1,7 +1,28 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { shouldFinalizeSessionNoHistory } from './billing-reconciliation.guards';
+import { shouldFinalizeSessionNoHistory, shouldRescheduleBillingCycleForSession } from './billing-reconciliation.guards';
+
+test('behavioral: should not reschedule billing cycle for SETTLED session', () => {
+  assert.equal(
+    shouldRescheduleBillingCycleForSession({ lifecycleState: 'SETTLED' }, false),
+    false
+  );
+});
+
+test('behavioral: should reschedule billing cycle for ACTIVE session without tombstone', () => {
+  assert.equal(
+    shouldRescheduleBillingCycleForSession({ lifecycleState: 'ACTIVE' }, false),
+    true
+  );
+});
+
+test('behavioral: should not reschedule billing cycle when settled tombstone present', () => {
+  assert.equal(
+    shouldRescheduleBillingCycleForSession({ lifecycleState: 'ACTIVE' }, true),
+    false
+  );
+});
 
 test('behavioral: should not finalize live session with deductions but no CallHistory', () => {
   const decision = shouldFinalizeSessionNoHistory(

@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import { invalidateAdminCaches } from '../../config/redis';
 import { getIO } from '../../config/socket';
 import { verifyUserBalance } from '../../utils/balance-integrity';
+import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
 import { getFirebaseAdmin } from '../../config/firebase';
 import { ensureStreamUser } from '../../config/stream';
 import {
@@ -618,6 +619,13 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Never show a drifted balance in UI; canonicalize coins from ledger on read.
+    const canonical = await getCanonicalCoinsAndRepairIfNeeded(
+      user._id,
+      Number(user.coins) || 0
+    );
+    const coinsForResponse = canonical.expectedCoins;
+
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
     const creator = await Creator.findOne({ userId: user._id });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
@@ -643,7 +651,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           categories: creator.categories,
           price: creator.price,
           // User-specific data (coins, role, etc.)
-          coins: user.coins,
+          coins: coinsForResponse,
           introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
           welcomeFreeCallEligible: welcomeFreeCallEligible(user),
           role: user.role,
@@ -684,7 +692,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             avatar: user.avatar,
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
-            coins: user.coins,
+            coins: coinsForResponse,
             introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
             welcomeFreeCallEligible: welcomeFreeCallEligible(user),
             blockedCreatorCount: (user.blockedCreatorIds || []).length,

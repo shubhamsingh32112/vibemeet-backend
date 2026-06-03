@@ -54,6 +54,16 @@ test('orphan slot cleanup clears terminal lifecycle sessions', () => {
   assert.ok(src.includes("lifecycle === 'SETTLED' || lifecycle === 'FAILED'"));
 });
 
+test('processTick short-circuits terminal lifecycle before insufficient balance path', () => {
+  const src = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(src.includes('billing_tick_terminal_short_circuit'));
+  assert.ok(src.includes('shortCircuitIfTerminalBillingSession'));
+  const shortCircuitIdx = src.indexOf('shortCircuitIfTerminalBillingSession');
+  const insufficientIdx = src.indexOf('insufficient_balance_pre_deduct');
+  assert.ok(shortCircuitIdx >= 0 && insufficientIdx >= 0);
+  assert.ok(shortCircuitIdx < insufficientIdx);
+});
+
 test('pending call end is consumed when session becomes active', () => {
   const src = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
   assert.ok(src.includes('consumePendingCallEndIfAny'));
@@ -124,6 +134,12 @@ test('runtime ownership takeover and deferred ticks are implemented', () => {
   assert.ok(queueSrc.includes('billing_cycle_zombie_sequence_stall'));
   assert.ok(queueSrc.includes('isBillingSequenceStalled'));
   assert.ok(queueSrc.includes("result === 'tick_deferred'"));
+});
+
+test('BullMQ stale watchdog skips terminal sessions before reschedule', () => {
+  const src = readFileSync(join(__dirname, 'billing-reconciliation.ts'), 'utf8');
+  assert.ok(src.includes('shouldRescheduleBillingCycleForSession'));
+  assert.ok(src.includes('billing_bullmq_watchdog_terminal_skipped'));
 });
 
 test('sync-warning autoheal reschedules billing ticks', () => {

@@ -316,6 +316,35 @@ async function isAlreadySettled(callId: string): Promise<boolean> {
   return call?.settlement?.status === 'settled';
 }
 
+/** Cancel BullMQ cycles and remove residual runtime keys when settlement already completed. */
+async function ensureTerminalBillingTeardown(callId: string): Promise<void> {
+  if (!(await isAlreadySettled(callId))) {
+    return;
+  }
+  await cancelBillingCycleJob(callId).catch(() => {});
+
+  const redis = getRedis();
+  const sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) {
+    return;
+  }
+  try {
+    const session = JSON.parse(sessionRaw) as {
+      userFirebaseUid?: string;
+      creatorFirebaseUid?: string;
+    };
+    const userFirebaseUid = session.userFirebaseUid;
+    const creatorFirebaseUid = session.creatorFirebaseUid;
+    if (userFirebaseUid && creatorFirebaseUid) {
+      await deleteBillingSessionRedisKeys(redis, callId, userFirebaseUid, creatorFirebaseUid);
+    } else {
+      await redis.del(callSessionKey(callId)).catch(() => 0);
+    }
+  } catch {
+    await redis.del(callSessionKey(callId)).catch(() => 0);
+  }
+}
+
 async function readFinalizePartyContext(callId: string): Promise<FinalizePartyContext> {
   const redis = getRedis();
   const sessionRaw = await redis.get(callSessionKey(callId));
@@ -1004,6 +1033,7 @@ export async function finalizeCallSession(
       finalizeAttemptId,
       ...snapshotMeta,
     });
+    await ensureTerminalBillingTeardown(callId);
     await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'duplicate', callId };
   }
@@ -1038,6 +1068,7 @@ export async function finalizeCallSession(
         duplicateSuppression: 'claim_contention_poll_settled',
         ...snapshotMeta,
       });
+      await ensureTerminalBillingTeardown(callId);
       await redis
         .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
         .catch(() => {});
@@ -1070,6 +1101,7 @@ export async function finalizeCallSession(
         duplicateSuppression: 'settle_lock_contention_poll_settled',
         ...snapshotMeta,
       });
+      await ensureTerminalBillingTeardown(callId);
       await redis
         .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
         .catch(() => {});
@@ -1134,6 +1166,7 @@ export async function finalizeCallSession(
         duplicateSuppression: 'post_flush_duplicate_guard',
         ...snapshotMeta,
       });
+      await ensureTerminalBillingTeardown(callId);
       return { status: 'duplicate', callId };
     }
 
@@ -1148,6 +1181,7 @@ export async function finalizeCallSession(
 
     if (!persistResult) {
       if (await isAlreadySettled(callId)) {
+        await ensureTerminalBillingTeardown(callId);
         return { status: 'duplicate', callId };
       }
       await enqueueSettlementRetry(params);

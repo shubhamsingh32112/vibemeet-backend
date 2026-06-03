@@ -10,8 +10,9 @@
 
 import { Router } from 'express';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
-import { imageRenderMetricsLimiter } from '../../middlewares/rate-limit.middleware';
+import { imageRenderMetricsLimiter, videoPlaybackMetricsLimiter } from '../../middlewares/rate-limit.middleware';
 import { postImageRenderMetricsHandler } from './image-render-metrics.controller';
+import { postVideoPlaybackMetricsHandler } from './video-playback-metrics.controller';
 
 const router = Router();
 
@@ -20,6 +21,13 @@ router.post(
   verifyFirebaseToken,
   imageRenderMetricsLimiter,
   postImageRenderMetricsHandler,
+);
+
+router.post(
+  '/video-playback',
+  verifyFirebaseToken,
+  videoPlaybackMetricsLimiter,
+  postVideoPlaybackMetricsHandler,
 );
 
 export default router;

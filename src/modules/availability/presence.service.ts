@@ -16,6 +16,7 @@ import {
 import { recordCallMetric } from '../../utils/monitoring';
 import { logInfo, logWarning, logError, logDebug } from '../../utils/logger';
 import { clearCreatorActiveCallSlotIfStale } from './creator-active-call-slot.service';
+import { getCreatorFeedCardSnapshot } from '../creator/creator-feed-snapshot.service';
 
 export type CreatorPresenceState = 'online' | 'on_call' | 'offline';
 type CreatorBaseAvailability = 'online' | 'offline';
@@ -681,20 +682,32 @@ export async function transitionCreatorPresence(
     eventType === 'CALL_STARTED' ||
     eventType === 'CALL_ENDED'
   ) {
-    io.to('consumers').emit('creator:status', {
+    const shouldAttachSummary =
+      nextRecord.state === 'online' || nextRecord.state === 'on_call';
+    const creatorSummary = shouldAttachSummary
+      ? await getCreatorFeedCardSnapshot(firebaseUid, {
+          availability: nextRecord.state,
+        })
+      : null;
+
+    const statusPayload: Record<string, unknown> = {
       creatorId: firebaseUid,
       status: nextRecord.state,
       version: nextRecord.version,
       updatedAt: nextRecord.updatedAt,
       source: nextRecord.source,
-    });
-    io.to('creators').emit('creator:status', {
-      creatorId: firebaseUid,
+    };
+    if (creatorSummary) {
+      statusPayload.creatorSummary = creatorSummary;
+    }
+
+    recordCallMetric('creator_status_events_sent', 1, {
       status: nextRecord.state,
-      version: nextRecord.version,
-      updatedAt: nextRecord.updatedAt,
-      source: nextRecord.source,
+      hasSummary: creatorSummary ? '1' : '0',
     });
+
+    io.to('consumers').emit('creator:status', statusPayload);
+    io.to('creators').emit('creator:status', statusPayload);
   }
 
   emitStaffDomainEvent({

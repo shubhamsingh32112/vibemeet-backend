@@ -445,7 +445,10 @@ function normalizeCreatorIds(
  *
  *   Server → Client:
  *     availability:batch  { [firebaseUid]: "online"|"on_call"|"offline" }  – response to availability:get
- *     creator:status       { creatorId, status }               – real-time incremental update
+ *     creator:status       { creatorId, status, version, updatedAt, source,
+ *                            creatorSummary? }                  – real-time incremental update;
+ *                          creatorSummary (feed card snapshot) is included when status is
+ *                          online or on_call so clients share one authoritative event shape.
  */
 export function setupAvailabilityGateway(io: Server): void {
   // 🔥 SCALABILITY: Start periodic cleanup of stale socket tracking (safety net)

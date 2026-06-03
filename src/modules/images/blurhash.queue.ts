@@ -29,7 +29,9 @@ export interface BlurhashJobData {
   target:
     | { kind: 'creator-avatar'; creatorId: string }
     | { kind: 'creator-gallery'; creatorId: string; galleryItemId: string }
-    | { kind: 'user-avatar'; userId: string };
+    | { kind: 'user-avatar'; userId: string }
+    | { kind: 'moment-image'; momentId: string }
+    | { kind: 'story-image'; storyId: string };
   enqueuedAt: number;
   requestId?: string;
 }

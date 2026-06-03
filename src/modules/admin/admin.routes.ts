@@ -79,6 +79,18 @@ import {
   getImagePipelineHealth,
 } from './admin-image-moderation.controller';
 import {
+  listMomentPurchasesHandler,
+  regrantMomentPurchaseHandler,
+  refundMomentPurchaseHandler,
+} from './admin-moment-purchase.controller';
+import {
+  approveMomentModerationHandler,
+  escalateMomentModerationHandler,
+  listEscalatedMomentsModerationHandler,
+  listPendingMomentsModerationHandler,
+  rejectMomentModerationHandler,
+} from './admin-moment-moderation.controller';
+import {
   getStaffWalletReconciliationLogs,
   postStaffWalletReconciliationRun,
 } from '../billing/staff-wallet-reconciliation.controller';
@@ -200,5 +212,15 @@ router.get('/images/pending', listPendingImages);
 router.post('/images/approve', approveImage);
 router.post('/images/reject', rejectImage);
 router.get('/images/health', getImagePipelineHealth);
+
+router.get('/moments/purchases', listMomentPurchasesHandler);
+router.post('/moments/purchases/regrant', regrantMomentPurchaseHandler);
+router.post('/moments/purchases/refund', refundMomentPurchaseHandler);
+
+router.get('/moments/moderation/pending', listPendingMomentsModerationHandler);
+router.get('/moments/moderation/escalated', listEscalatedMomentsModerationHandler);
+router.post('/moments/moderation/approve', approveMomentModerationHandler);
+router.post('/moments/moderation/reject', rejectMomentModerationHandler);
+router.post('/moments/moderation/escalate', escalateMomentModerationHandler);
 
 export default router;

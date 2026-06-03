@@ -207,6 +207,23 @@ export const imageRenderMetricsLimiter = createLimiter(
   'rl:image-render-metrics:',
 );
 
+export const videoPlaybackMetricsLimiter = createLimiter(
+  {
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: false,
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => {
+      const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+      return `video_playback_metrics:${firebaseUid}`;
+    },
+    skip: (_req: Request): boolean => {
+      return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+    },
+  },
+  'rl:video-playback-metrics:',
+);
+
 /**
  * Rate limiter for publishing global app updates (admin endpoint).
  * - Prevent rapid repeated publish actions across admin sessions.

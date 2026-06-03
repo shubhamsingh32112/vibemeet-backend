@@ -15,6 +15,9 @@ import appUpdateRoutes from './modules/app-update/app-update.routes';
 import availabilityRoutes from './modules/availability/availability.routes';
 import imagesRoutes from './modules/images/images.routes';
 import metricsRoutes from './modules/metrics/metrics.routes';
+import storiesRoutes from './modules/stories/routes/stories.routes';
+import momentsRoutes from './modules/moments/routes/moments.routes';
+import streamRoutes from './modules/stream/stream.routes';
 
 const router = Router();
 
@@ -34,5 +37,8 @@ router.use('/app-updates', appUpdateRoutes);
 router.use('/availability', availabilityRoutes);
 router.use('/images', imagesRoutes);
 router.use('/metrics', metricsRoutes);
+router.use('/stories', storiesRoutes);
+router.use('/moments', momentsRoutes);
+router.use('/stream', streamRoutes);
 
 export default router;

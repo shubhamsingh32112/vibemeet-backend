@@ -293,6 +293,13 @@ export function recordAPIMetric(metric: string, value: number, tags?: Record<str
 }
 
 /**
+ * Helper function to record creator home-feed metrics.
+ */
+export function recordFeedMetric(metric: string, value: number, tags?: Record<string, string>): void {
+  monitoring.recordMetric(`feed.${metric}`, value, tags);
+}
+
+/**
  * Helper function to record payment metrics.
  */
 export function recordPaymentMetric(

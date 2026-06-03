@@ -16,6 +16,7 @@ import {
   billingStartOrchestratorKey,
   billingStartReplayGuardKey,
   pendingCallEndKey,
+  settledCallKey,
 } from '../../config/redis';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
@@ -82,10 +83,36 @@ import {
   logBillingHealthDebug,
   logBillingHealthWarn,
 } from './billing-health-log';
+import { isNonTerminalLifecycle } from './billing-active-call.service';
+import { cancelBillingCycleJob } from './billing.queue';
 
 const CALL_SESSION_TTL = 7200;
 const FINAL_FLUSH_MARKER_PREFIX = 'billing:final_flush:';
 const FINAL_FLUSH_MARKER_TTL_SECONDS = 24 * 60 * 60;
+
+async function shortCircuitIfTerminalBillingSession(
+  redis: ReturnType<typeof getRedis>,
+  callId: string,
+  lifecycleState: string | undefined
+): Promise<BillingTickResult | null> {
+  if (!isNonTerminalLifecycle(lifecycleState)) {
+    await cancelBillingCycleJob(callId).catch(() => {});
+    recordBillingMetric('billing_tick_terminal_short_circuit', 1, {
+      callId,
+      lifecycleState: lifecycleState ?? 'unknown',
+    });
+    return 'stop_no_session';
+  }
+  if (await redis.get(settledCallKey(callId))) {
+    await cancelBillingCycleJob(callId).catch(() => {});
+    recordBillingMetric('billing_tick_terminal_short_circuit', 1, {
+      callId,
+      lifecycleState: 'settled_tombstone',
+    });
+    return 'stop_no_session';
+  }
+  return null;
+}
 
 /** Legacy creator earnings used 1e4 micro-units; convert to COIN_MICROS scale. */
 const LEGACY_EARNINGS_MICRO_FACTOR = 10_000;
@@ -2604,6 +2631,14 @@ export class BillingService {
 
       let balanceMicros = introMicros + walletMicros;
       normalizeV4SessionFields(session);
+      const terminalShort = await shortCircuitIfTerminalBillingSession(
+        redis,
+        callId,
+        session.lifecycleState
+      );
+      if (terminalShort) {
+        return terminalShort;
+      }
       const introPromoBilling = session.introPromoActive === true;
       const now = Date.now();
       const ownershipOk = await ensureRuntimeOwnership(redis, session, callId, now);

@@ -25,6 +25,8 @@ import { downloadImageBytes, CloudflareImagesError } from './cloudflare.client';
 import { BLURHASH_QUEUE_NAME, type BlurhashJobData } from './blurhash.queue';
 import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
+import { CreatorMoment } from '../moments/models/creator-moment.model';
+import { CreatorStory } from '../stories/models/creator-story.model';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { bumpImageCounter, recordImageMetric } from './image-metrics';
 
@@ -86,6 +88,22 @@ async function applyBlurhashToTarget(
     const result = await User.updateOne(
       { _id: userId, 'avatar.imageId': data.imageId },
       { $set: { 'avatar.blurhash': blurhash } },
+    );
+    return result.modifiedCount > 0;
+  }
+  if (data.target.kind === 'moment-image') {
+    const momentId = new mongoose.Types.ObjectId(data.target.momentId);
+    const result = await CreatorMoment.updateOne(
+      { _id: momentId, 'imageAsset.imageId': data.imageId },
+      { $set: { 'imageAsset.blurhash': blurhash } },
+    );
+    return result.modifiedCount > 0;
+  }
+  if (data.target.kind === 'story-image') {
+    const storyId = new mongoose.Types.ObjectId(data.target.storyId);
+    const result = await CreatorStory.updateOne(
+      { _id: storyId, 'imageAsset.imageId': data.imageId },
+      { $set: { 'imageAsset.blurhash': blurhash } },
     );
     return result.modifiedCount > 0;
   }

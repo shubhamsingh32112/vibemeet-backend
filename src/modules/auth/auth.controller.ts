@@ -22,6 +22,7 @@ import { makeImageAssetDoc } from '../images/image-asset.schema';
 import { serializeCreatorGallery, serializeUserImages } from '../images/creator-image-helpers';
 import { serializeAvatar } from '../images/serialize-image-asset';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
+import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
@@ -324,13 +325,20 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       }
     }
 
+    // Never show a drifted balance in UI; canonicalize coins from ledger on read.
+    const canonical = await getCanonicalCoinsAndRepairIfNeeded(
+      user._id,
+      Number(user.coins) || 0
+    );
+    const coinsForResponse = canonical.expectedCoins;
+
     logInfo('User login successful', {
       userId: user._id.toString(),
       firebaseUid,
       email: user.email || null,
       phone: user.phone || null,
       role: user.role,
-      coins: user.coins,
+      coins: coinsForResponse,
     });
 
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
@@ -386,7 +394,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           age: creator.age,
           location: creator.location,
           // User-specific data (coins, role, etc.)
-          coins: user.coins,
+          coins: coinsForResponse,
           introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
           welcomeFreeCallEligible: welcomeFreeCallEligibleForUser(user),
           role: user.role,
@@ -433,7 +441,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             avatar: user.avatar,
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
-            coins: user.coins,
+            coins: coinsForResponse,
             introFreeCallCredits: Number(user.introFreeCallCredits) || 0,
             welcomeFreeCallEligible: welcomeFreeCallEligibleForUser(user),
             role: user.role,

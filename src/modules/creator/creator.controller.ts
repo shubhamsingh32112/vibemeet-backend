@@ -36,6 +36,7 @@ import {
 } from '../../config/redis';
 import { safeRedisGet, safeRedisSet } from '../../utils/redis-circuit-breaker';
 import { verifyUserBalance } from '../../utils/balance-integrity';
+import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
 import { Withdrawal } from './withdrawal.model';
 import { emitToAdmin } from '../admin/admin.gateway';
 import { assertAdminOrOwningAgentForCreator } from '../../middlewares/staff.middleware';
@@ -44,7 +45,7 @@ import {
   CREATOR_GALLERY_MIN_IMAGES,
 } from './creator-gallery.constants';
 import { logError, logInfo, logWarning } from '../../utils/logger';
-import { recordCallMetric } from '../../utils/monitoring';
+import { recordCallMetric, recordFeedMetric } from '../../utils/monitoring';
 import { ensureCreatorPromotionBonusReversalEntry } from './creator-starter.service';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
@@ -73,10 +74,30 @@ import {
   serializeCreatorImages,
   serializeCreatorGallery,
 } from '../images/creator-image-helpers';
+import {
+  cacheCreatorFeedCardSnapshot,
+  type CreatorFeedCardSnapshot,
+} from './creator-feed-snapshot.service';
 import { isAgencyRole, isBdRole, isSuperAdminRole } from '../../utils/staff-roles';
+import { isMomentsEnabled } from '../../config/moments';
+import { CreatorMoment } from '../moments/models/creator-moment.model';
+import { MomentRevenue } from '../moments/models/moment-revenue.model';
 
 /** Bump when feed Redis JSON shape changes so stale entries are ignored. */
-const CREATOR_FEED_CACHE_VERSION = 2;
+const CREATOR_FEED_CACHE_VERSION = 3;
+
+type CreatorFeedSortMode = 'createdAt' | 'availability';
+
+function parseCreatorFeedSort(raw: unknown): CreatorFeedSortMode {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  return s === 'availability' ? 'availability' : 'createdAt';
+}
+
+function availabilityRank(state: 'online' | 'on_call' | 'offline' | undefined): number {
+  if (state === 'online') return 0;
+  if (state === 'on_call') return 1;
+  return 2;
+}
 
 /** Legacy root catalog removed — clients must use GET /creator/feed. */
 export const getCreatorCatalogGone = async (_req: Request, res: Response): Promise<void> => {
@@ -144,7 +165,9 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
     const skip = (page - 1) * limit;
-    const cacheKey = creatorFeedCacheKey(page, limit);
+    const feedSort = parseCreatorFeedSort(req.query.sort);
+    const canCacheFeed = feedSort === 'createdAt';
+    const cacheKey = creatorFeedCacheKey(page, limit, feedSort);
 
     const favoriteSet =
       currentUser && currentUser.role === 'user'
@@ -154,7 +177,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     let baseRows: CreatorFeedBaseRow[] = [];
     let total = 0;
 
-    if (isRedisConfigured()) {
+    if (canCacheFeed && isRedisConfigured()) {
       const cached = await safeRedisGet<{ v: number; creators: CreatorFeedBaseRow[]; total: number }>(
         cacheKey,
       );
@@ -174,86 +197,195 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
 
     if (!cacheHit) {
       const tMongo = Date.now();
-      const [creators, count] = await Promise.all([
-        Creator.find({})
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(limit)
-          .select(
-            '_id userId firebaseUid name photo avatar price age location isOnline categories createdAt updatedAt',
-          )
-          .lean(),
-        Creator.countDocuments({}),
-      ]);
-      mongoMs = Date.now() - tMongo;
-      total = count;
-
-      for (const c of creators) {
-        if (!c.firebaseUid || String(c.firebaseUid).trim() === '') missingCreatorFirebaseUidCount += 1;
-      }
-
-      // Shadow-period switch:
-      // - KEEP fallback join when ENABLE_CREATOR_UID_FALLBACK_JOIN=true
-      // - Disable join without redeploy by setting it to anything else
       const allowFallbackJoin = process.env.ENABLE_CREATOR_UID_FALLBACK_JOIN === 'true';
+      const feedSelect =
+        '_id userId firebaseUid name photo avatar price age location isOnline categories createdAt updatedAt';
 
-      const missingUidUserIds = allowFallbackJoin
-        ? creators
-            .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
-            .map((c) => c.userId)
-            .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
-        : [];
-      const linkedUsers =
-        allowFallbackJoin && missingUidUserIds.length
-          ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
+      if (feedSort === 'availability') {
+        const tAvailSort = Date.now();
+        const minimal = await Creator.find({})
+          .select('_id userId firebaseUid createdAt')
+          .lean();
+        total = minimal.length;
+
+        if (total > 5000) {
+          logWarning('creator.feed.availability_sort_large_catalog', {
+            count: total,
+            page,
+            limit,
+          });
+        }
+
+        const missingUidUserIds = allowFallbackJoin
+          ? minimal
+              .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
+              .map((c) => c.userId)
+              .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
           : [];
-      const firebaseUidByUserId = new Map(
-        linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
-      );
+        const linkedUsers =
+          allowFallbackJoin && missingUidUserIds.length
+            ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
+            : [];
+        const firebaseUidByUserId = new Map(
+          linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
+        );
 
-      if (missingCreatorFirebaseUidCount > 0) {
-        logError('creator.uid.fallback.used', new Error('creator firebaseUid missing'), {
-          endpoint: 'GET /creator/feed',
-          page,
-          limit,
-          allowFallbackJoin,
-          missingCount: missingCreatorFirebaseUidCount,
-        });
-      }
-
-      baseRows = creators.map((creator) => {
-        const avatar = serializeCreatorImages(creator as unknown as ICreator).avatar;
-        return {
-          id: creator._id.toString(),
-          userId: creator.userId ? creator.userId.toString() : null,
-          firebaseUid:
-            creator.firebaseUid && String(creator.firebaseUid).trim() !== ''
-              ? String(creator.firebaseUid).trim()
-              : allowFallbackJoin && creator.userId
-                ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
-                : null,
-          name: creator.name,
-          // Cloudflare-Images shape
-          avatar,
-          price: creator.price,
-          age: creator.age,
-          location: creator.location,
-          categories: creator.categories || [],
-          isOnline: creator.isOnline,
-          createdAt: creator.createdAt,
-          updatedAt: creator.updatedAt,
+        type RankRow = {
+          id: mongoose.Types.ObjectId;
+          firebaseUid: string | null;
+          createdAt: Date;
         };
-      });
-
-      if (isRedisConfigured()) {
-        const payload = JSON.stringify({
-          v: CREATOR_FEED_CACHE_VERSION,
-          creators: baseRows,
-          total,
+        const rankRows: RankRow[] = minimal.map((c) => {
+          const firebaseUid =
+            c.firebaseUid && String(c.firebaseUid).trim() !== ''
+              ? String(c.firebaseUid).trim()
+              : allowFallbackJoin && c.userId
+                ? (firebaseUidByUserId.get(c.userId.toString()) ?? null)
+                : null;
+          if (!firebaseUid) missingCreatorFirebaseUidCount += 1;
+          return { id: c._id, firebaseUid, createdAt: c.createdAt };
         });
-        await safeRedisSet(cacheKey, payload, { ex: CREATOR_FEED_TTL });
-        await registerCreatorFeedCacheKey(cacheKey);
+
+        const normalized = normalizeFirebaseUids(
+          rankRows.map((r) => r.firebaseUid).filter((uid): uid is string => uid !== null),
+        );
+        const presenceMap =
+          normalized.firebaseUids.length > 0
+            ? await getBatchCreatorPresence(normalized.firebaseUids)
+            : {};
+
+        rankRows.sort((a, b) => {
+          const aState = a.firebaseUid ? presenceMap[a.firebaseUid]?.state : 'offline';
+          const bState = b.firebaseUid ? presenceMap[b.firebaseUid]?.state : 'offline';
+          const rankDiff = availabilityRank(aState) - availabilityRank(bState);
+          if (rankDiff !== 0) return rankDiff;
+          return b.createdAt.getTime() - a.createdAt.getTime();
+        });
+
+        const pageSlice = rankRows.slice(skip, skip + limit);
+        const pageIds = pageSlice.map((r) => r.id);
+        const creators =
+          pageIds.length > 0
+            ? await Creator.find({ _id: { $in: pageIds } }).select(feedSelect).lean()
+            : [];
+        const creatorById = new Map(creators.map((c) => [c._id.toString(), c]));
+
+        const availSortMs = Date.now() - tAvailSort;
+        recordFeedMetric('creator_feed_availability_sort_ms', availSortMs, {
+          page: String(page),
+          limit: String(limit),
+        });
+        recordFeedMetric('creator_feed_availability_sort_count', 1, {
+          page: String(page),
+          limit: String(limit),
+        });
+        recordFeedMetric('creator_feed_availability_sort_total_creators', total, {
+          page: String(page),
+          limit: String(limit),
+        });
+
+        baseRows = pageSlice
+          .map((row) => creatorById.get(row.id.toString()))
+          .filter((c): c is NonNullable<typeof c> => Boolean(c))
+          .map((creator) => {
+            const avatar = serializeCreatorImages(creator as unknown as ICreator).avatar;
+            return {
+              id: creator._id.toString(),
+              userId: creator.userId ? creator.userId.toString() : null,
+              firebaseUid:
+                creator.firebaseUid && String(creator.firebaseUid).trim() !== ''
+                  ? String(creator.firebaseUid).trim()
+                  : allowFallbackJoin && creator.userId
+                    ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
+                    : null,
+              name: creator.name,
+              avatar,
+              price: creator.price,
+              age: creator.age,
+              location: creator.location,
+              categories: creator.categories || [],
+              isOnline: creator.isOnline,
+              createdAt: creator.createdAt,
+              updatedAt: creator.updatedAt,
+            };
+          });
+      } else {
+        const [creators, count] = await Promise.all([
+          Creator.find({})
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .select(feedSelect)
+            .lean(),
+          Creator.countDocuments({}),
+        ]);
+        total = count;
+
+        for (const c of creators) {
+          if (!c.firebaseUid || String(c.firebaseUid).trim() === '') {
+            missingCreatorFirebaseUidCount += 1;
+          }
+        }
+
+        const missingUidUserIds = allowFallbackJoin
+          ? creators
+              .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
+              .map((c) => c.userId)
+              .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
+          : [];
+        const linkedUsers =
+          allowFallbackJoin && missingUidUserIds.length
+            ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
+            : [];
+        const firebaseUidByUserId = new Map(
+          linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
+        );
+
+        if (missingCreatorFirebaseUidCount > 0) {
+          logError('creator.uid.fallback.used', new Error('creator firebaseUid missing'), {
+            endpoint: 'GET /creator/feed',
+            page,
+            limit,
+            allowFallbackJoin,
+            missingCount: missingCreatorFirebaseUidCount,
+          });
+        }
+
+        baseRows = creators.map((creator) => {
+          const avatar = serializeCreatorImages(creator as unknown as ICreator).avatar;
+          return {
+            id: creator._id.toString(),
+            userId: creator.userId ? creator.userId.toString() : null,
+            firebaseUid:
+              creator.firebaseUid && String(creator.firebaseUid).trim() !== ''
+                ? String(creator.firebaseUid).trim()
+                : allowFallbackJoin && creator.userId
+                  ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
+                  : null,
+            name: creator.name,
+            avatar,
+            price: creator.price,
+            age: creator.age,
+            location: creator.location,
+            categories: creator.categories || [],
+            isOnline: creator.isOnline,
+            createdAt: creator.createdAt,
+            updatedAt: creator.updatedAt,
+          };
+        });
+
+        if (canCacheFeed && isRedisConfigured()) {
+          const payload = JSON.stringify({
+            v: CREATOR_FEED_CACHE_VERSION,
+            creators: baseRows,
+            total,
+          });
+          await safeRedisSet(cacheKey, payload, { ex: CREATOR_FEED_TTL });
+          await registerCreatorFeedCacheKey(cacheKey);
+        }
       }
+
+      mongoMs = Date.now() - tMongo;
     } else {
       mongoMs = Date.now() - t0;
     }
@@ -288,17 +420,43 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
     });
     availabilityMs = Date.now() - tAvail;
 
-    const creatorsOut = baseRows.map((c) => ({
-      ...c,
-      about: '',
-      galleryImages: [] as unknown[],
-      isFavorite: favoriteSet.has(c.id),
-      availability: c.firebaseUid ? (availabilityMap[c.firebaseUid] ?? 'offline') : 'offline',
-    }));
+    const creatorsOut = baseRows.map((c) => {
+      const availability = c.firebaseUid
+        ? (availabilityMap[c.firebaseUid] ?? 'offline')
+        : 'offline';
+      return {
+        ...c,
+        about: '',
+        galleryImages: [] as unknown[],
+        isFavorite: favoriteSet.has(c.id),
+        availability,
+      };
+    });
+
+    for (const row of creatorsOut) {
+      if (!row.firebaseUid) continue;
+      const snapshot: CreatorFeedCardSnapshot = {
+        id: row.id,
+        userId: row.userId,
+        firebaseUid: row.firebaseUid,
+        name: row.name,
+        avatar: row.avatar,
+        price: row.price,
+        age: row.age,
+        location: row.location,
+        categories: row.categories,
+        availability: row.availability,
+        about: '',
+        galleryImages: [],
+        isFavorite: favoriteSet.has(row.id),
+      };
+      cacheCreatorFeedCardSnapshot(snapshot).catch(() => {});
+    }
 
     logInfo('creator.feed.timing', {
       page,
       limit,
+      sort: feedSort,
       cacheHit,
       mongoMs,
       availabilityMs,
@@ -500,7 +658,9 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
     }
 
     const creator = await Creator.findOne({ firebaseUid: uidRaw })
-      .select('_id userId firebaseUid name photo avatar createdAt updatedAt')
+      .select(
+        '_id userId firebaseUid name photo avatar price age location categories createdAt updatedAt',
+      )
       .lean();
     if (!creator) {
       res.status(404).json({ success: false, error: 'Creator not found' });
@@ -541,22 +701,47 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
       });
     }
 
+    const creatorOut = {
+      id: creator._id.toString(),
+      userId: creator.userId ? creator.userId.toString() : null,
+      firebaseUid: creator.firebaseUid ? String(creator.firebaseUid) : uidRaw,
+      name: creator.name,
+      avatar: images.avatar,
+      photo: legacyPhoto,
+      imageUrl: legacyPhoto,
+      price: creator.price,
+      age: creator.age,
+      location: creator.location,
+      categories: creator.categories || [],
+      about: '',
+      galleryImages: [] as unknown[],
+      isFavorite: false,
+      availability,
+      createdAt: creator.createdAt,
+      updatedAt: creator.updatedAt,
+    };
+
+    cacheCreatorFeedCardSnapshot({
+      id: creatorOut.id,
+      userId: creatorOut.userId,
+      firebaseUid: creatorOut.firebaseUid,
+      name: creatorOut.name,
+      avatar: creatorOut.avatar,
+      price: creatorOut.price,
+      age: creatorOut.age,
+      location: creatorOut.location,
+      categories: creatorOut.categories,
+      availability,
+      about: '',
+      galleryImages: [],
+      isFavorite: false,
+    }).catch(() => {});
+
     logInfo('creator.by_uid.timing', { totalMs: Date.now() - t0 });
     res.json({
       success: true,
       data: {
-        creator: {
-          id: creator._id.toString(),
-          userId: creator.userId ? creator.userId.toString() : null,
-          firebaseUid: creator.firebaseUid ? String(creator.firebaseUid) : uidRaw,
-          name: creator.name,
-          avatar: images.avatar,
-          photo: legacyPhoto,
-          imageUrl: legacyPhoto,
-          availability,
-          createdAt: creator.createdAt,
-          updatedAt: creator.updatedAt,
-        },
+        creator: creatorOut,
       },
     });
   } catch (error) {
@@ -2662,6 +2847,13 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       return;
     }
 
+    // Never show a drifted balance in UI; canonicalize coins from ledger on read.
+    const canonical = await getCanonicalCoinsAndRepairIfNeeded(
+      currentUser._id,
+      Number(currentUser.coins) || 0
+    );
+    const coinsForResponse = canonical.expectedCoins;
+
     const attachLiveOnline = async (data: Record<string, unknown>): Promise<void> => {
       const live = await getOnlineTodaySecondsLive(currentUser.firebaseUid);
       data.onlineTodaySeconds = live.onlineTodaySeconds;
@@ -2676,7 +2868,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       if (cached) {
         const data = typeof cached === 'string' ? JSON.parse(cached) : cached;
         // Update coins in cached data (coins can change outside of cache invalidation)
-        data.coins = currentUser.coins;
+        data.coins = coinsForResponse;
         await attachLiveOnline(data);
         console.log('⚡ [CREATOR] Dashboard served from Redis cache');
         res.json({ success: true, data });
@@ -2788,6 +2980,36 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       };
     });
 
+    let momentsAnalytics:
+      | {
+          momentsEarnings: number;
+          purchaseCount: number;
+          totalViews: number;
+          postCount: number;
+        }
+      | undefined;
+
+    if (isMomentsEnabled()) {
+      const [momentsAgg] = await MomentRevenue.aggregate([
+        { $match: { creatorId: creator._id } },
+        {
+          $group: {
+            _id: null,
+            totalEarnings: { $sum: '$creatorShareCoins' },
+            purchaseCount: { $sum: 1 },
+          },
+        },
+      ]);
+      const creatorMoments = await CreatorMoment.find({ creatorId: creator._id });
+      const totalViews = creatorMoments.reduce((sum, m) => sum + m.viewsCount, 0);
+      momentsAnalytics = {
+        momentsEarnings: momentsAgg?.totalEarnings ?? 0,
+        purchaseCount: momentsAgg?.purchaseCount ?? 0,
+        totalViews,
+        postCount: creatorMoments.filter((m) => !m.isDeleted).length,
+      };
+    }
+
     // 3. Compose response
     const dashboardData = {
       // Earnings (all-time)
@@ -2814,7 +3036,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         resetsAt: resetsAt.toISOString(),
       },
       // Account
-      coins: currentUser.coins,
+      coins: coinsForResponse,
       creatorProfile: {
         id: creator._id.toString(),
         name: creator.name,
@@ -2822,6 +3044,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         location: creator.location,
         isOnline: creator.isOnline,
       },
+      ...(momentsAnalytics ? { momentsAnalytics } : {}),
     };
 
     // ── Cache in Redis ───────────────────────────────────────────────────
@@ -2833,7 +3056,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       console.error('⚠️ [CREATOR] Redis cache write failed:', cacheErr);
     }
 
-    console.log(`✅ [CREATOR] Dashboard: ${totalEarnings} earnings, ${totalCalls} calls, ${tasks.length} tasks, ${currentUser.coins} coins`);
+    console.log(`✅ [CREATOR] Dashboard: ${totalEarnings} earnings, ${totalCalls} calls, ${tasks.length} tasks, ${coinsForResponse} coins`);
 
     await attachLiveOnline(dashboardData as unknown as Record<string, unknown>);
 
@@ -2856,7 +3079,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
  *   - Must be a creator
  *   - Minimum withdrawal: 100 coins
  *   - Amount must not exceed current balance
- *   - Coins are NOT deducted at this point (only on admin approval)
+ *   - Coins are NOT deducted at this point (only when payout is marked paid)
  *   - Creates a Withdrawal record with status 'pending'
  */
 export const requestWithdrawal = async (req: Request, res: Response): Promise<void> => {
@@ -3015,7 +3238,7 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
         accountNumber: withdrawal.accountNumber ?? null,
         ifsc: withdrawal.ifsc ?? null,
         assignedAgencyId: withdrawal.assignedAgencyId?.toString() ?? null,
-        message: 'Withdrawal request submitted. Coins will be deducted upon admin approval.',
+        message: 'Withdrawal request submitted. Coins will be deducted when payout is marked paid.',
       },
     });
   } catch (error) {

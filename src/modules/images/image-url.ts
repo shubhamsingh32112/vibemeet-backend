@@ -104,3 +104,22 @@ export function buildAdminOriginalUrl(imageId: string): string {
 export function buildCallBgUrl(imageId: string): string {
   return buildCloudflareImageUrl(imageId, 'callBg');
 }
+
+/** Moments / stories image variants (maps to existing CF variant names). */
+export interface MomentImageUrls {
+  thumb: string;
+  feed: string;
+  fullscreen: string;
+  blur: string;
+  avatar: string;
+}
+
+export function buildMomentImageUrls(imageId: string): MomentImageUrls {
+  return {
+    thumb: buildCloudflareImageUrl(imageId, 'galleryThumb'),
+    feed: buildCloudflareImageUrl(imageId, 'feedTile'),
+    fullscreen: buildCloudflareImageUrl(imageId, 'galleryXl'),
+    blur: buildCloudflareImageUrl(imageId, 'galleryThumb'),
+    avatar: buildCloudflareImageUrl(imageId, 'avatarSm'),
+  };
+}

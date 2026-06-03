@@ -2306,9 +2306,7 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
 /**
  * POST /admin/withdrawals/:id/approve
  *
- * Approves a pending withdrawal:
- *   - Deducts coins from creator
- *   - Creates CoinTransaction (type: debit, source: withdrawal)
+ * Approves a pending withdrawal (no coin deduction; deduction happens on mark-paid).
  *   - Logs AdminActionLog
  *   - Sets status to 'approved'
  */
@@ -2378,8 +2376,10 @@ export const rejectWithdrawal = async (req: Request, res: Response): Promise<voi
 /**
  * POST /admin/withdrawals/:id/mark-paid
  *
- * Marks an approved withdrawal as paid (external payment completed).
- * Sets processedAt timestamp.
+ * Marks an approved withdrawal as paid (external payment completed):
+ *   - Deducts coins from creator (or staff wallet for staff withdrawals)
+ *   - Creates CoinTransaction (type: debit, source: withdrawal)
+ *   - Sets status to 'paid'
  */
 export const markWithdrawalPaid = async (req: Request, res: Response): Promise<void> => {
   try {

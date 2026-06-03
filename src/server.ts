@@ -25,6 +25,7 @@ import { featureFlags } from './config/feature-flags';
 import { configureStreamPush } from './config/stream';
 import { setIO } from './config/socket';
 import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
+import { setupMomentsGateway } from './modules/moments/moments.gateway';
 import { auditCreatorPresenceOnStartup } from './modules/availability/creator-presence-audit.service';
 import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
 import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
@@ -56,6 +57,10 @@ import {
   startImagePipelineWorkers,
   stopImagePipelineWorkers,
 } from './modules/images/images.bootstrap';
+import {
+  startMomentsWorkers,
+  stopMomentsWorkers,
+} from './modules/moments/moments.bootstrap';
 import { isRazorpayConfigured } from './config/razorpay';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
@@ -217,7 +222,8 @@ function isSignedWebhookPost(req: Request): boolean {
   return (
     pathOnly === '/api/v1/video/webhook' ||
     pathOnly === '/api/v1/chat/webhook' ||
-    pathOnly === '/api/v1/payment/webhook'
+    pathOnly === '/api/v1/payment/webhook' ||
+    pathOnly === '/api/v1/stream/webhook'
   );
 }
 
@@ -597,6 +603,35 @@ app.get('/metrics', async (req, res) => {
     if (rollingCreatorUidContractViolationRate > 0.005) {
       metricsAlerts.push('creator_presence_uid_contract_violation_high_5m');
     }
+
+    const fanoutDuration = byName['stream.feed.fanout.duration_ms'];
+    const fanoutFailed = byName['stream.feed.fanout.failed']?.sum ?? 0;
+    const cfBreakerOpen = byName['stream.cloudflare.breaker_open']?.sum ?? 0;
+    let momentsFanoutQueueDepth = byName['stream.feed.fanout.queue_depth']?.max ?? 0;
+    let momentsWarmQueueDepth = byName['stream.feed.warm.queue_depth']?.max ?? 0;
+    if (isRedisConfigured()) {
+      const redis = getRedis();
+      const [fanoutLen, warmLen] = await Promise.all([
+        redis.llen('moments:fanout:queue'),
+        redis.llen('moments:feed:warm:queue'),
+      ]);
+      momentsFanoutQueueDepth = Math.max(momentsFanoutQueueDepth, Number(fanoutLen || 0));
+      momentsWarmQueueDepth = Math.max(momentsWarmQueueDepth, Number(warmLen || 0));
+    }
+    const fanoutQueueThreshold = Number(process.env.MOMENTS_FANOUT_QUEUE_ALERT_DEPTH || 500);
+    if (momentsFanoutQueueDepth > fanoutQueueThreshold) {
+      metricsAlerts.push('moments_fanout_queue_depth_high');
+    }
+    if ((fanoutDuration?.p95 ?? 0) > 120_000) {
+      metricsAlerts.push('moments_fanout_duration_p95_high');
+    }
+    if (fanoutFailed >= 10) {
+      metricsAlerts.push('moments_fanout_failed_high');
+    }
+    if (cfBreakerOpen >= 5) {
+      metricsAlerts.push('cloudflare_stream_breaker_open_high');
+    }
+
     const hardBlockerAlertKeys = new Set([
       'billing_runtime_missing_detected_5m',
       'billing_deferred_call_end_backlog_5m',
@@ -870,6 +905,31 @@ app.get('/metrics', async (req, res) => {
               maxRetries: Math.round(creatorTransitionRetryMetric.max * 100) / 100,
             }
           : null,
+      },
+      moments: {
+        fanout: {
+          queueDepth: momentsFanoutQueueDepth,
+          durationMs: fanoutDuration
+            ? {
+                samples: fanoutDuration.count,
+                avgMs: Math.round(fanoutDuration.avg * 100) / 100,
+                p95Ms: Math.round(fanoutDuration.p95 * 100) / 100,
+              }
+            : null,
+          failedSum: fanoutFailed,
+        },
+        warm: {
+          queueDepth: momentsWarmQueueDepth,
+          failedSum: byName['stream.feed.warm.failed']?.sum ?? 0,
+        },
+        cloudflare: {
+          breakerOpenSum: cfBreakerOpen,
+        },
+        playback: {
+          tokenRefreshFailSum: byName['video.playback.token_refresh_fail']?.sum ?? 0,
+          playerErrorSum: byName['video.playback.player_error']?.sum ?? 0,
+          startupP95Ms: Math.round((byName['video.playback.startup_ms']?.p95 ?? 0) * 100) / 100,
+        },
       },
       alerts: {
         active: metricsAlerts,
@@ -1211,6 +1271,7 @@ const startServer = async () => {
 
     // Set up Socket.IO gateways
     setupAvailabilityGateway(io);
+    setupMomentsGateway(io);
     logInfo('Socket.IO availability gateway ready');
     auditCreatorPresenceOnStartup(io, 'server.startup').catch((err) => {
       logError('Creator presence startup audit failed', err);
@@ -1251,6 +1312,8 @@ const startServer = async () => {
     startImagePipelineWorkers().catch((err) => {
       logError('Image pipeline workers failed to start', err);
     });
+
+    startMomentsWorkers();
 
     setupAdminGateway(io);
     logInfo('Socket.IO admin gateway ready');
@@ -1379,6 +1442,7 @@ process.on('uncaughtException', async (error) => {
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});
+  stopMomentsWorkers();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -1396,6 +1460,7 @@ process.on('SIGTERM', async () => {
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});
+  stopMomentsWorkers();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;
@@ -1413,6 +1478,7 @@ process.on('SIGINT', async () => {
   stopCallReconciliationJob();
   stopPaymentWebhookRetryWorker();
   await stopImagePipelineWorkers().catch(() => {});
+  stopMomentsWorkers();
   if (eventLoopProbe) {
     clearInterval(eventLoopProbe);
     eventLoopProbe = null;

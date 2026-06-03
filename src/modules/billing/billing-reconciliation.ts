@@ -20,6 +20,7 @@ import {
   parseCallIdFromSessionRedisKey,
   BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY,
   billingBalanceMismatchRepairPayloadKey,
+  settledCallKey,
 } from '../../config/redis';
 import { billingService } from './billing.service';
 import {
@@ -43,7 +44,7 @@ import { featureFlags } from '../../config/feature-flags';
 import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import mongoose from 'mongoose';
-import { shouldFinalizeSessionNoHistory } from './billing-reconciliation.guards';
+import { shouldFinalizeSessionNoHistory, shouldRescheduleBillingCycleForSession } from './billing-reconciliation.guards';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;
 const RELEASE_LOCK_LUA = `
@@ -330,6 +331,20 @@ async function runBullmqBillingWatchdog(startedAt: number): Promise<void> {
     try {
       const sessionRaw = await redis.get(callSessionKey(callId));
       if (!sessionRaw) return;
+      let session: { lifecycleState?: string } | null = null;
+      try {
+        session = JSON.parse(sessionRaw) as { lifecycleState?: string };
+      } catch {
+        return;
+      }
+      const settledTombstonePresent = (await redis.get(settledCallKey(callId))) != null;
+      if (!shouldRescheduleBillingCycleForSession(session, settledTombstonePresent)) {
+        recordBillingMetric('billing_bullmq_watchdog_terminal_skipped', 1, {
+          callId,
+          lifecycleState: session?.lifecycleState ?? 'unknown',
+        });
+        return;
+      }
       const needs = await needsBillingCycleReschedule(callId);
       if (!needs) return;
       await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS);
@@ -546,24 +561,44 @@ async function processDLQ(io: Server, startedAt: number): Promise<void> {
           if (isBullmqBillingEnabled()) {
             const sessionStillThere = await redis.get(callSessionKey(callId));
             if (sessionStillThere) {
-              if (tickResult === 'tick_ok') {
-                await scheduleNextBillingCycleAfterTickOk(callId, 0).catch((e) =>
-                  logError('DLQ: schedule next BullMQ cycle failed', e, { callId })
-                );
-              } else {
-                const { scheduleBillingJob } = await import('./billing.queue');
-                const { getBillingCycleLockDeferMs } = await import('./billing.constants');
-                await scheduleBillingJob(callId, getBillingCycleLockDeferMs()).catch((e) =>
-                  logError('DLQ: schedule deferred BullMQ cycle failed', e, { callId })
-                );
+              let session: { lifecycleState?: string } | null = null;
+              try {
+                session = JSON.parse(sessionStillThere) as { lifecycleState?: string };
+              } catch {
+                session = null;
+              }
+              const settledTombstonePresent =
+                (await redis.get(settledCallKey(callId))) != null;
+              if (shouldRescheduleBillingCycleForSession(session, settledTombstonePresent)) {
+                if (tickResult === 'tick_ok') {
+                  await scheduleNextBillingCycleAfterTickOk(callId, 0).catch((e) =>
+                    logError('DLQ: schedule next BullMQ cycle failed', e, { callId })
+                  );
+                } else {
+                  const { scheduleBillingJob } = await import('./billing.queue');
+                  const { getBillingCycleLockDeferMs } = await import('./billing.constants');
+                  await scheduleBillingJob(callId, getBillingCycleLockDeferMs()).catch((e) =>
+                    logError('DLQ: schedule deferred BullMQ cycle failed', e, { callId })
+                  );
+                }
               }
             }
           } else {
             const sessionRaw = await redis.get(callSessionKey(callId));
             if (sessionRaw) {
-              await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS).catch((e) =>
-                logError('DLQ: schedule billing cycle failed', e, { callId })
-              );
+              let session: { lifecycleState?: string } | null = null;
+              try {
+                session = JSON.parse(sessionRaw) as { lifecycleState?: string };
+              } catch {
+                session = null;
+              }
+              const settledTombstonePresent =
+                (await redis.get(settledCallKey(callId))) != null;
+              if (shouldRescheduleBillingCycleForSession(session, settledTombstonePresent)) {
+                await scheduleBillingJob(callId, BILLING_PROCESS_INTERVAL_MS).catch((e) =>
+                  logError('DLQ: schedule billing cycle failed', e, { callId })
+                );
+              }
             }
           }
           await Promise.all([

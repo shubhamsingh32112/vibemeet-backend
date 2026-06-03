@@ -3,6 +3,17 @@
  * Kept in a separate module so unit tests do not import the full reconciliation job.
  */
 
+import { isNonTerminalLifecycle } from './billing-active-call.service';
+
+export function shouldRescheduleBillingCycleForSession(
+  session: { lifecycleState?: string } | null,
+  settledTombstonePresent: boolean
+): boolean {
+  if (settledTombstonePresent) return false;
+  if (!session) return false;
+  return isNonTerminalLifecycle(session.lifecycleState);
+}
+
 export function shouldFinalizeSessionNoHistory(
   sess: {
     totalDeductedMicros?: number;

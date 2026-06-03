@@ -41,6 +41,9 @@ const VALID_PURPOSES: UploadPurpose[] = [
   'creator-gallery',
   'user-avatar',
   'support-ticket',
+  'story-image',
+  'moment-photo',
+  'moment-thumbnail',
 ];
 
 const PURPOSE_QUOTA: Record<UploadPurpose, QuotaScope> = {
@@ -49,6 +52,15 @@ const PURPOSE_QUOTA: Record<UploadPurpose, QuotaScope> = {
   'user-avatar': 'avatar',
   'admin-moderation': 'avatar',
   'support-ticket': 'support',
+  'story-image': 'moments',
+  'moment-photo': 'moments',
+  'moment-thumbnail': 'moments',
+};
+
+const PURPOSE_MAX_BYTES: Partial<Record<UploadPurpose, number>> = {
+  'story-image': 10 * 1024 * 1024,
+  'moment-photo': 20 * 1024 * 1024,
+  'moment-thumbnail': 5 * 1024 * 1024,
 };
 
 const MAX_DECLARED_SIZE_BYTES = 25 * 1024 * 1024;
@@ -158,7 +170,12 @@ export async function createDirectUploadHandler(req: Request, res: Response): Pr
   }
 
   const { maxUploadBytes } = getCloudflareConfig();
-  const hardCeiling = Math.min(MAX_DECLARED_SIZE_BYTES, maxUploadBytes);
+  const purposeMax = PURPOSE_MAX_BYTES[rawPurpose];
+  const hardCeiling = Math.min(
+    MAX_DECLARED_SIZE_BYTES,
+    maxUploadBytes,
+    purposeMax ?? maxUploadBytes,
+  );
   if (declaredSize > hardCeiling) {
     res.status(413).json({
       success: false,

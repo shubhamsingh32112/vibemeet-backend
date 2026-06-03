@@ -16,7 +16,7 @@ import { getImageQuotaConfig } from '../../config/cloudflare';
 import { logWarning } from '../../utils/logger';
 import { bumpImageCounter } from './image-metrics';
 
-export type QuotaScope = 'avatar' | 'gallery' | 'support';
+export type QuotaScope = 'avatar' | 'gallery' | 'support' | 'moments';
 
 export class UploadQuotaExceededError extends Error {
   readonly code = 'UPLOAD_QUOTA_EXCEEDED';
