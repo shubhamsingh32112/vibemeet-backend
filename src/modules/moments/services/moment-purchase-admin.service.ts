@@ -1,9 +1,9 @@
 import mongoose from 'mongoose';
 import { randomUUID } from 'crypto';
-import { getMomentsConfig } from '../../config/moments';
-import { User } from '../user/user.model';
-import { Creator } from '../creator/creator.model';
-import { CoinTransaction } from '../user/coin-transaction.model';
+import { getMomentsConfig } from '../../../config/moments';
+import { User } from '../../user/user.model';
+import { Creator } from '../../creator/creator.model';
+import { CoinTransaction } from '../../user/coin-transaction.model';
 import { CreatorMoment } from '../models/creator-moment.model';
 import { MomentPurchase } from '../models/moment-purchase.model';
 import { MomentRevenue } from '../models/moment-revenue.model';

@@ -78,12 +78,12 @@ export async function removeCreatorFromFollowingFeedCache(
   await pipeline.exec();
 }
 
-export function orderMomentsByIds(
-  moments: Array<{ _id: mongoose.Types.ObjectId } & Record<string, unknown>>,
+export function orderMomentsByIds<T extends { _id: { toString(): string } }>(
+  moments: T[],
   ids: string[],
-): typeof moments {
+): T[] {
   const byId = new Map(moments.map((m) => [m._id.toString(), m]));
-  return ids.map((id) => byId.get(id)).filter(Boolean) as typeof moments;
+  return ids.map((id) => byId.get(id)).filter((m): m is T => m != null);
 }
 
 async function recordQueueDepths(): Promise<void> {

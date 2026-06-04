@@ -145,11 +145,14 @@ export async function escalateMomentModerationHandler(req: Request, res: Respons
       res.status(404).json({ success: false, error: 'Not found' });
       return;
     }
-    const Model = kind === 'moment' ? CreatorMoment : CreatorStory;
-    await Model.updateOne(
-      { _id: id },
-      { $set: { moderationReason: reason.trim(), moderatedAt: new Date() } },
-    );
+    const moderationMeta = {
+      $set: { moderationReason: reason.trim(), moderatedAt: new Date() },
+    };
+    if (kind === 'moment') {
+      await CreatorMoment.updateOne({ _id: id }, moderationMeta);
+    } else {
+      await CreatorStory.updateOne({ _id: id }, moderationMeta);
+    }
     logInfo('Moment/story moderation escalated', {
       kind,
       id,
