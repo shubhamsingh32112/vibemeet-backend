@@ -17,6 +17,24 @@ const VALID_ROLES: ReadonlySet<EcsServiceRole> = new Set([
 
 const LEGACY_RUN_BACKGROUND_WORKERS = 'RUN_BACKGROUND_WORKERS';
 
+function isEcsTask(): boolean {
+  return !!(process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI);
+}
+
+/** Primary: SERVICE_ROLE. Legacy alias: ECS_SERVICE_ROLE. */
+export function readServiceRoleEnv(): string | undefined {
+  const serviceRole = (process.env.SERVICE_ROLE || '').trim();
+  const ecsRole = (process.env.ECS_SERVICE_ROLE || '').trim();
+
+  if (serviceRole && ecsRole && serviceRole.toLowerCase() !== ecsRole.toLowerCase()) {
+    throw new Error(
+      `Conflicting config: SERVICE_ROLE="${serviceRole}" and ECS_SERVICE_ROLE="${ecsRole}" differ. Use SERVICE_ROLE only.`,
+    );
+  }
+
+  return serviceRole || ecsRole || undefined;
+}
+
 function parseRole(raw: string | undefined): EcsServiceRole {
   const trimmed = (raw || '').trim().toLowerCase();
   if (!trimmed) {
@@ -26,19 +44,24 @@ function parseRole(raw: string | undefined): EcsServiceRole {
     return trimmed as EcsServiceRole;
   }
   throw new Error(
-    `Invalid ECS_SERVICE_ROLE="${raw}". Expected one of: ${[...VALID_ROLES].join(', ')}`,
+    `Invalid SERVICE_ROLE="${raw}". Expected one of: ${[...VALID_ROLES].join(', ')}`,
   );
 }
 
-function assertEcsRoleWhenOnEcs(role: EcsServiceRole): void {
+function assertProductionRoleConstraints(role: EcsServiceRole, raw: string | undefined): void {
   if (process.env.NODE_ENV !== 'production') return;
-  if (role !== 'monolith') return;
-  if (!process.env.ECS_CONTAINER_METADATA_URI_V4 && !process.env.ECS_CONTAINER_METADATA_URI) {
-    return;
+
+  if (!raw) {
+    throw new Error(
+      'SERVICE_ROLE is required in production. Set api-ws, billing-worker, moments-worker, image-worker, or monolith (non-ECS only).',
+    );
   }
-  throw new Error(
-    'ECS task detected but ECS_SERVICE_ROLE is unset. Set api-ws, billing-worker, moments-worker, or image-worker.',
-  );
+
+  if (isEcsTask() && role === 'monolith') {
+    throw new Error(
+      'SERVICE_ROLE=monolith is not allowed on ECS. Set api-ws, billing-worker, moments-worker, or image-worker.',
+    );
+  }
 }
 
 function assertNoConflictingLegacyFlags(role: EcsServiceRole): void {
@@ -49,11 +72,11 @@ function assertNoConflictingLegacyFlags(role: EcsServiceRole): void {
   const legacyTrue = legacy === 'true' || legacy === '1';
 
   if (legacyFalse && role !== 'api-ws' && role !== 'monolith') {
-    logWarning(`${LEGACY_RUN_BACKGROUND_WORKERS}=false ignored; ECS_SERVICE_ROLE=${role} controls workers`, {});
+    logWarning(`${LEGACY_RUN_BACKGROUND_WORKERS}=false ignored; SERVICE_ROLE=${role} controls workers`, {});
   }
   if (legacyTrue && role === 'api-ws') {
     throw new Error(
-      `Conflicting config: ECS_SERVICE_ROLE=api-ws with ${LEGACY_RUN_BACKGROUND_WORKERS}=true`,
+      `Conflicting config: SERVICE_ROLE=api-ws with ${LEGACY_RUN_BACKGROUND_WORKERS}=true`,
     );
   }
 }
@@ -62,13 +85,19 @@ let cachedRole: EcsServiceRole | null = null;
 
 export function getServiceRole(): EcsServiceRole {
   if (cachedRole) return cachedRole;
-  const role = parseRole(process.env.ECS_SERVICE_ROLE);
-  assertEcsRoleWhenOnEcs(role);
+  const raw = readServiceRoleEnv();
+  const role = parseRole(raw);
+  assertProductionRoleConstraints(role, raw);
   assertNoConflictingLegacyFlags(role);
   cachedRole = role;
   logInfo('Service role resolved', {
     serviceRole: role,
-    ecsTask: !!(process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI),
+    ecsTask: isEcsTask(),
+    configuredVia: !raw
+      ? 'default'
+      : (process.env.SERVICE_ROLE || '').trim()
+        ? 'SERVICE_ROLE'
+        : 'ECS_SERVICE_ROLE',
   });
   return role;
 }

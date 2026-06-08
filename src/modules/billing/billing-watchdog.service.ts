@@ -6,7 +6,13 @@ import {
   billingWatchdogCooldownKey,
   billingWatchdogAttemptsKey,
   billingRecoveryDeadLetterKey,
+  BILLING_WATCHDOG_LOCK_KEY,
 } from '../../config/redis';
+import {
+  acquireDistributedLock,
+  type DistributedLockHandle,
+} from '../../utils/distributed-lock';
+import { getBillingInstanceId } from './billing-instance-id';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { recoverBillingScheduleForCall } from './billing-recovery';
@@ -21,6 +27,11 @@ import { randomUUID } from 'crypto';
 import { isBullmqBillingEnabled, needsBillingCycleReschedule } from './billing.queue';
 
 let watchdogTimer: NodeJS.Timeout | null = null;
+let activeWatchdogLock: DistributedLockHandle | null = null;
+
+function isWatchdogClusterLockEnabled(): boolean {
+  return process.env.BILLING_WATCHDOG_CLUSTER_LOCK !== 'false';
+}
 
 function readInt(name: string, fallback: number, min: number, max: number): number {
   const n = parseInt(process.env[name] || '', 10);
@@ -340,13 +351,40 @@ async function runWatchdogPass(io: Server): Promise<void> {
   }
 }
 
+async function runWatchdogPassWithLock(io: Server): Promise<void> {
+  if (!isWatchdogClusterLockEnabled()) {
+    await runWatchdogPass(io);
+    return;
+  }
+
+  const handle = await acquireDistributedLock({
+    key: BILLING_WATCHDOG_LOCK_KEY,
+    ttlMs: WATCHDOG_INTERVAL_MS * 3,
+    ownerId: getBillingInstanceId(),
+    heartbeat: true,
+    onSkipped: () => recordBillingMetric('billing.watchdog.lock_skipped', 1, {}),
+  });
+  if (!handle) return;
+
+  recordBillingMetric('billing.watchdog.lock_acquired', 1, {});
+  activeWatchdogLock = handle;
+  try {
+    await runWatchdogPass(io);
+  } finally {
+    await handle.release();
+    if (activeWatchdogLock === handle) {
+      activeWatchdogLock = null;
+    }
+  }
+}
+
 export function startBillingWatchdog(io: Server): void {
   if (!featureFlags.billingWatchdogEnabled) {
     return;
   }
   if (watchdogTimer) return;
   watchdogTimer = setInterval(() => {
-    runWatchdogPass(io).catch((err) => {
+    runWatchdogPassWithLock(io).catch((err) => {
       logError('Billing watchdog pass failed', err, {});
     });
   }, WATCHDOG_INTERVAL_MS);
@@ -354,7 +392,13 @@ export function startBillingWatchdog(io: Server): void {
 }
 
 export function stopBillingWatchdog(): void {
-  if (!watchdogTimer) return;
-  clearInterval(watchdogTimer);
-  watchdogTimer = null;
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  const lock = activeWatchdogLock;
+  if (lock) {
+    void lock.release();
+    activeWatchdogLock = null;
+  }
 }

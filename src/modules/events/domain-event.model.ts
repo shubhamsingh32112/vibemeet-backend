@@ -9,6 +9,8 @@ export interface IDomainEvent extends Document {
   status: DomainEventStatus;
   retryCount: number;
   idempotencyKey?: string;
+  claimedBy?: string;
+  claimedAt?: Date;
   createdAt: Date;
   processedAt?: Date;
   lastError?: string;
@@ -22,11 +24,13 @@ const domainEventSchema = new Schema<IDomainEvent>(
     payload: { type: Schema.Types.Mixed, required: true },
     status: {
       type: String,
-      enum: ['pending', 'processed', 'failed', 'dead'],
+      enum: ['pending', 'processing', 'processed', 'failed', 'dead'],
       default: 'pending',
       index: true,
     },
     retryCount: { type: Number, default: 0 },
+    claimedBy: { type: String, trim: true },
+    claimedAt: { type: Date },
     idempotencyKey: { type: String, trim: true, sparse: true, unique: true },
     processedAt: { type: Date },
     lastError: { type: String, trim: true, maxlength: 2000 },

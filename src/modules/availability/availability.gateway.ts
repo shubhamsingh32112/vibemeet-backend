@@ -18,6 +18,11 @@ import {
   refreshUserAvailability,
   getBatchUserAvailability,
 } from './user-availability.service';
+import {
+  assertCreatorOrAdminForPresenceLookup,
+  capPresenceLookupBatch,
+  checkPresenceLookupRateLimit,
+} from './presence-lookup-access';
 // Keep this aligned with the availability service TTL (default 180s).
 const AVAILABILITY_TTL_SECONDS = Math.min(
   600,
@@ -649,8 +654,25 @@ export function setupAvailabilityGateway(io: Server): void {
       'availability:get',
       async (data: { creatorIds: string[] } | string[]) => {
         try {
+          const uid = socket.data.firebaseUid as string | undefined;
+          if (!uid) return;
+
+          const auth = await assertCreatorOrAdminForPresenceLookup(uid);
+          if (!auth.ok) {
+            socket.emit('availability:batch', {});
+            socket.emit('availability:batch:v2', {});
+            return;
+          }
+
+          const rateLimit = await checkPresenceLookupRateLimit(socket.id);
+          if (!rateLimit.allowed) {
+            socket.emit('availability:batch', {});
+            socket.emit('availability:batch:v2', {});
+            return;
+          }
+
           const normalized = normalizeCreatorIds(data);
-          const firebaseUids = normalized.firebaseUids;
+          const firebaseUids = capPresenceLookupBatch(normalized.firebaseUids);
           const processedCount = firebaseUids.length;
           if (normalized.invalidUids.length > 0) {
             const totalInput = firebaseUids.length + normalized.invalidUids.length;
@@ -803,8 +825,26 @@ export function setupAvailabilityGateway(io: Server): void {
           socket.emit('user:availability:batch', {});
           return;
         }
-        
-        const availability = await getBatchUserAvailability(firebaseUids);
+
+        const uid = socket.data.firebaseUid as string | undefined;
+        if (!uid) return;
+
+        const auth = await assertCreatorOrAdminForPresenceLookup(uid);
+        if (!auth.ok) {
+          socket.emit('user:availability:error', { error: auth.error });
+          socket.emit('user:availability:batch', {});
+          return;
+        }
+
+        const rateLimit = await checkPresenceLookupRateLimit(socket.id);
+        if (!rateLimit.allowed) {
+          socket.emit('user:availability:error', { error: 'RATE_LIMIT_EXCEEDED' });
+          socket.emit('user:availability:batch', {});
+          return;
+        }
+
+        const cappedUids = capPresenceLookupBatch(firebaseUids);
+        const availability = await getBatchUserAvailability(cappedUids);
         socket.emit('user:availability:batch', availability);
         logDebug('User availability batch fetched', {
           socketId: socket.id,

@@ -2,7 +2,7 @@
  * Internal domain events (Mongo-backed outbox). No external broker in phase 2.
  */
 
-export type DomainEventStatus = 'pending' | 'processed' | 'failed' | 'dead';
+export type DomainEventStatus = 'pending' | 'processing' | 'processed' | 'failed' | 'dead';
 
 export type BaseDomainEventPayload = {
   idempotencyKey: string;

@@ -6,7 +6,8 @@
  */
 
 import { Server } from 'socket.io';
-import { randomUUID } from 'crypto';
+import { withDistributedLock } from '../../utils/distributed-lock';
+import { getBillingInstanceId } from './billing-instance-id';
 import {
   getRedis,
   DLQ_BILLING_PREFIX,
@@ -47,12 +48,6 @@ import mongoose from 'mongoose';
 import { shouldFinalizeSessionNoHistory, shouldRescheduleBillingCycleForSession } from './billing-reconciliation.guards';
 
 let reconciliationInterval: NodeJS.Timeout | null = null;
-const RELEASE_LOCK_LUA = `
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  return redis.call("DEL", KEYS[1])
-end
-return 0
-`;
 
 function readNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
   const n = parseInt(raw || '', 10);
@@ -79,42 +74,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function releaseLock(lockKey: string, token: string): Promise<void> {
-  const redis = getRedis();
-  try {
-    await redis.eval(RELEASE_LOCK_LUA, 1, lockKey, token);
-  } catch {
-    // ignore lock release failures
-  }
-}
-
 async function withBillingReconciliationLock(task: () => Promise<void>): Promise<void> {
-  const redis = getRedis();
-  const token = randomUUID();
-  const lockResult = await redis.set(
-    BILLING_RECONCILIATION_LOCK_KEY,
-    token,
-    'PX',
-    RECONCILIATION_LOCK_TTL_MS,
-    'NX'
+  await withDistributedLock(
+    {
+      key: BILLING_RECONCILIATION_LOCK_KEY,
+      ttlMs: RECONCILIATION_LOCK_TTL_MS,
+      ownerId: getBillingInstanceId(),
+      heartbeat: true,
+      onSkipped: () => recordBillingMetric('reconciliation_skipped_lock_busy', 1, {}),
+    },
+    task
   );
-  if (lockResult !== 'OK') {
-    recordBillingMetric('reconciliation_skipped_lock_busy', 1, {});
-    return;
-  }
-
-  const heartbeat = setInterval(() => {
-    redis
-      .set(BILLING_RECONCILIATION_LOCK_KEY, token, 'PX', RECONCILIATION_LOCK_TTL_MS, 'XX')
-      .catch(() => {});
-  }, Math.max(1000, Math.floor(RECONCILIATION_LOCK_TTL_MS / 3)));
-
-  try {
-    await task();
-  } finally {
-    clearInterval(heartbeat);
-    await releaseLock(BILLING_RECONCILIATION_LOCK_KEY, token);
-  }
 }
 
 async function processInParallel<T>(

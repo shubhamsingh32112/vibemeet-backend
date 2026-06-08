@@ -16,6 +16,7 @@ import {
 } from './billing-active-call.service';
 import { logError, logInfo, logDebug, logWarning } from '../../utils/logger';
 import { checkCallRateLimit } from '../../utils/rate-limit.service';
+import { assertBillingRestCallStartedAccess } from './billing-rest-access';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
 import {
   finalizeCallEnd,
@@ -225,10 +226,27 @@ export function setupBillingGateway(io: Server): void {
       }) => {
         const callStartedRequestAt = Date.now();
         try {
-          const payerFirebaseUid = data.userFirebaseUid || firebaseUid;
           const initiatedByFirebaseUid = firebaseUid;
           const initiatedByRole = socket.data.isCreator ? 'creator' : 'user';
           const startCorrelationId = randomUUID();
+
+          const access = assertBillingRestCallStartedAccess(
+            firebaseUid,
+            data.callId,
+            data.creatorFirebaseUid,
+            data.creatorMongoId,
+            data.userFirebaseUid
+          );
+          if (!access.ok) {
+            socket.emit('billing:error', {
+              callId: data.callId,
+              error: 'UNAUTHORIZED',
+              message: access.error,
+              status: access.status,
+            });
+            return;
+          }
+          const payerFirebaseUid = access.payerFirebaseUid;
 
           logInfo('call:started received', {
             callId: data.callId,

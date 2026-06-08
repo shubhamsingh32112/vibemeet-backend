@@ -5,6 +5,8 @@
 **Scope:** `backend/` — migration from Railway to AWS  
 **Audience:** Engineering, DevOps, release owners
 
+> **Step-by-step deploy runbook:** For hands-on AWS provisioning (VPC, ElastiCache, ECR, ECS, ALB, Route53, Secrets Manager), see **[AWS_BACKEND_DEPLOYMENT_GUIDE.md](./AWS_BACKEND_DEPLOYMENT_GUIDE.md)**.
+
 ---
 
 ## Executive summary

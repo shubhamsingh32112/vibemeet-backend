@@ -1,3 +1,6 @@
+import { DOMAIN_EVENT_WORKER_LOCK_KEY } from '../../config/redis';
+import { withDistributedLock } from '../../utils/distributed-lock';
+import { getBillingInstanceId } from '../billing/billing-instance-id';
 import { logError } from '../../utils/logger';
 import { getDomainEventStats, processPendingDomainEvents } from './domain-event.service';
 
@@ -11,13 +14,24 @@ export function startDomainEventWorker(): void {
 
   const intervalMs = parseInt(process.env.DOMAIN_EVENT_WORKER_INTERVAL_MS ?? '5000', 10) || 5000;
 
+  const lockTtlMs = Math.max(intervalMs * 3, 15_000);
+
   timer = setInterval(() => {
-    processPendingDomainEvents(50)
-      .then((n) => {
+    withDistributedLock(
+      {
+        key: DOMAIN_EVENT_WORKER_LOCK_KEY,
+        ttlMs: lockTtlMs,
+        ownerId: getBillingInstanceId(),
+        heartbeat: true,
+      },
+      async () => {
+        const n = await processPendingDomainEvents(50);
         lastProcessedCount = n;
         lastProcessAt = new Date();
-      })
-      .catch((e) => logError('Domain event worker tick failed', e instanceof Error ? e : new Error(String(e))));
+      }
+    ).catch((e) =>
+      logError('Domain event worker tick failed', e instanceof Error ? e : new Error(String(e)))
+    );
   }, intervalMs);
 }
 

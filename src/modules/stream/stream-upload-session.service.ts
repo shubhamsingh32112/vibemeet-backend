@@ -6,6 +6,7 @@ import type { ContentClass, ProcessingStatus } from '../media-shared/types';
 export interface StreamUploadSession {
   sessionId: string;
   userId: string;
+  firebaseUid: string;
   contentClass: ContentClass;
   streamVideoId: string;
   processingStatus: ProcessingStatus;
@@ -32,6 +33,7 @@ function assertRedis(): void {
 
 export async function createStreamUploadSession(input: {
   userId: string;
+  firebaseUid: string;
   contentClass: ContentClass;
   streamVideoId: string;
   ttlSeconds?: number;
@@ -43,6 +45,7 @@ export async function createStreamUploadSession(input: {
   const session: StreamUploadSession = {
     sessionId,
     userId: input.userId,
+    firebaseUid: input.firebaseUid,
     contentClass: input.contentClass,
     streamVideoId: input.streamVideoId,
     processingStatus: 'uploading',

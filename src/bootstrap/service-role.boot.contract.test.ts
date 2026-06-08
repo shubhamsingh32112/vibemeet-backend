@@ -8,8 +8,9 @@ import { join } from 'node:path';
 
 const root = join(__dirname, '..');
 
-test('server.ts gates workloads by ECS_SERVICE_ROLE bootstrap modules', () => {
+test('server.ts gates workloads by SERVICE_ROLE bootstrap modules', () => {
   const server = readFileSync(join(root, 'server.ts'), 'utf8');
+  assert.ok(server.includes("import './bootstrap/load-env'"));
   assert.ok(server.includes('getServiceRole()'));
   assert.ok(server.includes('runsHttpApi()'));
   assert.ok(server.includes('runsBillingWorkers()'));

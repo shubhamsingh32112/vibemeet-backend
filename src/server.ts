@@ -1,8 +1,7 @@
+import './bootstrap/load-env';
 import express, { type Request } from 'express';
 import compression from 'compression';
 import { createServer } from 'http';
-import dotenv from 'dotenv';
-dotenv.config();
 import { bootstrapCore } from './bootstrap/bootstrap-core';
 import { buildSocketCorsOrigin, initializeSocketIo } from './bootstrap/bootstrap-socket';
 import { bootstrapApiWs } from './bootstrap/bootstrap-api-ws';
@@ -185,7 +184,8 @@ function isSignedWebhookPost(req: Request): boolean {
     pathOnly === '/api/v1/video/webhook' ||
     pathOnly === '/api/v1/chat/webhook' ||
     pathOnly === '/api/v1/payment/webhook' ||
-    pathOnly === '/api/v1/stream/webhook'
+    pathOnly === '/api/v1/stream/webhook' ||
+    pathOnly === '/api/v1/vip/webhook'
   );
 }
 

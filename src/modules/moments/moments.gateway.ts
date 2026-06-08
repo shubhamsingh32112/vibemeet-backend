@@ -24,6 +24,6 @@ export function emitCreatorFollowed(creatorId: string, followerCount?: number): 
   ioRef?.emit('creator:followed', { creatorId, followerCount });
 }
 
-export function emitMediaReady(userId: string, sessionId: string): void {
-  ioRef?.to(userId).emit('media:ready', { sessionId });
+export function emitMediaReady(firebaseUid: string, sessionId: string): void {
+  ioRef?.to(`user:${firebaseUid}`).emit('media:ready', { sessionId });
 }

@@ -372,6 +372,9 @@ export const RECONCILIATION_LAST_RUN_KEY = 'reconciliation:last_run';
 export const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 export const BILLING_RECONCILIATION_LOCK_KEY = 'lock:reconciliation:billing';
 export const CALL_RECONCILIATION_LOCK_KEY = 'lock:reconciliation:call';
+export const BILLING_WATCHDOG_LOCK_KEY = 'lock:billing:watchdog';
+export const VIP_RECONCILIATION_LOCK_KEY = 'lock:vip:reconciliation';
+export const DOMAIN_EVENT_WORKER_LOCK_KEY = 'lock:domain_events:worker';
 export const RECONCILIATION_LOCK_TTL_MS = Math.min(
   120_000,
   Math.max(10_000, parseInt(process.env.RECONCILIATION_LOCK_TTL_MS || '90000', 10) || 90_000)

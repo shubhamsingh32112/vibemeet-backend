@@ -56,6 +56,7 @@ export async function createDirectUploadHandler(req: Request, res: Response): Pr
 
     const session = await createStreamUploadSession({
       userId: user._id.toString(),
+      firebaseUid: user.firebaseUid,
       contentClass,
       streamVideoId: cf.uid,
     });
@@ -154,8 +155,8 @@ export async function handleStreamWebhook(req: Request, res: Response): Promise<
     }
 
     await updateStreamUploadSession(session);
-    if (session.processingStatus === 'ready') {
-      emitMediaReady(session.userId, session.sessionId);
+    if (session.processingStatus === 'ready' && session.firebaseUid) {
+      emitMediaReady(session.firebaseUid, session.sessionId);
     }
     res.sendStatus(200);
   } catch (error) {

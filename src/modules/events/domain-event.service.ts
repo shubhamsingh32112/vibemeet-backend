@@ -4,8 +4,13 @@ import { DomainEvent } from './domain-event.model';
 import { dispatchDomainEventPayload } from './event-dispatcher';
 import { logError } from '../../utils/logger';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
+import { getBillingInstanceId } from '../billing/billing-instance-id';
 
 const MAX_RETRIES = parseInt(process.env.DOMAIN_EVENT_MAX_RETRIES ?? '8', 10) || 8;
+const DOMAIN_EVENT_CLAIM_TTL_MS = Math.max(
+  30_000,
+  parseInt(process.env.DOMAIN_EVENT_CLAIM_TTL_MS ?? '120000', 10) || 120_000
+);
 
 function isDomainEventsEnabled(): boolean {
   return process.env.DOMAIN_EVENTS_ENABLED === 'true';
@@ -92,20 +97,46 @@ export async function enqueueSettlementDomainEvents(params: {
   }
 }
 
+async function resetStaleDomainEventClaims(): Promise<void> {
+  const cutoff = new Date(Date.now() - DOMAIN_EVENT_CLAIM_TTL_MS);
+  await DomainEvent.updateMany(
+    { status: 'processing', claimedAt: { $lt: cutoff } },
+    {
+      $set: { status: 'pending' },
+      $unset: { claimedBy: 1, claimedAt: 1 },
+    }
+  );
+}
+
+async function claimNextPendingDomainEvent(instanceId: string) {
+  const now = new Date();
+  return DomainEvent.findOneAndUpdate(
+    { status: 'pending' },
+    { $set: { status: 'processing', claimedBy: instanceId, claimedAt: now } },
+    { sort: { createdAt: 1 }, new: true }
+  ).lean();
+}
+
 export async function processPendingDomainEvents(limit = 50): Promise<number> {
   if (!isDomainEventsEnabled()) return 0;
-  const batch = await DomainEvent.find({ status: 'pending' })
-    .sort({ createdAt: 1 })
-    .limit(limit)
-    .lean();
 
+  await resetStaleDomainEventClaims();
+
+  const instanceId = getBillingInstanceId();
   let ok = 0;
-  for (const doc of batch) {
+
+  for (let i = 0; i < limit; i++) {
+    const doc = await claimNextPendingDomainEvent(instanceId);
+    if (!doc) break;
+
     try {
       await dispatchDomainEventPayload(doc.eventType, doc.payload as Record<string, unknown>);
       await DomainEvent.updateOne(
         { _id: doc._id },
-        { $set: { status: 'processed', processedAt: new Date(), lastError: undefined } }
+        {
+          $set: { status: 'processed', processedAt: new Date(), lastError: undefined },
+          $unset: { claimedBy: 1, claimedAt: 1 },
+        }
       );
       ok++;
     } catch (e) {
@@ -115,10 +146,11 @@ export async function processPendingDomainEvents(limit = 50): Promise<number> {
         { _id: doc._id },
         {
           $set: {
-            status: dead ? 'dead' : 'failed',
+            status: dead ? 'dead' : 'pending',
             retryCount: next,
             lastError: e instanceof Error ? e.message.slice(0, 2000) : String(e),
           },
+          $unset: { claimedBy: 1, claimedAt: 1 },
         }
       );
     }
