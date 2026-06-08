@@ -11,6 +11,7 @@ export interface IMomentPurchase extends Document {
   creatorLedgerEntryId?: mongoose.Types.ObjectId | null;
   entitlementVersion: number;
   revenueRecordId: mongoose.Types.ObjectId;
+  purchaseSource?: 'coin_purchase' | 'vip_daily_free' | 'vip_discounted';
   refundedAt?: Date | null;
 }
 
@@ -25,6 +26,11 @@ const momentPurchaseSchema = new Schema<IMomentPurchase>(
     creatorLedgerEntryId: { type: Schema.Types.ObjectId, ref: 'CoinTransaction', default: null },
     entitlementVersion: { type: Number, required: true, min: 1 },
     revenueRecordId: { type: Schema.Types.ObjectId, ref: 'MomentRevenue', required: true },
+    purchaseSource: {
+      type: String,
+      enum: ['coin_purchase', 'vip_daily_free', 'vip_discounted'],
+      default: 'coin_purchase',
+    },
     refundedAt: { type: Date, default: null },
   },
   { timestamps: false },

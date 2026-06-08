@@ -20,6 +20,7 @@ import { hasMomentAccess, canViewDeletedMoment } from './entitlement.service';
 import { getMomentsConfig } from '../../../config/moments';
 import { isImageModerationPendingByDefault } from '../../../config/cloudflare';
 import type { ProcessingStatus } from '../../media-shared/types';
+import { resolveMomentPriceForUser } from '../../vip/vip-entitlement.service';
 
 const PLACEHOLDER_THUMB =
   'https://imagedelivery.net/static/placeholder/moments/thumb';
@@ -50,6 +51,12 @@ function thumbFromImageAsset(asset: IImageAsset | null | undefined, variant: 'bl
 async function buildMomentMedia(
   moment: ICreatorMoment,
   locked: boolean,
+  pricing?: {
+    unlockPriceCoins?: number;
+    originalPriceCoins?: number;
+    vipFreeUnlockAvailable?: boolean;
+    discountApplied?: boolean;
+  },
 ): Promise<PresentationDTO['media']> {
   const processingStatus = moment.processingStatus;
   if (moment.type === 'photo') {
@@ -66,7 +73,10 @@ async function buildMomentMedia(
       playbackUrl,
       blurPlaceholder: moment.imageAsset?.blurhash ?? undefined,
       locked,
-      unlockPriceCoins: locked ? moment.priceCoins : undefined,
+      unlockPriceCoins: locked ? (pricing?.unlockPriceCoins ?? moment.priceCoins) : undefined,
+      originalPriceCoins: locked ? pricing?.originalPriceCoins : undefined,
+      vipFreeUnlockAvailable: locked ? pricing?.vipFreeUnlockAvailable : undefined,
+      discountApplied: locked ? pricing?.discountApplied : undefined,
       processingStatus,
     };
   }
@@ -96,7 +106,10 @@ async function buildMomentMedia(
     expiresAtMs,
     blurPlaceholder: moment.thumbnailAsset?.blurhash ?? moment.imageAsset?.blurhash ?? undefined,
     locked,
-    unlockPriceCoins: locked ? moment.priceCoins : undefined,
+    unlockPriceCoins: locked ? (pricing?.unlockPriceCoins ?? moment.priceCoins) : undefined,
+    originalPriceCoins: locked ? pricing?.originalPriceCoins : undefined,
+    vipFreeUnlockAvailable: locked ? pricing?.vipFreeUnlockAvailable : undefined,
+    discountApplied: locked ? pricing?.discountApplied : undefined,
     processingStatus,
   };
 }
@@ -123,16 +136,40 @@ export async function toMomentPresentationDTO(
   const locked = moment.accessType === 'paid' && !entitled;
   const meta = await resolveCreatorMeta(moment.creatorId);
 
+  let vipPricing:
+    | {
+        unlockPriceCoins: number;
+        originalPriceCoins: number;
+        vipFreeUnlockAvailable: boolean;
+        discountApplied: boolean;
+      }
+    | undefined;
+
+  if (locked && viewer.userId) {
+    const resolved = await resolveMomentPriceForUser(viewer.userId, moment.priceCoins);
+    vipPricing = {
+      unlockPriceCoins: resolved.priceCoins,
+      originalPriceCoins: resolved.originalPriceCoins,
+      vipFreeUnlockAvailable: resolved.vipFreeUnlockAvailable,
+      discountApplied: resolved.discountApplied,
+    };
+  }
+
   return {
     id: moment._id.toString(),
     creatorId: moment.creatorId.toString(),
     creatorName: meta.name,
     creatorAvatarUrl: meta.avatarUrl,
-    media: await buildMomentMedia(moment, locked),
+    media: await buildMomentMedia(moment, locked, vipPricing),
     caption: moment.caption ?? undefined,
     createdAt: moment.createdAt.toISOString(),
     locked,
-    unlockPriceCoins: locked ? moment.priceCoins : undefined,
+    unlockPriceCoins: locked
+      ? (vipPricing?.unlockPriceCoins ?? moment.priceCoins)
+      : undefined,
+    originalPriceCoins: locked ? vipPricing?.originalPriceCoins : undefined,
+    vipFreeUnlockAvailable: locked ? vipPricing?.vipFreeUnlockAvailable : undefined,
+    discountApplied: locked ? vipPricing?.discountApplied : undefined,
     processingStatus: moment.processingStatus,
     isFollowing: viewer.followedCreatorIds?.has(moment.creatorId.toString()) ?? false,
   };

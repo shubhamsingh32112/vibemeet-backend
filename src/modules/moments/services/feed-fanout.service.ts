@@ -62,6 +62,33 @@ export async function getCachedFeedResponse(cacheKey: string): Promise<string | 
   return getRedis().get(cacheKey);
 }
 
+export async function removeMomentFromFollowerFeeds(
+  momentId: string,
+  creatorId: string,
+): Promise<void> {
+  if (!isRedisConfigured()) return;
+  const batchSize = 500;
+  let lastId: mongoose.Types.ObjectId | null = null;
+  for (;;) {
+    const query: Record<string, unknown> = { creatorId };
+    if (lastId) query._id = { $gt: lastId };
+    const batch = await CreatorFollow.find(query)
+      .sort({ _id: 1 })
+      .limit(batchSize)
+      .select('followerUserId')
+      .lean();
+    if (!batch.length) break;
+    const redis = getRedis();
+    const pipeline = redis.pipeline();
+    for (const f of batch) {
+      pipeline.zrem(`${FOLLOWING_PREFIX}${f.followerUserId.toString()}`, momentId);
+    }
+    await pipeline.exec();
+    lastId = batch[batch.length - 1]._id as mongoose.Types.ObjectId;
+    if (batch.length < batchSize) break;
+  }
+}
+
 export async function removeCreatorFromFollowingFeedCache(
   followerUserId: string,
   creatorId: string,

@@ -176,6 +176,7 @@ export async function getStoriesFeedHandler(req: Request, res: Response): Promis
         ...g,
         creatorName: meta?.name ?? 'Creator',
         creatorAvatarUrl: meta?.avatarUrl,
+        creatorFirebaseUid: meta?.firebaseUid,
       };
     });
 

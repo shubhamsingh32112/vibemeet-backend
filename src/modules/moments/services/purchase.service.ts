@@ -14,6 +14,12 @@ import {
 import { toMomentPresentationDTO } from './moment-presentation.service';
 import type { PresentationDTO } from '../dto/moment.dto';
 import { enqueueAnalyticsEvent } from './analytics-emitter.service';
+import {
+  getRemainingFreeMoments,
+  incrementDailyMomentUsage,
+  isVipActive,
+  resolveMomentPriceForUser,
+} from '../../vip/vip-entitlement.service';
 
 export async function purchaseMoment(input: {
   userId: mongoose.Types.ObjectId;
@@ -57,7 +63,14 @@ export async function purchaseMoment(input: {
 
           const buyer = await User.findById(input.userId).session(session);
           if (!buyer) throw new Error('User not found');
-          if ((buyer.coins || 0) < moment.priceCoins) {
+
+          const pricing = await resolveMomentPriceForUser(buyer._id, moment.priceCoins);
+          const chargeAmount = pricing.priceCoins;
+          const isVipFree = pricing.vipFreeUnlockAvailable && chargeAmount === 0;
+          const isVipDiscounted =
+            pricing.discountApplied && chargeAmount > 0 && (await isVipActive(buyer._id));
+
+          if (!isVipFree && (buyer.coins || 0) < chargeAmount) {
             throw new Error('Insufficient coins');
           }
 
@@ -66,20 +79,41 @@ export async function purchaseMoment(input: {
           const creatorUser = await User.findById(creator.userId).session(session);
           if (!creatorUser) throw new Error('Creator user not found');
 
-          const gross = moment.priceCoins;
-          const creatorShare = Math.floor(gross * cfg.creatorRevenueShare);
+          if (isVipFree) {
+            const remaining = await getRemainingFreeMoments(buyer._id);
+            if (remaining <= 0) {
+              throw new Error('VIP daily free moment quota exhausted');
+            }
+          }
+
+          const gross = chargeAmount;
+          const creatorShare = isVipFree
+            ? 0
+            : Math.floor(gross * cfg.creatorRevenueShare);
           const platformShare = gross - creatorShare;
 
-          buyer.coins = (buyer.coins || 0) - gross;
-          await buyer.save({ session });
+          if (!isVipFree) {
+            buyer.coins = (buyer.coins || 0) - gross;
+            await buyer.save({ session });
+          }
 
-          creatorUser.coins = (creatorUser.coins || 0) + creatorShare;
-          creator.earningsCoins = (creator.earningsCoins || 0) + creatorShare;
-          await creatorUser.save({ session });
-          await creator.save({ session });
+          let creditTxId: mongoose.Types.ObjectId | null = null;
+          if (creatorShare > 0) {
+            creatorUser.coins = (creatorUser.coins || 0) + creatorShare;
+            creator.earningsCoins = (creator.earningsCoins || 0) + creatorShare;
+            await creatorUser.save({ session });
+            await creator.save({ session });
+          }
 
           const purchaseObjectId = new mongoose.Types.ObjectId();
           const revenueObjectId = new mongoose.Types.ObjectId();
+
+          const debitSource = isVipFree ? 'vip_moment_free' : 'moment_purchase';
+          const purchaseSource = isVipFree
+            ? 'vip_daily_free'
+            : isVipDiscounted
+              ? 'vip_discounted'
+              : 'coin_purchase';
 
           const [debitTx] = await CoinTransaction.create(
             [
@@ -88,29 +122,36 @@ export async function purchaseMoment(input: {
                 userId: buyer._id,
                 type: 'debit',
                 coins: gross,
-                source: 'moment_purchase',
-                description: `Unlock moment ${moment._id}`,
+                source: debitSource,
+                description: isVipFree
+                  ? `VIP free moment unlock ${moment._id}`
+                  : isVipDiscounted
+                    ? `Unlock moment ${moment._id} (VIP 10% off)`
+                    : `Unlock moment ${moment._id}`,
                 status: 'completed',
               },
             ],
             { session },
           );
 
-          const creatorTxnId = `${txnId}_creator`;
-          const [creditTx] = await CoinTransaction.create(
-            [
-              {
-                transactionId: creatorTxnId,
-                userId: creatorUser._id,
-                type: 'credit',
-                coins: creatorShare,
-                source: 'moment_earnings',
-                description: `Moment purchase earnings`,
-                status: 'completed',
-              },
-            ],
-            { session },
-          );
+          if (creatorShare > 0) {
+            const creatorTxnId = `${txnId}_creator`;
+            const [creditTx] = await CoinTransaction.create(
+              [
+                {
+                  transactionId: creatorTxnId,
+                  userId: creatorUser._id,
+                  type: 'credit',
+                  coins: creatorShare,
+                  source: 'moment_earnings',
+                  description: `Moment purchase earnings`,
+                  status: 'completed',
+                },
+              ],
+              { session },
+            );
+            creditTxId = creditTx._id;
+          }
 
           const revenue = (
             await MomentRevenue.create(
@@ -139,13 +180,18 @@ export async function purchaseMoment(input: {
                 amountCoins: gross,
                 transactionId: txnId,
                 ledgerEntryId: debitTx._id,
-                creatorLedgerEntryId: creditTx._id,
+                creatorLedgerEntryId: creditTxId,
                 entitlementVersion: cfg.entitlementVersion,
                 revenueRecordId: revenue._id,
+                purchaseSource,
               },
             ],
             { session },
           );
+
+          if (isVipFree) {
+            await incrementDailyMomentUsage(buyer._id);
+          }
 
           moment.purchaseCount += 1;
           await moment.save({ session });

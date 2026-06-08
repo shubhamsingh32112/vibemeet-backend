@@ -1,84 +1,46 @@
 import express, { type Request } from 'express';
 import compression from 'compression';
 import { createServer } from 'http';
-import { Server as SocketIOServer } from 'socket.io';
-import { createAdapter } from '@socket.io/redis-adapter';
-import Redis from 'ioredis';
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 dotenv.config();
+import { bootstrapCore } from './bootstrap/bootstrap-core';
+import { buildSocketCorsOrigin, initializeSocketIo } from './bootstrap/bootstrap-socket';
+import { bootstrapApiWs } from './bootstrap/bootstrap-api-ws';
+import { bootstrapBillingWorkers } from './bootstrap/bootstrap-billing-workers';
+import { bootstrapMomentsWorkers } from './bootstrap/bootstrap-moments-workers';
+import { bootstrapImageWorkers } from './bootstrap/bootstrap-image-workers';
+import {
+  createWorkerHealthServer,
+  listenWorkerHealthServer,
+} from './bootstrap/bootstrap-worker-health';
+import { registerShutdownHandlers, registerRuntimeServers } from './bootstrap/bootstrap-shutdown';
+import { registerHealthRoutes } from './bootstrap/health-routes';
+import { registerMetricsRoute } from './bootstrap/metrics-handler';
+import {
+  getServiceRole,
+  runsHttpApi,
+  runsBillingWorkers,
+  runsMomentsWorkers,
+  runsImageWorkers,
+  runsApiHygieneIntervals,
+} from './config/service-role';
 import { createStaffGeneralLimiter } from './middlewares/rate-limit.middleware';
 import { attachFirebaseRateLimitIdentity } from './middlewares/firebase-rate-limit.middleware';
 import { attachStaffRateLimitIdentity } from './middlewares/staff-rate-limit.middleware';
-import { connectDatabase } from './config/database';
-import { initializeFirebase } from './config/firebase';
-import {
-  isRedisConfigured,
-  getRedis,
-  getRedisEndpointMode,
-  metricsKey,
-  attachRedisClientMonitoring,
-} from './config/redis';
-import { featureFlags } from './config/feature-flags';
-import { configureStreamPush } from './config/stream';
-import { setIO } from './config/socket';
-import { setupAvailabilityGateway } from './modules/availability/availability.gateway';
-import { setupMomentsGateway } from './modules/moments/moments.gateway';
-import { auditCreatorPresenceOnStartup } from './modules/availability/creator-presence-audit.service';
-import { setupBillingGateway, cleanupBillingIntervals, startGlobalBillingProcessor } from './modules/billing/billing.gateway';
-import { isBullmqBillingEnabled } from './modules/billing/billing.queue';
-import { startTerminationRetryWorker } from './modules/billing/billing-termination.queue';
-import { startReconciliationJob, stopReconciliationJob } from './modules/billing/billing-reconciliation';
-import { startBillingWatchdog, stopBillingWatchdog } from './modules/billing/billing-watchdog.service';
-import {
-  startStaffWalletReconciliationScheduler,
-  stopStaffWalletReconciliationScheduler,
-} from './modules/billing/staff-wallet-reconciliation.scheduler';
-import {
-  startDomainEventWorker,
-  stopDomainEventWorker,
-} from './modules/events/domain-event.worker';
-import { verifyStartupRecovery } from './modules/billing/billing-recovery';
-import { setupAdminGateway } from './modules/admin/admin.gateway';
 import routes from './routes';
 import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
-import {
-  startCallReconciliationJob,
-  stopCallReconciliationJob,
-  repairStaleActiveCallSlotsOnStartup,
-} from './modules/video/call-reconciliation';
-import {
-  startPaymentWebhookRetryWorker,
-  stopPaymentWebhookRetryWorker,
-} from './modules/payment/payment-webhook-retry.service';
-import {
-  startImagePipelineWorkers,
-  stopImagePipelineWorkers,
-} from './modules/images/images.bootstrap';
-import {
-  startMomentsWorkers,
-  stopMomentsWorkers,
-} from './modules/moments/moments.bootstrap';
-import { isRazorpayConfigured } from './config/razorpay';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
-import { validatePricingConfig } from './config/pricing.config';
 import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { requestContextMiddleware } from './middlewares/request-context.middleware';
-import { logRateLimitConfig } from './utils/rate-limit.service';
-import { requestQueueMiddleware, getRequestQueueStats } from './middlewares/request-queue.middleware';
-import { mongoPoolMonitor } from './utils/mongo-pool-monitor';
-import { getDriverMetrics } from './utils/driver-metrics';
-import { monitoring, recordAPIMetric, recordSystemMetric } from './utils/monitoring';
-import { setLatestEventLoopLagMs } from './utils/runtime-signals';
-import mongoose from 'mongoose';
-import { performance } from 'perf_hooks';
+import { requestQueueMiddleware } from './middlewares/request-queue.middleware';
+import { recordAPIMetric } from './utils/monitoring';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-let eventLoopProbe: NodeJS.Timeout | null = null;
 
 // One hop (Railway, Heroku, Fly, nginx ingress, etc.) sets X-Forwarded-For.
 // Required so express-rate-limit can read client IPs without throwing
@@ -278,759 +240,8 @@ app.use('/api/', (_req, res, next) => {
   next();
 });
 
-// Metrics endpoint — set METRICS_TOKEN and send header X-Metrics-Token to access
-app.get('/metrics', async (req, res) => {
-  try {
-    const metricsToken = (process.env.METRICS_TOKEN || '').trim();
-    if (metricsToken) {
-      const sent = req.headers['x-metrics-token'];
-      if (sent !== metricsToken) {
-        res.status(403).json({ success: false, error: 'Forbidden' });
-        return;
-      }
-    }
-    const mongoStats = mongoPoolMonitor.getStats();
-    const queueStats = getRequestQueueStats();
-    const driver = getDriverMetrics();
-    const metricsSummary = monitoring.getMetricsSummary();
-    const byName = metricsSummary.byName;
-    const apiSummary = byName['api.latency_ms'];
-    const forceTerminateRequested = byName['billing.force_terminate_requested']?.sum ?? 0;
-    const forceTerminateFailed = byName['billing.force_terminate_stream_failed']?.sum ?? 0;
-    const forceTerminateFailureRate =
-      forceTerminateRequested > 0 ? forceTerminateFailed / forceTerminateRequested : 0;
-    const bullLagAvgMs = byName['billing.bullmq_queue_lag_ms']?.avg ?? 0;
-    const eventLoopLag = byName['system.event_loop_lag_ms'];
-    const tickDrift = byName['billing.tick_drift_ms'];
-    const settlementTotal = byName['billing.settlement_total_ms'];
-    const backpressureStage = byName['billing.backpressure_stage'];
-    const stateRecovery = byName['billing.state_recovery'];
-    const stateRecoverySuppressed = byName['billing.state_recovery_suppressed'];
-    const recoveryOutcome = byName['billing.recovery_outcome'];
-    const recoveryRuntimeMissing = byName['billing.recovery_runtime_missing'];
-    const billingRuntimeMissingRateMetric = byName['billing.runtime_missing_rate'];
-    const deferredCallEndAge = byName['billing.deferred_call_end_age_ms'];
-    const deferredCallEndAgeLegacy = byName['billing.deferred_call_end_age'];
-    const deferredCallEndQueued = byName['billing.deferred_call_end_queued'];
-    const deferredCallEndFlushed = byName['billing.deferred_call_end_flushed'];
-    const creatorCanonicalMissingRate =
-      byName['call.presence.creator_batch_canonical_missing_rate'];
-    const creatorFallbackRate = byName['call.presence.creator_batch_fallback_rate'];
-    const creatorCanonicalMissingRateMetric =
-      byName['call.creator_presence_canonical_missing_rate'];
-    const creatorFallbackRateMetric = byName['call.creator_presence_fallback_rate'];
-    const creatorMetaMissingRateMetric = byName['call.presence.creator_meta_missing_rate'];
-    const creatorMetaMissingAnyRateMetric = byName['call.presence.creator_meta_missing_any_rate'];
-    const creatorMetaMissingExpectedRateMetric = byName['call.presence.creator_meta_missing_expected_rate'];
-    const creatorExpectedCanonicalCoverageRateMetric =
-      byName['call.presence.creator_expected_canonical_coverage_rate'];
-    const creatorMetaParseFailureRateMetric = byName['call.presence.creator_meta_parse_failure_rate'];
-    const creatorUidContractViolationRateMetric =
-      byName['call.presence.creator_uid_contract_violation_rate'];
-    const creatorTransitionRetryMetric = byName['call.presence.creator_transition_retry_count'];
-    const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
-    const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
-    const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
-    const paymentWebhookProcessed = byName['payment.webhook.processed'];
-    const paymentWebhookProcessFailed = byName['payment.webhook.process_failed'];
-    const paymentFinalizeCompleted = byName['payment.finalize.completed'];
-    const paymentFinalizeAlreadyCompleted = byName['payment.finalize.already_completed'];
-    const paymentFinalizeFailed = byName['payment.finalize.failed'];
-    const paymentWebVerifySuccess = byName['payment.web.verify_success'];
-    const paymentWebVerifyFailed = byName['payment.web.verify_failed'];
-    const paymentWebVerifyDuration = byName['payment.web.verify_duration_ms'];
-    const reconRunMsAvg = byName['billing.reconciliation_run_ms']?.avg ?? 0;
-    const reconItemsAvg = byName['billing.reconciliation_items_processed']?.avg ?? 0;
-    const now = Date.now();
-    const rollingWindowMs = 5 * 60 * 1000;
-    const fromTs = now - rollingWindowMs;
-    const rollingSampleLimit = 2000;
-    const metricsAlerts: string[] = [];
-
-    let rollingForceTerminateRequested = 0;
-    let rollingForceTerminateFailed = 0;
-    let rollingForceTerminateFailureRate = 0;
-    let rollingBullLagAvgMs = 0;
-    let rollingReconRunAvgMs = 0;
-    let rollingRedisOpsPerSec = 0;
-    let rollingRedisPipelineSuccess = 0;
-    let rollingRedisPipelineFailure = 0;
-    let rollingRedisPipelineFailureRate = 0;
-    let rollingRecoveryRuntimeMissing = 0;
-    let rollingDeferredCallEndsQueued = 0;
-    let rollingDeferredCallEndsFlushed = 0;
-    let rollingCreatorCanonicalMissingRate = 0;
-    let rollingCreatorFallbackRate = 0;
-    let rollingCreatorMetaMissingRate = 0;
-    let rollingCreatorMetaMissingAnyRate = 0;
-    let rollingCreatorMetaMissingExpectedRate = 0;
-    let rollingCreatorExpectedCanonicalCoverageRate = 0;
-    let rollingCreatorMetaParseFailureRate = 0;
-    let rollingCreatorUidContractViolationRate = 0;
-
-    if (isRedisConfigured()) {
-      const redis = getRedis();
-      const [requested5m, failed5m] = await Promise.all([
-        redis.zcount(metricsKey('billing.force_terminate_requested'), fromTs, now),
-        redis.zcount(metricsKey('billing.force_terminate_stream_failed'), fromTs, now),
-      ]);
-      rollingForceTerminateRequested = Number(requested5m || 0);
-      rollingForceTerminateFailed = Number(failed5m || 0);
-      rollingForceTerminateFailureRate =
-        rollingForceTerminateRequested > 0
-          ? rollingForceTerminateFailed / rollingForceTerminateRequested
-          : 0;
-
-      const [
-        lagSampleRaw,
-        reconSampleRaw,
-        redisOpsRaw,
-        pipelineSuccess5m,
-        pipelineFailure5m,
-        recoveryRuntimeMissing5m,
-        deferredQueued5m,
-        deferredFlushed5m,
-        creatorCanonicalMissingRaw,
-        creatorFallbackRaw,
-        creatorMetaMissingRaw,
-        creatorMetaMissingAnyRaw,
-        creatorMetaMissingExpectedRaw,
-        creatorExpectedCoverageRaw,
-        creatorMetaParseFailureRaw,
-        creatorUidViolationRaw,
-      ] = await Promise.all([
-        redis.zrevrangebyscore(
-          metricsKey('billing.bullmq_queue_lag_ms'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('billing.reconciliation_run_ms'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('billing.redis_ops'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zcount(metricsKey('billing.redis_pipeline_success'), fromTs, now),
-        redis.zcount(metricsKey('billing.redis_pipeline_failure'), fromTs, now),
-        redis.zcount(metricsKey('billing.recovery_runtime_missing'), fromTs, now),
-        redis.zcount(metricsKey('billing.deferred_call_end_queued'), fromTs, now),
-        redis.zcount(metricsKey('billing.deferred_call_end_flushed'), fromTs, now),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_batch_canonical_missing_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_batch_fallback_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_meta_missing_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_meta_missing_any_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_meta_missing_expected_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_expected_canonical_coverage_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_meta_parse_failure_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-        redis.zrevrangebyscore(
-          metricsKey('call.presence.creator_uid_contract_violation_rate'),
-          now,
-          fromTs,
-          'LIMIT',
-          0,
-          rollingSampleLimit
-        ),
-      ]);
-
-      const parseMetricSampleStats = (raw: string[]): { avg: number; sum: number; count: number } => {
-        if (!raw || raw.length === 0) return { avg: 0, sum: 0, count: 0 };
-        let sum = 0;
-        let count = 0;
-        for (const item of raw) {
-          try {
-            const parsed = JSON.parse(item) as { value?: number };
-            const v = Number(parsed.value);
-            if (Number.isFinite(v)) {
-              sum += v;
-              count += 1;
-            }
-          } catch {
-            // ignore malformed sample
-          }
-        }
-        return {
-          avg: count > 0 ? sum / count : 0,
-          sum,
-          count,
-        };
-      };
-
-      const lagStats = parseMetricSampleStats(lagSampleRaw);
-      const reconStats = parseMetricSampleStats(reconSampleRaw);
-      const redisOpsStats = parseMetricSampleStats(redisOpsRaw);
-      rollingBullLagAvgMs = lagStats.avg;
-      rollingReconRunAvgMs = reconStats.avg;
-      rollingRedisOpsPerSec = redisOpsStats.sum / (rollingWindowMs / 1000);
-      rollingRedisPipelineSuccess = Number(pipelineSuccess5m || 0);
-      rollingRedisPipelineFailure = Number(pipelineFailure5m || 0);
-      rollingRecoveryRuntimeMissing = Number(recoveryRuntimeMissing5m || 0);
-      rollingDeferredCallEndsQueued = Number(deferredQueued5m || 0);
-      rollingDeferredCallEndsFlushed = Number(deferredFlushed5m || 0);
-      const creatorCanonicalMissingStats = parseMetricSampleStats(creatorCanonicalMissingRaw);
-      const creatorFallbackStats = parseMetricSampleStats(creatorFallbackRaw);
-      const creatorMetaMissingStats = parseMetricSampleStats(creatorMetaMissingRaw);
-      const creatorMetaMissingAnyStats = parseMetricSampleStats(creatorMetaMissingAnyRaw);
-      const creatorMetaMissingExpectedStats = parseMetricSampleStats(creatorMetaMissingExpectedRaw);
-      const creatorExpectedCoverageStats = parseMetricSampleStats(creatorExpectedCoverageRaw);
-      const creatorMetaParseFailureStats = parseMetricSampleStats(creatorMetaParseFailureRaw);
-      const creatorUidViolationStats = parseMetricSampleStats(creatorUidViolationRaw);
-      rollingCreatorCanonicalMissingRate = creatorCanonicalMissingStats.avg;
-      rollingCreatorFallbackRate = creatorFallbackStats.avg;
-      rollingCreatorMetaMissingRate = creatorMetaMissingStats.avg;
-      rollingCreatorMetaMissingAnyRate = creatorMetaMissingAnyStats.avg;
-      rollingCreatorMetaMissingExpectedRate = creatorMetaMissingExpectedStats.avg;
-      rollingCreatorExpectedCanonicalCoverageRate = creatorExpectedCoverageStats.avg;
-      rollingCreatorMetaParseFailureRate = creatorMetaParseFailureStats.avg;
-      rollingCreatorUidContractViolationRate = creatorUidViolationStats.avg;
-      const totalPipelines = rollingRedisPipelineSuccess + rollingRedisPipelineFailure;
-      rollingRedisPipelineFailureRate =
-        totalPipelines > 0 ? rollingRedisPipelineFailure / totalPipelines : 0;
-    }
-
-    if (rollingForceTerminateRequested > 0 && rollingForceTerminateFailureRate > 0.02) {
-      metricsAlerts.push('billing_force_termination_failure_rate_high_5m');
-    }
-    if (rollingBullLagAvgMs > 5000) {
-      metricsAlerts.push('bullmq_queue_lag_high_5m');
-    }
-    if ((eventLoopLag?.p95 ?? 0) > 50) {
-      metricsAlerts.push('event_loop_lag_p95_high');
-    }
-    if ((tickDrift?.p95 ?? 0) > 100 || (tickDrift?.p99 ?? 0) > 300) {
-      metricsAlerts.push('billing_tick_drift_high');
-    }
-    if ((backpressureStage?.max ?? 0) >= 3) {
-      metricsAlerts.push('billing_backpressure_stage3');
-    }
-    const recoverySuccess = stateRecovery?.sum ?? 0;
-    const recoverySuppressed = stateRecoverySuppressed?.sum ?? 0;
-    const recoveryTotal = recoverySuccess + recoverySuppressed;
-    if (recoveryTotal >= 20 && recoverySuppressed / recoveryTotal > 0.85) {
-      metricsAlerts.push('billing_recovery_suppressed_high');
-    }
-    if ((settlementTotal?.p95 ?? 0) > 5000) {
-      metricsAlerts.push('billing_settlement_p95_high');
-    }
-    if ((creatorStatusPropagation?.p95 ?? 0) > 500) {
-      metricsAlerts.push('creator_status_propagation_high');
-    }
-    if (rollingRedisPipelineFailureRate > 0.02) {
-      metricsAlerts.push('billing_redis_pipeline_failure_rate_high_5m');
-    }
-    if (rollingReconRunAvgMs > 0 && rollingReconRunAvgMs > 0.8 * 5 * 60 * 1000) {
-      metricsAlerts.push('billing_reconciliation_runtime_high_5m');
-    }
-    if (rollingRecoveryRuntimeMissing >= 5) {
-      metricsAlerts.push('billing_runtime_missing_detected_5m');
-    }
-    if (rollingDeferredCallEndsQueued > 0 && rollingDeferredCallEndsFlushed < rollingDeferredCallEndsQueued) {
-      metricsAlerts.push('billing_deferred_call_end_backlog_5m');
-    }
-    if (rollingCreatorCanonicalMissingRate > 0.05) {
-      metricsAlerts.push('creator_presence_canonical_missing_high_5m');
-    }
-    if (rollingCreatorFallbackRate > 0.05) {
-      metricsAlerts.push('creator_presence_fallback_high_5m');
-    }
-    if (rollingCreatorMetaMissingRate > 0.05) {
-      metricsAlerts.push('creator_presence_meta_missing_high_5m');
-    }
-    if (rollingCreatorMetaParseFailureRate > 0.01) {
-      metricsAlerts.push('creator_presence_meta_parse_failure_high_5m');
-    }
-    if (rollingCreatorUidContractViolationRate > 0.005) {
-      metricsAlerts.push('creator_presence_uid_contract_violation_high_5m');
-    }
-
-    const fanoutDuration = byName['stream.feed.fanout.duration_ms'];
-    const fanoutFailed = byName['stream.feed.fanout.failed']?.sum ?? 0;
-    const cfBreakerOpen = byName['stream.cloudflare.breaker_open']?.sum ?? 0;
-    let momentsFanoutQueueDepth = byName['stream.feed.fanout.queue_depth']?.max ?? 0;
-    let momentsWarmQueueDepth = byName['stream.feed.warm.queue_depth']?.max ?? 0;
-    if (isRedisConfigured()) {
-      const redis = getRedis();
-      const [fanoutLen, warmLen] = await Promise.all([
-        redis.llen('moments:fanout:queue'),
-        redis.llen('moments:feed:warm:queue'),
-      ]);
-      momentsFanoutQueueDepth = Math.max(momentsFanoutQueueDepth, Number(fanoutLen || 0));
-      momentsWarmQueueDepth = Math.max(momentsWarmQueueDepth, Number(warmLen || 0));
-    }
-    const fanoutQueueThreshold = Number(process.env.MOMENTS_FANOUT_QUEUE_ALERT_DEPTH || 500);
-    if (momentsFanoutQueueDepth > fanoutQueueThreshold) {
-      metricsAlerts.push('moments_fanout_queue_depth_high');
-    }
-    if ((fanoutDuration?.p95 ?? 0) > 120_000) {
-      metricsAlerts.push('moments_fanout_duration_p95_high');
-    }
-    if (fanoutFailed >= 10) {
-      metricsAlerts.push('moments_fanout_failed_high');
-    }
-    if (cfBreakerOpen >= 5) {
-      metricsAlerts.push('cloudflare_stream_breaker_open_high');
-    }
-
-    const hardBlockerAlertKeys = new Set([
-      'billing_runtime_missing_detected_5m',
-      'billing_deferred_call_end_backlog_5m',
-    ]);
-    const hardBlockerAlerts = metricsAlerts.filter((alert) => hardBlockerAlertKeys.has(alert));
-
-    res.status(200).json({
-      mongo: {
-        activeConnections: mongoStats.checkedOut,
-        maxConnections: mongoStats.maxPoolSize,
-        poolUtilization: Math.round(mongoStats.utilization * 100) / 100,
-        checkOutFailedTotal: mongoStats.checkOutFailedTotal,
-        lastCheckOutFailedAt: mongoStats.lastCheckOutFailedAt,
-        driverConnectionErrors: driver.mongo.connectionErrors,
-      },
-      redis: {
-        driverErrors: driver.redis.errors,
-        driverCloses: driver.redis.closes,
-      },
-      requestQueue: {
-        active: queueStats.active,
-        waiting: queueStats.waiting,
-        rejected: queueStats.rejected,
-      },
-      api: {
-        latencyMs: apiSummary
-          ? {
-              samples: apiSummary.count,
-              avgMs: Math.round((apiSummary.sum / apiSummary.count) * 100) / 100,
-            }
-          : null,
-        http5xxSamples: byName['api.http_5xx']?.count ?? 0,
-      },
-      billing: {
-        backpressure: {
-          currentStage: Math.round(backpressureStage?.max ?? 0),
-        },
-        recovery: {
-          stateRecoverySamples: stateRecovery?.count ?? 0,
-          stateRecoverySuccessSum: recoverySuccess,
-          stateRecoverySuppressedSamples: stateRecoverySuppressed?.count ?? 0,
-          stateRecoverySuppressedSum: recoverySuppressed,
-          recoveryOutcomeSamples: recoveryOutcome?.count ?? 0,
-          runtimeMissingSamples: recoveryRuntimeMissing?.count ?? 0,
-          runtimeMissingRateSamples: billingRuntimeMissingRateMetric?.count ?? 0,
-          rolling5mRuntimeMissingSamples: rollingRecoveryRuntimeMissing,
-          billing_runtime_missing_rate:
-            Math.round((rollingRecoveryRuntimeMissing / (rollingWindowMs / 1000)) * 1000) / 1000,
-        },
-        integrity: {
-          balanceMismatchSamples: byName['billing.balance_mismatch_total']?.count ?? 0,
-          balanceMismatchRepairEnqueued:
-            byName['billing.balance_mismatch_repair_enqueued_total']?.count ?? 0,
-          balanceMismatchRepairApplied:
-            byName['billing.balance_mismatch_repair_applied_total']?.count ?? 0,
-          finalizeConvergenceRetries:
-            byName['billing.billing_finalize_convergence_retry_total']?.count ?? 0,
-        },
-        deferredCallEnd: {
-          queuedSamples: deferredCallEndQueued?.count ?? 0,
-          flushedSamples: deferredCallEndFlushed?.count ?? 0,
-          ageMs: deferredCallEndAge
-            ? {
-                samples: deferredCallEndAge.count,
-                avgMs: Math.round(deferredCallEndAge.avg * 100) / 100,
-                p95Ms: Math.round(deferredCallEndAge.p95 * 100) / 100,
-                p99Ms: Math.round(deferredCallEndAge.p99 * 100) / 100,
-                maxMs: Math.round(deferredCallEndAge.max * 100) / 100,
-              }
-            : null,
-          deferred_call_end_age: deferredCallEndAgeLegacy
-            ? {
-                samples: deferredCallEndAgeLegacy.count,
-                avg: Math.round(deferredCallEndAgeLegacy.avg * 100) / 100,
-              }
-            : null,
-          rolling5m: {
-            queued: rollingDeferredCallEndsQueued,
-            flushed: rollingDeferredCallEndsFlushed,
-          },
-        },
-        tickDriftMs: tickDrift
-          ? {
-              samples: tickDrift.count,
-              avgMs: Math.round(tickDrift.avg * 100) / 100,
-              p95Ms: Math.round(tickDrift.p95 * 100) / 100,
-              p99Ms: Math.round(tickDrift.p99 * 100) / 100,
-              maxMs: Math.round(tickDrift.max * 100) / 100,
-            }
-          : null,
-        settlementTotalMs: settlementTotal
-          ? {
-              samples: settlementTotal.count,
-              avgMs: Math.round(settlementTotal.avg * 100) / 100,
-              p95Ms: Math.round(settlementTotal.p95 * 100) / 100,
-              p99Ms: Math.round(settlementTotal.p99 * 100) / 100,
-              maxMs: Math.round(settlementTotal.max * 100) / 100,
-            }
-          : null,
-        forceTermination: {
-          requested: forceTerminateRequested,
-          streamFailures: forceTerminateFailed,
-          failureRate: Math.round(forceTerminateFailureRate * 10000) / 10000,
-          rolling5m: {
-            requested: rollingForceTerminateRequested,
-            streamFailures: rollingForceTerminateFailed,
-            failureRate:
-              Math.round(rollingForceTerminateFailureRate * 10000) / 10000,
-          },
-        },
-        streamMarkEnded: {
-          samples: byName['billing.stream_mark_ended_result_total']?.count ?? 0,
-        },
-        bullmq: {
-          queueLagAvgMs: Math.round(bullLagAvgMs * 100) / 100,
-          queueLagSamples: byName['billing.bullmq_queue_lag_ms']?.count ?? 0,
-          rolling5m: {
-            queueLagAvgMs: Math.round(rollingBullLagAvgMs * 100) / 100,
-            sampleLimit: rollingSampleLimit,
-          },
-        },
-        redis: {
-          opsPerSecRolling5m: Math.round(rollingRedisOpsPerSec * 100) / 100,
-          pipelineRolling5m: {
-            success: rollingRedisPipelineSuccess,
-            failure: rollingRedisPipelineFailure,
-            failureRate: Math.round(rollingRedisPipelineFailureRate * 10000) / 10000,
-          },
-        },
-        reconciliation: {
-          runAvgMs: Math.round(reconRunMsAvg * 100) / 100,
-          runSamples: byName['billing.reconciliation_run_ms']?.count ?? 0,
-          itemsAvg: Math.round(reconItemsAvg * 100) / 100,
-          rolling5m: {
-            runAvgMs: Math.round(rollingReconRunAvgMs * 100) / 100,
-            sampleLimit: rollingSampleLimit,
-          },
-        },
-      },
-      payment: {
-        webhook: {
-          verify: {
-            successSamples: paymentWebhookVerifySuccess?.count ?? 0,
-            failedSamples: paymentWebhookVerifyFail?.count ?? 0,
-          },
-          processing: {
-            processedSamples: paymentWebhookProcessed?.count ?? 0,
-            failedSamples: paymentWebhookProcessFailed?.count ?? 0,
-          },
-        },
-        finalize: {
-          completedSamples: paymentFinalizeCompleted?.count ?? 0,
-          alreadyCompletedSamples: paymentFinalizeAlreadyCompleted?.count ?? 0,
-          failedSamples: paymentFinalizeFailed?.count ?? 0,
-        },
-        webVerify: {
-          successSamples: paymentWebVerifySuccess?.count ?? 0,
-          failedSamples: paymentWebVerifyFailed?.count ?? 0,
-          durationMs: paymentWebVerifyDuration
-            ? {
-                samples: paymentWebVerifyDuration.count,
-                avgMs: Math.round(paymentWebVerifyDuration.avg * 100) / 100,
-                p95Ms: Math.round(paymentWebVerifyDuration.p95 * 100) / 100,
-                p99Ms: Math.round(paymentWebVerifyDuration.p99 * 100) / 100,
-                maxMs: Math.round(paymentWebVerifyDuration.max * 100) / 100,
-              }
-            : null,
-        },
-      },
-      runtime: {
-        eventLoopLagMs: eventLoopLag
-          ? {
-              samples: eventLoopLag.count,
-              avgMs: Math.round(eventLoopLag.avg * 100) / 100,
-              p95Ms: Math.round(eventLoopLag.p95 * 100) / 100,
-              p99Ms: Math.round(eventLoopLag.p99 * 100) / 100,
-              maxMs: Math.round(eventLoopLag.max * 100) / 100,
-            }
-          : null,
-      },
-      presence: {
-        creatorStatusPropagationMs: creatorStatusPropagation
-          ? {
-              samples: creatorStatusPropagation.count,
-              avgMs: Math.round(creatorStatusPropagation.avg * 100) / 100,
-              p95Ms: Math.round(creatorStatusPropagation.p95 * 100) / 100,
-              p99Ms: Math.round(creatorStatusPropagation.p99 * 100) / 100,
-              maxMs: Math.round(creatorStatusPropagation.max * 100) / 100,
-            }
-          : null,
-        creatorCanonicalMissingRate: creatorCanonicalMissingRate
-          ? {
-              samples: creatorCanonicalMissingRate.count,
-              avgRate: Math.round(creatorCanonicalMissingRate.avg * 10000) / 10000,
-              p95Rate: Math.round(creatorCanonicalMissingRate.p95 * 10000) / 10000,
-              p99Rate: Math.round(creatorCanonicalMissingRate.p99 * 10000) / 10000,
-              maxRate: Math.round(creatorCanonicalMissingRate.max * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorCanonicalMissingRate * 10000) / 10000,
-            }
-          : null,
-        creator_presence_canonical_missing_rate: creatorCanonicalMissingRateMetric
-          ? {
-              samples: creatorCanonicalMissingRateMetric.count,
-              avgRate: Math.round(creatorCanonicalMissingRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorCanonicalMissingRate * 10000) / 10000,
-            }
-          : null,
-        creatorFallbackRate: creatorFallbackRate
-          ? {
-              samples: creatorFallbackRate.count,
-              avgRate: Math.round(creatorFallbackRate.avg * 10000) / 10000,
-              p95Rate: Math.round(creatorFallbackRate.p95 * 10000) / 10000,
-              p99Rate: Math.round(creatorFallbackRate.p99 * 10000) / 10000,
-              maxRate: Math.round(creatorFallbackRate.max * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorFallbackRate * 10000) / 10000,
-            }
-          : null,
-        creator_presence_fallback_rate: creatorFallbackRateMetric
-          ? {
-              samples: creatorFallbackRateMetric.count,
-              avgRate: Math.round(creatorFallbackRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorFallbackRate * 10000) / 10000,
-            }
-          : null,
-        creatorMetaMissingRate: creatorMetaMissingRateMetric
-          ? {
-              samples: creatorMetaMissingRateMetric.count,
-              avgRate: Math.round(creatorMetaMissingRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingRate * 10000) / 10000,
-            }
-          : null,
-        creatorMetaMissingAnyRate: creatorMetaMissingAnyRateMetric
-          ? {
-              samples: creatorMetaMissingAnyRateMetric.count,
-              avgRate: Math.round(creatorMetaMissingAnyRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingAnyRate * 10000) / 10000,
-            }
-          : null,
-        creatorMetaMissingExpectedRate: creatorMetaMissingExpectedRateMetric
-          ? {
-              samples: creatorMetaMissingExpectedRateMetric.count,
-              avgRate: Math.round(creatorMetaMissingExpectedRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorMetaMissingExpectedRate * 10000) / 10000,
-            }
-          : null,
-        creatorExpectedCanonicalCoverageRate: creatorExpectedCanonicalCoverageRateMetric
-          ? {
-              samples: creatorExpectedCanonicalCoverageRateMetric.count,
-              avgRate: Math.round(creatorExpectedCanonicalCoverageRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorExpectedCanonicalCoverageRate * 10000) / 10000,
-            }
-          : null,
-        creatorMetaParseFailureRate: creatorMetaParseFailureRateMetric
-          ? {
-              samples: creatorMetaParseFailureRateMetric.count,
-              avgRate: Math.round(creatorMetaParseFailureRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorMetaParseFailureRate * 10000) / 10000,
-            }
-          : null,
-        creatorUidContractViolationRate: creatorUidContractViolationRateMetric
-          ? {
-              samples: creatorUidContractViolationRateMetric.count,
-              avgRate: Math.round(creatorUidContractViolationRateMetric.avg * 10000) / 10000,
-              rolling5mAvgRate: Math.round(rollingCreatorUidContractViolationRate * 10000) / 10000,
-            }
-          : null,
-        creatorTransitionRetryCount: creatorTransitionRetryMetric
-          ? {
-              samples: creatorTransitionRetryMetric.count,
-              avgRetries: Math.round(creatorTransitionRetryMetric.avg * 100) / 100,
-              maxRetries: Math.round(creatorTransitionRetryMetric.max * 100) / 100,
-            }
-          : null,
-      },
-      moments: {
-        fanout: {
-          queueDepth: momentsFanoutQueueDepth,
-          durationMs: fanoutDuration
-            ? {
-                samples: fanoutDuration.count,
-                avgMs: Math.round(fanoutDuration.avg * 100) / 100,
-                p95Ms: Math.round(fanoutDuration.p95 * 100) / 100,
-              }
-            : null,
-          failedSum: fanoutFailed,
-        },
-        warm: {
-          queueDepth: momentsWarmQueueDepth,
-          failedSum: byName['stream.feed.warm.failed']?.sum ?? 0,
-        },
-        cloudflare: {
-          breakerOpenSum: cfBreakerOpen,
-        },
-        playback: {
-          tokenRefreshFailSum: byName['video.playback.token_refresh_fail']?.sum ?? 0,
-          playerErrorSum: byName['video.playback.player_error']?.sum ?? 0,
-          startupP95Ms: Math.round((byName['video.playback.startup_ms']?.p95 ?? 0) * 100) / 100,
-        },
-      },
-      alerts: {
-        active: metricsAlerts,
-        blockers: hardBlockerAlerts,
-      },
-      timestamp: new Date().toISOString(),
-    });
-  } catch (err: any) {
-    logError('Metrics endpoint error', err);
-    res.status(500).json({ error: 'Failed to collect metrics' });
-  }
-});
-
-// Health & readiness endpoints - CRITICAL for connectivity and orchestration
-// Test URLs: /health (backwards compatible), /live, /ready
-app.get('/health', (_req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    server: 'Eazy Talks Backend',
-    version: '1.0.0',
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    redis: {
-      configured: isRedisConfigured(),
-      note: 'Use GET /ready for write/read probe',
-    },
-  });
-});
-
-// Simple liveness probe: process is up and Express is responding
-app.get('/live', (_req, res) => {
-  res.status(200).json({
-    status: 'live',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-  });
-});
-
-// Readiness probe: verify we can talk to core dependencies
-app.get('/ready', async (_req, res) => {
-  const checks: Record<string, { ok: boolean; error?: string }> = {};
-
-  // MongoDB readiness
-  try {
-    // Check if mongoose connection exists and is ready
-    if (!mongoose.connection || mongoose.connection.readyState === undefined) {
-      checks.mongo = {
-        ok: false,
-        error: 'mongoose_not_initialized',
-      };
-    } else {
-      const state = mongoose.connection.readyState;
-      // 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
-      // Only state 1 (connected) is considered ready
-      checks.mongo = {
-        ok: state === 1,
-        error: state === 1 ? undefined : `mongo_state_${state}`,
-      };
-    }
-  } catch (err: any) {
-    checks.mongo = {
-      ok: false,
-      error: err?.message || 'mongo_check_failed',
-    };
-  }
-
-  // Redis readiness (configuration + write/read test)
-  try {
-    if (!isRedisConfigured()) {
-      checks.redis = { ok: false, error: 'not_configured' };
-    } else {
-      const { getRedis } = await import('./config/redis');
-      const redis = getRedis();
-      
-      // Test write/read operations (not just ping)
-      const testKey = `healthcheck:ready:${Date.now()}`;
-      await redis.setex(testKey, 10, 'test');
-      const value = await redis.get(testKey);
-      await redis.del(testKey);
-      
-      checks.redis = {
-        ok: value === 'test',
-        error: value === 'test' ? undefined : 'read_write_test_failed',
-      };
-    }
-  } catch (err: any) {
-    checks.redis = {
-      ok: false,
-      error: err?.message || 'redis_check_failed',
-    };
-  }
-
-  const allOk = Object.values(checks).every((c) => c.ok);
-
-  res.status(allOk ? 200 : 503).json({
-    status: allOk ? 'ready' : 'degraded',
-    timestamp: new Date().toISOString(),
-    checks,
-  });
-});
+registerMetricsRoute(app);
+registerHealthRoutes(app);
 
 // API routes
 app.use('/api/v1', routes);
@@ -1078,318 +289,74 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 // Initialize services and start server
-function assertProductionSecurity(): void {
-  if (process.env.NODE_ENV !== 'production') return;
-  const jwt = (process.env.JWT_SECRET || '').trim();
-  if (!jwt || jwt === 'admin-secret-change-me') {
-    throw new Error(
-      'NODE_ENV=production requires JWT_SECRET to be set to a secure non-default value',
-    );
-  }
-  const email = (process.env.ADMIN_EMAIL || '').trim();
-  const pw = (process.env.ADMIN_PASSWORD || '').trim();
-  if (!email || !pw) {
-    throw new Error('NODE_ENV=production requires ADMIN_EMAIL and ADMIN_PASSWORD to be set');
-  }
-}
-
-/** Web checkout depends on stable public URLs; warn early if unset. */
-function warnIfMissingPublicUrls(): void {
-  if (process.env.NODE_ENV !== 'production') return;
-  const apiBase =
-    (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || process.env.BACKEND_PUBLIC_URL || '').trim();
-  const webBase = (process.env.WEB_CHECKOUT_BASE_URL || '').trim();
-  if (!apiBase) {
-    logWarning('PUBLIC_API_BASE_URL is not set in production; checkout links may embed the wrong apiBase', {});
-  }
-  if (!webBase) {
-    logWarning('WEB_CHECKOUT_BASE_URL is not set in production; /payment/web/initiate may generate broken checkoutUrl', {});
-  }
-}
-
-/** Billing is Redis-backed; fail fast in production if not wired (e.g. Railway variable reference). */
-function assertProductionRedis(): void {
-  if (process.env.NODE_ENV !== 'production') return;
-  if (!isRedisConfigured()) {
-    throw new Error(
-      'NODE_ENV=production requires Redis. Add variable references: REDIS_URL (private) or REDISHOST, REDISPORT, REDIS_PASSWORD, REDISUSER from your Railway Redis service.',
-    );
-  }
-}
-
-function enforceProductionBillingDriverSafety(): void {
-  if (process.env.NODE_ENV !== 'production') return;
-  const isRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
-  const bullmq = isBullmqBillingEnabled();
-  if (bullmq) {
-    logInfo('Production billing driver safety check passed', { billingDriver: 'bullmq' });
-    return;
-  }
-  const allowUnsafe = process.env.BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION === 'true';
-  if (!isRailway) {
-    logWarning('Production is running billing driver without BullMQ', {
-      billingDriver: process.env.BILLING_DRIVER || 'zset',
-    });
-    return;
-  }
-  if (allowUnsafe) {
-    logWarning('Unsafe Railway billing driver override is enabled', {
-      billingDriver: process.env.BILLING_DRIVER || 'zset',
-      env: 'BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION=true',
-    });
-    return;
-  }
-  throw new Error(
-    'Unsafe Railway billing configuration: set BILLING_DRIVER=bullmq for production replicas, or explicitly override with BILLING_ALLOW_UNSAFE_ZSET_IN_PRODUCTION=true.'
-  );
-}
-
 const startServer = async () => {
   try {
-    // Initialize Firebase Admin
-    initializeFirebase();
+    const role = getServiceRole();
+    await bootstrapCore();
 
-    assertProductionSecurity();
-    warnIfMissingPublicUrls();
-    assertProductionRedis();
-    enforceProductionBillingDriverSafety();
+    let httpServer;
+    let io: import('socket.io').Server | null = null;
 
-    // 🔥 FIX 12: Validate pricing configuration on startup
-    validatePricingConfig();
-    if (!eventLoopProbe) {
-      eventLoopProbe = setInterval(() => {
-        const startedAt = performance.now();
-        setImmediate(() => {
-          const lagMs = Math.max(0, performance.now() - startedAt);
-          setLatestEventLoopLagMs(lagMs);
-          recordSystemMetric('event_loop_lag_ms', lagMs);
-        });
-      }, 1000);
-    }
-
-    // 🔥 FIX 40: Log rate limiting configuration on startup
-    logRateLimitConfig();
-    
-    // Connect to MongoDB
-    await connectDatabase();
-    
-    // 🔥 FIX 6: Cleanup stale creator locks on startup
-    await cleanupStaleCreatorLocks();
-
-    // ── Drop old unique index if it exists (migration: daily task reset) ──
-    // The old index { creatorUserId: 1, taskKey: 1 } must be replaced by
-    // { creatorUserId: 1, taskKey: 1, periodStart: 1 } for daily resets.
-    try {
-      const collection = CreatorTaskProgress.collection;
-      const indexes = await collection.indexes();
-      const oldIndex = indexes.find(
-        (idx: any) =>
-          idx.key?.creatorUserId === 1 &&
-          idx.key?.taskKey === 1 &&
-          !idx.key?.periodStart &&
-          idx.unique === true,
-      );
-      if (oldIndex) {
-        logInfo('Dropping old CreatorTaskProgress unique index (no periodStart)', {
-          indexName: oldIndex.name,
-          collection: 'CreatorTaskProgress',
-        });
-        await collection.dropIndex(oldIndex.name!);
-        logInfo('Old index dropped. New index will be created by Mongoose', {
-          indexName: oldIndex.name,
-        });
-      }
-    } catch (migrationErr) {
-      // Ignore if collection doesn't exist yet or index already dropped
-      logInfo('CreatorTaskProgress index check', {
-        error: (migrationErr as Error).message,
+    if (runsHttpApi()) {
+      httpServer = createServer(app);
+      io = initializeSocketIo(httpServer, buildSocketCorsOrigin());
+      bootstrapApiWs(io);
+    } else if (runsBillingWorkers()) {
+      const worker = createWorkerHealthServer({
+        includeMetrics: true,
+        headlessSocket: true,
       });
-    }
-
-    // Configure Stream Chat push notifications (FCM)
-    await configureStreamPush();
-    
-    // Create HTTP server and attach Socket.IO (same CORS policy as Express)
-    const httpServer = createServer(app);
-    const socketCorsOrigin = buildCorsOrigin();
-    const io = new SocketIOServer(httpServer, {
-      cors: {
-        origin: socketCorsOrigin,
-        methods: ['GET', 'POST'],
-      },
-      pingTimeout: 60000,
-      pingInterval: 25000,
-      transports: ['websocket', 'polling'],
-    });
-
-    // Multi-node Socket.IO: same Redis pub/sub for all replicas (opt-out via env)
-    if (isRedisConfigured() && process.env.SOCKET_IO_REDIS_ADAPTER !== 'false') {
-      try {
-        const rawFamily = process.env.REDIS_FAMILY;
-        const socketAdapterFamily =
-          rawFamily === undefined || rawFamily === ''
-            ? undefined
-            : (() => {
-                const n = parseInt(rawFamily, 10);
-                return Number.isFinite(n) && n >= 0 ? n : undefined;
-              })();
-        const redisUrl = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
-        let pubClient: Redis | null = null;
-        if (redisUrl) {
-          pubClient = new Redis(redisUrl, {
-            ...(socketAdapterFamily !== undefined ? { family: socketAdapterFamily } : {}),
-            maxRetriesPerRequest: 20,
-            enableReadyCheck: true,
-          });
-        } else if (process.env.REDISHOST) {
-          pubClient = new Redis({
-            host: process.env.REDISHOST,
-            port: parseInt(process.env.REDISPORT || '6379', 10),
-            password: process.env.REDIS_PASSWORD || process.env.REDISPASSWORD,
-            username: process.env.REDISUSER,
-            ...(socketAdapterFamily !== undefined ? { family: socketAdapterFamily } : {}),
-            maxRetriesPerRequest: 20,
-            enableReadyCheck: true,
-          });
-        }
-        if (pubClient) {
-          const subClient = pubClient.duplicate();
-          attachRedisClientMonitoring(pubClient, 'socket_adapter_pub');
-          attachRedisClientMonitoring(subClient, 'socket_adapter_sub');
-          io.adapter(createAdapter(pubClient, subClient));
-          logInfo('Socket.IO Redis adapter enabled (multi-node broadcasts)');
-        }
-      } catch (adapterErr) {
-        logWarning('Socket.IO Redis adapter failed — using in-memory adapter only', {
-          error: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
-        });
-      }
-    }
-
-    // Store IO instance globally (so controllers can broadcast)
-    setIO(io);
-
-    // Set up Socket.IO gateways
-    setupAvailabilityGateway(io);
-    setupMomentsGateway(io);
-    logInfo('Socket.IO availability gateway ready');
-    auditCreatorPresenceOnStartup(io, 'server.startup').catch((err) => {
-      logError('Creator presence startup audit failed', err);
-    });
-    logInfo('creator_presence_runtime_config', {
-      redisEndpointMode: getRedisEndpointMode(),
-      userModelEnabled: featureFlags.creatorPresenceUserModelEnabled,
-      userModelShadowCompareEnabled: featureFlags.creatorPresenceUserModelShadowCompareEnabled,
-    });
-
-    setupBillingGateway(io);
-    logInfo('Socket.IO billing gateway ready');
-    
-    // 🔥 FIX: Start global billing batch processor (replaces per-call polling)
-    startGlobalBillingProcessor(io);
-    startTerminationRetryWorker();
-    // 🔥 FIX 5: Start reconciliation job for error recovery
-    startReconciliationJob(io);
-    startBillingWatchdog(io);
-    startStaffWalletReconciliationScheduler();
-    startDomainEventWorker();
-    logInfo('Global billing batch processor started');
-    
-    // 🔥 FIX: Verify startup recovery for active calls
-    verifyStartupRecovery(io).catch((err) => {
-      logError('Startup recovery verification failed', err);
-    });
-    repairStaleActiveCallSlotsOnStartup().catch((err) => {
-      logError('Startup active-call slot repair failed', err);
-    });
-
-    // 🔥 NEW: Start periodic call reconciliation against Stream
-    startCallReconciliationJob(io);
-    startPaymentWebhookRetryWorker();
-
-    // ☁️ Image pipeline workers (blurhash + orphan cleanup).
-    // No-ops when USE_CLOUDFLARE_IMAGES is false or Cloudflare credentials are missing.
-    startImagePipelineWorkers().catch((err) => {
-      logError('Image pipeline workers failed to start', err);
-    });
-
-    startMomentsWorkers();
-
-    setupAdminGateway(io);
-    logInfo('Socket.IO admin gateway ready');
-    
-    // 🔴 Check Redis configuration (Railway Redis) - CRITICAL for billing
-    if (isRedisConfigured()) {
-      try {
-        const { getRedis } = await import('./config/redis');
-        const redis = getRedis();
-        
-        // Test Redis connection with ping
-        await redis.ping();
-        logInfo('Railway Redis connected successfully');
-        
-        // Test write/read operations
-        const testKey = `healthcheck:startup:${Date.now()}`;
-        await redis.setex(testKey, 10, 'test');
-        const value = await redis.get(testKey);
-        await redis.del(testKey);
-        
-        if (value !== 'test') {
-          logError('CRITICAL: Redis write/read test failed', new Error('Read value mismatch'), {
-            alert: true,
-            impact: 'Billing will not work correctly',
-          });
-        } else {
-          logInfo('Railway Redis health check passed');
-        }
-      } catch (err) {
-        logError('CRITICAL: Redis connection failed', err, {
-          alert: true,
-          impact: 'Billing will not work - coins will not be deducted, creators will not earn',
-          requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
-        });
-        if (process.env.NODE_ENV === 'production') {
-          throw new Error('Redis connection required for production billing');
-        }
-      }
+      httpServer = worker.httpServer;
+      io = worker.io;
     } else {
-      logError('CRITICAL: Redis not configured', {
-        alert: true,
-        impact: 'Billing will not work - coins will not be deducted, creators will not earn',
-        requiredEnvVars: ['REDIS_URL', 'REDIS_PUBLIC_URL', 'REDISHOST'],
-      });
-      if (process.env.NODE_ENV === 'production') {
-        throw new Error('Redis is required in production (assertProductionRedis should have failed)');
-      }
+      const worker = createWorkerHealthServer();
+      httpServer = worker.httpServer;
     }
 
-    // 💳 Check Razorpay configuration
-    if (isRazorpayConfigured()) {
-      logInfo('Payment gateway configured');
-    } else {
-      logWarning('Razorpay NOT configured - coin purchases will fail', {
-        requiredEnvVars: ['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET'],
-      });
+    if (runsBillingWorkers() && io) {
+      bootstrapBillingWorkers(io);
     }
-    
-    // Start server - listen on all interfaces (0.0.0.0) for USB/WiFi debugging
-    httpServer.listen(PORT, '0.0.0.0', () => {
+    if (runsMomentsWorkers()) {
+      bootstrapMomentsWorkers();
+    }
+    if (runsImageWorkers()) {
+      await bootstrapImageWorkers();
+    }
+
+    registerRuntimeServers(httpServer, io);
+
+    const onListen = () => {
       logInfo('Server started successfully', {
         port: PORT,
         interface: '0.0.0.0',
+        serviceRole: role,
         environment: process.env.NODE_ENV || 'development',
-        urls: {
-          http: `http://localhost:${PORT}/health`,
-          socket: `ws://localhost:${PORT}`,
-          network: `http://YOUR_DESKTOP_IP:${PORT}/health`,
-        },
-        frontendConfig: {
-          instruction: 'Find your desktop IP: ipconfig (Windows) or ifconfig (Mac/Linux)',
-          configFile: 'frontend/lib/core/constants/app_constants.dart',
-          example: `http://192.168.1.10:${PORT}/api/v1`,
-        },
+        urls: runsHttpApi()
+          ? {
+              http: `http://localhost:${PORT}/health`,
+              socket: `ws://localhost:${PORT}`,
+              network: `http://YOUR_DESKTOP_IP:${PORT}/health`,
+            }
+          : {
+              health: `http://localhost:${PORT}/health`,
+              ready: `http://localhost:${PORT}/ready`,
+            },
+        frontendConfig: runsHttpApi()
+          ? {
+              instruction: 'Find your desktop IP: ipconfig (Windows) or ifconfig (Mac/Linux)',
+              configFile: 'frontend/lib/core/constants/app_constants.dart',
+              example: `http://192.168.1.10:${PORT}/api/v1`,
+            }
+          : undefined,
       });
-    });
+    };
+
+    if (runsHttpApi()) {
+      httpServer.listen(PORT, '0.0.0.0', onListen);
+    } else {
+      await listenWorkerHealthServer(httpServer, PORT);
+      onListen();
+    }
   } catch (error) {
     logError('Failed to start server', error);
     process.exit(1);
@@ -1419,71 +386,17 @@ async function cleanupOldTaskProgress(): Promise<void> {
   }
 }
 
-// Run cleanup every 6 hours
-setInterval(cleanupOldTaskProgress, 6 * 60 * 60 * 1000);
+// Run cleanup every 6 hours (api-ws / monolith only)
+if (runsApiHygieneIntervals()) {
+  setInterval(cleanupOldTaskProgress, 6 * 60 * 60 * 1000);
 
-// 🔥 FIX: Periodic creator lock cleanup during runtime
-// In addition to startup cleanup, run every 5 minutes to release stale locks
-setInterval(() => {
-  cleanupStaleCreatorLocks().catch((err) => {
-    logError('Creator lock cleanup failed', err);
-  });
-}, 5 * 60 * 1000);
+  setInterval(() => {
+    cleanupStaleCreatorLocks().catch((err) => {
+      logError('Creator lock cleanup failed', err);
+    });
+  }, 5 * 60 * 1000);
+}
 
-// Process cleanup: do not mass-clear Stream Chat busy flags (deploys would desync presence).
-// Stale locks are handled by cleanupStaleCreatorLocks + call reconciliation jobs.
-process.on('uncaughtException', async (error) => {
-  logError('Uncaught exception - cleaning up and exiting', error);
-  await cleanupBillingIntervals().catch(() => {});
-  stopReconciliationJob();
-  stopBillingWatchdog();
-  stopStaffWalletReconciliationScheduler();
-  stopDomainEventWorker();
-  stopCallReconciliationJob();
-  stopPaymentWebhookRetryWorker();
-  await stopImagePipelineWorkers().catch(() => {});
-  stopMomentsWorkers();
-  if (eventLoopProbe) {
-    clearInterval(eventLoopProbe);
-    eventLoopProbe = null;
-  }
-  process.exit(1);
-});
-
-process.on('SIGTERM', async () => {
-  logInfo('SIGTERM received — cleaning up', { signal: 'SIGTERM' });
-  await cleanupBillingIntervals();
-  stopReconciliationJob();
-  stopBillingWatchdog();
-  stopStaffWalletReconciliationScheduler();
-  stopDomainEventWorker();
-  stopCallReconciliationJob();
-  stopPaymentWebhookRetryWorker();
-  await stopImagePipelineWorkers().catch(() => {});
-  stopMomentsWorkers();
-  if (eventLoopProbe) {
-    clearInterval(eventLoopProbe);
-    eventLoopProbe = null;
-  }
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  logInfo('SIGINT received — cleaning up', { signal: 'SIGINT' });
-  await cleanupBillingIntervals();
-  stopReconciliationJob();
-  stopBillingWatchdog();
-  stopStaffWalletReconciliationScheduler();
-  stopDomainEventWorker();
-  stopCallReconciliationJob();
-  stopPaymentWebhookRetryWorker();
-  await stopImagePipelineWorkers().catch(() => {});
-  stopMomentsWorkers();
-  if (eventLoopProbe) {
-    clearInterval(eventLoopProbe);
-    eventLoopProbe = null;
-  }
-  process.exit(0);
-});
+registerShutdownHandlers();
 
 startServer();

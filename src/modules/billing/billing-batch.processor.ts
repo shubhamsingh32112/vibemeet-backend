@@ -22,10 +22,12 @@ export async function processBillingBatch(io: Server): Promise<void> {
 export function startGlobalBillingProcessor(io: Server): void {
   if (isBullmqBillingEnabled()) {
     try {
-      startBillingBullWorker();
-      logInfo('Global billing processor delegated to BullMQ worker', {
-        driver: 'bullmq',
-      });
+      const worker = startBillingBullWorker();
+      if (worker) {
+        logInfo('Global billing processor delegated to BullMQ worker', {
+          driver: 'bullmq',
+        });
+      }
     } catch (err) {
       logError('Failed to start BullMQ billing worker', err, { driver: 'bullmq' });
       throw err;

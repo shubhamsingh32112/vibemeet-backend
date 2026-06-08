@@ -1,0 +1,4808 @@
+openapi: 3.0.3
+info:
+  title: Eazy Talks / Match Vibe Backend API
+  description: |
+    Auto-generated from Express route files (scripts/generate-openapi.mjs).
+    Base path for API modules is /api/v1. Regenerate after route changes.
+  version: 1.0.0
+  contact:
+    name: zztherapy backend
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://api.yourdomain.com
+    description: Production (set PUBLIC_API_BASE_URL host)
+
+tags:
+  - name: Admin
+  - name: Agency
+  - name: App updates
+  - name: Auth
+  - name: Availability
+  - name: Bd
+  - name: Billing
+  - name: Chat
+  - name: Creator
+  - name: Images
+  - name: Infrastructure
+  - name: Metrics
+  - name: Moments
+  - name: Payment
+  - name: Referral
+  - name: Stories
+  - name: Stream
+  - name: Support
+  - name: User
+  - name: Video
+  - name: Vip
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT or Firebase ID token
+      description: Staff JWT from /auth/admin-login, /agency-login, /bd-login OR Firebase ID token for mobile
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: Provider HMAC signature on raw body (Stream, Razorpay, Cloudflare)
+    metricsToken:
+      type: apiKey
+      in: header
+      name: X-Metrics-Token
+      description: Optional ops token when METRICS_TOKEN env is set
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+    ErrorEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+
+paths:
+  "/api/v1/admin/actions/log":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_actions_log
+      summary: Admin GET /api/v1/admin/actions/log
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/agencies":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_agencies
+      summary: Admin GET /api/v1/admin/agencies
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_agencies
+      summary: Admin POST /api/v1/admin/agencies
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/agencies/:id":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_agencies_id
+      summary: Admin GET /api/v1/admin/agencies/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_agencies_id
+      summary: Admin PATCH /api/v1/admin/agencies/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/agencies/brief":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_agencies_brief
+      summary: Admin GET /api/v1/admin/agencies/brief
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/analytics/rebuild":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_analytics_rebuild
+      summary: Admin POST /api/v1/admin/analytics/rebuild
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/app-updates/current":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_app_updates_current
+      summary: Admin GET /api/v1/admin/app-updates/current
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/app-updates/publish":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_app_updates_publish
+      summary: Admin POST /api/v1/admin/app-updates/publish
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/audit-events":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_audit_events
+      summary: Admin GET /api/v1/admin/audit-events
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/bds":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_bds
+      summary: Admin GET /api/v1/admin/bds
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_bds
+      summary: Admin POST /api/v1/admin/bds
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/bds/:id":
+    delete:
+      tags:
+        - Admin
+      operationId: delete__api_v1_admin_bds_id
+      summary: Admin DELETE /api/v1/admin/bds/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_bds_id
+      summary: Admin GET /api/v1/admin/bds/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_bds_id
+      summary: Admin PATCH /api/v1/admin/bds/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/blocked-hosts":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_blocked_hosts
+      summary: Admin GET /api/v1/admin/blocked-hosts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/calls":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_calls
+      summary: Admin GET /api/v1/admin/calls
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/calls/:callId/refund":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_calls_callId_refund
+      summary: Admin POST /api/v1/admin/calls/:callId/refund
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/calls/:callId/refund-preview":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_calls_callId_refund_preview
+      summary: Admin GET /api/v1/admin/calls/:callId/refund-preview
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/coins":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_coins
+      summary: Admin GET /api/v1/admin/coins
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/avatar/commit":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_creators_id_avatar_commit
+      summary: Admin POST /api/v1/admin/creators/:id/avatar/commit
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/detail":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_creators_id_detail
+      summary: Admin GET /api/v1/admin/creators/:id/detail
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/gallery/:imageId":
+    delete:
+      tags:
+        - Admin
+      operationId: delete__api_v1_admin_creators_id_gallery_imageId
+      summary: Admin DELETE /api/v1/admin/creators/:id/gallery/:imageId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/gallery/commit":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_creators_id_gallery_commit
+      summary: Admin POST /api/v1/admin/creators/:id/gallery/commit
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/gallery/reorder":
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_creators_id_gallery_reorder
+      summary: Admin PATCH /api/v1/admin/creators/:id/gallery/reorder
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/reset-presence":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_creators_id_reset_presence
+      summary: Admin POST /api/v1/admin/creators/:id/reset-presence
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/transfer-agency":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_creators_id_transfer_agency
+      summary: Admin POST /api/v1/admin/creators/:id/transfer-agency
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/:id/user":
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_creators_id_user
+      summary: Admin PATCH /api/v1/admin/creators/:id/user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/performance":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_creators_performance
+      summary: Admin GET /api/v1/admin/creators/performance
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/creators/security-flags":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_creators_security_flags
+      summary: Admin GET /api/v1/admin/creators/security-flags
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/alerts":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_alerts
+      summary: Admin GET /api/v1/admin/dashboard/alerts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/call-analytics":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_call_analytics
+      summary: Admin GET /api/v1/admin/dashboard/call-analytics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/geo":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_geo
+      summary: Admin GET /api/v1/admin/dashboard/geo
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/heatmap":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_heatmap
+      summary: Admin GET /api/v1/admin/dashboard/heatmap
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/live-calls":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_live_calls
+      summary: Admin GET /api/v1/admin/dashboard/live-calls
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/overview":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_overview
+      summary: Admin GET /api/v1/admin/dashboard/overview
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/payouts":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_payouts
+      summary: Admin GET /api/v1/admin/dashboard/payouts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/razorpay-balance":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_razorpay_balance
+      summary: Admin GET /api/v1/admin/dashboard/razorpay-balance
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/realtime":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_realtime
+      summary: Admin GET /api/v1/admin/dashboard/realtime
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/revenue":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_revenue
+      summary: Admin GET /api/v1/admin/dashboard/revenue
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/top-agencies":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_top_agencies
+      summary: Admin GET /api/v1/admin/dashboard/top-agencies
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/top-bds":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_top_bds
+      summary: Admin GET /api/v1/admin/dashboard/top-bds
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/dashboard/top-hosts":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_dashboard_top_hosts
+      summary: Admin GET /api/v1/admin/dashboard/top-hosts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/domain-events/:eventId/replay":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_domain_events_eventId_replay
+      summary: Admin POST /api/v1/admin/domain-events/:eventId/replay
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/fraud/investigations":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_fraud_investigations
+      summary: Admin GET /api/v1/admin/fraud/investigations
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/fraud/investigations/:id/notes":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_fraud_investigations_id_notes
+      summary: Admin POST /api/v1/admin/fraud/investigations/:id/notes
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/fraud/rules/run":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_fraud_rules_run
+      summary: Admin POST /api/v1/admin/fraud/rules/run
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/fraud/signals":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_fraud_signals
+      summary: Admin GET /api/v1/admin/fraud/signals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/full-audit-report":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_full_audit_report
+      summary: Admin GET /api/v1/admin/full-audit-report
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/images/approve":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_images_approve
+      summary: Admin POST /api/v1/admin/images/approve
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/images/health":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_images_health
+      summary: Admin GET /api/v1/admin/images/health
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/images/pending":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_images_pending
+      summary: Admin GET /api/v1/admin/images/pending
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/images/reject":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_images_reject
+      summary: Admin POST /api/v1/admin/images/reject
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/integrity-checks":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_integrity_checks
+      summary: Admin GET /api/v1/admin/integrity-checks
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/leaderboards/hosts":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_leaderboards_hosts
+      summary: Admin GET /api/v1/admin/leaderboards/hosts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/leaderboards/users":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_leaderboards_users
+      summary: Admin GET /api/v1/admin/leaderboards/users
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/moderation/approve":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_moments_moderation_approve
+      summary: Admin POST /api/v1/admin/moments/moderation/approve
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/moderation/escalate":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_moments_moderation_escalate
+      summary: Admin POST /api/v1/admin/moments/moderation/escalate
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/moderation/escalated":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_moments_moderation_escalated
+      summary: Admin GET /api/v1/admin/moments/moderation/escalated
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/moderation/pending":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_moments_moderation_pending
+      summary: Admin GET /api/v1/admin/moments/moderation/pending
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/moderation/reject":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_moments_moderation_reject
+      summary: Admin POST /api/v1/admin/moments/moderation/reject
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/purchases":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_moments_purchases
+      summary: Admin GET /api/v1/admin/moments/purchases
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/purchases/refund":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_moments_purchases_refund
+      summary: Admin POST /api/v1/admin/moments/purchases/refund
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/moments/purchases/regrant":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_moments_purchases_regrant
+      summary: Admin POST /api/v1/admin/moments/purchases/regrant
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/overview":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_overview
+      summary: Admin GET /api/v1/admin/overview
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/platform-revenue":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_platform_revenue
+      summary: Admin GET /api/v1/admin/platform-revenue
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    put:
+      tags:
+        - Admin
+      operationId: put__api_v1_admin_platform_revenue
+      summary: Admin PUT /api/v1/admin/platform-revenue
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/realtime-metrics":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_realtime_metrics
+      summary: Admin GET /api/v1/admin/realtime-metrics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/revenue-split/summary":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_revenue_split_summary
+      summary: Admin GET /api/v1/admin/revenue-split/summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/staff-wallet-reconciliation":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_staff_wallet_reconciliation
+      summary: Admin GET /api/v1/admin/staff-wallet-reconciliation
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/staff-wallet-reconciliation/run":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_staff_wallet_reconciliation_run
+      summary: Admin POST /api/v1/admin/staff-wallet-reconciliation/run
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/support":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_support
+      summary: Admin GET /api/v1/admin/support
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/support/:id/assign":
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_support_id_assign
+      summary: Admin PATCH /api/v1/admin/support/:id/assign
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/support/:id/status":
+    patch:
+      tags:
+        - Admin
+      operationId: patch__api_v1_admin_support_id_status
+      summary: Admin PATCH /api/v1/admin/support/:id/status
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/system/health":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_system_health
+      summary: Admin GET /api/v1/admin/system/health
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/users/:id/adjust-coins":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_users_id_adjust_coins
+      summary: Admin POST /api/v1/admin/users/:id/adjust-coins
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/users/:id/ledger":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_users_id_ledger
+      summary: Admin GET /api/v1/admin/users/:id/ledger
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/users/analytics":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_users_analytics
+      summary: Admin GET /api/v1/admin/users/analytics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/vip/members":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_vip_members
+      summary: Admin GET /api/v1/admin/vip/members
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/vip/members/:id/grant":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_vip_members_id_grant
+      summary: Admin POST /api/v1/admin/vip/members/:id/grant
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/vip/members/:id/revoke":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_vip_members_id_revoke
+      summary: Admin POST /api/v1/admin/vip/members/:id/revoke
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/vip/plan":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_vip_plan
+      summary: Admin GET /api/v1/admin/vip/plan
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    put:
+      tags:
+        - Admin
+      operationId: put__api_v1_admin_vip_plan
+      summary: Admin PUT /api/v1/admin/vip/plan
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/vip/stats":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_vip_stats
+      summary: Admin GET /api/v1/admin/vip/stats
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/wallet-pricing":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_wallet_pricing
+      summary: Admin GET /api/v1/admin/wallet-pricing
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    put:
+      tags:
+        - Admin
+      operationId: put__api_v1_admin_wallet_pricing
+      summary: Admin PUT /api/v1/admin/wallet-pricing
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/withdrawals":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_withdrawals
+      summary: Admin GET /api/v1/admin/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/withdrawals/:id/approve":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_withdrawals_id_approve
+      summary: Admin POST /api/v1/admin/withdrawals/:id/approve
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/withdrawals/:id/mark-paid":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_withdrawals_id_mark_paid
+      summary: Admin POST /api/v1/admin/withdrawals/:id/mark-paid
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/withdrawals/:id/reject":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_withdrawals_id_reject
+      summary: Admin POST /api/v1/admin/withdrawals/:id/reject
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/change-password":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_change_password
+      summary: Agency POST /api/v1/agency/change-password
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/creators":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_creators
+      summary: Agency GET /api/v1/agency/creators
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/creators/:creatorId":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_creators_creatorId
+      summary: Agency GET /api/v1/agency/creators/:creatorId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/profile":
+    patch:
+      tags:
+        - Agency
+      operationId: patch__api_v1_agency_profile
+      summary: Agency PATCH /api/v1/agency/profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/referred-users":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_referred_users
+      summary: Agency GET /api/v1/agency/referred-users
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/referred-users/:userId/approve":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_referred_users_userId_approve
+      summary: Agency POST /api/v1/agency/referred-users/:userId/approve
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/referred-users/:userId/reject":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_referred_users_userId_reject
+      summary: Agency POST /api/v1/agency/referred-users/:userId/reject
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/staff-withdrawals":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_staff_withdrawals
+      summary: Agency POST /api/v1/agency/staff-withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/summary":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_summary
+      summary: Agency GET /api/v1/agency/summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/wallet":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_wallet
+      summary: Agency GET /api/v1/agency/wallet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/wallet/payout-account":
+    put:
+      tags:
+        - Agency
+      operationId: put__api_v1_agency_wallet_payout_account
+      summary: Agency PUT /api/v1/agency/wallet/payout-account
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/wallet/transactions":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_wallet_transactions
+      summary: Agency GET /api/v1/agency/wallet/transactions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/wallet/withdrawals":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_wallet_withdrawals
+      summary: Agency GET /api/v1/agency/wallet/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_wallet_withdrawals
+      summary: Agency POST /api/v1/agency/wallet/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/withdrawals":
+    get:
+      tags:
+        - Agency
+      operationId: get__api_v1_agency_withdrawals
+      summary: Agency GET /api/v1/agency/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/withdrawals/:id/approve":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_withdrawals_id_approve
+      summary: Agency POST /api/v1/agency/withdrawals/:id/approve
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/withdrawals/:id/mark-paid":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_withdrawals_id_mark_paid
+      summary: Agency POST /api/v1/agency/withdrawals/:id/mark-paid
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/agency/withdrawals/:id/reject":
+    post:
+      tags:
+        - Agency
+      operationId: post__api_v1_agency_withdrawals_id_reject
+      summary: Agency POST /api/v1/agency/withdrawals/:id/reject
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/app-updates/:id/ack-update-now":
+    post:
+      tags:
+        - App updates
+      operationId: post__api_v1_app_updates_id_ack_update_now
+      summary: App updates POST /api/v1/app-updates/:id/ack-update-now
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/app-updates/pending":
+    get:
+      tags:
+        - App updates
+      operationId: get__api_v1_app_updates_pending
+      summary: App updates GET /api/v1/app-updates/pending
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/admin-login":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_admin_login
+      summary: Auth POST /api/v1/auth/admin-login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/agency-login":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_agency_login
+      summary: Auth POST /api/v1/auth/agency-login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/bd-login":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_bd_login
+      summary: Auth POST /api/v1/auth/bd-login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/fast-login":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_fast_login
+      summary: Auth POST /api/v1/auth/fast-login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/login":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_login
+      summary: Auth POST /api/v1/auth/login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/auth/logout":
+    post:
+      tags:
+        - Auth
+      operationId: post__api_v1_auth_logout
+      summary: Auth POST /api/v1/auth/logout
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/availability/online-users":
+    get:
+      tags:
+        - Availability
+      operationId: get__api_v1_availability_online_users
+      summary: Availability GET /api/v1/availability/online-users
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/availability/resolve-users":
+    post:
+      tags:
+        - Availability
+      operationId: post__api_v1_availability_resolve_users
+      summary: Availability POST /api/v1/availability/resolve-users
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/agencies":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_agencies
+      summary: Bd GET /api/v1/bd/agencies
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Bd
+      operationId: post__api_v1_bd_agencies
+      summary: Bd POST /api/v1/bd/agencies
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/change-password":
+    post:
+      tags:
+        - Bd
+      operationId: post__api_v1_bd_change_password
+      summary: Bd POST /api/v1/bd/change-password
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/creators":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_creators
+      summary: Bd GET /api/v1/bd/creators
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/creators/:creatorId":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_creators_creatorId
+      summary: Bd GET /api/v1/bd/creators/:creatorId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/creators/:creatorId/price":
+    patch:
+      tags:
+        - Bd
+      operationId: patch__api_v1_bd_creators_creatorId_price
+      summary: Bd PATCH /api/v1/bd/creators/:creatorId/price
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/dashboard":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_dashboard
+      summary: Bd GET /api/v1/bd/dashboard
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/profile":
+    patch:
+      tags:
+        - Bd
+      operationId: patch__api_v1_bd_profile
+      summary: Bd PATCH /api/v1/bd/profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/staff-withdrawals":
+    post:
+      tags:
+        - Bd
+      operationId: post__api_v1_bd_staff_withdrawals
+      summary: Bd POST /api/v1/bd/staff-withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/summary":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_summary
+      summary: Bd GET /api/v1/bd/summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/wallet":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_wallet
+      summary: Bd GET /api/v1/bd/wallet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/wallet/payout-account":
+    put:
+      tags:
+        - Bd
+      operationId: put__api_v1_bd_wallet_payout_account
+      summary: Bd PUT /api/v1/bd/wallet/payout-account
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/wallet/transactions":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_wallet_transactions
+      summary: Bd GET /api/v1/bd/wallet/transactions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/bd/wallet/withdrawals":
+    get:
+      tags:
+        - Bd
+      operationId: get__api_v1_bd_wallet_withdrawals
+      summary: Bd GET /api/v1/bd/wallet/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Bd
+      operationId: post__api_v1_bd_wallet_withdrawals
+      summary: Bd POST /api/v1/bd/wallet/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/billing/call-ended":
+    post:
+      tags:
+        - Billing
+      operationId: post__api_v1_billing_call_ended
+      summary: Billing POST /api/v1/billing/call-ended
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/billing/call-started":
+    post:
+      tags:
+        - Billing
+      operationId: post__api_v1_billing_call_started
+      summary: Billing POST /api/v1/billing/call-started
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/channel":
+    post:
+      tags:
+        - Chat
+      operationId: post__api_v1_chat_channel
+      summary: Chat POST /api/v1/chat/channel
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/channel/:channelId/creator-call-info":
+    get:
+      tags:
+        - Chat
+      operationId: get__api_v1_chat_channel_channelId_creator_call_info
+      summary: Chat GET /api/v1/chat/channel/:channelId/creator-call-info
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/channel/:channelId/other-member":
+    get:
+      tags:
+        - Chat
+      operationId: get__api_v1_chat_channel_channelId_other_member
+      summary: Chat GET /api/v1/chat/channel/:channelId/other-member
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/pre-send":
+    post:
+      tags:
+        - Chat
+      operationId: post__api_v1_chat_pre_send
+      summary: Chat POST /api/v1/chat/pre-send
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/quota/:channelId":
+    get:
+      tags:
+        - Chat
+      operationId: get__api_v1_chat_quota_channelId
+      summary: Chat GET /api/v1/chat/quota/:channelId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/token":
+    post:
+      tags:
+        - Chat
+      operationId: post__api_v1_chat_token
+      summary: Chat POST /api/v1/chat/token
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/chat/webhook":
+    post:
+      tags:
+        - Chat
+      operationId: post__api_v1_chat_webhook
+      summary: Chat POST /api/v1/chat/webhook
+      security:
+        - webhookSignature: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_
+      summary: Creator GET /api/v1/creator/
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Creator
+      operationId: post__api_v1_creator_
+      summary: Creator POST /api/v1/creator/
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/:id":
+    delete:
+      tags:
+        - Creator
+      operationId: delete__api_v1_creator_id
+      summary: Creator DELETE /api/v1/creator/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_id
+      summary: Creator GET /api/v1/creator/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    put:
+      tags:
+        - Creator
+      operationId: put__api_v1_creator_id
+      summary: Creator PUT /api/v1/creator/:id
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/by-firebase-uid/:uid":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_by_firebase_uid_uid
+      summary: Creator GET /api/v1/creator/by-firebase-uid/:uid
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/dashboard":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_dashboard
+      summary: Creator GET /api/v1/creator/dashboard
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/earnings":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_earnings
+      summary: Creator GET /api/v1/creator/earnings
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/feed":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_feed
+      summary: Creator GET /api/v1/creator/feed
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/leaderboard":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_leaderboard
+      summary: Creator GET /api/v1/creator/leaderboard
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/leaderboard/summary":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_leaderboard_summary
+      summary: Creator GET /api/v1/creator/leaderboard/summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/profile":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_profile
+      summary: Creator GET /api/v1/creator/profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    patch:
+      tags:
+        - Creator
+      operationId: patch__api_v1_creator_profile
+      summary: Creator PATCH /api/v1/creator/profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/profile/gallery/:imageId":
+    delete:
+      tags:
+        - Creator
+      operationId: delete__api_v1_creator_profile_gallery_imageId
+      summary: Creator DELETE /api/v1/creator/profile/gallery/:imageId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/profile/gallery/commit":
+    post:
+      tags:
+        - Creator
+      operationId: post__api_v1_creator_profile_gallery_commit
+      summary: Creator POST /api/v1/creator/profile/gallery/commit
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/profile/gallery/reorder":
+    patch:
+      tags:
+        - Creator
+      operationId: patch__api_v1_creator_profile_gallery_reorder
+      summary: Creator PATCH /api/v1/creator/profile/gallery/reorder
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/status":
+    patch:
+      tags:
+        - Creator
+      operationId: patch__api_v1_creator_status
+      summary: Creator PATCH /api/v1/creator/status
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/tasks":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_tasks
+      summary: Creator GET /api/v1/creator/tasks
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/tasks/:taskKey/claim":
+    post:
+      tags:
+        - Creator
+      operationId: post__api_v1_creator_tasks_taskKey_claim
+      summary: Creator POST /api/v1/creator/tasks/:taskKey/claim
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/transactions":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_transactions
+      summary: Creator GET /api/v1/creator/transactions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/uids":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_uids
+      summary: Creator GET /api/v1/creator/uids
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/withdraw":
+    post:
+      tags:
+        - Creator
+      operationId: post__api_v1_creator_withdraw
+      summary: Creator POST /api/v1/creator/withdraw
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/creator/withdrawals":
+    get:
+      tags:
+        - Creator
+      operationId: get__api_v1_creator_withdrawals
+      summary: Creator GET /api/v1/creator/withdrawals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/images/direct-upload":
+    post:
+      tags:
+        - Images
+      operationId: post__api_v1_images_direct_upload
+      summary: Images POST /api/v1/images/direct-upload
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/images/health":
+    get:
+      tags:
+        - Images
+      operationId: get__api_v1_images_health
+      summary: Images GET /api/v1/images/health
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/images/presets":
+    get:
+      tags:
+        - Images
+      operationId: get__api_v1_images_presets
+      summary: Images GET /api/v1/images/presets
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/metrics/image-render":
+    post:
+      tags:
+        - Metrics
+      operationId: post__api_v1_metrics_image_render
+      summary: Metrics POST /api/v1/metrics/image-render
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/metrics/video-playback":
+    post:
+      tags:
+        - Metrics
+      operationId: post__api_v1_metrics_video_playback
+      summary: Metrics POST /api/v1/metrics/video-playback
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/":
+    post:
+      tags:
+        - Moments
+      operationId: post__api_v1_moments_
+      summary: Moments POST /api/v1/moments/
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/:momentId":
+    delete:
+      tags:
+        - Moments
+      operationId: delete__api_v1_moments_momentId
+      summary: Moments DELETE /api/v1/moments/:momentId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_momentId
+      summary: Moments GET /api/v1/moments/:momentId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/:momentId/complete":
+    post:
+      tags:
+        - Moments
+      operationId: post__api_v1_moments_momentId_complete
+      summary: Moments POST /api/v1/moments/:momentId/complete
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/:momentId/playback":
+    post:
+      tags:
+        - Moments
+      operationId: post__api_v1_moments_momentId_playback
+      summary: Moments POST /api/v1/moments/:momentId/playback
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/:momentId/purchase":
+    post:
+      tags:
+        - Moments
+      operationId: post__api_v1_moments_momentId_purchase
+      summary: Moments POST /api/v1/moments/:momentId/purchase
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/creator/:creatorId":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_creator_creatorId
+      summary: Moments GET /api/v1/moments/creator/:creatorId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/creator/me":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_creator_me
+      summary: Moments GET /api/v1/moments/creator/me
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/creator/me/analytics":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_creator_me_analytics
+      summary: Moments GET /api/v1/moments/creator/me/analytics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/creators/:creatorId/follow":
+    delete:
+      tags:
+        - Moments
+      operationId: delete__api_v1_moments_creators_creatorId_follow
+      summary: Moments DELETE /api/v1/moments/creators/:creatorId/follow
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    post:
+      tags:
+        - Moments
+      operationId: post__api_v1_moments_creators_creatorId_follow
+      summary: Moments POST /api/v1/moments/creators/:creatorId/follow
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/creators/:creatorId/summary":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_creators_creatorId_summary
+      summary: Moments GET /api/v1/moments/creators/:creatorId/summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/feed":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_feed
+      summary: Moments GET /api/v1/moments/feed
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/following":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_following
+      summary: Moments GET /api/v1/moments/following
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/moments/following/list":
+    get:
+      tags:
+        - Moments
+      operationId: get__api_v1_moments_following_list
+      summary: Moments GET /api/v1/moments/following/list
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/create-order":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_create_order
+      summary: Payment POST /api/v1/payment/create-order
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/packages":
+    get:
+      tags:
+        - Payment
+      operationId: get__api_v1_payment_packages
+      summary: Payment GET /api/v1/payment/packages
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/verify":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_verify
+      summary: Payment POST /api/v1/payment/verify
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/web/create-order":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_web_create_order
+      summary: Payment POST /api/v1/payment/web/create-order
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/web/initiate":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_web_initiate
+      summary: Payment POST /api/v1/payment/web/initiate
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/web/verify":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_web_verify
+      summary: Payment POST /api/v1/payment/web/verify
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/webhook":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_webhook
+      summary: Payment POST /api/v1/payment/webhook
+      security:
+        - webhookSignature: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/referral/preview":
+    get:
+      tags:
+        - Referral
+      operationId: get__api_v1_referral_preview
+      summary: Referral GET /api/v1/referral/preview
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/":
+    post:
+      tags:
+        - Stories
+      operationId: post__api_v1_stories_
+      summary: Stories POST /api/v1/stories/
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/:storyId":
+    delete:
+      tags:
+        - Stories
+      operationId: delete__api_v1_stories_storyId
+      summary: Stories DELETE /api/v1/stories/:storyId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/:storyId/complete":
+    post:
+      tags:
+        - Stories
+      operationId: post__api_v1_stories_storyId_complete
+      summary: Stories POST /api/v1/stories/:storyId/complete
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/:storyId/playback":
+    post:
+      tags:
+        - Stories
+      operationId: post__api_v1_stories_storyId_playback
+      summary: Stories POST /api/v1/stories/:storyId/playback
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/:storyId/view":
+    post:
+      tags:
+        - Stories
+      operationId: post__api_v1_stories_storyId_view
+      summary: Stories POST /api/v1/stories/:storyId/view
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/:storyId/viewers":
+    get:
+      tags:
+        - Stories
+      operationId: get__api_v1_stories_storyId_viewers
+      summary: Stories GET /api/v1/stories/:storyId/viewers
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/creator/:creatorId":
+    get:
+      tags:
+        - Stories
+      operationId: get__api_v1_stories_creator_creatorId
+      summary: Stories GET /api/v1/stories/creator/:creatorId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/creator/me":
+    get:
+      tags:
+        - Stories
+      operationId: get__api_v1_stories_creator_me
+      summary: Stories GET /api/v1/stories/creator/me
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stories/feed":
+    get:
+      tags:
+        - Stories
+      operationId: get__api_v1_stories_feed
+      summary: Stories GET /api/v1/stories/feed
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stream/direct-upload":
+    post:
+      tags:
+        - Stream
+      operationId: post__api_v1_stream_direct_upload
+      summary: Stream POST /api/v1/stream/direct-upload
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stream/health":
+    get:
+      tags:
+        - Stream
+      operationId: get__api_v1_stream_health
+      summary: Stream GET /api/v1/stream/health
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stream/upload-status/:sessionId":
+    get:
+      tags:
+        - Stream
+      operationId: get__api_v1_stream_upload_status_sessionId
+      summary: Stream GET /api/v1/stream/upload-status/:sessionId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/stream/webhook":
+    post:
+      tags:
+        - Stream
+      operationId: post__api_v1_stream_webhook
+      summary: Stream POST /api/v1/stream/webhook
+      security:
+        - webhookSignature: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/support/attachments/commit":
+    post:
+      tags:
+        - Support
+      operationId: post__api_v1_support_attachments_commit
+      summary: Support POST /api/v1/support/attachments/commit
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/support/call-feedback":
+    post:
+      tags:
+        - Support
+      operationId: post__api_v1_support_call_feedback
+      summary: Support POST /api/v1/support/call-feedback
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/support/my-tickets":
+    get:
+      tags:
+        - Support
+      operationId: get__api_v1_support_my_tickets
+      summary: Support GET /api/v1/support/my-tickets
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/support/ticket":
+    post:
+      tags:
+        - Support
+      operationId: post__api_v1_support_ticket
+      summary: Support POST /api/v1/support/ticket
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/:id/promote-to-creator":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_id_promote_to_creator
+      summary: User POST /api/v1/user/:id/promote-to-creator
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/block-creator":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_block_creator
+      summary: User POST /api/v1/user/block-creator
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/blocked-creators/count":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_blocked_creators_count
+      summary: User GET /api/v1/user/blocked-creators/count
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/by-firebase-uid/:firebaseUid":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_by_firebase_uid_firebaseUid
+      summary: User GET /api/v1/user/by-firebase-uid/:firebaseUid
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/call-history":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_call_history
+      summary: User GET /api/v1/user/call-history
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/coins":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_coins
+      summary: User POST /api/v1/user/coins
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/delete-account":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_delete_account
+      summary: User POST /api/v1/user/delete-account
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/favorites":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_favorites
+      summary: User GET /api/v1/user/favorites
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/favorites/:creatorId":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_favorites_creatorId
+      summary: User POST /api/v1/user/favorites/:creatorId
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/favorites/creators":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_favorites_creators
+      summary: User GET /api/v1/user/favorites/creators
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/list":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_list
+      summary: User GET /api/v1/user/list
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/me":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_me
+      summary: User GET /api/v1/user/me
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/onboarding/permissions-decision":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_onboarding_permissions_decision
+      summary: User POST /api/v1/user/onboarding/permissions-decision
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/onboarding/permissions-reconcile":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_onboarding_permissions_reconcile
+      summary: User POST /api/v1/user/onboarding/permissions-reconcile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/onboarding/stage":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_onboarding_stage
+      summary: User POST /api/v1/user/onboarding/stage
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/profile":
+    put:
+      tags:
+        - User
+      operationId: put__api_v1_user_profile
+      summary: User PUT /api/v1/user/profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/referral/apply":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_referral_apply
+      summary: User POST /api/v1/user/referral/apply
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/referral/apply-agency":
+    post:
+      tags:
+        - User
+      operationId: post__api_v1_user_referral_apply_agency
+      summary: User POST /api/v1/user/referral/apply-agency
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/referrals":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_referrals
+      summary: User GET /api/v1/user/referrals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/search":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_search
+      summary: User GET /api/v1/user/search
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/user/transactions":
+    get:
+      tags:
+        - User
+      operationId: get__api_v1_user_transactions
+      summary: User GET /api/v1/user/transactions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/video/calls/active":
+    get:
+      tags:
+        - Video
+      operationId: get__api_v1_video_calls_active
+      summary: Video GET /api/v1/video/calls/active
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/video/token":
+    post:
+      tags:
+        - Video
+      operationId: post__api_v1_video_token
+      summary: Video POST /api/v1/video/token
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/video/webhook":
+    post:
+      tags:
+        - Video
+      operationId: post__api_v1_video_webhook
+      summary: Video POST /api/v1/video/webhook
+      security:
+        - webhookSignature: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/queue":
+    delete:
+      tags:
+        - Vip
+      operationId: delete__api_v1_vip_calls_queue
+      summary: Vip DELETE /api/v1/vip/calls/queue
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+    get:
+      tags:
+        - Vip
+      operationId: get__api_v1_vip_calls_queue
+      summary: Vip GET /api/v1/vip/calls/queue
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/schedule":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_calls_schedule
+      summary: Vip POST /api/v1/vip/calls/schedule
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/scheduled":
+    get:
+      tags:
+        - Vip
+      operationId: get__api_v1_vip_calls_scheduled
+      summary: Vip GET /api/v1/vip/calls/scheduled
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/scheduled/:id/cancel":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_calls_scheduled_id_cancel
+      summary: Vip POST /api/v1/vip/calls/scheduled/:id/cancel
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/scheduled/:id/confirm":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_calls_scheduled_id_confirm
+      summary: Vip POST /api/v1/vip/calls/scheduled/:id/confirm
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/calls/scheduled/incoming":
+    get:
+      tags:
+        - Vip
+      operationId: get__api_v1_vip_calls_scheduled_incoming
+      summary: Vip GET /api/v1/vip/calls/scheduled/incoming
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/checkout/create-order":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_checkout_create_order
+      summary: Vip POST /api/v1/vip/checkout/create-order
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/checkout/initiate":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_checkout_initiate
+      summary: Vip POST /api/v1/vip/checkout/initiate
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/checkout/verify":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_checkout_verify
+      summary: Vip POST /api/v1/vip/checkout/verify
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/plan":
+    get:
+      tags:
+        - Vip
+      operationId: get__api_v1_vip_plan
+      summary: Vip GET /api/v1/vip/plan
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/status":
+    get:
+      tags:
+        - Vip
+      operationId: get__api_v1_vip_status
+      summary: Vip GET /api/v1/vip/status
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/vip/webhook":
+    post:
+      tags:
+        - Vip
+      operationId: post__api_v1_vip_webhook
+      summary: Vip POST /api/v1/vip/webhook
+      security:
+        - webhookSignature: []
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/health":
+    get:
+      tags:
+        - Infrastructure
+      operationId: get__health
+      summary: Infrastructure GET /health
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/live":
+    get:
+      tags:
+        - Infrastructure
+      operationId: get__live
+      summary: Infrastructure GET /live
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/metrics":
+    get:
+      tags:
+        - Infrastructure
+      operationId: get__metrics
+      summary: Infrastructure GET /metrics
+      security:
+        - metricsToken: []
+        - {}
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/ready":
+    get:
+      tags:
+        - Infrastructure
+      operationId: get__ready
+      summary: Infrastructure GET /ready
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error

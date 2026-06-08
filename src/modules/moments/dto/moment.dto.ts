@@ -9,6 +9,9 @@ export interface MediaPresentation {
   blurPlaceholder?: string;
   locked: boolean;
   unlockPriceCoins?: number;
+  originalPriceCoins?: number;
+  vipFreeUnlockAvailable?: boolean;
+  discountApplied?: boolean;
   processingStatus: ProcessingStatus;
 }
 
@@ -22,6 +25,9 @@ export interface PresentationDTO {
   createdAt: string;
   locked: boolean;
   unlockPriceCoins?: number;
+  originalPriceCoins?: number;
+  vipFreeUnlockAvailable?: boolean;
+  discountApplied?: boolean;
   isFollowing?: boolean;
   processingStatus?: ProcessingStatus;
   moderationStatus?: string;

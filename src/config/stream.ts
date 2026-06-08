@@ -128,6 +128,7 @@ export const ensureStreamUser = async (
     appRole?: 'user' | 'creator' | 'admin';
     username?: string; // Username from MongoDB (single source of truth)
     mongoId?: string; // MongoDB _id so frontend can start calls without extra lookups
+    isVip?: boolean;
   }
 ): Promise<void> => {
   const client = getStreamClient();
@@ -140,6 +141,7 @@ export const ensureStreamUser = async (
       appRole: userData.appRole || 'user', // Store app role in metadata
       username: userData.username, // Store username as single source of truth
       ...(userData.mongoId ? { mongoId: userData.mongoId } : {}), // MongoDB _id for call initiation
+      ...(userData.isVip ? { isVip: true } : {}),
     },
   };
 

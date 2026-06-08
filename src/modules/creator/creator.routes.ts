@@ -27,6 +27,10 @@ import {
   requestWithdrawal,
   getMyWithdrawals,
 } from './creator.controller';
+import {
+  getCreatorLeaderboardHandler,
+  getCreatorLeaderboardSummaryHandler,
+} from './creator-leaderboard.controller';
 
 const router = Router();
 
@@ -37,6 +41,8 @@ router.get('/feed', verifyFirebaseToken, getCreatorFeed);
 router.get('/uids', verifyFirebaseToken, getCreatorFirebaseUids);
 router.get('/by-firebase-uid/:uid', verifyFirebaseToken, getCreatorByFirebaseUid);
 router.get('/dashboard', verifyFirebaseToken, getCreatorDashboard); // Consolidated creator dashboard (cached)
+router.get('/leaderboard/summary', verifyFirebaseToken, getCreatorLeaderboardSummaryHandler);
+router.get('/leaderboard', verifyFirebaseToken, getCreatorLeaderboardHandler);
 router.get('/earnings', verifyFirebaseToken, getCreatorEarnings); // Get creator earnings summary
 router.get('/transactions', verifyFirebaseToken, getCreatorTransactions); // Get creator transaction history
 router.get('/tasks', verifyFirebaseToken, tasksLimiter, getCreatorTasks); // Get creator tasks progress (rate limited)

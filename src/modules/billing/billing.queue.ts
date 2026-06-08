@@ -11,6 +11,7 @@ import {
   getBillingCycleLockDeferMs,
 } from './billing.constants';
 import { getIO } from '../../config/socket';
+import { runsBillingWorkers } from '../../config/service-role';
 import { billingService } from './billing.service';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
@@ -44,7 +45,20 @@ function readBullmqConcurrency(): number {
   if (!Number.isFinite(raw)) {
     return 130;
   }
+  if (raw <= 0) {
+    return 0;
+  }
   return Math.min(200, Math.max(1, raw));
+}
+
+export function shouldStartBillingBullWorker(): boolean {
+  if (!runsBillingWorkers()) {
+    return false;
+  }
+  if (!isBullmqBillingEnabled()) {
+    return false;
+  }
+  return readBullmqConcurrency() > 0;
 }
 
 function readBackpressureLagThresholdMs(): number {
@@ -415,7 +429,14 @@ export async function cancelBillingCycleJob(callId: string): Promise<void> {
   recordBillingMetric('bullmq_cycle_cancelled', 1, { callId, removedCount: String(removed) });
 }
 
-export function startBillingBullWorker(): Worker {
+export function startBillingBullWorker(): Worker | null {
+  if (!shouldStartBillingBullWorker()) {
+    logInfo('Billing BullMQ worker skipped for this process', {
+      runsBillingWorkers: runsBillingWorkers(),
+      concurrency: readBullmqConcurrency(),
+    });
+    return null;
+  }
   assertBullmqRuntimeSafety();
   if (billingWorker) {
     logWarning('Billing BullMQ worker already running', {});

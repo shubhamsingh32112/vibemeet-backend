@@ -23,6 +23,8 @@ import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { parseAppVideoCallId } from '../billing/billing-call-id.util';
 import { markStreamCallEnded } from '../billing/billing-termination.stream';
+import { isVipActive } from '../vip/vip-entitlement.service';
+import { enqueueVipCaller } from '../vip/vip-call-queue.service';
 
 export interface StreamVideoWebhookPayload {
   type: string;
@@ -647,6 +649,22 @@ export class CallLifecycleService {
     const conflictingActiveCallId = callerConflict ?? creatorConflict;
     if (!conflictingActiveCallId) {
       return false;
+    }
+
+    if (
+      creatorConflict &&
+      !callerConflict &&
+      participants.callerUser?._id
+    ) {
+      const callerIsVip = await isVipActive(participants.callerUser._id);
+      if (callerIsVip) {
+        await enqueueVipCaller({
+          creatorFirebaseUid,
+          callerFirebaseUid,
+          callerUserId: participants.callerUser._id,
+          callId,
+        });
+      }
     }
 
     const dedupeKey = `call:overlap:reject:${callId}`;

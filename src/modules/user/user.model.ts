@@ -30,6 +30,8 @@ export interface IUser extends Document {
   coins: number;
   /** Promo-only intro call allowance (face-value coin units; billing uses micros). Never IAP/refund wallet. */
   introFreeCallCredits: number;
+  /** Denormalized VIP expiry for fast reads; kept in sync by vip purchase finalization. */
+  vipExpiresAt?: Date | null;
   /** Set when the welcome intro program is atomically consumed after a qualifying billed session. */
   welcomeFreeCallConsumedAt?: Date | null;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
@@ -138,6 +140,11 @@ const userSchema = new Schema<IUser>(
       type: Number,
       default: 0,
       min: 0,
+    },
+    vipExpiresAt: {
+      type: Date,
+      default: null,
+      index: true,
     },
     welcomeFreeCallConsumedAt: {
       type: Date,

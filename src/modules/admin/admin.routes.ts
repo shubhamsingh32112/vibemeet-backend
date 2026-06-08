@@ -91,6 +91,16 @@ import {
   rejectMomentModerationHandler,
 } from './admin-moment-moderation.controller';
 import {
+  getAdminVipPlan,
+  getAdminVipStats,
+  grantAdminVipMembership,
+  listAdminVipMembers,
+  listAdminVipPlans,
+  revokeAdminVipMembership,
+  updateAdminVipPlan,
+  updateAdminVipPlanById,
+} from '../vip/admin-vip.controller';
+import {
   getStaffWalletReconciliationLogs,
   postStaffWalletReconciliationRun,
 } from '../billing/staff-wallet-reconciliation.controller';
@@ -222,5 +232,14 @@ router.get('/moments/moderation/escalated', listEscalatedMomentsModerationHandle
 router.post('/moments/moderation/approve', approveMomentModerationHandler);
 router.post('/moments/moderation/reject', rejectMomentModerationHandler);
 router.post('/moments/moderation/escalate', escalateMomentModerationHandler);
+
+router.get('/vip/plan', getAdminVipPlan);
+router.get('/vip/plans', listAdminVipPlans);
+router.put('/vip/plan', updateAdminVipPlan);
+router.put('/vip/plans/:planId', updateAdminVipPlanById);
+router.get('/vip/members', listAdminVipMembers);
+router.get('/vip/stats', getAdminVipStats);
+router.post('/vip/members/:id/grant', grantAdminVipMembership);
+router.post('/vip/members/:id/revoke', revokeAdminVipMembership);
 
 export default router;

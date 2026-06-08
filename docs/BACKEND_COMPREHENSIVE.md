@@ -1,7 +1,8 @@
 # Match Vibe / Eazy Talks — Backend Comprehensive Reference
 
 > **Package:** `eazy-talks-backend` · **Path:** `D:\zztherapy\backend`  
-> **Generated from:** source code analysis (`src/`, `package.json`, `.env.example`) — May 2026
+> **Generated from:** source code analysis (`src/`, `package.json`, `.env.example`) — June 2026  
+> **See also:** [BACKEND_COMPLETE_ANALYSIS.md](./BACKEND_COMPLETE_ANALYSIS.md) (full inventory) · [openapi.yaml](./openapi.yaml) (REST spec)
 
 ---
 
@@ -27,7 +28,11 @@
 18. [Background workers and jobs](#18-background-workers-and-jobs)
 19. [Cross-cutting concerns](#19-cross-cutting-concerns)
 20. [Testing, scripts, and operations](#20-testing-scripts-and-operations)
-21. [Appendix](#21-appendix)
+21. [VIP membership](#21-vip-membership)
+22. [Moments and Stories](#22-moments-and-stories)
+23. [Cloudflare Stream uploads](#23-cloudflare-stream-uploads)
+24. [Fraud and domain events](#24-fraud-and-domain-events)
+25. [Appendix](#25-appendix)
 
 ---
 
@@ -43,7 +48,7 @@ The backend is a **modular monolith** Node.js/Express API that powers the Match 
 | Admin dashboard | JWT from `/auth/admin-login` | `/admin/*` |
 | Agency portal | JWT from `/auth/agency-login` | `/agency/*` |
 | BD portal | JWT from `/auth/bd-login` | `/bd/*` |
-| Webhooks | HMAC signatures | `/video/webhook`, `/chat/webhook`, `/payment/webhook` |
+| Webhooks | HMAC signatures | `/video/webhook`, `/chat/webhook`, `/payment/webhook`, `/vip/webhook`, `/stream/webhook` |
 
 ### Technology stack
 
@@ -60,6 +65,7 @@ The backend is a **modular monolith** Node.js/Express API that powers the Match 
 | Video / chat | Stream Video + Stream Chat (`@stream-io/node-sdk`, `stream-chat`) |
 | Payments | Razorpay |
 | Images | Cloudflare Images API + sharp/blurhash workers |
+| Video media (Moments/Stories) | Cloudflare Stream |
 
 ### Critical design rules
 
@@ -95,6 +101,7 @@ flowchart TB
     SC[Stream Chat]
     RZ[Razorpay]
     CF[Cloudflare Images]
+    CFS[Cloudflare Stream]
   end
   Flutter --> Express
   Flutter --> SIO
@@ -109,6 +116,7 @@ flowchart TB
   Express --> SC
   Express --> RZ
   Express --> CF
+  Express --> CFS
 ```
 
 ### Module layout
@@ -166,7 +174,11 @@ backend/
 | `referral` | Public referral preview |
 | `support` | Tickets, call feedback |
 | `app-update` | Force-update popups |
-| `metrics` | Client image-render telemetry |
+| `metrics` | Client image/video telemetry |
+| `stories` | Ephemeral creator stories |
+| `moments` | Reels feed, purchases, follows |
+| `stream` | Cloudflare Stream direct upload + webhook |
+| `vip` | Membership, checkout, scheduled calls, priority queue |
 | `analytics` | Daily revenue rollups |
 | `audit` / `events` / `fraud` | Ops and compliance |
 
@@ -190,6 +202,7 @@ backend/
 10. `setIO(io)`
 11. Gateways (order matters):
     - `setupAvailabilityGateway(io)` — installs global Firebase socket auth
+    - `setupMomentsGateway(io)` — media upload broadcast events
     - `setupBillingGateway(io)`
     - `setupAdminGateway(io)` — namespace `/admin`
 12. Background workers:
@@ -201,6 +214,8 @@ backend/
     - Call reconciliation vs Stream
     - Payment webhook retry worker
     - Image pipeline workers (blurhash, orphan cleanup)
+    - Moments workers (fanout, analytics, story expiry) when `USE_MOMENTS=true`
+    - VIP reconciliation job when `VIP_SCHEDULING_ENABLED`
 13. Redis health ping
 14. `httpServer.listen(PORT, '0.0.0.0')`
 
@@ -213,7 +228,7 @@ backend/
 | Rate limit identity | Firebase UID + staff JWT buckets on `/api/` |
 | General + status limiters | Per-IP / per-user throttling |
 | Compression | gzip |
-| Raw body | Signed webhooks only (`/video/webhook`, `/chat/webhook`, `/payment/webhook`) |
+| Raw body | Signed webhooks only (`/video/webhook`, `/chat/webhook`, `/payment/webhook`, `/vip/webhook`, `/stream/webhook`) |
 | JSON parser | 50mb limit elsewhere |
 | Request context + logging | Correlation IDs |
 | Request queue | Backpressure on `/api/` |
@@ -259,7 +274,11 @@ backend/
 | `/app-updates` | Force update |
 | `/availability` | Presence REST |
 | `/images` | Cloudflare pipeline |
-| `/metrics` | Telemetry |
+| `/metrics` | Client telemetry |
+| `/stories` | Ephemeral stories |
+| `/moments` | Paid/free reels, follows |
+| `/stream` | Cloudflare Stream uploads |
+| `/vip` | VIP membership and scheduling |
 
 ---
 
@@ -472,7 +491,7 @@ Subsequent staff API calls use the same `verifyFirebaseToken` middleware (JWT br
 
 ## 7. MongoDB models and schemas
 
-**33** `*.model.ts` files under `src/modules/`. MongoDB is the **system of record** for users, financial state, calls, and audits.
+**47** `*.model.ts` files under `src/modules/` (**49** MongoDB collections). MongoDB is the **system of record** for users, financial state, calls, media, and audits.
 
 ### Embedded image schema
 
@@ -563,6 +582,19 @@ API responses serialize to `avatarUrls` / `galleryUrls` via [`serialize-image-as
 | DomainEvent | `events/domain-event.model.ts` | Outbox for staff invalidation |
 | *RevenueDaily | `analytics/*.model.ts` | Daily rollups |
 | StaffWalletLedger | `billing/staff-wallet-ledger.model.ts` | BD/agency wallets |
+| CreatorMoment | `moments/models/creator-moment.model.ts` | Paid/free reels |
+| MomentPurchase | `moments/models/moment-purchase.model.ts` | Moment purchase records |
+| CreatorFollow | `moments/models/creator-follow.model.ts` | Follow graph |
+| CreatorStory | `stories/models/creator-story.model.ts` | Ephemeral stories |
+| StoryView | `stories/models/story-view.model.ts` | Story view records |
+| VipMembership | `vip/models/vip-membership.model.ts` | Active VIP memberships |
+| VipPlanConfig | `vip/models/vip-plan-config.model.ts` | Plan price/duration |
+| ScheduledCall | `vip/models/scheduled-call.model.ts` | VIP scheduled calls |
+| CallQueueEntry | `vip/models/call-queue-entry.model.ts` | VIP priority queue |
+| AnalyticsEvent | `moments/models/analytics-event.model.ts` | Moment analytics events |
+| MomentRevenue | `moments/models/moment-revenue.model.ts` | Creator moment revenue |
+| VipPurchaseEvent | `vip/models/vip-purchase-event.model.ts` | VIP purchase audit |
+| VipDailyMomentUsage | `vip/models/vip-daily-moment-usage.model.ts` | Free moments/day tracking |
 
 ---
 
@@ -618,6 +650,9 @@ Redis is **required in production** for billing. `@upstash/redis` is in `package
 | `image:quota:avatar:{userId}:{day}` | Daily avatar upload quota |
 | `image:quota:gallery:{userId}:{hour}` | Hourly gallery quota |
 | `chat:presend:*` | Pre-send idempotency |
+| `moments:fanout:queue` | Follower feed fanout jobs |
+| `moments:feed:warm:queue` | Following-feed pre-warm jobs |
+| `analytics:events` | Moment analytics queue (RPOP → Mongo) |
 | `idempotency:webhook:{eventId}` | Webhook dedup (1h) |
 | `metrics:{name}` | Ops metrics ZSET |
 | `admin:{section}:v1` | Admin dashboard cache |
@@ -857,8 +892,9 @@ On successful payment: updates `User.coins`, writes `CoinTransaction`, emits `co
 ### Gateway install order ([`server.ts`](backend/src/server.ts))
 
 1. `setupAvailabilityGateway` — **global** `io.use` Firebase auth
-2. `setupBillingGateway`
-3. `setupAdminGateway` — namespace `/admin`
+2. `setupMomentsGateway` — server broadcasts for media events
+3. `setupBillingGateway`
+4. `setupAdminGateway` — namespace `/admin`
 
 ### Default namespace — Firebase auth
 
@@ -896,6 +932,12 @@ On successful payment: updates `User.coins`, writes `CoinTransaction`, emits `co
 | `creator:data_updated` | Dashboard refresh signal |
 | `wallet_pricing_updated` | Admin changed packages |
 | `app_update:published` | Force update popup |
+| `moment:uploaded` | New moment available (Moments gateway) |
+| `story:uploaded` | New story available |
+| `moment:purchased` | Purchase count update |
+| `creator:followed` | Follower count update |
+| `media:ready` | Cloudflare Stream processing complete |
+| `vip:scheduled_call:due` | VIP scheduled call reminder |
 
 ### `/admin` namespace — staff JWT
 
@@ -978,7 +1020,14 @@ Password login → JWT → same `verifyFirebaseToken` on all staff routes.
 | Payment webhook retry | Worker | Failed Razorpay processing |
 | Blurhash worker | BullMQ | Compute blurhash after upload |
 | Orphan image cleanup | Cron (~30 min) | Delete abandoned Cloudflare uploads |
-| Staff wallet reconciliation | Scheduler | BD/agency ledger audit |
+| Moments fanout drainer | ~5s | Push moments into follower Redis caches |
+| Moments feed warm drainer | ~10s | Pre-warm following-feed for large creators |
+| Moments analytics drainer | ~30s | Redis `analytics:events` → Mongo |
+| Story expiry job | ~30 min | Soft-delete expired stories |
+| Stream upload session sweeper | ~15 min | Clean stale Cloudflare Stream sessions |
+| VIP reconciliation | ~60s | Expire queue entries; emit scheduled-call due |
+| Billing watchdog | ~5s | Stalled billing session recovery |
+| Staff wallet reconciliation | Scheduler (opt-in) | BD/agency ledger audit |
 | Domain event worker | `DOMAIN_EVENTS_ENABLED` | Staff dashboard outbox |
 
 ---
@@ -1037,6 +1086,7 @@ Contract tests (no I/O) for billing, payment webhooks, creator feed, admin dashb
 |--------|---------|
 | `dev.ps1` | Local dev with env |
 | `verify-redis.ts` | Redis connectivity |
+| `generate-openapi.mjs` | Regenerate `docs/openapi.yaml` from route files |
 | `check-hierarchy-legacy.cjs` | CI guard |
 
 ### Deploy notes
@@ -1047,7 +1097,153 @@ Contract tests (no I/O) for billing, payment webhooks, creator feed, admin dashb
 
 ---
 
-## 21. Appendix
+## 21. VIP membership
+
+**Files:** `vip.routes.ts`, `vip.controller.ts`, `vip-entitlement.service.ts`, `vip-purchase-finalization.service.ts`, `vip-scheduling.service.ts`, `vip-call-queue.service.ts`
+
+**Feature flags:** `VIP_ENABLED`, `VIP_SCHEDULING_ENABLED`, `VIP_PRIORITY_QUEUE_ENABLED` in [`feature-flags.ts`](../src/config/feature-flags.ts).
+
+### REST (`/api/v1/vip`)
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| GET | `/plan` | Public | Plan config (price, duration, benefits) |
+| GET | `/status` | Firebase | Current membership status |
+| POST | `/checkout/initiate` | Firebase (user) | Start VIP web checkout |
+| POST | `/checkout/create-order` | Session-bound | Website Razorpay order |
+| POST | `/checkout/verify` | Session-bound | Verify web payment |
+| POST | `/webhook` | Razorpay HMAC | VIP purchase finalization |
+| POST | `/calls/schedule` | Firebase (VIP user) | Schedule call with creator |
+| GET | `/calls/scheduled` | Firebase | User's scheduled calls |
+| GET | `/calls/scheduled/incoming` | Firebase (creator) | Incoming scheduled calls |
+| POST | `/calls/scheduled/:id/confirm` | Firebase (creator) | Confirm scheduled call |
+| POST | `/calls/scheduled/:id/cancel` | Firebase | Cancel scheduled call |
+| GET | `/calls/queue` | Firebase (VIP user) | Priority queue status |
+| DELETE | `/calls/queue` | Firebase (VIP user) | Leave priority queue |
+
+### Entitlements
+
+On successful purchase (`vip-purchase-finalization.service.ts`):
+
+- Writes `VipMembership` and syncs `User.vipExpiresAt`
+- Recharge discounts on coin purchases
+- Free moments per day (`VipDailyMomentUsage`)
+- Scheduled calls and priority queue when flags enabled
+
+### Admin (`/api/v1/admin/vip/*`)
+
+Plan CRUD, member list, stats, manual grant/revoke. See [`admin-vip.controller.ts`](../src/modules/admin/admin-vip.controller.ts).
+
+### Background job
+
+`vip-scheduling.reconciliation.ts` (~60s): expires stale queue entries; emits `vip:scheduled_call:due` for confirmed calls past scheduled time.
+
+---
+
+## 22. Moments and Stories
+
+**Gated by:** `USE_MOMENTS=true` and `USE_CLOUDFLARE_STREAM=true`. Bootstrap: [`moments.bootstrap.ts`](../src/modules/moments/moments.bootstrap.ts).
+
+### Moments REST (`/api/v1/moments`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/` | Create paid/free moment (creator) |
+| GET | `/feed`, `/following` | Public and following feeds |
+| GET | `/creator/me`, `/creator/me/analytics` | Own moments + analytics |
+| GET | `/creator/:creatorId` | Creator's public moments |
+| GET/POST/DELETE | `/creators/:creatorId/follow` | Follow graph |
+| GET | `/:momentId` | Moment detail |
+| POST | `/:momentId/purchase` | Coin purchase |
+| POST | `/:momentId/playback`, `/complete` | Playback tokens |
+| DELETE | `/:momentId` | Delete (owner) |
+
+### Stories REST (`/api/v1/stories`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/` | Create story (creator) |
+| GET | `/feed` | Stories feed |
+| GET | `/creator/me`, `/creator/:creatorId` | Creator stories |
+| POST | `/:storyId/view`, `/playback`, `/complete` | View and playback |
+| GET | `/:storyId/viewers` | Viewers list (owner) |
+| DELETE | `/:storyId` | Delete (owner) |
+
+### Upload flow
+
+1. Creator → `POST /stream/direct-upload` → Cloudflare Stream URL
+2. Cloudflare webhook → `POST /stream/webhook` → Socket `media:ready`
+3. Creator commits moment/story → feed fanout queue → follower Redis ZSET caches
+
+### Admin moderation (`/admin/moments/*`)
+
+Purchase regrant/refund, moderation pending/escalated/approve/reject/escalate.
+
+### Workers (when enabled)
+
+| Job | Interval | Purpose |
+|-----|----------|---------|
+| Feed fanout drainer | 5s | `moments:fanout:queue` → follower caches |
+| Feed warm drainer | 10s | Pre-warm large creator following feeds |
+| Analytics drainer | 30s | `analytics:events` → Mongo |
+| Story expiry | 30 min | Delete expired stories + CF assets |
+| Thumbnail validation | 10 min | HEAD-check Stream thumbnails |
+
+See also: [`docs/MOMENTS_COMPREHENSIVE_REFERENCE.md`](../../docs/MOMENTS_COMPREHENSIVE_REFERENCE.md).
+
+---
+
+## 23. Cloudflare Stream uploads
+
+**Files:** `stream.routes.ts`, `stream.controller.ts`, `cloudflare-stream.client.ts`, `stream-upload-session.service.ts`
+
+**Config:** `CLOUDFLARE_STREAM_*` env vars in `.env.example`; master flag `USE_CLOUDFLARE_STREAM`.
+
+### REST (`/api/v1/stream`)
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| GET | `/health` | Public | Pipeline health |
+| POST | `/direct-upload` | Firebase (creator) | Signed upload URL |
+| GET | `/upload-status/:sessionId` | Firebase | Poll processing status |
+| POST | `/webhook` | Cloudflare signature | Processing state → `media:ready` |
+
+Used by Moments and Stories for video upload. Signed playback tokens via `signed-token.service.ts`.
+
+---
+
+## 24. Fraud and domain events
+
+### Fraud module
+
+**Files:** `modules/fraud/` — no direct HTTP routes; exposed via admin.
+
+| Admin endpoint | Purpose |
+|----------------|---------|
+| GET `/admin/fraud/signals` | List fraud signals |
+| GET `/admin/fraud/investigations` | Investigation cases |
+| POST `/admin/fraud/investigations/:id/notes` | Add note |
+| POST `/admin/fraud/rules/run` | Run detection rules (`FRAUD_STUB_RULES_ENABLED`) |
+
+**Models:** `FraudSignal`, `FraudInvestigation`.
+
+### Domain events (outbox)
+
+**Files:** `modules/events/domain-event.service.ts`, `domain-event.worker.ts`
+
+When `DOMAIN_EVENTS_ENABLED=true`, a worker (~5s) processes pending `DomainEvent` rows via `event-dispatcher.ts`. Used for staff dashboard invalidation over Socket.IO `/admin` namespace.
+
+**Admin ops:** `POST /admin/domain-events/:eventId/replay`, `GET /admin/audit-events`.
+
+### Audit
+
+**Files:** `modules/audit/audit-event.service.ts`, `AdminActionLog` model.
+
+Admin mutations log to `AdminActionLog`; domain-level audit stream in `AuditEvent`.
+
+---
+
+## 25. Appendix
 
 ### Environment variables (essential)
 
@@ -1062,11 +1258,17 @@ Contract tests (no I/O) for billing, payment webhooks, creator feed, admin dashb
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Payments |
 | `CLOUDFLARE_*` | Images |
 | `USE_CLOUDFLARE_IMAGES` | Image pipeline gate |
+| `USE_MOMENTS` / `USE_CLOUDFLARE_STREAM` | Moments/Stories module |
+| `VIP_ENABLED`, `VIP_SCHEDULING_ENABLED` | VIP features |
 | `BILLING_DRIVER` | `bullmq` for scale-out |
 | `BILLING_PROCESS_INTERVAL_MS` | Tick interval |
 | `CORS_ORIGIN` | Allowed web origins |
 | `PUBLIC_API_BASE_URL` | Web checkout API base |
 | `WEB_CHECKOUT_BASE_URL` | Checkout page host |
+
+### OpenAPI
+
+Auto-generated REST spec: [`openapi.yaml`](./openapi.yaml). Regenerate with `npm run generate:openapi` after route changes.
 
 ### Mobile API quick index (Flutter parity)
 

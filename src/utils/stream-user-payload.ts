@@ -1,5 +1,6 @@
 import type { IUser } from '../modules/user/user.model';
 import { Creator } from '../modules/creator/creator.model';
+import { isVipActive } from '../modules/vip/vip-entitlement.service';
 import type { IImageAsset } from '../modules/images/image-asset.schema';
 import { buildAvatarUrls } from '../modules/images/image-url';
 import { serializeAvatar, type AvatarSerialization } from '../modules/images/serialize-image-asset';
@@ -92,6 +93,7 @@ export type StreamUserUpsertInput = {
   appRole: 'user' | 'creator' | 'admin';
   username?: string;
   mongoId: string;
+  isVip?: boolean;
 };
 
 /**
@@ -107,6 +109,7 @@ export async function getStreamUpsertPayload(user: IUser): Promise<StreamUserUps
       .lean<{ name?: string; avatar?: IImageAsset | null } | null>();
   }
   const { name, image } = resolveChatPresentationFromDocs(user, creatorDoc);
+  const vipActive = appRole === 'user' ? await isVipActive(user._id) : false;
 
   return {
     name,
@@ -114,5 +117,6 @@ export async function getStreamUpsertPayload(user: IUser): Promise<StreamUserUps
     appRole,
     username: user.username?.trim() || undefined,
     mongoId,
+    isVip: vipActive || undefined,
   };
 }

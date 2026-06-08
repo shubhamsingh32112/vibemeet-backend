@@ -19,6 +19,7 @@ import {
 } from './chat-quota-period.util';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
+import { isVipActive } from '../vip/vip-entitlement.service';
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -239,14 +240,22 @@ export const createOrGetChannel = async (
     let freeRemaining = FREE_MESSAGES_PER_CREATOR;
     let costPerMessage = 0;
 
+    let isVipUnlimited = false;
+
     // Hard-guard: only billable roles get quota lookups
     if (isBillableRole(currentUser.role)) {
+      if (await isVipActive(currentUser._id)) {
+        isVipUnlimited = true;
+        freeRemaining = 0;
+        costPerMessage = 0;
+      }
+
       const creatorUid =
         otherUser.role === 'creator' || otherUser.role === 'admin'
           ? otherUid
           : null;
 
-      if (creatorUid) {
+      if (creatorUid && !isVipUnlimited) {
         const quota = await ChatMessageQuota.findOne({
           userFirebaseUid: currentUid,
           creatorFirebaseUid: creatorUid,
@@ -267,10 +276,11 @@ export const createOrGetChannel = async (
         type: 'messaging',
         cid: channel.cid,
         quota: {
-          freeRemaining,
+          freeRemaining: isVipUnlimited ? null : freeRemaining,
           costPerMessage,
           freeTotal: FREE_MESSAGES_PER_CREATOR,
           userCoins: currentUser.coins,
+          isVipUnlimited,
         },
       },
     });
@@ -331,6 +341,22 @@ export const preSendMessage = async (
           userCoins: user.coins,
         },
       });
+      return;
+    }
+
+    if (await isVipActive(user._id)) {
+      const vipResponse = {
+        success: true,
+        data: {
+          canSend: true,
+          freeRemaining: null,
+          coinsCharged: 0,
+          userCoins: user.coins,
+          isVipUnlimited: true,
+          billing: 'vip_unlimited',
+        },
+      };
+      res.json(vipResponse);
       return;
     }
 
@@ -597,6 +623,20 @@ export const getMessageQuota = async (
           costPerMessage: 0,
           freeTotal: FREE_MESSAGES_PER_CREATOR,
           userCoins: user.coins,
+        },
+      });
+      return;
+    }
+
+    if (await isVipActive(user._id)) {
+      res.json({
+        success: true,
+        data: {
+          freeRemaining: null,
+          costPerMessage: 0,
+          freeTotal: FREE_MESSAGES_PER_CREATOR,
+          userCoins: user.coins,
+          isVipUnlimited: true,
         },
       });
       return;

@@ -6,6 +6,7 @@ import {
   COST_PER_MESSAGE,
 } from './chat-message-quota.model';
 import { normalizeQuotaForCurrentPeriod } from './chat-quota-period.util';
+import { isVipActive } from '../vip/vip-entitlement.service';
 
 /**
  * Stream Chat webhook handler.
@@ -109,6 +110,11 @@ export const handleStreamWebhook = async (
       // ── Quota / coin backup check (catches bypassed clients) ───────
       const user = await User.findOne({ firebaseUid: userId });
       if (user && user.role === 'user' && payload.channel?.id) {
+        if (await isVipActive(user._id)) {
+          res.status(200).json({ success: true });
+          return;
+        }
+
         const channelId = payload.channel.id;
 
         // Resolve creator UID from channel members

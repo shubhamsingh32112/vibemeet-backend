@@ -19,6 +19,7 @@ import { processReferralRewardOnPurchase } from '../user/referral.service';
 import { finalizePaymentAtomically } from './payment-finalization.service';
 import { PaymentWebhookEvent } from './payment-webhook-event.model';
 import { recordPaymentMetric } from '../../utils/monitoring';
+import { applyRechargeDiscountForUser } from '../vip/vip-entitlement.service';
 
 const CHECKOUT_SESSION_TTL_SECONDS = 15 * 60;
 const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
@@ -283,12 +284,14 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       return;
     }
 
+    const priced = await applyRechargeDiscountForUser(user._id, pack.priceInr);
+
     const checkoutToken = signCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
       packageId: pack.packageId,
       coins: pack.coins,
-      priceInr: pack.priceInr,
+      priceInr: priced.priceInr,
       pricingTier,
     });
 
@@ -306,8 +309,10 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
         sessionId: checkoutToken,
         packageId: pack.packageId,
         coins: pack.coins,
-        priceInr: pack.priceInr,
-        amount: pack.priceInr * 100,
+        priceInr: priced.priceInr,
+        originalPriceInr: priced.originalPriceInr,
+        vipDiscountApplied: priced.vipDiscountApplied,
+        amount: priced.priceInr * 100,
         expiresInSeconds: CHECKOUT_SESSION_TTL_SECONDS,
       },
     });
@@ -362,7 +367,11 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
     }
 
     const razorpay = getRazorpayInstance();
-    const amountInPaise = activePack.priceInr * 100;
+    const chargedPriceInr =
+      typeof session.priceInr === 'number' && session.priceInr > 0
+        ? session.priceInr
+        : activePack.priceInr;
+    const amountInPaise = chargedPriceInr * 100;
 
     const order = await razorpay.orders.create({
       amount: amountInPaise,
@@ -373,12 +382,17 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
         firebaseUid: user.firebaseUid,
         packageId: session.packageId,
         coins: activePack.coins.toString(),
-        priceInr: activePack.priceInr.toString(),
+        priceInr: chargedPriceInr.toString(),
         pricingTier: session.pricingTier,
       },
     });
 
-    await createPendingCoinTransaction(user._id.toString(), order.id, activePack.coins, activePack.priceInr);
+    await createPendingCoinTransaction(
+      user._id.toString(),
+      order.id,
+      activePack.coins,
+      chargedPriceInr,
+    );
 
     if (!process.env.RAZORPAY_KEY_ID) {
       recordPaymentMetric('web.create_order_failed', 1, { reason: 'missing_razorpay_key_id' });
@@ -999,20 +1013,28 @@ export const getWalletPackages = async (req: Request, res: Response): Promise<vo
     const hasPurchasedCoinPackage = pricingTier === 'tier2';
     const config = await getOrCreateWalletPricingConfig();
 
-    const packages = config.packages
-      .filter((p) => p.isActive)
-      .sort((a, b) => {
-        if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
-        return a.coins - b.coins;
-      })
-      .map((p) => ({
-        packageId: normalizePackageId(p.coins),
-        coins: p.coins,
-        priceInr: getEffectivePackPrice(p, pricingTier),
-        oldPriceInr: p.oldPriceInr,
-        badge: p.badge,
-        sortOrder: p.sortOrder,
-      }));
+    const packages = await Promise.all(
+      config.packages
+        .filter((p) => p.isActive)
+        .sort((a, b) => {
+          if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+          return a.coins - b.coins;
+        })
+        .map(async (p) => {
+          const basePrice = getEffectivePackPrice(p, pricingTier);
+          const priced = await applyRechargeDiscountForUser(user._id, basePrice);
+          return {
+            packageId: normalizePackageId(p.coins),
+            coins: p.coins,
+            priceInr: priced.priceInr,
+            originalPriceInr: priced.vipDiscountApplied ? priced.originalPriceInr : undefined,
+            vipDiscountApplied: priced.vipDiscountApplied,
+            oldPriceInr: p.oldPriceInr,
+            badge: p.badge,
+            sortOrder: p.sortOrder,
+          };
+        }),
+    );
 
     res.json({
       success: true,

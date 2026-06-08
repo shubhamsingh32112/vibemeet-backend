@@ -27,6 +27,7 @@ import {
   enqueueFanoutTask,
   orderMomentsByIds,
   removeCreatorFromFollowingFeedCache,
+  removeMomentFromFollowerFeeds,
 } from '../services/feed-fanout.service';
 import { logError } from '../../../utils/logger';
 import { emitMomentUploaded, emitMomentPurchased, emitCreatorFollowed } from '../moments.gateway';
@@ -346,6 +347,7 @@ export async function deleteMomentHandler(req: Request, res: Response): Promise<
     }
     moment.isDeleted = true;
     await moment.save();
+    void removeMomentFromFollowerFeeds(moment._id.toString(), creator._id.toString());
     res.json({ success: true });
   } catch (error) {
     logError('Delete moment failed', error);

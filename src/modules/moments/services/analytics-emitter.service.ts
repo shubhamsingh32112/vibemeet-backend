@@ -2,7 +2,6 @@ import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { getMomentsConfig } from '../../../config/moments';
 import { AnalyticsEvent, type AnalyticsEventType } from '../models/analytics-event.model';
 import { CreatorMoment } from '../models/creator-moment.model';
-import { CreatorStory } from '../../stories/models/creator-story.model';
 import { logWarning } from '../../../utils/logger';
 
 const QUEUE_KEY = 'analytics:events';
@@ -95,9 +94,9 @@ async function updateCountersAsync(event: AnalyticsEventPayload): Promise<void> 
   try {
     if (event.type === 'moment_viewed') {
       await CreatorMoment.updateOne({ _id: event.targetId }, { $inc: { viewsCount: 1 } });
-    } else if (event.type === 'story_opened') {
-      await CreatorStory.updateOne({ _id: event.targetId }, { $inc: { viewsCount: 1 } });
     }
+    // story_opened: viewsCount is incremented in recordStoryViewHandler when
+    // the StoryView doc is created — do not double-count here.
   } catch (err) {
     logWarning('Analytics counter update failed', { error: String(err), type: event.type });
   }

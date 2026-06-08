@@ -9,6 +9,9 @@ import { transitionCreatorPresence } from '../availability/presence.service';
 import { resolveBillingRuntimeState } from '../billing/billing-runtime-resolver.service';
 import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
+import { User } from '../user/user.model';
+import { Creator } from '../creator/creator.model';
+import { popNextQueuedCaller } from '../vip/vip-call-queue.service';
 
 const FINALIZE_LOCK_TTL_SECONDS = 45;
 const FINALIZE_DONE_TTL_SECONDS = 60 * 15;
@@ -188,6 +191,30 @@ export async function finalizeCallEnd(
     await redis.set(doneKey, source, 'EX', FINALIZE_DONE_TTL_SECONDS);
     recordCallMetric('call.finalize.success', 1, { source });
     logInfo('Call finalization completed', { callId, source, hasCallRecord: !!call });
+
+    if (call?.creatorUserId) {
+      try {
+        const creatorUser = await User.findById(call.creatorUserId)
+          .select('firebaseUid')
+          .lean();
+        if (creatorUser?.firebaseUid) {
+          const next = await popNextQueuedCaller(creatorUser.firebaseUid);
+          if (next) {
+            const creator = await Creator.findOne({ userId: call.creatorUserId })
+              .select('_id')
+              .lean();
+            io.to(`user:${next.callerFirebaseUid}`).emit('vip:call:ready_to_ring', {
+              creatorFirebaseUid: creatorUser.firebaseUid,
+              creatorId: creator?._id?.toString(),
+              entryId: next.entryId,
+            });
+          }
+        }
+      } catch (queueErr) {
+        logError('vip_queue_dequeue_failed', queueErr, { callId, source });
+      }
+    }
+
     return { finalized: true, deduped: false };
   } catch (error) {
     recordCallMetric('call.finalize.error', 1, { source });

@@ -18,6 +18,7 @@ import metricsRoutes from './modules/metrics/metrics.routes';
 import storiesRoutes from './modules/stories/routes/stories.routes';
 import momentsRoutes from './modules/moments/routes/moments.routes';
 import streamRoutes from './modules/stream/stream.routes';
+import vipRoutes from './modules/vip/vip.routes';
 
 const router = Router();
 
@@ -40,5 +41,6 @@ router.use('/metrics', metricsRoutes);
 router.use('/stories', storiesRoutes);
 router.use('/moments', momentsRoutes);
 router.use('/stream', streamRoutes);
+router.use('/vip', vipRoutes);
 
 export default router;
