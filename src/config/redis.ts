@@ -208,6 +208,20 @@ export const creatorPresenceKey = (firebaseUid: string): string =>
 export const creatorAvailOnlineSinceKey = (firebaseUid: string): string =>
   `creator:avail_online_since:${firebaseUid}`;
 
+// Presence socket registry (Milestone B — cross-node socket coordination)
+export const PRESENCE_SOCKETS_KEY_PREFIX = 'presence:sockets:';
+export const PRESENCE_HB_OWNER_KEY_PREFIX = 'presence:hb:owner:';
+export const PRESENCE_DISCONNECT_GRACE_KEY_PREFIX = 'presence:disconnect:grace:';
+
+export const presenceSocketsKey = (firebaseUid: string): string =>
+  `${PRESENCE_SOCKETS_KEY_PREFIX}${firebaseUid}`;
+
+export const presenceHbOwnerKey = (firebaseUid: string): string =>
+  `${PRESENCE_HB_OWNER_KEY_PREFIX}${firebaseUid}`;
+
+export const presenceDisconnectGraceKey = (firebaseUid: string): string =>
+  `${PRESENCE_DISCONNECT_GRACE_KEY_PREFIX}${firebaseUid}`;
+
 // Call billing Redis key helpers
 export const CALL_SESSION_PREFIX = 'call:session:';
 export const CALL_USER_COINS_PREFIX = 'call:user_coins:';

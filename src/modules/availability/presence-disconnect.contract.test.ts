@@ -69,3 +69,31 @@ test('presence metadata key is used for monotonic versioning', () => {
   const src = readFileSync(join(__dirname, 'presence.service.ts'), 'utf8');
   assert.ok(src.includes('creator:presence:meta:'));
 });
+
+test('availability gateway uses presence socket tracker and registry flags', () => {
+  const gateway = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  const flags = readFileSync(join(__dirname, 'presence-registry-flags.ts'), 'utf8');
+  assert.ok(gateway.includes('presence-socket-tracker'));
+  assert.ok(gateway.includes('useRegistryAsAuthoritative'));
+  assert.ok(flags.includes('PRESENCE_REGISTRY_SHADOW'));
+  assert.ok(flags.includes('isPresenceRegistryShadow'));
+});
+
+test('creator heartbeat re-verifies lease before transitionCreatorPresence', () => {
+  const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  const block = src.slice(src.indexOf('async function startCreatorHeartbeat'), src.indexOf('function startUserHeartbeat'));
+  const first = block.indexOf('isHeartbeatLeaseHolder');
+  const second = block.indexOf('isHeartbeatLeaseHolder', first + 1);
+  assert.ok(first >= 0);
+  assert.ok(second > first);
+  assert.ok(block.includes('presence.heartbeat_lease_lost_before_write'));
+  assert.ok(src.includes('renewHeartbeatLeaseOrStop'));
+  assert.ok(src.includes('stop interval immediately'));
+});
+
+test('creator disconnect grace uses redis grace key and skip metric', () => {
+  const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  assert.ok(src.includes('startDisconnectGrace'));
+  assert.ok(src.includes('presence.grace_callback_skipped'));
+  assert.ok(src.includes('cancelDisconnectGrace'));
+});

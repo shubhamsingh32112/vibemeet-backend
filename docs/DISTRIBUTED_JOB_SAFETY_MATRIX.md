@@ -26,7 +26,7 @@ Post–Milestone A state (2026-06-08). Source: code in `backend/src` after P0 se
 | Staff wallet recon | `staff-wallet-reconciliation.scheduler.ts` | 24h | **Unsafe** | none | Defer unless enabled in staging |
 | Moments story expiry | various | periodic | Documented only | — | Idempotent |
 | Stream upload sweeper | `stream-upload-session.service.ts` | periodic | Documented only | — | Idempotent |
-| Presence heartbeat sweep | `availability.gateway.ts` | 30s | **Unsafe** | none | Blocked until Milestone B (Phase 3) |
+| Presence heartbeat sweep | `availability.gateway.ts` | 30s | **Safe when `PRESENCE_REDIS_SOCKET_REGISTRY_ENABLED=true`** | Redis socket registry | Unsafe with local Maps only |
 | API hygiene intervals | `bootstrap-core.ts` | varies | Per-replica safe | — | |
 
 ## Lock observability
@@ -41,5 +41,5 @@ Fields: `instanceId`, `lockKey`, `event`.
 ## Scaling guidance
 
 - **billing-worker:** Safe to run ≥2 tasks after Milestone A (watchdog + VIP recon singleton).
-- **api-ws:** Keep ALB stickiness until Phase 3 presence registry; heartbeat sweep remains unsafe across tasks.
+- **api-ws:** With `PRESENCE_REDIS_SOCKET_REGISTRY_ENABLED=true`, heartbeat sweep uses cluster-wide `hasAnySocket`; ALB stickiness optional.
 - **DOMAIN_EVENTS_ENABLED:** Only enable after Milestone A staging validates claim + lock behavior.

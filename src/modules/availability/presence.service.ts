@@ -585,6 +585,26 @@ export async function transitionCreatorPresence(
     });
   }
 
+  if (
+    eventType === 'HEARTBEAT' &&
+    process.env.PRESENCE_HEARTBEAT_TTL_SKIP_ENABLED !== 'false'
+  ) {
+    const ttl = await redis.ttl(availabilityKey(firebaseUid));
+    if (
+      ttl > PRESENCE_TTL_SECONDS * 0.5 &&
+      nextState === current.state &&
+      nextBase === current.base
+    ) {
+      recordCallMetric('presence.heartbeat_ttl_skip', 1, { endpointMode });
+      return {
+        state: current.state,
+        updatedAt: current.updatedAt,
+        source: current.source,
+        version: current.version,
+      };
+    }
+  }
+
   const retries = featureFlags.creatorPresenceWriterRetryEnabled ? PRESENCE_WRITE_MAX_RETRIES : 0;
   const maxAttempts = 1 + retries;
   let writeSucceeded = false;

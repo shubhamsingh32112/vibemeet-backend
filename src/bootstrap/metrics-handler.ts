@@ -55,7 +55,14 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
     const creatorUidContractViolationRateMetric =
       byName['call.presence.creator_uid_contract_violation_rate'];
     const creatorTransitionRetryMetric = byName['call.presence.creator_transition_retry_count'];
-    const creatorStatusPropagation = byName['presence.creator_status_propagation_ms'];
+    const creatorStatusPropagation = byName['call.presence.creator_status_propagation_ms'];
+    const registryShadowMismatch = byName['call.presence.registry.shadow_mismatch'];
+    const registryRegister = byName['call.presence.registry.register'];
+    const registryUnregister = byName['call.presence.registry.unregister'];
+    const heartbeatLeaseLost = byName['call.presence.heartbeat_lease_lost_before_write'];
+    const heartbeatLeaseRenewFailed = byName['call.presence.heartbeat_lease_renew_failed'];
+    const graceCallbackSkipped = byName['call.presence.grace_callback_skipped'];
+    const heartbeatTtlSkip = byName['call.presence.heartbeat_ttl_skip'];
     const paymentWebhookVerifyFail = byName['payment.webhook.verify_failed'];
     const paymentWebhookVerifySuccess = byName['payment.webhook.verify_success'];
     const paymentWebhookProcessed = byName['payment.webhook.processed'];
@@ -540,6 +547,13 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
           : null,
       },
       presence: {
+        registryShadowMismatch: registryShadowMismatch?.sum ?? 0,
+        registryRegister: registryRegister?.sum ?? 0,
+        registryUnregister: registryUnregister?.sum ?? 0,
+        heartbeatLeaseLostBeforeWrite: heartbeatLeaseLost?.sum ?? 0,
+        heartbeatLeaseRenewFailed: heartbeatLeaseRenewFailed?.sum ?? 0,
+        graceCallbackSkipped: graceCallbackSkipped?.sum ?? 0,
+        heartbeatTtlSkip: heartbeatTtlSkip?.sum ?? 0,
         creatorStatusPropagationMs: creatorStatusPropagation
           ? {
               samples: creatorStatusPropagation.count,

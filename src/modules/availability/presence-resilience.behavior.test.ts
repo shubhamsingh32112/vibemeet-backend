@@ -15,6 +15,7 @@ import { featureFlags } from '../../config/feature-flags';
 
 class FlakyInMemoryRedis {
   private store = new Map<string, string>();
+  private ttls = new Map<string, number>();
   private failNextExec = false;
 
   failNextTransitionWrite(): void {
@@ -25,9 +26,14 @@ class FlakyInMemoryRedis {
     return this.store.has(key) ? this.store.get(key)! : null;
   }
 
-  async setex(key: string, _ttl: number, value: string): Promise<'OK'> {
+  async setex(key: string, ttl: number, value: string): Promise<'OK'> {
     this.store.set(key, value);
+    this.ttls.set(key, ttl);
     return 'OK';
+  }
+
+  async ttl(key: string): Promise<number> {
+    return this.ttls.get(key) ?? -1;
   }
 
   async set(key: string, value: string, ..._args: Array<string | number>): Promise<'OK' | null> {
@@ -226,4 +232,36 @@ test('uid enforce mode drops invalid entries but keeps valid lookups', async () 
     featureFlags.creatorPresenceUidContractEnforced = previous;
     resetRedisForTests();
   }
+});
+
+test('HEARTBEAT skips MULTI when availability TTL is above 50 percent', async () => {
+  monitoring.clear();
+  const redis = new FlakyInMemoryRedis();
+  setRedisForTests(redis as any);
+  const { io } = createMockIo();
+  setIO(io as any);
+
+  const uid = 'creator_hb_skip';
+  await redis.setex(availabilityKey(uid), 180, 'online');
+  await redis.setex(creatorPresenceKey(uid), 180, JSON.stringify({
+    state: 'online',
+    updatedAt: Date.now(),
+    source: 'test.heartbeat_skip',
+    version: 10,
+  }));
+  await redis.setex(creatorPresenceMetaKey(uid), 180, JSON.stringify({
+    base: 'online',
+    updatedAt: Date.now(),
+    source: 'test.heartbeat_skip',
+    version: 10,
+  }));
+  await redis.ttl(availabilityKey(uid));
+  (redis as any).ttls.set(availabilityKey(uid), 120);
+
+  const before = monitoring.getMetricsSummary().byName['call.presence.heartbeat_ttl_skip']?.sum ?? 0;
+  await transitionCreatorPresence(io as any, uid, 'HEARTBEAT', 'test.heartbeat_skip');
+  const after = monitoring.getMetricsSummary().byName['call.presence.heartbeat_ttl_skip']?.sum ?? 0;
+  assert.equal(after, before + 1);
+
+  resetRedisForTests();
 });
