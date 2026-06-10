@@ -36,19 +36,42 @@ let billingQueue: Queue | null = null;
 let billingWorker: Worker | null = null;
 let lastQueueStatsAt = 0;
 
-function readBullmqConcurrency(): number {
+export function readBullmqConcurrency(): number {
   const fallback = parseInt(
-    process.env.BILLING_BATCH_SIZE || process.env.BILLING_DEFAULT_BULLMQ_CONCURRENCY || '130',
+    process.env.BILLING_BATCH_SIZE || process.env.BILLING_DEFAULT_BULLMQ_CONCURRENCY || '50',
     10
   );
   const raw = parseInt(process.env.BILLING_BULLMQ_CONCURRENCY || String(fallback), 10);
   if (!Number.isFinite(raw)) {
-    return 130;
+    return 50;
   }
   if (raw <= 0) {
     return 0;
   }
   return Math.min(200, Math.max(1, raw));
+}
+
+export async function getBillingQueueSnapshot(): Promise<{
+  active: number;
+  waiting: number;
+  delayed: number;
+  concurrency: number;
+} | null> {
+  if (!isBullmqBillingEnabled() || !isRedisConfigured()) {
+    return null;
+  }
+  try {
+    const q = getQueue();
+    const counts = await q.getJobCounts('active', 'waiting', 'delayed');
+    return {
+      active: Number(counts.active || 0),
+      waiting: Number(counts.waiting || 0),
+      delayed: Number(counts.delayed || 0),
+      concurrency: readBullmqConcurrency(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function shouldStartBillingBullWorker(): boolean {

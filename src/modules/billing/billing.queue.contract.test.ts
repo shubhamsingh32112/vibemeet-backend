@@ -17,6 +17,12 @@ test('billingCycleJobId matches BullMQ jobId used for deduplication', () => {
   assert.ok(!billingCycleJobId('call:terminal:abc').includes(':'));
 });
 
+test('BullMQ concurrency fallback defaults to 50 for ECS tuning', () => {
+  const src = readFileSync(join(__dirname, 'billing.queue.ts'), 'utf8');
+  assert.ok(src.includes("|| '50'"));
+  assert.ok(src.includes('return 50'));
+});
+
 test('billing cycle jobs persist completion/failure history', () => {
   const src = readFileSync(join(__dirname, 'billing.queue.ts'), 'utf8');
   assert.ok(src.includes('removeOnComplete: 200'));

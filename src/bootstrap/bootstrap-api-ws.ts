@@ -7,8 +7,15 @@ import { setupBillingGateway } from '../modules/billing/billing.gateway';
 import { setupMomentsGateway } from '../modules/moments/moments.gateway';
 import { setupAdminGateway } from '../modules/admin/admin.gateway';
 import { logInfo, logError } from '../utils/logger';
+import { shouldRebuildCreatorFeedRankOnStartup } from '../modules/creator/creator-feed-rank-flags';
+import { rebuildCreatorFeedRankIndex } from '../modules/creator/creator-feed-rank.service';
 
 export function bootstrapApiWs(io: Server): void {
+  if (shouldRebuildCreatorFeedRankOnStartup()) {
+    rebuildCreatorFeedRankIndex().catch((err) => {
+      logError('Creator feed rank startup rebuild failed', err);
+    });
+  }
   setupAvailabilityGateway(io);
   setupMomentsGateway(io);
   logInfo('Socket.IO availability gateway ready');

@@ -13,6 +13,16 @@ import { applyCreatorAvailabilityIntent } from '../availability/availability.gat
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
 import { getBatchCreatorPresence, normalizeFirebaseUids } from '../availability/presence.service';
 import {
+  addCreatorFirebaseUidToCache,
+  getCreatorFirebaseUidsCached,
+  removeCreatorFirebaseUidFromCache,
+} from './creator-uids-cache.service';
+import {
+  getAvailabilityFeedPageFromRank,
+  recordFeedRankShadowMismatchIfNeeded,
+  removeCreatorFromFeedRank,
+} from './creator-feed-rank.service';
+import {
   getRedis,
   creatorDashboardKey,
   CREATOR_DASHBOARD_TTL,
@@ -26,8 +36,6 @@ import {
   creatorDetailCacheKey,
   CREATOR_FEED_TTL,
   CREATOR_DETAIL_TTL,
-  CREATOR_UIDS_CACHE_KEY,
-  CREATOR_UIDS_TTL,
   registerCreatorFeedCacheKey,
   registerCreatorDetailCacheKey,
   invalidateCreatorCatalogCaches,
@@ -203,72 +211,109 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
 
       if (feedSort === 'availability') {
         const tAvailSort = Date.now();
-        const minimal = await Creator.find({})
-          .select('_id userId firebaseUid createdAt')
-          .lean();
-        total = minimal.length;
+        let pageIds: mongoose.Types.ObjectId[] = [];
+        let firebaseUidByUserId = new Map<string, string | null>();
+        const rankPage = await getAvailabilityFeedPageFromRank(skip, limit);
 
-        if (total > 5000) {
-          logWarning('creator.feed.availability_sort_large_catalog', {
-            count: total,
-            page,
-            limit,
+        const buildLegacyAvailabilityPage = async (): Promise<mongoose.Types.ObjectId[]> => {
+          const minimal = await Creator.find({})
+            .select('_id userId firebaseUid createdAt')
+            .lean();
+          total = minimal.length;
+
+          if (total > 5000) {
+            logWarning('creator.feed.availability_sort_large_catalog', {
+              count: total,
+              page,
+              limit,
+            });
+          }
+
+          const missingUidUserIds = allowFallbackJoin
+            ? minimal
+                .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
+                .map((c) => c.userId)
+                .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
+            : [];
+          const linkedUsers =
+            allowFallbackJoin && missingUidUserIds.length
+              ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
+              : [];
+          firebaseUidByUserId = new Map(
+            linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
+          );
+
+          type RankRow = {
+            id: mongoose.Types.ObjectId;
+            firebaseUid: string | null;
+            createdAt: Date;
+          };
+          const rankRows: RankRow[] = minimal.map((c) => {
+            const firebaseUid =
+              c.firebaseUid && String(c.firebaseUid).trim() !== ''
+                ? String(c.firebaseUid).trim()
+                : allowFallbackJoin && c.userId
+                  ? (firebaseUidByUserId.get(c.userId.toString()) ?? null)
+                  : null;
+            if (!firebaseUid) missingCreatorFirebaseUidCount += 1;
+            return { id: c._id, firebaseUid, createdAt: c.createdAt };
           });
+
+          const normalized = normalizeFirebaseUids(
+            rankRows.map((r) => r.firebaseUid).filter((uid): uid is string => uid !== null),
+          );
+          const presenceMap =
+            normalized.firebaseUids.length > 0
+              ? await getBatchCreatorPresence(normalized.firebaseUids)
+              : {};
+
+          rankRows.sort((a, b) => {
+            const aState = a.firebaseUid ? presenceMap[a.firebaseUid]?.state : 'offline';
+            const bState = b.firebaseUid ? presenceMap[b.firebaseUid]?.state : 'offline';
+            const rankDiff = availabilityRank(aState) - availabilityRank(bState);
+            if (rankDiff !== 0) return rankDiff;
+            return b.createdAt.getTime() - a.createdAt.getTime();
+          });
+
+          return rankRows.slice(skip, skip + limit).map((r) => r.id);
+        };
+
+        if (rankPage && rankPage.pageIds.length > 0) {
+          total = rankPage.total;
+          pageIds = rankPage.pageIds;
+          if (process.env.CREATOR_FEED_RANK_SHADOW === 'true') {
+            const rankTotal = total;
+            const legacyIds = await buildLegacyAvailabilityPage();
+            total = rankTotal;
+            await recordFeedRankShadowMismatchIfNeeded(
+              legacyIds.map((id) => id.toString()),
+              pageIds.map((id) => id.toString()),
+            );
+          }
+        } else {
+          pageIds = await buildLegacyAvailabilityPage();
         }
 
-        const missingUidUserIds = allowFallbackJoin
-          ? minimal
-              .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
-              .map((c) => c.userId)
-              .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
-          : [];
-        const linkedUsers =
-          allowFallbackJoin && missingUidUserIds.length
-            ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
-            : [];
-        const firebaseUidByUserId = new Map(
-          linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
-        );
-
-        type RankRow = {
-          id: mongoose.Types.ObjectId;
-          firebaseUid: string | null;
-          createdAt: Date;
-        };
-        const rankRows: RankRow[] = minimal.map((c) => {
-          const firebaseUid =
-            c.firebaseUid && String(c.firebaseUid).trim() !== ''
-              ? String(c.firebaseUid).trim()
-              : allowFallbackJoin && c.userId
-                ? (firebaseUidByUserId.get(c.userId.toString()) ?? null)
-                : null;
-          if (!firebaseUid) missingCreatorFirebaseUidCount += 1;
-          return { id: c._id, firebaseUid, createdAt: c.createdAt };
-        });
-
-        const normalized = normalizeFirebaseUids(
-          rankRows.map((r) => r.firebaseUid).filter((uid): uid is string => uid !== null),
-        );
-        const presenceMap =
-          normalized.firebaseUids.length > 0
-            ? await getBatchCreatorPresence(normalized.firebaseUids)
-            : {};
-
-        rankRows.sort((a, b) => {
-          const aState = a.firebaseUid ? presenceMap[a.firebaseUid]?.state : 'offline';
-          const bState = b.firebaseUid ? presenceMap[b.firebaseUid]?.state : 'offline';
-          const rankDiff = availabilityRank(aState) - availabilityRank(bState);
-          if (rankDiff !== 0) return rankDiff;
-          return b.createdAt.getTime() - a.createdAt.getTime();
-        });
-
-        const pageSlice = rankRows.slice(skip, skip + limit);
-        const pageIds = pageSlice.map((r) => r.id);
         const creators =
           pageIds.length > 0
             ? await Creator.find({ _id: { $in: pageIds } }).select(feedSelect).lean()
             : [];
         const creatorById = new Map(creators.map((c) => [c._id.toString(), c]));
+
+        if (allowFallbackJoin && firebaseUidByUserId.size === 0) {
+          const missingUidUserIds = creators
+            .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
+            .map((c) => c.userId)
+            .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+          if (missingUidUserIds.length) {
+            const linkedUsers = await User.find({ _id: { $in: missingUidUserIds } })
+              .select('_id firebaseUid')
+              .lean();
+            firebaseUidByUserId = new Map(
+              linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
+            );
+          }
+        }
 
         const availSortMs = Date.now() - tAvailSort;
         recordFeedMetric('creator_feed_availability_sort_ms', availSortMs, {
@@ -284,8 +329,8 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
           limit: String(limit),
         });
 
-        baseRows = pageSlice
-          .map((row) => creatorById.get(row.id.toString()))
+        baseRows = pageIds
+          .map((id) => creatorById.get(id.toString()))
           .filter((c): c is NonNullable<typeof c> => Boolean(c))
           .map((creator) => {
             const avatar = serializeCreatorImages(creator as unknown as ICreator).avatar;
@@ -537,86 +582,13 @@ export const getCreatorFirebaseUids = async (req: Request, res: Response): Promi
       return;
     }
 
-    if (isRedisConfigured()) {
-      const cached = await safeRedisGet<{ firebaseUids: string[] }>(CREATOR_UIDS_CACHE_KEY);
-      if (cached?.firebaseUids) {
-        if (cached.firebaseUids.length > 0) {
-          logInfo('creator.uids.timing', {
-            cacheHit: true,
-            totalMs: Date.now() - t0,
-            count: cached.firebaseUids.length,
-          });
-          res.json({ success: true, data: { firebaseUids: cached.firebaseUids } });
-          return;
-        }
-        const hasAnyCreator = await Creator.exists({});
-        if (!hasAnyCreator) {
-          logInfo('creator.uids.timing', { cacheHit: true, totalMs: Date.now() - t0, count: 0 });
-          res.json({ success: true, data: { firebaseUids: cached.firebaseUids } });
-          return;
-        }
-        logInfo('creator.uids.cache_empty_bypass', {
-          reason: 'creator_exists_but_cached_uid_list_empty',
-        });
-      }
-    }
+    const { firebaseUids, cacheHit } = await getCreatorFirebaseUidsCached();
 
-    const tMongo = Date.now();
-    const allowFallbackJoin = process.env.ENABLE_CREATOR_UID_FALLBACK_JOIN === 'true';
-
-    const creatorRows = await Creator.find({}).select(allowFallbackJoin ? 'firebaseUid userId' : 'firebaseUid').lean();
-    const missingUidUserIds = allowFallbackJoin
-      ? creatorRows
-          .filter((c) => !c.firebaseUid || String(c.firebaseUid).trim() === '')
-          .map((c) => (c as { userId?: mongoose.Types.ObjectId }).userId)
-          .filter((id): id is mongoose.Types.ObjectId => Boolean(id))
-      : [];
-    const linkedUsers =
-      allowFallbackJoin && missingUidUserIds.length
-        ? await User.find({ _id: { $in: missingUidUserIds } }).select('_id firebaseUid').lean()
-        : [];
-    const uidByUserId = new Map(
-      linkedUsers.map((u) => [u._id.toString(), (u.firebaseUid ?? null) as string | null] as const),
-    );
-    const mongoMs = Date.now() - tMongo;
-
-    const uidSet = new Set<string>();
-    for (const c of creatorRows) {
-      const direct = c.firebaseUid;
-      if (typeof direct === 'string') {
-        const trimmed = direct.trim();
-        if (trimmed.length > 0) uidSet.add(trimmed);
-        continue;
-      }
-      if (allowFallbackJoin) {
-        const userId = (c as { userId?: mongoose.Types.ObjectId }).userId;
-        const fallback =
-          userId && uidByUserId.get(userId.toString())
-            ? uidByUserId.get(userId.toString())
-            : null;
-        if (typeof fallback === 'string') {
-          const trimmed = fallback.trim();
-          if (trimmed.length > 0) uidSet.add(trimmed);
-        }
-      }
-    }
-    const firebaseUids = Array.from(uidSet);
-
-    if (allowFallbackJoin && missingUidUserIds.length > 0) {
-      logError('creator.uid.fallback.used', new Error('creator firebaseUid missing'), {
-        endpoint: 'GET /creator/uids',
-        allowFallbackJoin,
-        missingCount: missingUidUserIds.length,
-      });
-    }
-
-    if (isRedisConfigured()) {
-      await safeRedisSet(CREATOR_UIDS_CACHE_KEY, JSON.stringify({ firebaseUids }), {
-        ex: CREATOR_UIDS_TTL,
-      });
-    }
-
-    logInfo('creator.uids.timing', { cacheHit: false, mongoMs, totalMs: Date.now() - t0, count: firebaseUids.length });
+    logInfo('creator.uids.timing', {
+      cacheHit,
+      totalMs: Date.now() - t0,
+      count: firebaseUids.length,
+    });
     res.json({ success: true, data: { firebaseUids } });
   } catch (error) {
     logError('Get creator firebase UIDs error', error);
@@ -1053,6 +1025,11 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
 
     invalidateCreatorCatalogCaches().catch(() => {});
     invalidateCreatorDetailCache(creator._id.toString()).catch(() => {});
+    const createdUid =
+      (creator.firebaseUid && String(creator.firebaseUid).trim()) ||
+      (targetUser.firebaseUid && String(targetUser.firebaseUid).trim()) ||
+      '';
+    if (createdUid) addCreatorFirebaseUidToCache(createdUid).catch(() => {});
     
     res.status(201).json({
       success: true,
@@ -1375,6 +1352,10 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
     }
     
     const userId = creator.userId;
+    const deletedFirebaseUid =
+      creator.firebaseUid && String(creator.firebaseUid).trim()
+        ? String(creator.firebaseUid).trim()
+        : '';
     
     // Atomic operation: Delete creator profile + Downgrade user role (using transaction)
     const session = await mongoose.startSession();
@@ -1417,6 +1398,10 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
 
       invalidateCreatorCatalogCaches().catch(() => {});
       invalidateCreatorDetailCache(id).catch(() => {});
+      if (deletedFirebaseUid) {
+        removeCreatorFirebaseUidFromCache(deletedFirebaseUid).catch(() => {});
+      }
+      removeCreatorFromFeedRank(id).catch(() => {});
       
       res.json({
         success: true,

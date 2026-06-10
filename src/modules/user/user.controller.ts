@@ -8,7 +8,8 @@ import { CallHistory } from '../billing/call-history.model';
 import { DeletedUserPhone } from './deleted-user-phone.model';
 import { upsertDeletedIdentities } from './deleted-identity.service';
 import { randomUUID } from 'crypto';
-import { invalidateAdminCaches } from '../../config/redis';
+import { invalidateAdminCaches, invalidateCreatorCatalogCaches } from '../../config/redis';
+import { addCreatorFirebaseUidToCache } from '../creator/creator-uids-cache.service';
 import { getIO } from '../../config/socket';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
@@ -1651,6 +1652,12 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
 
       // Invalidate admin caches after promotion
       invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
+      invalidateCreatorCatalogCaches().catch(() => {});
+      const promotedUid =
+        (createdCreator.firebaseUid && String(createdCreator.firebaseUid).trim()) ||
+        (targetUser.firebaseUid && String(targetUser.firebaseUid).trim()) ||
+        '';
+      if (promotedUid) addCreatorFirebaseUidToCache(promotedUid).catch(() => {});
 
       res.status(201).json({
         success: true,

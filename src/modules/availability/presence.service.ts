@@ -695,6 +695,23 @@ export async function transitionCreatorPresence(
   await updateOnlinePresenceSets(firebaseUid, nextState === 'online' ? 'online' : 'offline', scope);
 
   const statusChanged = current.state !== nextRecord.state || current.base !== nextBase;
+
+  if (statusChanged) {
+    import('../creator/creator-feed-rank.service')
+      .then(async ({ updateCreatorFeedRankOnPresence }) => {
+        const { Creator } = await import('../creator/creator.model');
+        const row = await Creator.findOne({ firebaseUid }).select('_id createdAt').lean();
+        if (!row?._id) return;
+        await updateCreatorFeedRankOnPresence(
+          row._id.toString(),
+          firebaseUid,
+          nextRecord.state,
+          row.createdAt?.getTime() ?? Date.now(),
+        );
+      })
+      .catch(() => {});
+  }
+
   if (
     statusChanged ||
     eventType === 'RECOVERED' ||

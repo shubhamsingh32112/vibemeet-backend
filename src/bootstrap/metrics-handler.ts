@@ -1,10 +1,13 @@
 import express from 'express';
-import { isRedisConfigured, getRedis, metricsKey } from '../config/redis';
+import { isRedisConfigured, getRedis, metricsKey, DLQ_BILLING_PREFIX } from '../config/redis';
 import { mongoPoolMonitor } from '../utils/mongo-pool-monitor';
 import { getRequestQueueStats } from '../middlewares/request-queue.middleware';
 import { getDriverMetrics } from '../utils/driver-metrics';
 import { monitoring } from '../utils/monitoring';
 import { logError } from '../utils/logger';
+import { getBillingInstanceId } from '../modules/billing/billing-instance-id';
+import { getBillingQueueSnapshot, readBullmqConcurrency } from '../modules/billing/billing.queue';
+import { getCreatorFeedRankZcard } from '../modules/creator/creator-feed-rank.service';
 
 export async function metricsRequestHandler(req: express.Request, res: express.Response): Promise<void> {
   try {
@@ -101,6 +104,13 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
     let rollingCreatorExpectedCanonicalCoverageRate = 0;
     let rollingCreatorMetaParseFailureRate = 0;
     let rollingCreatorUidContractViolationRate = 0;
+    let rollingWatchdogLockSkipped5m = 0;
+    let rollingWatchdogLockAcquired5m = 0;
+    let rollingReconLockSkipped5m = 0;
+    let rollingCycleLockDeferred5m = 0;
+    let dlqSize = 0;
+    let bullmqQueueSnapshot: Awaited<ReturnType<typeof getBillingQueueSnapshot>> = null;
+    let feedRankZcard = 0;
 
     if (isRedisConfigured()) {
       const redis = getRedis();
@@ -132,6 +142,13 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
         creatorExpectedCoverageRaw,
         creatorMetaParseFailureRaw,
         creatorUidViolationRaw,
+        watchdogSkipped5m,
+        watchdogAcquired5m,
+        reconSkipped5m,
+        cycleLockDeferred5m,
+        dlqSizeRaw,
+        queueSnapshot,
+        rankZcard,
       ] = await Promise.all([
         redis.zrevrangebyscore(
           metricsKey('billing.bullmq_queue_lag_ms'),
@@ -226,7 +243,22 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
           0,
           rollingSampleLimit
         ),
+        redis.zcount(metricsKey('billing.billing.watchdog.lock_skipped'), fromTs, now),
+        redis.zcount(metricsKey('billing.billing.watchdog.lock_acquired'), fromTs, now),
+        redis.zcount(metricsKey('billing.reconciliation_skipped_lock_busy'), fromTs, now),
+        redis.zcount(metricsKey('billing.billing_cycle_lock_deferred'), fromTs, now),
+        redis.scard(`${DLQ_BILLING_PREFIX}set`),
+        getBillingQueueSnapshot(),
+        getCreatorFeedRankZcard(),
       ]);
+
+      dlqSize = Number(dlqSizeRaw || 0);
+      bullmqQueueSnapshot = queueSnapshot;
+      feedRankZcard = Number(rankZcard || 0);
+      rollingWatchdogLockSkipped5m = Number(watchdogSkipped5m || 0);
+      rollingWatchdogLockAcquired5m = Number(watchdogAcquired5m || 0);
+      rollingReconLockSkipped5m = Number(reconSkipped5m || 0);
+      rollingCycleLockDeferred5m = Number(cycleLockDeferred5m || 0);
 
       const parseMetricSampleStats = (raw: string[]): { avg: number; sum: number; count: number } => {
         if (!raw || raw.length === 0) return { avg: 0, sum: 0, count: 0 };
@@ -306,6 +338,20 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
     }
     if ((settlementTotal?.p95 ?? 0) > 5000) {
       metricsAlerts.push('billing_settlement_p95_high');
+    }
+    if (dlqSize > 50) {
+      metricsAlerts.push('billing_dlq_size_high');
+    }
+    if (
+      rollingWatchdogLockAcquired5m > 0 &&
+      rollingWatchdogLockSkipped5m / rollingWatchdogLockAcquired5m > 0.3
+    ) {
+      metricsAlerts.push('billing_watchdog_lock_contention_high');
+    }
+    const delayedJobs = bullmqQueueSnapshot?.delayed ?? byName['billing.bullmq_cycle_jobs_delayed']?.max ?? 0;
+    const activeJobs = bullmqQueueSnapshot?.active ?? byName['billing.bullmq_cycle_jobs_active']?.max ?? 0;
+    if (Number(delayedJobs) > Math.max(100, Number(activeJobs) * 2)) {
+      metricsAlerts.push('billing_queue_depth_high');
     }
     if ((creatorStatusPropagation?.p95 ?? 0) > 500) {
       metricsAlerts.push('creator_status_propagation_high');
@@ -479,9 +525,27 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
         streamMarkEnded: {
           samples: byName['billing.stream_mark_ended_result_total']?.count ?? 0,
         },
+        instanceId: getBillingInstanceId(),
+        dlq: {
+          size: dlqSize,
+          batchFetchP95Ms: byName['billing.dlq_batch_fetch_ms']?.p95 ?? 0,
+        },
+        locks: {
+          watchdogSkipped5m: rollingWatchdogLockSkipped5m,
+          watchdogAcquired5m: rollingWatchdogLockAcquired5m,
+          reconSkipped5m: rollingReconLockSkipped5m,
+          cycleLockDeferred5m: rollingCycleLockDeferred5m,
+        },
+        runtime: {
+          eventLoopLagP95: Math.round((eventLoopLag?.p95 ?? 0) * 100) / 100,
+        },
         bullmq: {
           queueLagAvgMs: Math.round(bullLagAvgMs * 100) / 100,
           queueLagSamples: byName['billing.bullmq_queue_lag_ms']?.count ?? 0,
+          jobsActive: bullmqQueueSnapshot?.active ?? byName['billing.bullmq_cycle_jobs_active']?.max ?? 0,
+          jobsWaiting: bullmqQueueSnapshot?.waiting ?? byName['billing.bullmq_cycle_jobs_waiting']?.max ?? 0,
+          jobsDelayed: bullmqQueueSnapshot?.delayed ?? byName['billing.bullmq_cycle_jobs_delayed']?.max ?? 0,
+          concurrency: bullmqQueueSnapshot?.concurrency ?? readBullmqConcurrency(),
           rolling5m: {
             queueLagAvgMs: Math.round(rollingBullLagAvgMs * 100) / 100,
             sampleLimit: rollingSampleLimit,
@@ -547,6 +611,7 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
           : null,
       },
       presence: {
+        feedRankZcard: feedRankZcard,
         registryShadowMismatch: registryShadowMismatch?.sum ?? 0,
         registryRegister: registryRegister?.sum ?? 0,
         registryUnregister: registryUnregister?.sum ?? 0,

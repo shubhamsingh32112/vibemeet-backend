@@ -131,5 +131,6 @@ callHistorySchema.index({
   createdAt: 1,
   durationSeconds: 1 
 });
+callHistorySchema.index({ ownerRole: 1, ownerUserId: 1, createdAt: -1 });
 
 export const CallHistory = mongoose.model<ICallHistory>('CallHistory', callHistorySchema);

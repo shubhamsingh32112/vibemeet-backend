@@ -427,11 +427,23 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
 // GET /admin/creators/performance — Creator performance table (CACHED 60s)
 // With abuse signals.
 // ══════════════════════════════════════════════════════════════════════════
+function parseCreatorsPerformancePaging(req: Request): { page: number; limit: number } {
+  const rawPage = parseInt(String(req.query.page ?? '1'), 10);
+  const rawLimit = parseInt(String(req.query.limit ?? '100'), 10);
+  const page = Number.isFinite(rawPage) && rawPage >= 1 ? rawPage : 1;
+  const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 100;
+  return { page, limit };
+}
+
 export const getCreatorsPerformance = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const data = await getCachedOrCompute('creators_performance', computeCreatorsPerformance);
+    const { page, limit } = parseCreatorsPerformancePaging(req);
+    const cacheSection = `creators_performance:p${page}:l${limit}`;
+    const data = await getCachedOrCompute(cacheSection, () =>
+      computeCreatorsPerformance({ page, limit })
+    );
 
     res.json({ success: true, data });
   } catch (error) {
@@ -482,13 +494,191 @@ export const getAdminCreatorDetail = async (req: Request, res: Response): Promis
   }
 };
 
-async function computeCreatorsPerformance() {
+async function computeCreatorsPerformance(options: { page: number; limit: number }) {
+  const { page, limit } = options;
   const thirtyDaysAgo = daysAgo(30);
   const { periodStart, periodEnd } = getDailyPeriodBounds();
+  const idleDays = parseInt(process.env.ADMIN_PERFORMANCE_INCLUDE_IDLE_DAYS || '90', 10);
+  const idleCutoff = daysAgo(Number.isFinite(idleDays) && idleDays > 0 ? idleDays : 90);
 
-  const creators = await Creator.find({}).lean();
-  const userIds = creators.map((c) => c.userId);
-  const users = await User.find({ _id: { $in: userIds } }).lean();
+  // All-time call stats per creator (billable calls only — matches creator dashboard)
+  const callStatsPerCreator = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerRole: 'creator',
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        totalCalls: { $sum: 1 },
+        totalDurationSec: { $sum: '$durationSeconds' },
+        totalEarned: { $sum: '$coinsEarned' },
+        avgDurationSec: { $avg: '$durationSeconds' },
+        lastCallAt: { $max: '$createdAt' },
+      },
+    },
+  ]);
+  const callMap = new Map(callStatsPerCreator.map((c: any) => [c._id.toString(), c]));
+
+  // 30d call stats per creator (billable only)
+  const callStats30d = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerRole: 'creator',
+        createdAt: { $gte: thirtyDaysAgo },
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        calls30d: { $sum: 1 },
+        minutes30d: { $sum: '$durationSeconds' },
+        earned30d: { $sum: '$coinsEarned' },
+      },
+    },
+  ]);
+  const call30dMap = new Map(callStats30d.map((c: any) => [c._id.toString(), c]));
+
+  // Task period minutes + claims (current daily period — matches creator tasks UI)
+  const periodMinutesAgg = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerRole: 'creator',
+        createdAt: { $gte: periodStart, $lt: periodEnd },
+        ...CREATOR_BILLABLE_CALL_MATCH,
+      },
+    },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        periodMinutes: { $sum: { $divide: ['$durationSeconds', 60] } },
+      },
+    },
+  ]);
+  const periodMinutesMap = new Map(
+    periodMinutesAgg.map((r: any) => [r._id.toString(), r.periodMinutes as number])
+  );
+
+  const taskProgressCurrent = await CreatorTaskProgress.find({
+    periodStart,
+  }).lean();
+  const taskClaimedByCreator = new Map<string, Set<string>>();
+  for (const rec of taskProgressCurrent) {
+    const uid = rec.creatorUserId.toString();
+    if (!rec.claimedAt) continue;
+    if (!taskClaimedByCreator.has(uid)) taskClaimedByCreator.set(uid, new Set());
+    taskClaimedByCreator.get(uid)!.add(rec.taskKey);
+  }
+
+  // ── Abuse signals (30d) ─────────────────────────────────────────────
+  // Per-creator: short call %, refund count, forced-end count (user-side 0-duration)
+  const abuseSignalsAgg = await CallHistory.aggregate([
+    { $match: { ownerRole: 'creator', createdAt: { $gte: thirtyDaysAgo } } },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        total: { $sum: 1 },
+        billableCalls: {
+          $sum: { $cond: [{ $gt: ['$durationSeconds', 0] }, 1, 0] },
+        },
+        shortCalls: {
+          $sum: {
+            $cond: [
+              {
+                $and: [
+                  { $gt: ['$durationSeconds', 0] },
+                  { $lt: ['$durationSeconds', 20] },
+                ],
+              },
+              1,
+              0,
+            ],
+          },
+        },
+        zeroDuration: { $sum: { $cond: [{ $eq: ['$durationSeconds', 0] }, 1, 0] } },
+      },
+    },
+  ]);
+  const abuseMap = new Map(abuseSignalsAgg.map((a: any) => [a._id.toString(), a]));
+
+  // Refund count per creator — aggregate callIds (no unbounded find); batch $in for refunds
+  const REFUND_LOOKUP_BATCH = 500;
+  const callIdsByCreatorAgg = await CallHistory.aggregate([
+    {
+      $match: {
+        ownerRole: 'creator',
+        createdAt: { $gte: thirtyDaysAgo },
+      },
+    },
+    { $project: { ownerUserId: 1, callId: 1 } },
+    {
+      $group: {
+        _id: '$ownerUserId',
+        callIds: { $addToSet: '$callId' },
+      },
+    },
+  ]);
+
+  const uniqueCallIds = [
+    ...new Set(
+      callIdsByCreatorAgg.flatMap((row: { callIds?: string[] }) => row.callIds ?? [])
+    ),
+  ];
+
+  const refundedCallIds = new Set<string>();
+  for (let offset = 0; offset < uniqueCallIds.length; offset += REFUND_LOOKUP_BATCH) {
+    const batch = uniqueCallIds.slice(offset, offset + REFUND_LOOKUP_BATCH);
+    if (batch.length === 0) continue;
+    const refundRows = await CoinTransaction.find({
+      callId: { $in: batch },
+      source: 'admin',
+      description: { $regex: /^REFUND/ },
+    })
+      .select('callId')
+      .lean();
+    for (const row of refundRows) {
+      if (row.callId) refundedCallIds.add(row.callId);
+    }
+  }
+
+  const refundCountByCreator = new Map<string, number>();
+  for (const row of callIdsByCreatorAgg) {
+    const uid = row._id.toString();
+    const callIds = (row.callIds as string[]) ?? [];
+    const cnt = callIds.filter((id) => refundedCallIds.has(id)).length;
+    if (cnt > 0) refundCountByCreator.set(uid, cnt);
+  }
+
+  const activeUserIdSet = new Set<string>();
+  for (const row of callStatsPerCreator) {
+    activeUserIdSet.add(row._id.toString());
+  }
+  for (const row of callStats30d) {
+    activeUserIdSet.add(row._id.toString());
+  }
+  for (const row of abuseSignalsAgg) {
+    activeUserIdSet.add(row._id.toString());
+  }
+
+  const idleCreators = await Creator.find({ createdAt: { $gte: idleCutoff } })
+    .select('userId')
+    .lean();
+  for (const c of idleCreators) {
+    if (c.userId) activeUserIdSet.add(c.userId.toString());
+  }
+
+  const boundedUserIds = [...activeUserIdSet].map((id) => new mongoose.Types.ObjectId(id));
+  const creators =
+    boundedUserIds.length > 0
+      ? await Creator.find({ userId: { $in: boundedUserIds } }).lean()
+      : [];
+  const users =
+    boundedUserIds.length > 0
+      ? await User.find({ _id: { $in: boundedUserIds } }).lean()
+      : [];
   const userMap = new Map(users.map((u) => [u._id.toString(), u]));
 
   const assignedAgencyIds = [
@@ -517,147 +707,6 @@ async function computeCreatorsPerformance() {
       return [a._id.toString(), label];
     })
   );
-
-  // All-time call stats per creator (billable calls only — matches creator dashboard)
-  const callStatsPerCreator = await CallHistory.aggregate([
-    {
-      $match: {
-        ownerRole: 'creator',
-        ownerUserId: { $in: userIds },
-        ...CREATOR_BILLABLE_CALL_MATCH,
-      },
-    },
-    {
-      $group: {
-        _id: '$ownerUserId',
-        totalCalls: { $sum: 1 },
-        totalDurationSec: { $sum: '$durationSeconds' },
-        totalEarned: { $sum: '$coinsEarned' },
-        avgDurationSec: { $avg: '$durationSeconds' },
-        lastCallAt: { $max: '$createdAt' },
-      },
-    },
-  ]);
-  const callMap = new Map(callStatsPerCreator.map((c: any) => [c._id.toString(), c]));
-
-  // 30d call stats per creator (billable only)
-  const callStats30d = await CallHistory.aggregate([
-    {
-      $match: {
-        ownerRole: 'creator',
-        ownerUserId: { $in: userIds },
-        createdAt: { $gte: thirtyDaysAgo },
-        ...CREATOR_BILLABLE_CALL_MATCH,
-      },
-    },
-    {
-      $group: {
-        _id: '$ownerUserId',
-        calls30d: { $sum: 1 },
-        minutes30d: { $sum: '$durationSeconds' },
-        earned30d: { $sum: '$coinsEarned' },
-      },
-    },
-  ]);
-  const call30dMap = new Map(callStats30d.map((c: any) => [c._id.toString(), c]));
-
-  // Task period minutes + claims (current daily period — matches creator tasks UI)
-  const periodMinutesAgg = await CallHistory.aggregate([
-    {
-      $match: {
-        ownerRole: 'creator',
-        ownerUserId: { $in: userIds },
-        createdAt: { $gte: periodStart, $lt: periodEnd },
-        ...CREATOR_BILLABLE_CALL_MATCH,
-      },
-    },
-    {
-      $group: {
-        _id: '$ownerUserId',
-        periodMinutes: { $sum: { $divide: ['$durationSeconds', 60] } },
-      },
-    },
-  ]);
-  const periodMinutesMap = new Map(
-    periodMinutesAgg.map((r: any) => [r._id.toString(), r.periodMinutes as number])
-  );
-
-  const taskProgressCurrent = await CreatorTaskProgress.find({
-    creatorUserId: { $in: userIds },
-    periodStart,
-  }).lean();
-  const taskClaimedByCreator = new Map<string, Set<string>>();
-  for (const rec of taskProgressCurrent) {
-    const uid = rec.creatorUserId.toString();
-    if (!rec.claimedAt) continue;
-    if (!taskClaimedByCreator.has(uid)) taskClaimedByCreator.set(uid, new Set());
-    taskClaimedByCreator.get(uid)!.add(rec.taskKey);
-  }
-
-  // ── Abuse signals (30d) ─────────────────────────────────────────────
-  // Per-creator: short call %, refund count, forced-end count (user-side 0-duration)
-  const abuseSignalsAgg = await CallHistory.aggregate([
-    { $match: { ownerRole: 'creator', ownerUserId: { $in: userIds }, createdAt: { $gte: thirtyDaysAgo } } },
-    {
-      $group: {
-        _id: '$ownerUserId',
-        total: { $sum: 1 },
-        billableCalls: {
-          $sum: { $cond: [{ $gt: ['$durationSeconds', 0] }, 1, 0] },
-        },
-        shortCalls: {
-          $sum: {
-            $cond: [
-              {
-                $and: [
-                  { $gt: ['$durationSeconds', 0] },
-                  { $lt: ['$durationSeconds', 20] },
-                ],
-              },
-              1,
-              0,
-            ],
-          },
-        },
-        zeroDuration: { $sum: { $cond: [{ $eq: ['$durationSeconds', 0] }, 1, 0] } },
-      },
-    },
-  ]);
-  const abuseMap = new Map(abuseSignalsAgg.map((a: any) => [a._id.toString(), a]));
-
-  // Refund count per creator (by matching creator-side callIds against refund transactions)
-  const creatorCallIds = await CallHistory.find({
-    ownerRole: 'creator',
-    ownerUserId: { $in: userIds },
-    createdAt: { $gte: thirtyDaysAgo },
-  })
-    .select('callId ownerUserId')
-    .lean();
-
-  // Group callIds by creatorUserId
-  const callIdsByCreator = new Map<string, string[]>();
-  for (const rec of creatorCallIds) {
-    const uid = rec.ownerUserId.toString();
-    if (!callIdsByCreator.has(uid)) callIdsByCreator.set(uid, []);
-    callIdsByCreator.get(uid)!.push(rec.callId);
-  }
-
-  // Count refunds per creator (look for REFUND CoinTransactions with those callIds)
-  const allCallIds = creatorCallIds.map((r) => r.callId);
-  const refundsAgg = allCallIds.length > 0
-    ? await CoinTransaction.aggregate([
-        { $match: { callId: { $in: allCallIds }, source: 'admin', description: { $regex: /^REFUND/ } } },
-        { $group: { _id: '$callId', count: { $sum: 1 } } },
-      ])
-    : [];
-  const refundedCallIds = new Set(refundsAgg.map((r: any) => r._id));
-
-  // Count refunds per creator
-  const refundCountByCreator = new Map<string, number>();
-  for (const [creatorUserId, callIds] of callIdsByCreator) {
-    const cnt = callIds.filter((id) => refundedCallIds.has(id)).length;
-    if (cnt > 0) refundCountByCreator.set(creatorUserId, cnt);
-  }
 
   // Build performance table
   const performance = creators.map((creator) => {
@@ -754,7 +803,17 @@ async function computeCreatorsPerformance() {
 
   performance.sort((a, b) => b.earned30d - a.earned30d);
 
-  return { creators: performance };
+  const total = performance.length;
+  const skip = (page - 1) * limit;
+  const paginated = performance.slice(skip, skip + limit);
+
+  return {
+    creators: paginated,
+    total,
+    page,
+    limit,
+    note: `Creators with call activity or created within the last ${idleDays} days. Paginate with page/limit (max 100 per page).`,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════

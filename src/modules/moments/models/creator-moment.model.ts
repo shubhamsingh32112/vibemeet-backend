@@ -90,6 +90,7 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
 );
 
 creatorMomentSchema.index({ creatorId: 1, createdAt: -1 });
+creatorMomentSchema.index({ creatorId: 1, isDeleted: 1 });
 creatorMomentSchema.index({ feedScore: -1, _id: -1 });
 
 export const CreatorMoment = mongoose.model<ICreatorMoment>(

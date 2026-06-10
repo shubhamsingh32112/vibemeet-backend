@@ -62,7 +62,18 @@ test('redis config defines creator feed and uids cache keys', () => {
   const src = readFileSync(join(__dirname, '../../config/redis.ts'), 'utf8');
   assert.ok(src.includes('CREATOR_FEED_PREFIX'));
   assert.ok(src.includes('CREATOR_UIDS_CACHE_KEY'));
+  assert.ok(src.includes('CREATOR_UIDS_SET_KEY'));
   assert.ok(src.includes('invalidateCreatorCatalogCaches'));
+});
+
+test('getCreatorFirebaseUids uses streaming cache service not bare Creator.find({})', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFirebaseUids');
+  const end = src.indexOf('export const getCreatorById');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes('getCreatorFirebaseUidsCached'));
+  assert.ok(!block.includes('Creator.find({})'));
 });
 
 test('getCreatorFeed serves unscoped consumer catalog (not agency-filtered)', () => {
@@ -125,4 +136,35 @@ test('presence service emits creator_status_events_sent metric', () => {
   );
   assert.ok(src.includes('creator_status_events_sent'));
   assert.ok(src.includes("nextRecord.state === 'on_call'"));
+});
+
+test('redis config defines creator feed rank key and invalidation', () => {
+  const src = readFileSync(join(__dirname, '../../config/redis.ts'), 'utf8');
+  assert.ok(src.includes('CREATOR_FEED_RANK_KEY'));
+  assert.ok(src.includes('creator:feed:rank:v1'));
+});
+
+test('getCreatorFeed availability sort uses rank ZSET when enabled with legacy fallback', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  const start = src.indexOf('export const getCreatorFeed');
+  const end = src.indexOf('export const getCreatorFirebaseUids');
+  const block = src.slice(start, end);
+  assert.ok(block.includes('getAvailabilityFeedPageFromRank'));
+  assert.ok(block.includes('buildLegacyAvailabilityPage'));
+  assert.ok(block.includes('CREATOR_FEED_RANK_SHADOW'));
+});
+
+test('creator feed rank service documents Redis ownership and uses catalog cap', () => {
+  const src = readFileSync(join(__dirname, 'creator-feed-rank.service.ts'), 'utf8');
+  assert.ok(src.includes('creator:feed:rank:v1'));
+  assert.ok(src.includes('readCreatorFeedAvailabilityMaxCatalog'));
+  assert.ok(src.includes('rebuildCreatorFeedRankIndex'));
+  assert.ok(src.includes('removeCreatorFromFeedRank'));
+});
+
+test('creator create/delete syncs UID cache and feed rank membership', () => {
+  const src = readFileSync(join(__dirname, 'creator.controller.ts'), 'utf8');
+  assert.ok(src.includes('addCreatorFirebaseUidToCache'));
+  assert.ok(src.includes('removeCreatorFirebaseUidFromCache'));
+  assert.ok(src.includes('removeCreatorFromFeedRank'));
 });

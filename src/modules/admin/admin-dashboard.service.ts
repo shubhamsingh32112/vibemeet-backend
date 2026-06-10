@@ -2,6 +2,7 @@
  * Composable aggregations for GET /admin/dashboard/* (BFF-style).
  * Caps limits; indexed queries only.
  */
+import mongoose from 'mongoose';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { CallHistory } from '../billing/call-history.model';
@@ -330,24 +331,43 @@ async function aggregateCreatorPerformanceInRange(range?: DashboardDateFilter) {
 
 export async function dashboardTopHosts(limit: number, range?: DashboardDateFilter) {
   const lim = clampDashboardLimit(limit, 10);
-  const rows = await Creator.find({})
-    .select('name earningsCoins userId avatar')
-    .lean();
   const { creatorStatsByUserId } = await aggregateCreatorPerformanceInRange(range);
 
-  const ranked = rows
-    .map((c) => {
-      const ownerUserId = c.userId?.toString() ?? '';
-      const stat = creatorStatsByUserId.get(ownerUserId);
-      return {
-        creator: c,
-        calls: stat?.calls ?? 0,
-        minutes: stat?.minutes ?? 0,
-        earningsCoins: stat?.earnings ?? 0,
-      };
-    })
+  const rankedStats = [...creatorStatsByUserId.entries()]
+    .map(([ownerUserId, stat]) => ({
+      ownerUserId,
+      calls: stat.calls,
+      minutes: stat.minutes,
+      earningsCoins: stat.earnings,
+    }))
     .sort((a, b) => b.earningsCoins - a.earningsCoins || b.calls - a.calls)
     .slice(0, lim);
+
+  const topUserIds = rankedStats
+    .map((r) => r.ownerUserId)
+    .filter((id) => id.length > 0)
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  const creatorRows =
+    topUserIds.length > 0
+      ? await Creator.find({ userId: { $in: topUserIds } })
+          .select('name earningsCoins userId avatar')
+          .lean()
+      : [];
+  const creatorByUserId = new Map(creatorRows.map((c) => [c.userId?.toString() ?? '', c]));
+
+  const ranked = rankedStats
+    .map((stat) => {
+      const creator = creatorByUserId.get(stat.ownerUserId);
+      if (!creator) return null;
+      return {
+        creator,
+        calls: stat.calls,
+        minutes: stat.minutes,
+        earningsCoins: stat.earningsCoins,
+      };
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null);
 
   return {
     rows: ranked.map((row, i) => {

@@ -407,15 +407,21 @@ export async function getCreatorAnalyticsHandler(req: Request, res: Response): P
         },
       },
     ]);
-    const moments = await CreatorMoment.find({ creatorId: creator._id });
-    const views = moments.reduce((s, m) => s + m.viewsCount, 0);
+    const [viewsAgg] = await CreatorMoment.aggregate([
+      { $match: { creatorId: creator._id } },
+      { $group: { _id: null, totalViews: { $sum: '$viewsCount' } } },
+    ]);
+    const postCount = await CreatorMoment.countDocuments({
+      creatorId: creator._id,
+      isDeleted: false,
+    });
     res.json({
       success: true,
       data: {
         momentsEarnings: agg?.totalEarnings ?? 0,
         purchaseCount: agg?.purchaseCount ?? 0,
-        totalViews: views,
-        postCount: moments.filter((m) => !m.isDeleted).length,
+        totalViews: viewsAgg?.totalViews ?? 0,
+        postCount,
       },
     });
   } catch (error) {

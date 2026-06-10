@@ -475,11 +475,17 @@ export const invalidateAdminCaches = async (
 };
 
 // ── Creator public catalog / detail caches (feed, uids, by-id) ───────────
+/** ZSET: creatorId → availability rank score (cache-like; see creator-feed-rank.service.ts) */
+export const CREATOR_FEED_RANK_KEY = 'creator:feed:rank:v1';
+
 export const CREATOR_FEED_PREFIX = 'creator:feed:';
 export const CREATOR_FEED_INDEX_KEY = 'creator:feed:index';
 export const CREATOR_FEED_TTL = 30;
 
 export const CREATOR_UIDS_CACHE_KEY = 'creator:uids:v1';
+/** SET of firebase UIDs — incremental SADD/SREM; see creator-uids-cache.service.ts */
+export const CREATOR_UIDS_SET_KEY = 'creator:uids:set:v1';
+export const CREATOR_UIDS_REBUILD_LOCK_KEY = 'creator:uids:rebuild:lock';
 export const CREATOR_UIDS_TTL = 60;
 
 export const CREATOR_DETAIL_PREFIX = 'creator:detail:';
@@ -533,9 +539,9 @@ export async function invalidateCreatorFeedCaches(): Promise<void> {
     const redis = getRedis();
     const keys = await redis.smembers(CREATOR_FEED_INDEX_KEY);
     if (keys.length > 0) {
-      await redis.del(...keys, CREATOR_FEED_INDEX_KEY);
+      await redis.del(...keys, CREATOR_FEED_INDEX_KEY, CREATOR_FEED_RANK_KEY);
     } else {
-      await redis.del(CREATOR_FEED_INDEX_KEY);
+      await redis.del(CREATOR_FEED_INDEX_KEY, CREATOR_FEED_RANK_KEY);
     }
     logInfo('Invalidated creator feed caches', { keysRemoved: keys.length });
   } catch (err) {
@@ -547,7 +553,7 @@ export async function invalidateCreatorUidsCache(): Promise<void> {
   if (!isRedisConfigured()) return;
   try {
     const redis = getRedis();
-    await redis.del(CREATOR_UIDS_CACHE_KEY);
+    await redis.del(CREATOR_UIDS_CACHE_KEY, CREATOR_UIDS_SET_KEY, CREATOR_UIDS_REBUILD_LOCK_KEY);
     logInfo('Invalidated creator UIDs cache');
   } catch (err) {
     logError('Failed to invalidate creator UIDs cache', err);

@@ -29,9 +29,30 @@ test('dashboard service keeps leaderboard numeric contract', () => {
   assert.ok(src.includes('metricContract: buildOverviewMetricContract()'));
 });
 
+test('dashboardTopHosts does not use unbounded Creator.find({})', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  const start = src.indexOf('export async function dashboardTopHosts');
+  const end = src.indexOf('export async function dashboardTopBds');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(!block.includes('Creator.find({})'));
+  assert.ok(block.includes('aggregateCreatorPerformanceInRange'));
+});
+
 test('admin date range parser reports invalid reasons', () => {
   const src = readFileSync(join(__dirname, 'admin-date-range.ts'), 'utf8');
   assert.ok(src.includes("invalidReason: 'missing_from'"));
   assert.ok(src.includes("invalidReason: 'missing_to'"));
   assert.ok(src.includes("invalidReason: 'invalid_bounds'"));
+});
+
+test('computeCreatorsPerformance does not use unbounded CallHistory.find for abuse refunds', () => {
+  const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
+  const start = src.indexOf('async function computeCreatorsPerformance');
+  const end = src.indexOf('// GET /admin/users/analytics');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(!block.includes('CallHistory.find({'));
+  assert.ok(block.includes('REFUND_LOOKUP_BATCH'));
+  assert.ok(block.includes('$addToSet: \'$callId\''));
 });
