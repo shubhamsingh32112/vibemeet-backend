@@ -22,6 +22,9 @@ export interface ICallHistory extends Document {
   ownerRole: 'user' | 'creator';    // Role of the owner in this call
   direction?: 'incoming' | 'outgoing'; // Relative to owner (durable; do not derive dynamically)
   durationSeconds: number;           // Call duration in seconds
+  callStartedAt?: Date;              // When the call session started (from Call lifecycle)
+  callEndedAt?: Date;                // When the call session ended
+  settledAt?: Date;                  // When billing settlement completed
   coinsDeducted: number;             // Coins deducted (user) or 0 (creator)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
   ratingStars?: number;              // 1-5 star rating submitted by user for creator
@@ -83,6 +86,20 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: Number,
       required: true,
       min: 0,
+    },
+    callStartedAt: {
+      type: Date,
+      sparse: true,
+      index: true,
+    },
+    callEndedAt: {
+      type: Date,
+      sparse: true,
+    },
+    settledAt: {
+      type: Date,
+      sparse: true,
+      index: true,
     },
     coinsDeducted: {
       type: Number,

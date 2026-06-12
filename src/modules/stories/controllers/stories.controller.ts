@@ -2,7 +2,11 @@ import type { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { User } from '../../user/user.model';
 import { Creator } from '../../creator/creator.model';
-import { assertMomentsEnabled, getMomentsConfig } from '../../../config/moments';
+import {
+  assertMomentsEnabled,
+  getMomentsConfig,
+  respondMomentsDisabled,
+} from '../../../config/moments';
 import { CreatorStory } from '../models/creator-story.model';
 import { StoryView } from '../models/story-view.model';
 import { commitImageAsset, CommitImageAssetError } from '../../images/commit-image-asset';
@@ -113,6 +117,7 @@ export async function createStoryHandler(req: Request, res: Response): Promise<v
     emitStoryUploaded(creator._id.toString());
     res.status(201).json({ success: true, data: dto });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     if (error instanceof CommitImageAssetError) {
       res.status(error.status).json({ success: false, error: error.message });
       return;
@@ -182,6 +187,7 @@ export async function getStoriesFeedHandler(req: Request, res: Response): Promis
 
     res.json({ success: true, data: { groups: enrichedGroups } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Stories feed failed', error);
     res.status(500).json({ success: false, error: 'Failed to load stories feed' });
   }
@@ -207,6 +213,7 @@ export async function getCreatorStoriesHandler(req: Request, res: Response): Pro
     ).filter(Boolean);
     res.json({ success: true, data: { stories: items } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Creator stories failed', error);
     res.status(500).json({ success: false, error: 'Failed to load stories' });
   }
@@ -230,6 +237,7 @@ export async function deleteStoryHandler(req: Request, res: Response): Promise<v
     await story.save();
     res.json({ success: true });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Delete story failed', error);
     res.status(500).json({ success: false, error: 'Failed to delete story' });
   }
@@ -276,6 +284,7 @@ export async function recordStoryViewHandler(req: Request, res: Response): Promi
 
     res.json({ success: true, data: { viewsCount: story.viewsCount } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Record story view failed', error);
     res.status(500).json({ success: false, error: 'Failed to record view' });
   }
@@ -328,6 +337,7 @@ export async function getStoryViewersHandler(req: Request, res: Response): Promi
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Story viewers failed', error);
     res.status(500).json({ success: false, error: 'Failed to load viewers' });
   }
@@ -362,6 +372,7 @@ export async function getMyStoriesHandler(req: Request, res: Response): Promise<
     ).filter(Boolean);
     res.json({ success: true, data: { stories: items } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('My stories failed', error);
     res.status(500).json({ success: false, error: 'Failed to load stories' });
   }
@@ -405,6 +416,7 @@ export async function refreshStoryPlaybackHandler(req: Request, res: Response): 
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     recordPlaybackRefreshMetric('error');
     logError('Refresh story playback failed', error);
     res.status(500).json({ success: false, error: 'Failed to refresh playback' });
@@ -426,6 +438,7 @@ export async function completeStoryHandler(req: Request, res: Response): Promise
     });
     res.json({ success: true });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Complete story failed', error);
     res.status(500).json({ success: false, error: 'Failed to record completion' });
   }

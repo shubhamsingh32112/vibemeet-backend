@@ -11,7 +11,7 @@ info:
 servers:
   - url: http://localhost:3000
     description: Local development
-  - url: https://api.yourdomain.com
+  - url: https://api.prestigeinteriordesign.com
     description: Production (set PUBLIC_API_BASE_URL host)
 
 tags:

@@ -116,6 +116,17 @@ import {
 import { getBlockedHosts } from './admin-blocked-hosts.controller';
 import { getRevenueSplitSummary } from './admin-revenue-split.controller';
 import { getLeaderboardHosts, getLeaderboardUsers } from './admin-leaderboards.controller';
+import {
+  getCachedLeaderboardHosts,
+  getFinancePayments,
+  getFinancePayoutsSummary,
+  getFinanceSettlements,
+  getMomentsPaidUsers,
+  getRevenueAnalyticsSummary,
+  getUsersSummary,
+  getVipPaidUsers,
+  getWalletTransactions,
+} from './admin-analytics.controller';
 
 const router = Router();
 
@@ -130,7 +141,16 @@ router.get('/users/analytics', getUsersAnalytics);
 router.get('/blocked-hosts', getBlockedHosts);
 router.get('/revenue-split/summary', getRevenueSplitSummary);
 router.get('/leaderboards/hosts', getLeaderboardHosts);
+router.get('/leaderboards/hosts/cached', getCachedLeaderboardHosts);
 router.get('/leaderboards/users', getLeaderboardUsers);
+router.get('/analytics/users/summary', getUsersSummary);
+router.get('/analytics/moments/paid-users', getMomentsPaidUsers);
+router.get('/analytics/vip/paid-users', getVipPaidUsers);
+router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
+router.get('/wallet/transactions', getWalletTransactions);
+router.get('/finance/payments', getFinancePayments);
+router.get('/finance/payouts/summary', getFinancePayoutsSummary);
+router.get('/finance/settlements', getFinanceSettlements);
 router.get('/users/:id/ledger', getUserLedger);
 router.get('/coins', getCoinEconomy);
 router.get('/wallet-pricing', getWalletPricing);

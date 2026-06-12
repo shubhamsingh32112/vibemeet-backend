@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import { Response } from 'express';
+import { featureFlags } from '../../config/feature-flags';
 import { User } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { logError } from '../../utils/logger';
@@ -12,8 +13,18 @@ import {
   VipSchedulingError,
 } from './vip-scheduling.service';
 
+function rejectIfVipDisabled(res: Response): boolean {
+  if (!featureFlags.vipEnabled) {
+    res.status(503).json({ success: false, error: 'VIP is not available yet' });
+    return true;
+  }
+  return false;
+}
+
 export const scheduleCall = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -71,6 +82,8 @@ export const listScheduledCalls = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -105,6 +118,8 @@ export const listIncomingScheduledCalls = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -145,6 +160,8 @@ export const confirmScheduledCallHandler = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -187,6 +204,8 @@ export const cancelScheduledCallHandler = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -229,6 +248,8 @@ export const getCallQueueStatus = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
@@ -245,6 +266,8 @@ export const getCallQueueStatus = async (
 
 export const leaveCallQueue = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (rejectIfVipDisabled(res)) return;
+
     if (!req.auth) {
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;

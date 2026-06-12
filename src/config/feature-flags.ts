@@ -88,11 +88,11 @@ export const featureFlags = {
   onboardingFastForwardUntil: process.env.ONBOARDING_FAST_FORWARD_UNTIL ?? '',
   /** First mobile semver that sends strict v2 onboarding (legacy clients below may use rollout fast-forward). */
   onboardingMinFixedClientVersion: process.env.MIN_FIXED_CLIENT_VERSION ?? '',
-  /** Master switch for VIP membership and entitlements. */
-  vipEnabled: process.env.VIP_ENABLED !== 'false',
-  /** Enables VIP call scheduling APIs and jobs. */
-  vipSchedulingEnabled: process.env.VIP_SCHEDULING_ENABLED !== 'false',
-  /** Enables VIP priority call queue when creator is busy. */
-  vipPriorityQueueEnabled: process.env.VIP_PRIORITY_QUEUE_ENABLED !== 'false',
+  /** Master switch for VIP membership and entitlements (opt-in). */
+  vipEnabled: process.env.VIP_ENABLED === 'true',
+  /** Enables VIP call scheduling APIs and jobs (opt-in). */
+  vipSchedulingEnabled: process.env.VIP_SCHEDULING_ENABLED === 'true',
+  /** Enables VIP priority call queue when creator is busy (opt-in). */
+  vipPriorityQueueEnabled: process.env.VIP_PRIORITY_QUEUE_ENABLED === 'true',
 };
 

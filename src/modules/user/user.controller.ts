@@ -68,6 +68,7 @@ import {
   type PermissionsDecision,
 } from './onboarding-transition.service';
 import { getVipStatus } from '../vip/vip-entitlement.service';
+import { getPublicAppConfig } from '../app-config/app-config.service';
 
 function welcomeFreeCallEligible(user: {
   role: string;
@@ -634,6 +635,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     const onboarding = buildOnboardingPayload(user);
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
     const vip = await getVipStatus(user._id);
+    const features = getPublicAppConfig().features;
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -679,6 +681,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             : {}),
           hasAgencyAssignment,
           vip,
+          features,
         },
       });
     } else {
@@ -716,6 +719,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           creator: null,
           hasAgencyAssignment: false,
           vip,
+          features,
         },
       });
     }

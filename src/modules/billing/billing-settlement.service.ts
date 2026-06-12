@@ -25,6 +25,7 @@ import { User, IUser } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from './call-history.model';
+import { Call } from '../video/call.model';
 import { emitCreatorDataUpdated } from '../creator/creator.controller';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 import { emitStaffDomainEvent, setCreatorStaffScope } from '../staff/staff-dashboard-invalidation.service';
@@ -766,6 +767,19 @@ export async function settleCall(
     const userDirection = creatorInitiated ? 'incoming' : 'outgoing';
     const creatorDirection = creatorInitiated ? 'outgoing' : 'incoming';
 
+    const callLifecycle = await Call.findOne({ callId })
+      .select('startedAt endedAt settlement.settledAt')
+      .session(dbSession)
+      .lean();
+    const settledAt = new Date();
+    const callStartedAt = callLifecycle?.startedAt ?? new Date(session.startTime);
+    const callEndedAt = callLifecycle?.endedAt ?? settledAt;
+    const callTimestampFields = {
+      callStartedAt,
+      callEndedAt,
+      settledAt,
+    };
+
     await CallHistory.findOneAndUpdate(
       { callId, ownerUserId: session.userMongoId },
       {
@@ -779,6 +793,7 @@ export async function settleCall(
         ownerRole: 'user',
         direction: userDirection,
         durationSeconds,
+        ...callTimestampFields,
         coinsDeducted: totalDeducted,
         coinsEarned: 0,
       },
@@ -798,6 +813,7 @@ export async function settleCall(
           ownerRole: 'creator',
           direction: creatorDirection,
           durationSeconds,
+          ...callTimestampFields,
           coinsDeducted: 0,
           coinsEarned: totalEarnedCreator,
         },

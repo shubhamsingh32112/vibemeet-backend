@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { User } from '../../user/user.model';
 import { Creator } from '../../creator/creator.model';
-import { assertMomentsEnabled } from '../../../config/moments';
+import { assertMomentsEnabled, respondMomentsDisabled } from '../../../config/moments';
 import { CreatorMoment } from '../models/creator-moment.model';
 import { CreatorFollow } from '../models/creator-follow.model';
 import { MomentRevenue } from '../models/moment-revenue.model';
@@ -42,6 +42,7 @@ import {
   isUserFollowingCreator,
   loadFollowedCreatorIds,
 } from '../services/follow-context.service';
+import { creditMomentUploadReward } from '../services/moment-upload-reward.service';
 
 async function resolveUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
@@ -161,11 +162,36 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
 
     emitMomentUploaded(creator._id.toString(), moment._id.toString());
     void enqueueFanoutTask(moment._id.toString(), creator._id.toString(), moment.feedScore);
+
+    let uploadRewardCoins = 0;
+    try {
+      const uploadReward = await creditMomentUploadReward({
+        userId: user._id,
+        creatorId: creator._id,
+        momentId: moment._id.toString(),
+        momentType: type,
+      });
+      uploadRewardCoins = uploadReward?.coinsCredited ?? 0;
+    } catch (rewardError) {
+      logError('Moment upload reward failed (moment saved)', rewardError);
+    }
+
+    const momentDto = await toCreatorSelfMomentDTO(moment, {
+      userId: user._id,
+      isCreatorOwner: true,
+    });
     res.status(201).json({
       success: true,
-      data: await toCreatorSelfMomentDTO(moment, { userId: user._id, isCreatorOwner: true }),
+      data: momentDto
+        ? { ...momentDto, uploadRewardCoins }
+        : {
+            id: moment._id.toString(),
+            creatorId: creator._id.toString(),
+            uploadRewardCoins,
+          },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     if (error instanceof CommitImageAssetError) {
       res.status(error.status).json({ success: false, error: error.message });
       return;
@@ -213,6 +239,7 @@ export async function getMomentsFeedHandler(req: Request, res: Response): Promis
     await cacheFeedResponse(cacheKey, JSON.stringify(payload));
     res.json(payload);
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Moments feed failed', error);
     res.status(500).json({ success: false, error: 'Failed to load feed' });
   }
@@ -264,6 +291,7 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
     const hasMore = moments.length >= limit;
     res.json({ success: true, data: { items, hasMore, nextOffset: offset + items.length } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Following feed failed', error);
     res.status(500).json({ success: false, error: 'Failed to load following feed' });
   }
@@ -288,6 +316,7 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
     }
     res.json({ success: true, data: dto });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Get moment failed', error);
     res.status(500).json({ success: false, error: 'Failed to load moment' });
   }
@@ -317,6 +346,7 @@ export async function purchaseMomentHandler(req: Request, res: Response): Promis
     }
     res.json({ success: true, data: dto });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     if (error instanceof PurchaseInProgressError) {
       res.status(409).json({ success: false, error: 'Purchase in progress' });
       return;
@@ -350,6 +380,7 @@ export async function deleteMomentHandler(req: Request, res: Response): Promise<
     void removeMomentFromFollowerFeeds(moment._id.toString(), creator._id.toString());
     res.json({ success: true });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Delete moment failed', error);
     res.status(500).json({ success: false, error: 'Failed to delete moment' });
   }
@@ -379,6 +410,7 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
     ).filter(Boolean);
     res.json({ success: true, data: { items } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Creator moments failed', error);
     res.status(500).json({ success: false, error: 'Failed to load creator moments' });
   }
@@ -425,6 +457,7 @@ export async function getCreatorAnalyticsHandler(req: Request, res: Response): P
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Creator analytics failed', error);
     res.status(500).json({ success: false, error: 'Failed to load analytics' });
   }
@@ -466,6 +499,7 @@ export async function followCreatorHandler(req: Request, res: Response): Promise
     }
     res.json({ success: true, data: { followerCount, isFollowing: true } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Follow creator failed', error);
     res.status(500).json({ success: false, error: 'Failed to follow' });
   }
@@ -489,6 +523,7 @@ export async function unfollowCreatorHandler(req: Request, res: Response): Promi
     emitCreatorFollowed(creatorId, followerCount);
     res.json({ success: true, data: { followerCount, isFollowing: false } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Unfollow failed', error);
     res.status(500).json({ success: false, error: 'Failed to unfollow' });
   }
@@ -508,6 +543,7 @@ export async function getFollowingListHandler(req: Request, res: Response): Prom
       data: { creatorIds: follows.map((f) => f.creatorId.toString()) },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Following list failed', error);
     res.status(500).json({ success: false, error: 'Failed to load following' });
   }
@@ -551,6 +587,7 @@ export async function refreshPlaybackHandler(req: Request, res: Response): Promi
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     recordPlaybackRefreshMetric('error');
     logError('Refresh playback failed', error);
     res.status(500).json({ success: false, error: 'Failed to refresh playback' });
@@ -572,6 +609,7 @@ export async function completeMomentHandler(req: Request, res: Response): Promis
     });
     res.json({ success: true });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Complete moment failed', error);
     res.status(500).json({ success: false, error: 'Failed to record completion' });
   }
@@ -613,6 +651,7 @@ export async function getCreatorSummaryHandler(req: Request, res: Response): Pro
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Creator summary failed', error);
     res.status(500).json({ success: false, error: 'Failed to load creator summary' });
   }
@@ -642,6 +681,7 @@ export async function getMyMomentsHandler(req: Request, res: Response): Promise<
     ).filter(Boolean);
     res.json({ success: true, data: { items } });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('My moments failed', error);
     res.status(500).json({ success: false, error: 'Failed to load moments' });
   }

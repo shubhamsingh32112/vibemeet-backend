@@ -1,6 +1,10 @@
 import type { Request, Response } from 'express';
 import { User } from '../user/user.model';
-import { assertMomentsEnabled, getMomentsConfig } from '../../config/moments';
+import {
+  assertMomentsEnabled,
+  getMomentsConfig,
+  respondMomentsDisabled,
+} from '../../config/moments';
 import {
   assertCloudflareStreamEnabled,
   CloudflareStreamDisabledError,
@@ -70,6 +74,7 @@ export async function createDirectUploadHandler(req: Request, res: Response): Pr
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     if (error instanceof CloudflareStreamDisabledError) {
       res.status(503).json({ success: false, error: error.message, code: 'CLOUDFLARE_STREAM_DISABLED' });
       return;
@@ -109,6 +114,7 @@ export async function getUploadStatusHandler(req: Request, res: Response): Promi
       },
     });
   } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
     logError('Stream upload status failed', error);
     res.status(500).json({ success: false, error: 'Failed to get upload status' });
   }

@@ -21,6 +21,8 @@ export interface MomentsConfig {
   creatorRevenueShare: number;
   photoPriceCoins: number;
   videoPriceCoins: number;
+  photoUploadRewardCoins: number;
+  videoUploadRewardCoins: number;
   entitlementVersion: number;
   storyImageMaxBytes: number;
   storyVideoMaxSeconds: number;
@@ -58,6 +60,8 @@ export function getMomentsConfig(): MomentsConfig {
     creatorRevenueShare: readNumberEnv('MOMENTS_CREATOR_REVENUE_SHARE', 0.5),
     photoPriceCoins: readIntEnv('MOMENTS_PHOTO_PRICE_COINS', 10),
     videoPriceCoins: readIntEnv('MOMENTS_VIDEO_PRICE_COINS', 30),
+    photoUploadRewardCoins: readIntEnv('MOMENTS_PHOTO_UPLOAD_REWARD_COINS', 10),
+    videoUploadRewardCoins: readIntEnv('MOMENTS_VIDEO_UPLOAD_REWARD_COINS', 30),
     entitlementVersion: readIntEnv('MOMENTS_ENTITLEMENT_VERSION', 1),
     storyImageMaxBytes: readIntEnv('MOMENTS_STORY_IMAGE_MAX_BYTES', 10 * 1024 * 1024),
     storyVideoMaxSeconds: readIntEnv('MOMENTS_STORY_VIDEO_MAX_SECONDS', 90),
@@ -84,10 +88,35 @@ export function getMomentsConfig(): MomentsConfig {
   return cached;
 }
 
+export class MomentsDisabledError extends Error {
+  readonly status = 503;
+  readonly code = 'FEATURE_DISABLED';
+
+  constructor() {
+    super('Moments is not available yet');
+    this.name = 'MomentsDisabledError';
+  }
+}
+
 export function assertMomentsEnabled(): void {
   if (!isMomentsEnabled()) {
-    throw new Error('Moments feature is disabled (USE_MOMENTS is not true)');
+    throw new MomentsDisabledError();
   }
+}
+
+export function respondMomentsDisabled(
+  error: unknown,
+  res: { status: (code: number) => { json: (body: unknown) => void } },
+): boolean {
+  if (error instanceof MomentsDisabledError) {
+    res.status(error.status).json({
+      success: false,
+      error: error.message,
+      code: error.code,
+    });
+    return true;
+  }
+  return false;
 }
 
 export function __resetMomentsConfigForTests(): void {

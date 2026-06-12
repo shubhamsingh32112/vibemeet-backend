@@ -30,7 +30,12 @@ import { randomUUID } from 'crypto';
 import { getIO } from '../../config/socket';
 import { emitToAdmin } from './admin.gateway';
 import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
-import { readCreatorPresenceState, transitionCreatorPresence } from '../availability/presence.service';
+import {
+  getBatchCreatorPresence,
+  readCreatorPresenceState,
+  transitionCreatorPresence,
+} from '../availability/presence.service';
+import { Call } from '../video/call.model';
 import { releaseCreatorCallLock } from '../video/creator-call-lock.service';
 import { getStreamClient } from '../../config/stream';
 import { AdminActionLog } from './admin-action-log.model';
@@ -427,23 +432,36 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
 // GET /admin/creators/performance — Creator performance table (CACHED 60s)
 // With abuse signals.
 // ══════════════════════════════════════════════════════════════════════════
-function parseCreatorsPerformancePaging(req: Request): { page: number; limit: number } {
+function parseCreatorsPerformancePaging(req: Request): {
+  page: number;
+  limit: number;
+  search?: string;
+  agencyId?: string;
+  bdId?: string;
+  presenceStatus?: string;
+} {
   const rawPage = parseInt(String(req.query.page ?? '1'), 10);
-  const rawLimit = parseInt(String(req.query.limit ?? '100'), 10);
+  const rawLimit = parseInt(String(req.query.limit ?? '50'), 10);
   const page = Number.isFinite(rawPage) && rawPage >= 1 ? rawPage : 1;
-  const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 100;
-  return { page, limit };
+  const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
+  const search = firstQueryString(req.query.search)?.trim() || undefined;
+  const agencyId = firstQueryString(req.query.agencyId)?.trim() || undefined;
+  const bdId = firstQueryString(req.query.bdId)?.trim() || undefined;
+  const presenceStatus = firstQueryString(req.query.presenceStatus)?.trim() || undefined;
+  return { page, limit, search, agencyId, bdId, presenceStatus };
 }
 
 export const getCreatorsPerformance = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const { page, limit } = parseCreatorsPerformancePaging(req);
-    const cacheSection = `creators_performance:p${page}:l${limit}`;
-    const data = await getCachedOrCompute(cacheSection, () =>
-      computeCreatorsPerformance({ page, limit })
-    );
+    const opts = parseCreatorsPerformancePaging(req);
+    const hasFilters = !!(opts.search || opts.agencyId || opts.bdId || opts.presenceStatus);
+    const data = hasFilters
+      ? await computeCreatorsPerformance(opts)
+      : await getCachedOrCompute(`creators_performance:p${opts.page}:l${opts.limit}`, () =>
+          computeCreatorsPerformance(opts)
+        );
 
     res.json({ success: true, data });
   } catch (error) {
@@ -494,13 +512,17 @@ export const getAdminCreatorDetail = async (req: Request, res: Response): Promis
   }
 };
 
-async function computeCreatorsPerformance(options: { page: number; limit: number }) {
-  const { page, limit } = options;
+async function computeCreatorsPerformance(options: {
+  page: number;
+  limit: number;
+  search?: string;
+  agencyId?: string;
+  bdId?: string;
+  presenceStatus?: string;
+}) {
+  const { page, limit, search, agencyId, bdId, presenceStatus } = options;
   const thirtyDaysAgo = daysAgo(30);
   const { periodStart, periodEnd } = getDailyPeriodBounds();
-  const idleDays = parseInt(process.env.ADMIN_PERFORMANCE_INCLUDE_IDLE_DAYS || '90', 10);
-  const idleCutoff = daysAgo(Number.isFinite(idleDays) && idleDays > 0 ? idleDays : 90);
-
   // All-time call stats per creator (billable calls only — matches creator dashboard)
   const callStatsPerCreator = await CallHistory.aggregate([
     {
@@ -652,34 +674,53 @@ async function computeCreatorsPerformance(options: { page: number; limit: number
     if (cnt > 0) refundCountByCreator.set(uid, cnt);
   }
 
-  const activeUserIdSet = new Set<string>();
-  for (const row of callStatsPerCreator) {
-    activeUserIdSet.add(row._id.toString());
+  const creatorQuery: Record<string, unknown> = {};
+  if (agencyId && mongoose.Types.ObjectId.isValid(agencyId)) {
+    creatorQuery.assignedAgencyId = new mongoose.Types.ObjectId(agencyId);
+  } else if (bdId && mongoose.Types.ObjectId.isValid(bdId)) {
+    const agencyIds = await User.find({
+      bdId: new mongoose.Types.ObjectId(bdId),
+      role: 'agency',
+    })
+      .distinct('_id');
+    creatorQuery.assignedAgencyId = { $in: agencyIds };
   }
-  for (const row of callStats30d) {
-    activeUserIdSet.add(row._id.toString());
-  }
-  for (const row of abuseSignalsAgg) {
-    activeUserIdSet.add(row._id.toString());
+  if (search && search.length > 0) {
+    const regex = buildSafeMongoSubstringRegex(search);
+    creatorQuery.$or = [{ name: regex }];
   }
 
-  const idleCreators = await Creator.find({ createdAt: { $gte: idleCutoff } })
-    .select('userId')
+  const totalCreators = await Creator.countDocuments(creatorQuery);
+  const skip = (page - 1) * limit;
+  let creators = await Creator.find(creatorQuery)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
     .lean();
-  for (const c of idleCreators) {
-    if (c.userId) activeUserIdSet.add(c.userId.toString());
-  }
 
-  const boundedUserIds = [...activeUserIdSet].map((id) => new mongoose.Types.ObjectId(id));
-  const creators =
-    boundedUserIds.length > 0
-      ? await Creator.find({ userId: { $in: boundedUserIds } }).lean()
-      : [];
+  const pageUserIds = creators
+    .map((c) => c.userId)
+    .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
   const users =
-    boundedUserIds.length > 0
-      ? await User.find({ _id: { $in: boundedUserIds } }).lean()
+    pageUserIds.length > 0
+      ? await User.find({ _id: { $in: pageUserIds } })
+          .select('username email phone firebaseUid')
+          .lean()
       : [];
   const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+
+  const firebaseUids = creators
+    .map((c) => userMap.get(c.userId?.toString() ?? '')?.firebaseUid)
+    .filter((uid): uid is string => typeof uid === 'string' && uid.length > 0);
+  const presenceByUid = await getBatchCreatorPresence(firebaseUids);
+
+  if (presenceStatus && ['online', 'on_call', 'offline'].includes(presenceStatus)) {
+    creators = creators.filter((creator) => {
+      const uid = userMap.get(creator.userId?.toString() ?? '')?.firebaseUid;
+      const state = uid ? presenceByUid[uid]?.state ?? 'offline' : 'offline';
+      return state === presenceStatus;
+    });
+  }
 
   const assignedAgencyIds = [
     ...new Set(
@@ -754,6 +795,10 @@ async function computeCreatorsPerformance(options: { page: number; limit: number
 
     const media = buildCreatorMediaPayload(creator);
 
+    const firebaseUid = user?.firebaseUid ?? '';
+    const presenceRecord = firebaseUid ? presenceByUid[firebaseUid] : undefined;
+    const presenceStatusValue = presenceRecord?.state ?? 'offline';
+
     return {
       creatorId: creator._id.toString(),
       userId,
@@ -766,6 +811,10 @@ async function computeCreatorsPerformance(options: { page: number; limit: number
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
+      presenceStatus: presenceStatusValue,
+      presenceUpdatedAt: presenceRecord?.updatedAt
+        ? new Date(presenceRecord.updatedAt).toISOString()
+        : null,
       assignedAgencyId: creator.assignedAgencyId?.toString() ?? null,
       assignedAgencyLabel: creator.assignedAgencyId
         ? agencyLabelById.get(creator.assignedAgencyId.toString()) ?? null
@@ -803,16 +852,13 @@ async function computeCreatorsPerformance(options: { page: number; limit: number
 
   performance.sort((a, b) => b.earned30d - a.earned30d);
 
-  const total = performance.length;
-  const skip = (page - 1) * limit;
-  const paginated = performance.slice(skip, skip + limit);
-
   return {
-    creators: paginated,
-    total,
+    creators: performance,
+    total: presenceStatus ? performance.length : totalCreators,
     page,
     limit,
-    note: `Creators with call activity or created within the last ${idleDays} days. Paginate with page/limit (max 100 per page).`,
+    note:
+      'Host list paginated from Creator collection. presenceStatus is Redis live state (online / on_call / offline).',
   };
 }
 
@@ -860,6 +906,9 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
       !!referrerAgencyOid ||
       range.hasRange;
 
+    const pageNum = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const pageLimit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+
     const data = hasFilters
       ? await computeUsersAnalytics(
           searchQuery,
@@ -867,10 +916,21 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
           sortField,
           referrerAgencyOid,
           range.hasRange ? range.from : undefined,
-          range.hasRange ? range.to : undefined
+          range.hasRange ? range.to : undefined,
+          pageNum,
+          pageLimit
         )
-      : await getCachedOrCompute('users_analytics', () =>
-          computeUsersAnalytics(undefined, undefined, undefined, undefined)
+      : await getCachedOrCompute(`users_analytics:p${pageNum}:l${pageLimit}`, () =>
+          computeUsersAnalytics(
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            pageNum,
+            pageLimit
+          )
         );
 
     res.json({
@@ -878,6 +938,9 @@ export const getUsersAnalytics = async (req: Request, res: Response): Promise<vo
       data: {
         users: data.users,
         total: data.total,
+        page: pageNum,
+        limit: pageLimit,
+        totalPages: Math.ceil(data.total / pageLimit),
       },
     });
   } catch (error) {
@@ -892,7 +955,9 @@ async function computeUsersAnalytics(
   sortField?: string,
   referrerAgencyId?: mongoose.Types.ObjectId,
   from?: Date,
-  to?: Date
+  to?: Date,
+  page = 1,
+  limit = 50
 ) {
   const filter: Record<string, unknown> = {};
   if (roleFilter && roleFilter !== 'all') filter.role = roleFilter;
@@ -907,12 +972,14 @@ async function computeUsersAnalytics(
     filter.createdAt = { $gte: from, $lt: to };
   }
 
+  const skip = (page - 1) * limit;
   const total = await User.countDocuments(filter);
 
   const users = await User.find(filter)
     .select('firebaseUid email phone gender username avatar categories coins role usernameChangeCount createdAt referredBy')
     .sort({ createdAt: -1 })
-    .limit(200)
+    .skip(skip)
+    .limit(limit)
     .lean();
 
   const userIds = users.map((u) => u._id);
@@ -1534,6 +1601,14 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
       creatorSideRecords.map((r) => [r.callId, r.coinsEarned] as const)
     );
 
+    const callLifecycleRows =
+      callIds.length > 0
+        ? await Call.find({ callId: { $in: callIds } })
+            .select('callId startedAt endedAt settlement')
+            .lean()
+        : [];
+    const callById = new Map(callLifecycleRows.map((r) => [r.callId, r]));
+
     res.json({
       success: true,
       data: {
@@ -1541,6 +1616,16 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
           const owner = userLookup.get(c.ownerUserId.toString());
           const other = userLookup.get(c.otherUserId.toString());
           const creatorCoinsEarned = creatorEarnByCallId.get(c.callId) ?? 0;
+          const lifecycle = callById.get(c.callId);
+          const callStartedAt =
+            c.callStartedAt ?? lifecycle?.startedAt ?? null;
+          const callEndedAt = c.callEndedAt ?? lifecycle?.endedAt ?? null;
+          const settledAt =
+            c.settledAt ??
+            (lifecycle?.settlement as { settledAt?: Date } | undefined)?.settledAt ??
+            c.createdAt;
+          const billingStatus =
+            (lifecycle?.settlement as { status?: string } | undefined)?.status ?? 'settled';
           return {
             callId: c.callId,
             ownerUserId: c.ownerUserId.toString(),
@@ -1556,6 +1641,10 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
             coinsDeducted: c.coinsDeducted,
             coinsEarned: c.coinsEarned,
             creatorCoinsEarned,
+            callStartedAt,
+            callEndedAt,
+            settledAt,
+            billingStatus,
             createdAt: c.createdAt,
             isZeroDuration: c.durationSeconds === 0,
             isVeryShort: c.durationSeconds > 0 && c.durationSeconds < 10,

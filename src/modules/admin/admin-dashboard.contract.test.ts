@@ -46,6 +46,16 @@ test('admin date range parser reports invalid reasons', () => {
   assert.ok(src.includes("invalidReason: 'invalid_bounds'"));
 });
 
+test('creators performance uses Redis batch presence', () => {
+  const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
+  const start = src.indexOf('async function computeCreatorsPerformance');
+  const end = src.indexOf('// GET /admin/users/analytics');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes('getBatchCreatorPresence'));
+  assert.ok(block.includes('presenceStatus'));
+});
+
 test('computeCreatorsPerformance does not use unbounded CallHistory.find for abuse refunds', () => {
   const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
   const start = src.indexOf('async function computeCreatorsPerformance');

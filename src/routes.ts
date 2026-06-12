@@ -19,6 +19,7 @@ import storiesRoutes from './modules/stories/routes/stories.routes';
 import momentsRoutes from './modules/moments/routes/moments.routes';
 import streamRoutes from './modules/stream/stream.routes';
 import vipRoutes from './modules/vip/vip.routes';
+import appConfigRoutes from './modules/app-config/app-config.routes';
 
 const router = Router();
 
@@ -35,6 +36,7 @@ router.use('/billing', billingRoutes);
 router.use('/support', supportRoutes);
 router.use('/payment', paymentRoutes);
 router.use('/app-updates', appUpdateRoutes);
+router.use('/app-config', appConfigRoutes);
 router.use('/availability', availabilityRoutes);
 router.use('/images', imagesRoutes);
 router.use('/metrics', metricsRoutes);

@@ -148,6 +148,7 @@ export const getVipPlan = async (_req: Request, res: Response): Promise<void> =>
       success: true,
       data: {
         ...legacyPlan,
+        vipEnabled,
         plans: planShapes,
         perks,
         plan: legacyPlan,
@@ -254,6 +255,11 @@ export const createVipWebOrder = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (!featureFlags.vipEnabled) {
+      res.status(503).json({ success: false, error: 'VIP is not available yet' });
+      return;
+    }
+
     const { checkoutToken } = req.body;
     if (!checkoutToken || typeof checkoutToken !== 'string') {
       res.status(400).json({ success: false, error: 'Missing checkoutToken' });
@@ -337,6 +343,11 @@ export const verifyVipWebPayment = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (!featureFlags.vipEnabled) {
+      res.status(503).json({ success: false, error: 'VIP is not available yet' });
+      return;
+    }
+
     const {
       checkoutToken,
       razorpay_order_id,
@@ -489,6 +500,11 @@ export const handleVipRazorpayWebhook = async (
   res: Response,
 ): Promise<void> => {
   try {
+    if (!featureFlags.vipEnabled) {
+      res.status(503).json({ success: false, error: 'VIP is not available yet' });
+      return;
+    }
+
     const payload = req.body as {
       event?: string;
       payload?: {

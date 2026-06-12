@@ -121,6 +121,10 @@ export function validatePricingConfig(): void {
   if (MIN_COINS_TO_CALL < 0) {
     throw new Error('MIN_COINS_TO_CALL must be >= 0');
   }
+
+  if (WELCOME_INTRO_CALL_CREDITS < 0) {
+    throw new Error('WELCOME_INTRO_CALL_CREDITS must be >= 0');
+  }
   
   if (MAX_CALL_DURATION_SECONDS < 60) {
     throw new Error('MAX_CALL_DURATION_SECONDS must be >= 60');
@@ -145,6 +149,7 @@ export function validatePricingConfig(): void {
       logInfo('Pricing configuration validated', {
         creatorSharePercentage: (CREATOR_SHARE_PERCENTAGE * 100).toFixed(1) + '%',
         minCoinsToCall: MIN_COINS_TO_CALL,
+        welcomeIntroCallCredits: WELCOME_INTRO_CALL_CREDITS,
         maxCallDurationSeconds: MAX_CALL_DURATION_SECONDS,
         defaultCreatorLimit: DEFAULT_CREATOR_CALL_DURATION_SECONDS,
         defaultUserLimit: DEFAULT_USER_CALL_DURATION_SECONDS,

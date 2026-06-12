@@ -17,6 +17,7 @@ import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug, logWarning } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agency/creator-application-status.service';
 import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
+import { getPublicAppConfig } from '../app-config/app-config.service';
 import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
 import { serializeCreatorGallery, serializeUserImages } from '../images/creator-image-helpers';
@@ -375,6 +376,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     });
     const appFlags = await getCreatorApplicationFlagsForUser(user._id);
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
+    const features = getPublicAppConfig().features;
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -419,6 +421,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
           hasAgencyAssignment,
+          features,
           ...(referralApply !== undefined ? { referralApply } : {}),
           meta: {
             showWelcomeBackDialog,
@@ -459,6 +462,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           needsOnboarding,
           createdNow,
           hasAgencyAssignment: false,
+          features,
           ...(referralApply !== undefined ? { referralApply } : {}),
           meta: {
             showWelcomeBackDialog,
