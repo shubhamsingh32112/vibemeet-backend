@@ -301,13 +301,6 @@ export async function financePayoutsSummaryPayload(period: AnalyticsPeriod) {
       paid.map((w) => w.staffUserId?.toString()).filter((id): id is string => !!id)
     ),
   ].map((id) => new mongoose.Types.ObjectId(id));
-  const creatorIds = [
-    ...new Set(
-      paid
-        .filter((w) => !w.staffUserId && w.creatorUserId)
-        .map((w) => w.creatorUserId!.toString())
-    ),
-  ];
 
   const staffUsers =
     staffIds.length > 0
