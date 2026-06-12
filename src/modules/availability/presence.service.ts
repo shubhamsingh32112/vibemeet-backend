@@ -214,56 +214,23 @@ function resolveLegacyTargetState(
   }
 }
 
-async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<CreatorPresenceSnapshot> {
-  const redis = getRedis();
-  const [baseRaw, metaRaw, activeCallIdRaw] = await redis.mget(
-    availabilityKey(firebaseUid),
-    creatorPresenceMetaKey(firebaseUid),
-    activeCallByUserKey(firebaseUid)
-  );
+/** Pure derivation from Redis fields — no writes or slot cleanup. */
+function derivePresenceSnapshotFromRedisFields(
+  baseRaw: string | null,
+  metaRaw: string | null,
+  activeCallIdRaw: string | null
+): CreatorPresenceSnapshot {
   const base = parseBaseAvailability(baseRaw);
   const parsedMeta = parsePresenceMeta(metaRaw);
   const meta = parsedMeta.meta;
-  let activeCallId = activeCallIdRaw;
-  let hasActiveCallState = Boolean(activeCallId);
-  if (hasActiveCallState && activeCallId) {
-    const slotClear = await clearCreatorActiveCallSlotIfStale(firebaseUid, {
-      source: 'presence.read_creator_presence_snapshot',
-    });
-    if (slotClear.cleared) {
-      activeCallId = null;
-      hasActiveCallState = false;
-      recordCallMetric('presence.read_path_stale_slot_cleared', 1, {
-        reason: slotClear.reason,
-      });
-    }
-  }
+  const hasActiveCallState = Boolean(activeCallIdRaw);
   const updatedAt = meta?.updatedAt ?? Date.now();
-  const source = deriveRecordSource(base, hasActiveCallState, sanitizePresenceSource(meta?.source || ONLINE_SOURCE));
+  const source = deriveRecordSource(
+    base,
+    hasActiveCallState,
+    sanitizePresenceSource(meta?.source || ONLINE_SOURCE)
+  );
   const version = meta?.version ?? syntheticFallbackVersion(updatedAt);
-  const endpointMode = getRedisEndpointMode();
-  recordCallMetric('presence.creator_meta_age_ms', Math.max(0, Date.now() - updatedAt), {
-    endpointMode,
-    source: meta?.source ? 'canonical' : 'fallback',
-  });
-  if (!meta) {
-    recordCallMetric('presence.creator_meta_missing', 1, {
-      endpointMode,
-      reason: parsedMeta.reason,
-    });
-    if (parsedMeta.reason !== 'missing') {
-      recordCallMetric('presence.creator_meta_parse_failure', 1, {
-        endpointMode,
-        reason: parsedMeta.reason,
-      });
-      logWarning('creator_presence_meta_parse_failed', {
-        firebaseUid,
-        reason: parsedMeta.reason,
-        rawFingerprint: metaRaw ? fingerprintPresenceMetaRaw(metaRaw) : 'none',
-        endpointMode,
-      });
-    }
-  }
   return {
     base,
     state: derivePresenceState(base, hasActiveCallState),
@@ -271,6 +238,49 @@ async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<Creator
     source,
     version,
   };
+}
+
+function recordPresenceMetaReadTelemetry(
+  firebaseUid: string,
+  metaRaw: string | null,
+  parsedMeta: { meta: CreatorPresenceMeta | null; reason: string },
+  updatedAt: number
+): void {
+  const endpointMode = getRedisEndpointMode();
+  recordCallMetric('presence.creator_meta_age_ms', Math.max(0, Date.now() - updatedAt), {
+    endpointMode,
+    source: parsedMeta.meta?.source ? 'canonical' : 'fallback',
+  });
+  if (parsedMeta.meta) return;
+  recordCallMetric('presence.creator_meta_missing', 1, {
+    endpointMode,
+    reason: parsedMeta.reason,
+  });
+  if (parsedMeta.reason !== 'missing') {
+    recordCallMetric('presence.creator_meta_parse_failure', 1, {
+      endpointMode,
+      reason: parsedMeta.reason,
+    });
+    logWarning('creator_presence_meta_parse_failed', {
+      firebaseUid,
+      reason: parsedMeta.reason,
+      rawFingerprint: metaRaw ? fingerprintPresenceMetaRaw(metaRaw) : 'none',
+      endpointMode,
+    });
+  }
+}
+
+async function readCreatorPresenceSnapshot(firebaseUid: string): Promise<CreatorPresenceSnapshot> {
+  const redis = getRedis();
+  const [baseRaw, metaRaw, activeCallIdRaw] = await redis.mget(
+    availabilityKey(firebaseUid),
+    creatorPresenceMetaKey(firebaseUid),
+    activeCallByUserKey(firebaseUid)
+  );
+  const parsedMeta = parsePresenceMeta(metaRaw);
+  const snapshot = derivePresenceSnapshotFromRedisFields(baseRaw, metaRaw, activeCallIdRaw);
+  recordPresenceMetaReadTelemetry(firebaseUid, metaRaw, parsedMeta, snapshot.updatedAt);
+  return snapshot;
 }
 
 /** Redis base availability (`online` | `offline`), not effective on_call. */
@@ -390,17 +400,15 @@ export async function getBatchCreatorPresence(
 
   validFirebaseUids.forEach((id, idx) => {
     const baseRaw = baseVals[idx];
-    const base = parseBaseAvailability(baseVals[idx]);
     const parsedMeta = parsePresenceMeta(metaVals[idx]);
     const meta = parsedMeta.meta;
+    const snapshot = derivePresenceSnapshotFromRedisFields(
+      baseRaw,
+      metaVals[idx],
+      activeCallVals[idx]
+    );
     const hasActiveCallState = Boolean(activeCallVals[idx]);
     const expectedCanonical = baseRaw != null || hasActiveCallState;
-    const updatedAt = meta?.updatedAt ?? Date.now();
-    const derivedSource = deriveRecordSource(
-      base,
-      hasActiveCallState,
-      sanitizePresenceSource(meta?.source || ONLINE_SOURCE)
-    );
     if (expectedCanonical) {
       expectedCanonicalCount += 1;
     }
@@ -422,21 +430,21 @@ export async function getBatchCreatorPresence(
         reason: parsedMeta.reason,
       });
       if (featureFlags.creatorPresenceMetaSelfHealEnabled && expectedCanonical) {
-        selfHealCandidates.push({ firebaseUid: id, base });
+        selfHealCandidates.push({ firebaseUid: id, base: snapshot.base });
       }
     }
-    if (!meta || derivedSource.includes('fallback') || derivedSource === OFFLINE_SOURCE) {
+    if (!meta || snapshot.source.includes('fallback') || snapshot.source === OFFLINE_SOURCE) {
       fallbackCount += 1;
     }
-    recordCallMetric('presence.creator_meta_age_ms', Math.max(0, Date.now() - updatedAt), {
+    recordCallMetric('presence.creator_meta_age_ms', Math.max(0, Date.now() - snapshot.updatedAt), {
       endpointMode,
       source: meta?.source ? 'canonical' : 'fallback',
     });
     result[id] = {
-      state: derivePresenceState(base, hasActiveCallState),
-      updatedAt,
-      source: derivedSource,
-      version: meta?.version ?? syntheticFallbackVersion(updatedAt),
+      state: snapshot.state,
+      updatedAt: snapshot.updatedAt,
+      source: snapshot.source,
+      version: snapshot.version,
     };
   });
   const batchSize = validFirebaseUids.length;

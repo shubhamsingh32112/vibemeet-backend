@@ -19,7 +19,7 @@ import {
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError, logDebug } from '../../utils/logger';
-import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
+import { clearCreatorActiveCallSlotIfStale, clearActiveCallSlotForReconciliationSweep } from '../availability/creator-active-call-slot.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { getIO } from '../../config/socket';
@@ -640,17 +640,19 @@ async function cleanupSettledCreatorBusyDrift(): Promise<void> {
 }
 
 /**
- * Clear Redis active-call slots that have no live billing session (forces effective offline/on_call fix).
+ * Age-gated reconciliation sweep for orphan `active:call:user:*` slots.
+ * Runs inside the periodic call reconciliation job (default every 5 minutes).
  */
 async function cleanupOrphanActiveCallSlots(): Promise<void> {
-  const redis = getRedis();
   const passStarted = Date.now();
   let cursor = '0';
   let scanned = 0;
   let cleared = 0;
+  let skippedGrace = 0;
 
   try {
     do {
+      const redis = getRedis();
       const [next, keys] = await redis.scan(
         cursor,
         'MATCH',
@@ -666,12 +668,15 @@ async function cleanupOrphanActiveCallSlots(): Promise<void> {
         scanned += 1;
         const firebaseUid = key.slice(ACTIVE_CALL_BY_USER_PREFIX.length).trim();
         if (!firebaseUid) continue;
-        const slotCallId = await redis.get(key);
-        if (!slotCallId) continue;
 
-        const slotClear = await clearCreatorActiveCallSlotIfStale(firebaseUid, {
-          source: 'call-reconciliation.cleanupOrphanActiveCallSlots',
-        });
+        const slotClear = await clearActiveCallSlotForReconciliationSweep(
+          firebaseUid,
+          'reconciliation.sweep'
+        );
+        if (slotClear.reason === 'within_sweep_grace_window') {
+          skippedGrace += 1;
+          continue;
+        }
         if (!slotClear.cleared) {
           continue;
         }
@@ -682,18 +687,21 @@ async function cleanupOrphanActiveCallSlots(): Promise<void> {
             getIO(),
             firebaseUid,
             'RECONCILED',
-            'call-reconciliation.cleanupOrphanActiveCallSlots'
+            'reconciliation.sweep'
           );
         }
         cleared += 1;
-        logInfo('Reconciliation cleared orphan active call slot', {
+        logInfo('Reconciliation sweep cleared orphan active call slot', {
           creatorFirebaseUid: firebaseUid,
           slotCallId: slotClear.slotCallId,
           clearReason: slotClear.reason,
+          slotAgeSeconds: slotClear.slotAgeSeconds,
           previousStatus: currentStatus,
         });
       }
     } while (cursor !== '0');
+    recordCallMetric('presence.reconciliation_sweep_scan', scanned, {});
+    recordCallMetric('presence.reconciliation_sweep_skipped_grace_total', skippedGrace, {});
     recordCallMetric('call_reconciliation.orphan_slot_scan', scanned, {});
     recordCallMetric('call_reconciliation.orphan_slot_cleared', cleared, {});
   } catch (err) {

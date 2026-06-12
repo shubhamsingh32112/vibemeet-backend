@@ -194,8 +194,7 @@ export async function markCreatorBusyForCall(
     await snapshotPreCallAvailability(callId, creatorFirebaseUid);
     await redis.set(activeCallByUserKey(creatorFirebaseUid), callId, 'EX', PRECALL_SNAPSHOT_TTL_SECONDS);
 
-    const current = await getAvailability(creatorFirebaseUid);
-    if (shouldEnforceAvailabilityWrites() && (featureFlags.creatorPresenceUserModelEnabled || current !== 'on_call')) {
+    if (shouldEnforceAvailabilityWrites()) {
       await transitionCreatorPresence(
         getIO(),
         creatorFirebaseUid,

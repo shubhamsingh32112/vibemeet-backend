@@ -12,21 +12,54 @@ import {
 import { readCreatorPresenceState, transitionCreatorPresence } from './presence.service';
 import {
   clearCreatorActiveCallSlotIfStale,
+  clearActiveCallSlotForReconciliationSweep,
   isCreatorActiveCallSlotLive,
   setIsCreatorActiveCallSlotLiveResolverForTests,
+  setResolveCallRecordForTests,
+  ACTIVE_CALL_SLOT_TTL_SECONDS,
+  RINGING_SLOT_GRACE_SECONDS,
 } from './creator-active-call-slot.service';
 import { setIO } from '../../config/socket';
 
 class InMemoryRedis {
   private store = new Map<string, string>();
+  private expiries = new Map<string, number>();
 
   async get(key: string): Promise<string | null> {
+    this.evictExpired(key);
     return this.store.has(key) ? this.store.get(key)! : null;
   }
 
-  async setex(key: string, _ttl: number, value: string): Promise<'OK'> {
+  private evictExpired(key: string): void {
+    const expiresAt = this.expiries.get(key);
+    if (expiresAt != null && Date.now() >= expiresAt) {
+      this.store.delete(key);
+      this.expiries.delete(key);
+    }
+  }
+
+  async set(key: string, value: string, ...args: Array<string | number>): Promise<'OK'> {
     this.store.set(key, value);
+    const exIndex = args.findIndex((v) => String(v).toUpperCase() === 'EX');
+    if (exIndex >= 0 && args[exIndex + 1] != null) {
+      const ttlSeconds = Number(args[exIndex + 1]);
+      if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+        this.expiries.set(key, Date.now() + ttlSeconds * 1000);
+      }
+    }
     return 'OK';
+  }
+
+  async ttl(key: string): Promise<number> {
+    this.evictExpired(key);
+    if (!this.store.has(key)) return -2;
+    const expiresAt = this.expiries.get(key);
+    if (expiresAt == null) return -1;
+    return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+  }
+
+  async setex(key: string, ttl: number, value: string): Promise<'OK'> {
+    return this.set(key, value, 'EX', ttl);
   }
 
   async del(...keys: string[]): Promise<number> {
@@ -112,7 +145,28 @@ function createMockIo() {
   };
 }
 
-test('behavioral: read path clears orphan active-call slot so creator is not stuck on_call', async () => {
+test('behavioral: read path is read-only and does not clear orphan active-call slot', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+  setIO(createMockIo() as any);
+  setIsCreatorActiveCallSlotLiveResolverForTests(async () => false);
+
+  const creatorFirebaseUid = 'creator-read-only-slot';
+  const staleCallId = 'call-ended-hours-ago';
+  await redis.setex(availabilityKey(creatorFirebaseUid), 120, 'online');
+  await redis.setex(activeCallByUserKey(creatorFirebaseUid), 7200, staleCallId);
+
+  const state = await readCreatorPresenceState(creatorFirebaseUid);
+  assert.equal(state.state, 'on_call', 'reads derive on_call from slot without side effects');
+
+  const slot = await redis.get(activeCallByUserKey(creatorFirebaseUid));
+  assert.equal(slot, staleCallId, 'read path must not delete the slot');
+
+  setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: explicit stale cleanup still clears orphan active-call slot', async () => {
   const redis = new InMemoryRedis();
   setRedisForTests(redis as any);
   setIO(createMockIo() as any);
@@ -154,6 +208,82 @@ test('behavioral: FORCE_OFFLINE transition clears active-call slot', async () =>
   assert.equal(state.state, 'offline');
 
   setIsCreatorActiveCallSlotLiveResolverForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: ringing slot is live when precall snapshot exists without Mongo call', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+  setResolveCallRecordForTests(async () => null);
+
+  const callId = 'call-ringing-precall';
+  const creatorUid = 'creator-ringing-precall';
+  await redis.set(activeCallByUserKey(creatorUid), callId, 'EX', 7200);
+  await redis.setex(`call:precall:availability:${callId}:${creatorUid}`, 7200, 'online');
+
+  const live = await isCreatorActiveCallSlotLive(callId, creatorUid);
+  assert.equal(live, true);
+
+  setResolveCallRecordForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: fresh ringing slot is live via TTL grace when Mongo call is missing', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+  setResolveCallRecordForTests(async () => null);
+
+  const callId = 'call-ringing-ttl-grace';
+  const creatorUid = 'creator-ringing-ttl';
+  await redis.set(activeCallByUserKey(creatorUid), callId, 'EX', 7200);
+
+  const live = await isCreatorActiveCallSlotLive(callId, creatorUid);
+  assert.equal(live, true);
+
+  setResolveCallRecordForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: reconciliation sweep skips slots within grace window', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+  setResolveCallRecordForTests(async () => null);
+
+  const callId = 'call-sweep-grace';
+  const creatorUid = 'creator-sweep-grace';
+  await redis.set(activeCallByUserKey(creatorUid), callId, 'EX', ACTIVE_CALL_SLOT_TTL_SECONDS);
+
+  const result = await clearActiveCallSlotForReconciliationSweep(creatorUid, 'test.sweep');
+  assert.equal(result.cleared, false);
+  assert.equal(result.reason, 'within_sweep_grace_window');
+  assert.ok((result.slotAgeSeconds ?? 0) < RINGING_SLOT_GRACE_SECONDS + 120);
+
+  setResolveCallRecordForTests(null);
+  resetRedisForTests();
+});
+
+test('behavioral: reconciliation sweep clears aged orphan without Mongo call', async () => {
+  const redis = new InMemoryRedis();
+  setRedisForTests(redis as any);
+  setResolveCallRecordForTests(async () => null);
+
+  const callId = 'call-sweep-orphan';
+  const creatorUid = 'creator-sweep-orphan';
+  const agedTtl = Math.max(1, ACTIVE_CALL_SLOT_TTL_SECONDS - RINGING_SLOT_GRACE_SECONDS - 120);
+  await redis.set(activeCallByUserKey(creatorUid), callId, 'EX', agedTtl);
+  await redis.setex(`call:precall:availability:${callId}:${creatorUid}`, 7200, 'online');
+
+  const liveDefault = await isCreatorActiveCallSlotLive(callId, creatorUid, 'default');
+  assert.equal(liveDefault, true, 'precall grace protects slot during default liveness check');
+
+  const result = await clearActiveCallSlotForReconciliationSweep(creatorUid, 'test.sweep');
+  assert.equal(result.cleared, true);
+  assert.equal(result.reason, 'reconciliation_sweep_orphan');
+
+  const slot = await redis.get(activeCallByUserKey(creatorUid));
+  assert.equal(slot, null);
+
+  setResolveCallRecordForTests(null);
   resetRedisForTests();
 });
 
