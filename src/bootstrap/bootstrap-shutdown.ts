@@ -20,9 +20,14 @@ import { stopImagePipelineWorkers } from '../modules/images/images.bootstrap';
 import { stopMomentsWorkers } from '../modules/moments/moments.bootstrap';
 import { clearEventLoopProbe } from './bootstrap-core';
 import { logInfo } from '../utils/logger';
+import {
+  flushOwnedSessionsToMongoOnShutdown,
+  markShuttingDown,
+} from '../modules/billing/billing-shutdown.service';
 
 const SHUTDOWN_HTTP_MS = parseInt(process.env.SHUTDOWN_HTTP_MS || '30000', 10);
 const SHUTDOWN_BULLMQ_MS = parseInt(process.env.SHUTDOWN_BULLMQ_MS || '60000', 10);
+const SHUTDOWN_SOCKETIO_MS = parseInt(process.env.SOCKETIO_CLOSE_MS || '15000', 10);
 
 let httpServerRef: HttpServer | null = null;
 let ioRef: Server | null = null;
@@ -55,9 +60,12 @@ function closeHttpServer(timeoutMs: number): Promise<void> {
 
 async function closeSocketIo(): Promise<void> {
   if (!ioRef) return;
-  await new Promise<void>((resolve) => {
-    ioRef!.close(() => resolve());
-  });
+  await Promise.race([
+    new Promise<void>((resolve) => {
+      ioRef!.close(() => resolve());
+    }),
+    new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_SOCKETIO_MS)),
+  ]);
 }
 
 async function stopBillingWorkersWithTimeout(timeoutMs: number): Promise<void> {
@@ -67,11 +75,16 @@ async function stopBillingWorkersWithTimeout(timeoutMs: number): Promise<void> {
   ]);
 }
 
+export { isShuttingDown } from '../modules/billing/billing-shutdown.service';
+
 async function runRoleShutdown(): Promise<void> {
   if (shuttingDown) return;
+  markShuttingDown();
   shuttingDown = true;
   const role = getServiceRole();
   logInfo('Role-aware shutdown starting', { serviceRole: role, signal: 'shutdown' });
+
+  await flushOwnedSessionsToMongoOnShutdown().catch(() => {});
 
   if (runsHttpApi()) {
     await closeHttpServer(SHUTDOWN_HTTP_MS);

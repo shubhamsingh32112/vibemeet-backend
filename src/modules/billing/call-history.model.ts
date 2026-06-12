@@ -25,6 +25,7 @@ export interface ICallHistory extends Document {
   callStartedAt?: Date;              // When the call session started (from Call lifecycle)
   callEndedAt?: Date;                // When the call session ended
   settledAt?: Date;                  // When billing settlement completed
+  settlementStatus?: 'pending' | 'settled' | 'failed'; // Billing projection status
   coinsDeducted: number;             // Coins deducted (user) or 0 (creator)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
   ratingStars?: number;              // 1-5 star rating submitted by user for creator
@@ -98,6 +99,12 @@ const callHistorySchema = new Schema<ICallHistory>(
     },
     settledAt: {
       type: Date,
+      sparse: true,
+      index: true,
+    },
+    settlementStatus: {
+      type: String,
+      enum: ['pending', 'settled', 'failed'],
       sparse: true,
       index: true,
     },

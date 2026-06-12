@@ -19,6 +19,21 @@ import { checkCallRateLimit } from '../../utils/rate-limit.service';
 import { assertBillingRestCallStartedAccess } from './billing-rest-access';
 import { COIN_MICROS, BILLING_SESSION_SCHEMA_VERSION, microsToWholeCoinsFloor } from './billing.constants';
 import {
+  assertNotShuttingDown,
+  ShutdownAdmissionRejectedError,
+} from './billing-shutdown.service';
+import {
+  bumpReconnectGeneration,
+  getDurableCallSession,
+} from './call-session.service';
+import { isBillingOwnershipV2Enabled } from './billing-phase-flags';
+import { flushBillingPersist, flushBillingPersistForCallId } from './billing-persist.service';
+import { recordReconnectGenerationMismatch } from './billing-phase-metrics';
+import {
+  releaseRecoveryGate,
+  tryAcquireRecoveryGate,
+} from './billing-recovery-gate.service';
+import {
   finalizeCallEnd,
   restoreCreatorPresenceForEndedCall,
 } from '../video/call-finalization.service';
@@ -55,22 +70,6 @@ const SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD = Math.min(
     parseInt(process.env.BILLING_SYNC_WARNING_CONNECTED_AUTOHEAL_THRESHOLD || '1', 10) || 1
   )
 );
-
-type RecoveryGate = {
-  inFlight: boolean;
-  lastRecoveryAtMs: number;
-};
-
-const recoveryGateByUid = new Map<string, RecoveryGate>();
-
-function getRecoveryGate(firebaseUid: string): RecoveryGate {
-  let gate = recoveryGateByUid.get(firebaseUid);
-  if (!gate) {
-    gate = { inFlight: false, lastRecoveryAtMs: 0 };
-    recoveryGateByUid.set(firebaseUid, gate);
-  }
-  return gate;
-}
 
 function buildRecoverSnapshot(
   session: BillingRecoverSession,
@@ -213,7 +212,6 @@ export function setupBillingGateway(io: Server): void {
 
     socket.join(`user:${firebaseUid}`);
     logDebug('User joined billing room', { firebaseUid, room: `user:${firebaseUid}` });
-    const recoveryGate = getRecoveryGate(firebaseUid);
     let recoveryRequestSeq = 0;
 
     socket.on(
@@ -226,6 +224,8 @@ export function setupBillingGateway(io: Server): void {
       }) => {
         const callStartedRequestAt = Date.now();
         try {
+          assertNotShuttingDown('call:started');
+
           const initiatedByFirebaseUid = firebaseUid;
           const initiatedByRole = socket.data.isCreator ? 'creator' : 'user';
           const startCorrelationId = randomUUID();
@@ -305,6 +305,14 @@ export function setupBillingGateway(io: Server): void {
             initiatedByRole,
           });
         } catch (err) {
+          if (err instanceof ShutdownAdmissionRejectedError) {
+            socket.emit('billing:error', {
+              callId: data.callId,
+              error: 'SERVER_DRAINING',
+              message: 'Server is shutting down. Please retry on another node.',
+            });
+            return;
+          }
           logError('Error in call:started', err, { callId: data.callId, firebaseUid });
           const redis = getRedis();
           await redis.del(pendingCallEndKey(data.callId)).catch(() => {});
@@ -316,9 +324,27 @@ export function setupBillingGateway(io: Server): void {
       }
     );
 
-    socket.on('call:ended', async (data: { callId: string }) => {
+    socket.on('call:ended', async (data: { callId: string; reconnectGeneration?: number }) => {
       try {
+        assertNotShuttingDown('call:ended');
         logInfo('call:ended received', { callId: data.callId, firebaseUid });
+
+        if (isBillingOwnershipV2Enabled()) {
+          const durable = await getDurableCallSession(data.callId);
+          if (
+            durable &&
+            data.reconnectGeneration != null &&
+            data.reconnectGeneration < (durable.reconnectGeneration ?? 0)
+          ) {
+            recordReconnectGenerationMismatch(data.callId);
+            logInfo('call:ended_stale_generation_ignored', {
+              callId: data.callId,
+              eventGeneration: data.reconnectGeneration,
+              currentGeneration: durable.reconnectGeneration,
+            });
+            return;
+          }
+        }
 
         const redis = getRedis();
         const sessionForEnd = (await resolveBillingRuntimeState(data.callId)).session;
@@ -475,7 +501,9 @@ export function setupBillingGateway(io: Server): void {
         );
       };
 
-      if (recoveryGate.inFlight) {
+      const gateStatus = await tryAcquireRecoveryGate(firebaseUid, RECOVERY_DEBOUNCE_MS);
+
+      if (gateStatus === 'in_flight') {
         logInfo('billing_state_recovery_suppressed', {
           firebaseUid,
           recoveryRequestId,
@@ -490,7 +518,7 @@ export function setupBillingGateway(io: Server): void {
         await emitSuppressedRecoverySnapshot('in_flight');
         return;
       }
-      if (now - recoveryGate.lastRecoveryAtMs < RECOVERY_DEBOUNCE_MS) {
+      if (gateStatus === 'debounce') {
         logInfo('billing_state_recovery_suppressed', {
           firebaseUid,
           recoveryRequestId,
@@ -506,9 +534,9 @@ export function setupBillingGateway(io: Server): void {
         await emitSuppressedRecoverySnapshot('debounce');
         return;
       }
-      recoveryGate.inFlight = true;
-      recoveryGate.lastRecoveryAtMs = now;
       try {
+        assertNotShuttingDown('billing:recover-state');
+
         logInfo('State recovery requested', {
           firebaseUid,
           recoveryRequestId,
@@ -749,9 +777,21 @@ export function setupBillingGateway(io: Server): void {
         }
 
         recordRecoveryOutcome(firebaseUid, 'recover_success');
+        const newGeneration = callId ? await bumpReconnectGeneration(callId) : null;
+        if (callId && runtime.session) {
+          await flushBillingPersist(
+            callId,
+            runtime.session as import('./billing.service').CallSession,
+            'reconnect'
+          ).catch(() => {});
+        }
+        const payloadWithGeneration = {
+          ...snapshot.payload,
+          ...(newGeneration != null ? { reconnectGeneration: newGeneration } : {}),
+        };
         emitBillingRecoverStateFromSnapshot(
           socket,
-          [snapshot.payload],
+          [payloadWithGeneration],
           {
             recoveryRequestId,
             clientRecoveryRequestId,
@@ -773,6 +813,20 @@ export function setupBillingGateway(io: Server): void {
 
         recordBillingMetric('state_recovery', 1, { callId, firebaseUid });
       } catch (err) {
+        if (err instanceof ShutdownAdmissionRejectedError) {
+          emitBillingRecoverStateResponse(socket, {
+            success: false,
+            error: 'Server draining',
+            activeCalls: [],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: Date.now(),
+            status: 'error',
+            reason: 'server_draining',
+            recoveryOutcome: 'recover_emit_skipped',
+          });
+          return;
+        }
         logError('State recovery failed', err, { firebaseUid });
         recordRecoveryOutcome(firebaseUid, 'recover_emit_skipped', { reason: 'exception' });
         emitBillingRecoverStateResponse(socket, {
@@ -787,7 +841,7 @@ export function setupBillingGateway(io: Server): void {
           recoveryOutcome: 'recover_emit_skipped',
         });
       } finally {
-        recoveryGate.inFlight = false;
+        await releaseRecoveryGate(firebaseUid).catch(() => {});
       }
     });
 
@@ -981,6 +1035,21 @@ export function setupBillingGateway(io: Server): void {
       // Calls continue over Stream/WebRTC even if Socket.IO drops briefly; settling
       // here truncates billed duration and causes timer/UI desync on clients.
       // Settlement is handled by explicit `call:ended` and Stream webhooks.
+      try {
+        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
+        const callId = activeRuntime.callId;
+        const session = activeRuntime.runtime.session;
+        if (!callId || !session) return;
+        const flushReason =
+          session.creatorFirebaseUid === firebaseUid ? 'creator_disconnect' : 'disconnect';
+        await flushBillingPersistForCallId(
+          callId,
+          flushReason,
+          session as import('./billing.service').CallSession
+        );
+      } catch {
+        // best-effort billing persist on disconnect
+      }
     });
   });
 }

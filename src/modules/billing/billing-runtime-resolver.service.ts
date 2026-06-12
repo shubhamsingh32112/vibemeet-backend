@@ -18,6 +18,9 @@ import { getBillingInstanceId } from './billing-instance-id';
 import { logInfo, logWarning, logDebug } from '../../utils/logger';
 import { logBillingHealthWarn } from './billing-health-log';
 import { pricingService } from '../video/pricing.service';
+import { getDurableCallSession } from './call-session.service';
+import { isDurableCallSessionEnabled } from './billing-phase-flags';
+import { DurableCallSessionState } from './call-session.model';
 
 export interface BillingRuntimeSession {
   schemaVersion?: number;
@@ -143,6 +146,57 @@ async function buildSessionFromCheckpoint(
   };
 }
 
+function mapDurableStateToLifecycle(state: DurableCallSessionState): BillingLifecycleState {
+  switch (state) {
+    case 'reconnecting':
+      return 'RECOVERING';
+    case 'ending':
+      return 'ENDING';
+    case 'settling':
+      return 'SETTLING';
+    case 'settled':
+      return 'SETTLED';
+    case 'failed_settlement':
+      return 'FAILED_RECOVERY_SETTLEMENT';
+    default:
+      return 'ACTIVE';
+  }
+}
+
+async function buildSessionFromDurableCallSession(
+  callId: string
+): Promise<BillingRuntimeSession | null> {
+  const doc = await getDurableCallSession(callId);
+  if (!doc || doc.finalized) return null;
+
+  const startTimeMs = doc.serverStartedAt?.getTime() ?? doc.startedAt?.getTime() ?? Date.now();
+  const lastProcessedAt = doc.lastServerAccrualAt?.getTime() ?? doc.lastBillingAt?.getTime() ?? startTimeMs;
+
+  return {
+    schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
+    callId,
+    userFirebaseUid: doc.callerFirebaseUid,
+    creatorFirebaseUid: doc.creatorFirebaseUid,
+    userMongoId: doc.callerId.toString(),
+    creatorMongoId: doc.creatorId.toString(),
+    pricePerMinute: doc.pricePerMinute ?? 0,
+    pricePerSecondMicros: doc.pricePerSecondMicros ?? 0,
+    startTime: startTimeMs,
+    lastProcessedAt,
+    totalDeductedMicros: doc.totalUserDebitedMicros ?? 0,
+    totalEarnedMicros: doc.totalCreatorCreditedMicros ?? 0,
+    billingSequence: doc.billingSequence ?? 0,
+    lifecycleState: mapDurableStateToLifecycle(doc.state),
+    elapsedSeconds: doc.accumulatedDurationSec ?? 0,
+    version: doc.settlementVersion ?? 0,
+    lastHealthyTickAt: lastProcessedAt,
+    lastSequenceAdvanceAt: lastProcessedAt,
+    instanceId: doc.leaseOwnerId ?? getBillingInstanceId(),
+    runtimeEpoch: doc.fencingToken ?? 1,
+    leaderLock: `billing:runtime:owner:${callId}`,
+  };
+}
+
 export async function resolveBillingRuntimeState(callId: string): Promise<ResolvedBillingRuntime> {
   const redis = getRedis();
   const sessionRaw = await redis.get(callSessionKey(callId));
@@ -179,6 +233,30 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
       balanceMicros: introMicros + walletMicros,
       earningsMicros,
     };
+  }
+
+  if (isDurableCallSessionEnabled()) {
+    const durableSession = await buildSessionFromDurableCallSession(callId);
+    if (durableSession) {
+      const balanceMicros = Math.max(0, durableSession.totalDeductedMicros ?? 0);
+      const earningsMicros = Math.max(0, durableSession.totalEarnedMicros ?? 0);
+      await redis
+        .multi()
+        .setex(callSessionKey(callId), 7200, JSON.stringify(durableSession))
+        .setex(callUserWalletMicrosKey(callId), 7200, String(balanceMicros))
+        .setex(callCreatorEarningsKey(callId), 7200, String(earningsMicros))
+        .exec();
+      recordBillingMetric('billing_recovery_source', 1, { source: 'reconstructed', callId });
+      logInfo('billing_runtime_reconstructed_from_mongo', { callId, state: durableSession.lifecycleState });
+      return {
+        source: 'reconstructed',
+        session: durableSession,
+        introMicros: 0,
+        walletMicros: balanceMicros,
+        balanceMicros,
+        earningsMicros,
+      };
+    }
   }
 
   const terminalRaw = await redis.get(callSessionTerminalKey(callId));

@@ -463,11 +463,13 @@ Save as `task-definition-monolith.json` (do not commit secrets):
         "retries": 3,
         "startPeriod": 60
       },
-      "stopTimeout": 30
+      "stopTimeout": 90
     }
   ]
 }
 ```
+
+> **Graceful drain (Phase A+):** Set ECS `stopTimeout` ≥ **90s**, ALB target group deregistration delay **60–120s**, and env `SHUTDOWN_HTTP_MS=30000`, `SHUTDOWN_BULLMQ_MS=60000`, `SOCKETIO_CLOSE_MS=15000`. `/ready` returns **503** while draining so reconnects do not migrate into dying tasks.
 
 > **ECS production:** Add `"environment": [{ "name": "ECS_SERVICE_ROLE", "value": "api-ws" }]` only for api-ws service. Monolith `node dist/server.js` without role **fails on ECS** — use Phase 2 task definitions for production ECS.
 

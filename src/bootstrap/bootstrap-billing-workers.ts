@@ -7,6 +7,7 @@ import {
   startStaffWalletReconciliationScheduler,
 } from '../modules/billing/staff-wallet-reconciliation.scheduler';
 import { startDomainEventWorker } from '../modules/events/domain-event.worker';
+import '../modules/events/billing-domain-event-handlers';
 import { verifyStartupRecovery } from '../modules/billing/billing-recovery';
 import {
   startCallReconciliationJob,

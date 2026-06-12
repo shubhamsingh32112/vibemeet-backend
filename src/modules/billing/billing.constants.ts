@@ -4,8 +4,8 @@
  */
 export const COIN_MICROS = 1_000_000;
 
-/** How often the ZSET scheduler wakes a call for processing (ms). */
-const DEFAULT_BILLING_PROCESS_INTERVAL_MS = 450;
+/** How often the ZSET scheduler wakes a call for processing (ms). Phase C default: 1s. */
+const DEFAULT_BILLING_PROCESS_INTERVAL_MS = 1000;
 const MIN_BILLING_PROCESS_INTERVAL_MS = 200;
 const MAX_BILLING_PROCESS_INTERVAL_MS = 5000;
 

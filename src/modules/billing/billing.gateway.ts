@@ -7,6 +7,7 @@ import {
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
 import { billingService, type BillingSessionStartSource } from './billing.service';
+import { assertNotShuttingDown } from './billing-shutdown.service';
 import { logInfo, logDebug, logError } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
@@ -41,6 +42,7 @@ async function handleCallStarted(
     startIngress?: 'socket' | 'http' | 'webhook' | 'system';
   }
 ): Promise<void> {
+  assertNotShuttingDown('billing.start');
   await billingService.startBillingSession(io, userFirebaseUid, data, opts);
 
   logDebug('Call started via handleCallStarted', {

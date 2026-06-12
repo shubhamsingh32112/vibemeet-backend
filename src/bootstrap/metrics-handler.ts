@@ -78,6 +78,18 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
     const paymentWebVerifyDuration = byName['payment.web.verify_duration_ms'];
     const reconRunMsAvg = byName['billing.reconciliation_run_ms']?.avg ?? 0;
     const reconItemsAvg = byName['billing.reconciliation_items_processed']?.avg ?? 0;
+    const durableFinalizeDuplicate = byName['billing.billing_finalize_duplicate_prevented'];
+    const durablePersistLag = byName['billing.billing_persist_lag_seconds'];
+    const durablePendingRecentsAge = byName['billing.call_history_pending_recents_age_seconds'];
+    const durableSettlementRetry = byName['billing.billing_settlement_retry_count'];
+    const durableStaleFencingReject = byName['billing.billing_stale_fencing_reject_count'];
+    const durableLeaseTakeover = byName['billing.billing_lease_takeover_count'];
+    const durableReconnectGenMismatch = byName['billing.billing_reconnect_generation_mismatch'];
+    const durableLedgerOverlap = byName['billing.billing_ledger_overlap_detected'];
+    const durableReconciliationDrift = byName['billing.billing_reconciliation_drift_count'];
+    const durableOrphanRecovered = byName['billing.billing_orphaned_sessions_recovered'];
+    const durableWatchdogAlert = byName['billing.billing_watchdog_alert_count'];
+    const durableLedgerAuthoritative = byName['billing.settlement_ledger_authoritative'];
     const now = Date.now();
     const rollingWindowMs = 5 * 60 * 1000;
     const fromTs = now - rollingWindowMs;
@@ -383,6 +395,18 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
     if (rollingCreatorUidContractViolationRate > 0.005) {
       metricsAlerts.push('creator_presence_uid_contract_violation_high_5m');
     }
+    if ((durablePersistLag?.p95 ?? 0) > 10) {
+      metricsAlerts.push('billing_persist_lag_p95_high');
+    }
+    if ((durableLedgerOverlap?.count ?? 0) > 0) {
+      metricsAlerts.push('billing_ledger_overlap_detected');
+    }
+    if ((durableStaleFencingReject?.count ?? 0) >= 5) {
+      metricsAlerts.push('billing_stale_fencing_reject_elevated');
+    }
+    if ((durableReconciliationDrift?.count ?? 0) >= 3) {
+      metricsAlerts.push('billing_reconciliation_drift_elevated');
+    }
 
     const fanoutDuration = byName['stream.feed.fanout.duration_ms'];
     const fanoutFailed = byName['stream.feed.fanout.failed']?.sum ?? 0;
@@ -567,6 +591,34 @@ export async function metricsRequestHandler(req: express.Request, res: express.R
             runAvgMs: Math.round(rollingReconRunAvgMs * 100) / 100,
             sampleLimit: rollingSampleLimit,
           },
+        },
+        durableCallSession: {
+          finalizeDuplicatePrevented: durableFinalizeDuplicate?.count ?? 0,
+          persistLagSeconds: durablePersistLag
+            ? {
+                samples: durablePersistLag.count,
+                avg: Math.round(durablePersistLag.avg * 100) / 100,
+                p95: Math.round(durablePersistLag.p95 * 100) / 100,
+                max: Math.round(durablePersistLag.max * 100) / 100,
+              }
+            : null,
+          pendingRecentsAgeSeconds: durablePendingRecentsAge
+            ? {
+                samples: durablePendingRecentsAge.count,
+                avg: Math.round(durablePendingRecentsAge.avg * 100) / 100,
+                p95: Math.round(durablePendingRecentsAge.p95 * 100) / 100,
+                max: Math.round(durablePendingRecentsAge.max * 100) / 100,
+              }
+            : null,
+          settlementRetryCount: durableSettlementRetry?.count ?? 0,
+          staleFencingRejectCount: durableStaleFencingReject?.count ?? 0,
+          leaseTakeoverCount: durableLeaseTakeover?.count ?? 0,
+          reconnectGenerationMismatch: durableReconnectGenMismatch?.count ?? 0,
+          ledgerOverlapDetected: durableLedgerOverlap?.count ?? 0,
+          reconciliationDriftCount: durableReconciliationDrift?.count ?? 0,
+          orphanedSessionsRecovered: durableOrphanRecovered?.count ?? 0,
+          watchdogAlertCount: durableWatchdogAlert?.count ?? 0,
+          settlementLedgerAuthoritative: durableLedgerAuthoritative?.count ?? 0,
         },
       },
       payment: {

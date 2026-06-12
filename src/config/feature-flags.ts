@@ -77,12 +77,17 @@ export const featureFlags = {
    */
   billingBalanceMismatchAutoRepairEnabled:
     process.env.BILLING_BALANCE_MISMATCH_AUTO_REPAIR_ENABLED !== 'false',
-  /**
-   * Onboarding strict mode rollout:
-   * - log-only: log invalid transitions, allow
-   * - soft-enforce: ignore invalid transitions
-   * - hard-enforce: reject invalid transitions (HTTP 409)
-   */
+  /** Phase A: durable Mongo CallSession dual-write */
+  durableCallSessionEnabled: process.env.DURABLE_CALL_SESSION_ENABLED === 'true',
+  /** Phase B: lease + fencing ownership */
+  billingOwnershipV2Enabled: process.env.BILLING_OWNERSHIP_V2_ENABLED === 'true',
+  /** Phase C: append-only billing ledger persist */
+  incrementalBillingPersistEnabled: process.env.INCREMENTAL_BILLING_PERSIST_ENABLED === 'true',
+  /** Phase D: outbox CallHistory projection */
+  billingOutboxProjectionEnabled: process.env.BILLING_OUTBOX_PROJECTION_ENABLED === 'true',
+  /** Watchdog auto-finalize (off by default — alert-only first) */
+  billingWatchdogAutoFinalizeEnabled:
+    process.env.BILLING_WATCHDOG_AUTO_FINALIZE_ENABLED === 'true',
   onboardingStrictMode: process.env.ONBOARDING_STRICT_MODE ?? 'log-only',
   /** ISO date; after this, rollout fast-forward (welcome/bonus→completed) is disabled. */
   onboardingFastForwardUntil: process.env.ONBOARDING_FAST_FORWARD_UNTIL ?? '',

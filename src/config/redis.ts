@@ -353,6 +353,11 @@ export const BILLING_START_ORCHESTRATOR_PREFIX = 'billing:start:orchestrator:';
 export const BILLING_START_REPLAY_GUARD_PREFIX = 'billing:start:replay_guard:';
 export const BILLING_SYNC_WARNING_DEDUP_PREFIX = 'billing:sync_warning:dedup:';
 export const BILLING_SYNC_WARNING_COUNT_PREFIX = 'billing:sync_warning:count:';
+export const BILLING_RECOVERY_GATE_PREFIX = 'billing:recovery:gate:';
+export const billingRecoveryGateKey = (firebaseUid: string): string =>
+  `${BILLING_RECOVERY_GATE_PREFIX}${firebaseUid}`;
+export const billingRecoveryGateInflightKey = (firebaseUid: string): string =>
+  `${BILLING_RECOVERY_GATE_PREFIX}${firebaseUid}:inflight`;
 export const billingStartOrchestratorKey = (callId: string): string =>
   `${BILLING_START_ORCHESTRATOR_PREFIX}${callId}`;
 export const billingStartReplayGuardKey = (callId: string): string =>

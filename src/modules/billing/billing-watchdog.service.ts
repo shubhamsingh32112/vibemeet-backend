@@ -21,6 +21,9 @@ import {
   getRecoveryOwnerInstanceId,
   moveCallToRecoveryDeadLetter,
 } from './billing-session-finalization.service';
+import { isDurableCallSessionEnabled, isWatchdogAutoFinalizeEnabled } from './billing-phase-flags';
+import { DurableCallSession } from './call-session.model';
+import { recordWatchdogAlert } from './billing-phase-metrics';
 import { featureFlags } from '../../config/feature-flags';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
 import { randomUUID } from 'crypto';
@@ -116,6 +119,29 @@ async function runWatchdogPass(io: Server): Promise<void> {
   const recoveryOwnerInstanceId = getRecoveryOwnerInstanceId();
   const callIds = await getActiveCallIds();
   recordBillingMetric('billing_watchdog_active_calls', callIds.size, {});
+
+  if (isDurableCallSessionEnabled()) {
+    const staleThreshold = new Date(now - STALLED_ACTIVE_MS);
+    const staleMongo = await DurableCallSession.find({
+      finalized: false,
+      state: { $in: ['active', 'reconnecting', 'ending', 'settling'] },
+      lastBillingAt: { $lt: staleThreshold },
+    })
+      .select('_id state lastBillingAt')
+      .limit(100)
+      .lean();
+
+    for (const row of staleMongo) {
+      recordWatchdogAlert(row._id, `mongo_stale_${row.state}`);
+      logWarning('billing_watchdog_mongo_stale_alert', {
+        callId: row._id,
+        state: row.state,
+        lastBillingAt: row.lastBillingAt,
+        watchdogPassId,
+        autoFinalize: isWatchdogAutoFinalizeEnabled(),
+      });
+    }
+  }
 
   for (const callId of callIds) {
     try {
@@ -245,6 +271,10 @@ async function runWatchdogPass(io: Server): Promise<void> {
           watchdogPassId,
           recoveryOwnerInstanceId,
         });
+        recordWatchdogAlert(callId, 'stalled_settling');
+        if (!isWatchdogAutoFinalizeEnabled()) {
+          continue;
+        }
         await finalizeCallSession(io, {
           callId,
           reason: 'timeout',
@@ -326,6 +356,10 @@ async function runWatchdogPass(io: Server): Promise<void> {
           watchdogPassId,
           recoveryOwnerInstanceId,
         });
+        recordWatchdogAlert(callId, 'stalled_recovering');
+        if (!isWatchdogAutoFinalizeEnabled()) {
+          continue;
+        }
         await finalizeCallSession(io, {
           callId,
           reason: 'timeout',

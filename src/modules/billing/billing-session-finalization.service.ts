@@ -50,6 +50,16 @@ import { logError, logInfo, logWarning } from '../../utils/logger';
 import { transitionBillingStateWithAudit } from './billing-lifecycle.machine';
 import { cancelBillingCycleJob } from './billing.queue';
 import { featureFlags } from '../../config/feature-flags';
+import {
+  claimDurableCallSessionForSettlement,
+  isDurableCallSessionFinalized,
+  markDurableCallSessionFailedSettlement,
+  markDurableCallSessionSettled,
+} from './call-session.service';
+import { isDurableCallSessionEnabled, isBillingOutboxProjectionEnabled } from './billing-phase-flags';
+import { recordFinalizeDuplicatePrevented, recordSettlementRetry } from './billing-phase-metrics';
+import { enqueueCallBillingProjectionEvent } from './call-history-projector.service';
+import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
 
 export type SettlementReason =
   | 'insufficient_coins'
@@ -287,6 +297,23 @@ export async function moveCallToRecoveryDeadLetter(
     error: `dead_letter:${reason}`,
   });
   await drainSettlementArtifacts(callId, 'dead_letter_transition');
+  if (isDurableCallSessionEnabled()) {
+    await markDurableCallSessionFailedSettlement(callId).catch(() => {});
+  }
+  if (isBillingOutboxProjectionEnabled()) {
+    const runtime = await resolveBillingRuntimeState(callId).catch(() => null);
+    const session = runtime?.session;
+    await enqueueCallBillingProjectionEvent({
+      type: 'call.billing.failed_settlement',
+      callId,
+      payload: {
+        userMongoId: session?.userMongoId,
+        creatorMongoId: session?.creatorMongoId,
+        userFirebaseUid: session?.userFirebaseUid,
+        creatorFirebaseUid: session?.creatorFirebaseUid,
+      },
+    }).catch(() => {});
+  }
   recordBillingMetric('billing_recovery_dead_letter_total', 1, {
     callId,
     reason,
@@ -308,11 +335,21 @@ async function isAlreadySettled(callId: string): Promise<boolean> {
   if (await redis.get(settledCallKey(callId))) {
     return true;
   }
-  const history = await CallHistory.findOne({ callId, ownerRole: 'user' }).lean();
-  if (history) {
+  if (await isDurableCallSessionFinalized(callId)) {
     return true;
   }
-  const call = await Call.findOne({ callId }).select('settlement.status').lean();
+  const history = await CallHistory.findOne({ callId, ownerRole: 'user' })
+    .select('settlementStatus settledAt coinsDeducted')
+    .lean();
+  if (history) {
+    if (history.settlementStatus === 'settled' || history.settledAt) {
+      return true;
+    }
+    if (history.settlementStatus !== 'pending' && (history.coinsDeducted ?? 0) > 0) {
+      return true;
+    }
+  }
+  const call = await Call.findOne({ callId }).select('settlement.status isSettled').lean();
   return call?.settlement?.status === 'settled';
 }
 
@@ -475,6 +512,7 @@ export async function enqueueSettlementRetry(
     payload
   );
   await redis.zadd(BILLING_SETTLEMENT_RETRY_KEY, score, params.callId);
+  recordSettlementRetry(params.callId, params.source);
   recordBillingMetric('billing_finalize_retry_total', 1, {
     callId: params.callId,
     source: params.source,
@@ -1122,7 +1160,26 @@ export async function finalizeCallSession(
   let settlementVersion = 1;
 
   try {
-    settlementVersion = await markCallSettling(callId, source, reason, ownerToken, ownerInstanceId);
+    if (isDurableCallSessionEnabled()) {
+      const claim = await claimDurableCallSessionForSettlement({
+        callId,
+        reason,
+        source,
+      });
+      if (!claim.ok) {
+        if (claim.reason === 'already_finalized') {
+          recordFinalizeDuplicatePrevented(callId, source);
+          recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
+          await ensureTerminalBillingTeardown(callId);
+          return { status: 'duplicate', callId };
+        }
+        await enqueueSettlementRetry(params);
+        return { status: 'pending_retry', callId };
+      }
+      settlementVersion = claim.settlementVersion;
+    } else {
+      settlementVersion = await markCallSettling(callId, source, reason, ownerToken, ownerInstanceId);
+    }
     const checkpointOk = await checkpointLifecycleState(callId, 'SETTLING', 'settling');
     if (!checkpointOk) {
       if (snapshotMeta.recoverySource === 'missing') {
@@ -1189,6 +1246,20 @@ export async function finalizeCallSession(
     }
 
     await markCallSettled(callId, source, reason, settlementVersion);
+    await markDurableCallSessionSettled({ callId, settlementVersion });
+    if (isBillingOutboxProjectionEnabled()) {
+      const { enqueueCallBillingProjectionEvent } = await import('./call-history-projector.service');
+      await enqueueCallBillingProjectionEvent({
+        type: 'call.billing.settled',
+        callId,
+        payload: {
+          coinsDeducted: persistResult.totalDeducted,
+          coinsEarned: persistResult.totalEarnedCreator,
+          durationSeconds: persistResult.durationSeconds,
+          userMongoId: persistResult.userFirebaseUid,
+        },
+      }).catch(() => {});
+    }
     await checkpointLifecycleState(callId, 'SETTLED', 'settled');
     emitBillingSettledFromSnapshot(
       io,

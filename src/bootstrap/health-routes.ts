@@ -2,6 +2,7 @@ import type { Express } from 'express';
 import mongoose from 'mongoose';
 import { isRedisConfigured } from '../config/redis';
 import { getServiceRole } from '../config/service-role';
+import { isShuttingDown } from '../modules/billing/billing-shutdown.service';
 
 export function registerHealthRoutes(app: Express): void {
   app.get('/health', (_req, res) => {
@@ -31,6 +32,10 @@ export function registerHealthRoutes(app: Express): void {
 
   app.get('/ready', async (_req, res) => {
     const checks: Record<string, { ok: boolean; error?: string }> = {};
+
+    if (isShuttingDown()) {
+      checks.shutdown = { ok: false, error: 'draining' };
+    }
 
     try {
       if (!mongoose.connection || mongoose.connection.readyState === undefined) {

@@ -2,6 +2,11 @@ import { Server } from 'socket.io';
 import { Call, ICall } from './call.model';
 import { getRedis } from '../../config/redis';
 import { finalizeCallSession } from '../billing/billing-session-finalization.service';
+import { markDurableCallSessionEnding } from '../billing/call-session.service';
+import { upsertPendingCallHistoryOnEnding } from '../billing/call-history-pending.service';
+import { flushBillingPersistForCallId } from '../billing/billing-persist.service';
+import { enqueueCallBillingProjectionEvent } from '../billing/call-history-projector.service';
+import { isBillingOutboxProjectionEnabled } from '../billing/billing-phase-flags';
 import { finalizeCreatorAvailabilityForCall, releaseCreatorCallLock } from './creator-call-lock.service';
 import { transitionCallStatus } from './call-state.service';
 import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
@@ -153,8 +158,27 @@ export async function finalizeCallEnd(
           call.status = 'ended';
         }
       }
-      if (!call.isSettled) {
-        call.isSettled = true;
+
+      await flushBillingPersistForCallId(callId, 'call_end').catch(() => {});
+      await markDurableCallSessionEnding(callId);
+      const runtimeForPending = await resolveBillingRuntimeState(callId);
+      if (isBillingOutboxProjectionEnabled() && runtimeForPending.session) {
+        await enqueueCallBillingProjectionEvent({
+          type: 'call.billing.ending',
+          callId,
+          payload: {
+            userMongoId: runtimeForPending.session.userMongoId,
+            creatorMongoId: runtimeForPending.session.creatorMongoId,
+            userFirebaseUid: runtimeForPending.session.userFirebaseUid,
+            creatorFirebaseUid: runtimeForPending.session.creatorFirebaseUid,
+            durationSeconds: runtimeForPending.session.elapsedSeconds ?? 0,
+          },
+        });
+      } else {
+        await upsertPendingCallHistoryOnEnding({
+          callId,
+          redisSession: runtimeForPending.session as import('../billing/billing.service').CallSession | null,
+        });
       }
 
       const settlementSource =
@@ -173,13 +197,20 @@ export async function finalizeCallEnd(
                 : 'webhook';
 
       const finalizeSessionFn = finalizeCallSessionForTests ?? finalizeCallSession;
-      await finalizeSessionFn(io, {
+      const finalizeResult = await finalizeSessionFn(io, {
         callId,
         reason: 'explicit_end',
         source: settlementSource,
       });
+      if (finalizeResult && typeof finalizeResult === 'object' && 'status' in finalizeResult) {
+        const status = (finalizeResult as { status: string }).status;
+        if (status === 'settled' || status === 'duplicate') {
+          call.isSettled = true;
+        }
+      }
       await call.save();
     } else {
+      await flushBillingPersistForCallId(callId, 'call_end').catch(() => {});
       const finalizeSessionFn = finalizeCallSessionForTests ?? finalizeCallSession;
       await finalizeSessionFn(io, {
         callId,

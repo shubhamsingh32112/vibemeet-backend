@@ -155,6 +155,8 @@ export function startReconciliationJob(io: Server): void {
       await processDLQ(io, startedAt);
       await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
       await runBullmqBillingWatchdog(startedAt);
+      const { runCallSessionReconciliationPass } = await import('./billing-call-session-reconciliation');
+      await runCallSessionReconciliationPass();
       recordBillingMetric('reconciliation_run_ms', Date.now() - startedAt, {});
     }).catch((err) => {
       logError('Error in reconciliation run', err);

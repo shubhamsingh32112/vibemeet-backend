@@ -78,6 +78,13 @@ import {
 } from './billing-emitter.service';
 import { billingInstanceIdsMatch, getBillingInstanceId } from './billing-instance-id';
 import {
+  createDurableCallSessionAtStart,
+  maybeMirrorRedisSessionToDurable,
+  flushMirrorRedisSessionToDurable,
+} from './call-session.service';
+import { isDurableCallSessionEnabled } from './billing-phase-flags';
+import { maybePeriodicBillingPersist, flushBillingPersistForCallId } from './billing-persist.service';
+import {
   billingHealthFieldsFromSession,
   logBillingHealth,
   logBillingHealthDebug,
@@ -195,6 +202,16 @@ async function ensureRuntimeOwnership(
   callId: string,
   nowMs: number = Date.now()
 ): Promise<boolean> {
+  const { isShuttingDown, assertNotShuttingDown } = await import('./billing-shutdown.service');
+  if (isShuttingDown()) {
+    return false;
+  }
+  try {
+    assertNotShuttingDown('billing.ownership');
+  } catch {
+    return false;
+  }
+
   const ownerLockKey = session.leaderLock || `${BILLING_RUNTIME_OWNER_LOCK_PREFIX}${callId}`;
   const runtimeEpoch = Math.max(1, Number(session.runtimeEpoch) || 1);
   const workerInstanceId = getBillingInstanceId();
@@ -2269,7 +2286,28 @@ export class BillingService {
     session.lastHealthyTickAt = serverTimestamp;
     session.lastSequenceAdvanceAt = serverTimestamp;
     session.lastSocketEmitAt = serverTimestamp;
+
+    if (isDurableCallSessionEnabled()) {
+      const creatorUser = await User.findOne({ firebaseUid: creatorFirebaseUid })
+        .select('_id')
+        .lean();
+      await createDurableCallSessionAtStart({
+        callId,
+        callerId: session.userMongoId,
+        creatorId: creatorUser?._id?.toString() || session.creatorMongoId,
+        callerFirebaseUid: userFirebaseUid,
+        creatorFirebaseUid,
+        pricePerMinute: session.pricePerMinute,
+        pricePerSecondMicros: session.pricePerSecondMicros,
+        creatorShareAtCallTime: session.creatorShareAtCallTime,
+      });
+    }
+
     await persistCallSession(redis, callId, session);
+
+    if (isDurableCallSessionEnabled()) {
+      await flushMirrorRedisSessionToDurable(callId, session);
+    }
 
     const settledFromPendingEnd = await consumePendingCallEndIfAny(
       io,
@@ -2761,6 +2799,7 @@ export class BillingService {
             })
           ).next;
           const userReason = introPromoBilling ? 'intro_promo_exhausted' : 'insufficient_coins';
+          void flushBillingPersistForCallId(callId, 'insufficient_balance', session).catch(() => {});
           emitSoon(() => {
             void forceTerminateCall(io, {
               callId,
@@ -3002,6 +3041,8 @@ export class BillingService {
         await releaseActiveCallSlotsIfTerminal(redis, session);
         await refreshActiveCallSlotsTtl(redis, session.userFirebaseUid, session.creatorFirebaseUid);
         recordBillingMetric('redis_pipeline_success', 1, { callId, path: 'tick_persist' });
+        void maybeMirrorRedisSessionToDurable(callId, session).catch(() => {});
+        void maybePeriodicBillingPersist(callId, session).catch(() => {});
       } catch (redisError) {
         recordBillingMetric('redis_pipeline_failure', 1, { callId, path: 'tick_persist' });
         logError('CRITICAL: Redis error during billing cycle', redisError, {

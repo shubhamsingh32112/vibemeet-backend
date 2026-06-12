@@ -49,6 +49,9 @@ import { computeStaffCutsFromHostEarnings } from './staff-revenue-share';
 import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
 import { cancelBillingCycleJob } from './billing.queue';
 import { emitBillingSettledFromSnapshot } from './billing-emitter.service';
+import { flushBillingPersist } from './billing-persist.service';
+import { sumLedgerForCall } from './billing-ledger.model';
+import { isIncrementalBillingPersistEnabled } from './billing-phase-flags';
 
 interface CallSession {
   schemaVersion?: number;
@@ -307,8 +310,15 @@ export async function settleCall(
   }
 
   if (!sessionRaw) {
-    const mongoAlready = await CallHistory.findOne({ callId, ownerRole: 'user' }).lean();
-    if (mongoAlready) {
+    const mongoAlready = await CallHistory.findOne({ callId, ownerRole: 'user' })
+      .select('settlementStatus settledAt coinsDeducted')
+      .lean();
+    if (
+      mongoAlready &&
+      (mongoAlready.settlementStatus === 'settled' ||
+        mongoAlready.settledAt ||
+        (mongoAlready.settlementStatus !== 'pending' && (mongoAlready.coinsDeducted ?? 0) > 0))
+    ) {
       recordBillingMetric('settlement_idempotent_mongo_no_redis', 1, { callId });
       await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
     } else {
@@ -324,11 +334,51 @@ export async function settleCall(
   const session: CallSession =
     typeof sessionRaw === 'string' ? JSON.parse(sessionRaw) : (sessionRaw as CallSession);
 
+  if (isIncrementalBillingPersistEnabled()) {
+    try {
+      await flushBillingPersist(
+        callId,
+        session as import('./billing.service').CallSession,
+        'call_end'
+      );
+      const ledgerSum = await sumLedgerForCall(callId);
+      if (ledgerSum.tickCount > 0) {
+        const introDeductedMicros = Math.max(0, Number(session.totalIntroDeductedMicros) || 0);
+        session.totalDeductedMicros = ledgerSum.userDebitMicros;
+        session.totalEarnedMicros = ledgerSum.creatorCreditMicros;
+        session.totalWalletDeductedMicros = Math.max(
+          0,
+          ledgerSum.userDebitMicros - introDeductedMicros
+        );
+        recordBillingMetric('settlement_ledger_authoritative', 1, { callId });
+        logInfo('Settlement using ledger-authoritative totals', {
+          callId,
+          ledgerUserDebitMicros: ledgerSum.userDebitMicros,
+          ledgerCreatorCreditMicros: ledgerSum.creatorCreditMicros,
+          tickCount: ledgerSum.tickCount,
+        });
+      }
+    } catch (ledgerErr) {
+      logWarning('Settlement ledger flush/reconcile failed — falling back to Redis session totals', {
+        callId,
+        error: ledgerErr instanceof Error ? ledgerErr.message : String(ledgerErr),
+      });
+    }
+  }
+
   const existingUserHistory = await CallHistory.findOne({
     callId,
     ownerUserId: session.userMongoId,
-  }).lean();
-  if (existingUserHistory) {
+  })
+    .select('settlementStatus settledAt coinsDeducted')
+    .lean();
+  if (
+    existingUserHistory &&
+    (existingUserHistory.settlementStatus === 'settled' ||
+      existingUserHistory.settledAt ||
+      (existingUserHistory.settlementStatus !== 'pending' &&
+        (existingUserHistory.coinsDeducted ?? 0) > 0))
+  ) {
     recordBillingMetric('settlement_idempotent_mongo', 1, { callId });
     await deleteBillingSessionRedisKeys(
       redis,
@@ -794,6 +844,7 @@ export async function settleCall(
         direction: userDirection,
         durationSeconds,
         ...callTimestampFields,
+        settlementStatus: 'settled',
         coinsDeducted: totalDeducted,
         coinsEarned: 0,
       },
@@ -814,6 +865,7 @@ export async function settleCall(
           direction: creatorDirection,
           durationSeconds,
           ...callTimestampFields,
+          settlementStatus: 'settled',
           coinsDeducted: 0,
           coinsEarned: totalEarnedCreator,
         },
