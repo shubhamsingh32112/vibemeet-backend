@@ -63,6 +63,17 @@ export async function projectCallHistoryFromBillingEvent(
     const durationSeconds = Math.max(0, Number(payload.durationSeconds) || 0);
 
     if (event.type === 'call.billing.ending') {
+      const alreadySettled = await CallHistory.findOne({
+        callId,
+        settlementStatus: 'settled',
+      })
+        .select('_id')
+        .lean();
+      if (alreadySettled) {
+        logInfo('call_history_projected_pending_skip_already_settled', { callId });
+        return;
+      }
+
       const base = {
         durationSeconds,
         callStartedAt: parties.callStartedAt,
@@ -71,9 +82,14 @@ export async function projectCallHistoryFromBillingEvent(
         coinsDeducted: 0,
         coinsEarned: 0,
       };
+      const pendingOnlyFilter = { settlementStatus: { $ne: 'settled' as const } };
 
       await CallHistory.findOneAndUpdate(
-        { callId, ownerUserId: new mongoose.Types.ObjectId(parties.userMongoId) },
+        {
+          callId,
+          ownerUserId: new mongoose.Types.ObjectId(parties.userMongoId),
+          ...pendingOnlyFilter,
+        },
         {
           callId,
           ownerUserId: parties.userMongoId,
@@ -91,7 +107,11 @@ export async function projectCallHistoryFromBillingEvent(
 
       if (parties.creatorOwnerUserId) {
         await CallHistory.findOneAndUpdate(
-          { callId, ownerUserId: parties.creatorOwnerUserId },
+          {
+            callId,
+            ownerUserId: parties.creatorOwnerUserId,
+            ...pendingOnlyFilter,
+          },
           {
             callId,
             ownerUserId: parties.creatorOwnerUserId,
@@ -114,16 +134,35 @@ export async function projectCallHistoryFromBillingEvent(
 
     if (event.type === 'call.billing.settled') {
       const settledAt = new Date();
-      const update = {
+      const coinsDeducted = Math.max(0, Number(payload.coinsDeducted) || 0);
+      const coinsEarned = Math.max(0, Number(payload.coinsEarned) || 0);
+      const settledBase = {
         settlementStatus: 'settled' as const,
         settledAt,
         durationSeconds,
-        coinsDeducted: Math.max(0, Number(payload.coinsDeducted) || 0),
-        coinsEarned: Math.max(0, Number(payload.coinsEarned) || 0),
       };
 
-      await CallHistory.updateMany({ callId }, { $set: update });
-      logInfo('call_history_projected_settled', { callId });
+      await CallHistory.updateOne(
+        { callId, ownerRole: 'user' },
+        {
+          $set: {
+            ...settledBase,
+            coinsDeducted,
+            coinsEarned: 0,
+          },
+        }
+      );
+      await CallHistory.updateOne(
+        { callId, ownerRole: 'creator' },
+        {
+          $set: {
+            ...settledBase,
+            coinsDeducted: 0,
+            coinsEarned,
+          },
+        }
+      );
+      logInfo('call_history_projected_settled', { callId, coinsDeducted, coinsEarned });
       return;
     }
 

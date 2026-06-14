@@ -57,6 +57,17 @@ export async function upsertPendingCallHistoryOnEnding(params: {
 
   const { callId } = params;
   try {
+    const alreadySettled = await CallHistory.findOne({
+      callId,
+      settlementStatus: 'settled',
+    })
+      .select('_id')
+      .lean();
+    if (alreadySettled) {
+      logInfo('pending_call_history_skip_already_settled', { callId });
+      return;
+    }
+
     const durable = await getDurableCallSession(callId);
     const callLifecycle = await Call.findOne({ callId })
       .select('startedAt endedAt callerUserId creatorUserId initiatedByRole')
@@ -109,8 +120,14 @@ export async function upsertPendingCallHistoryOnEnding(params: {
       coinsEarned: 0,
     };
 
+    const pendingOnlyFilter = { settlementStatus: { $ne: 'settled' as const } };
+
     await CallHistory.findOneAndUpdate(
-      { callId, ownerUserId: new mongoose.Types.ObjectId(userMongoId) },
+      {
+        callId,
+        ownerUserId: new mongoose.Types.ObjectId(userMongoId),
+        ...pendingOnlyFilter,
+      },
       {
         callId,
         ownerUserId: new mongoose.Types.ObjectId(userMongoId),
@@ -128,7 +145,11 @@ export async function upsertPendingCallHistoryOnEnding(params: {
 
     if (details.creatorOwnerUserId) {
       await CallHistory.findOneAndUpdate(
-        { callId, ownerUserId: details.creatorOwnerUserId },
+        {
+          callId,
+          ownerUserId: details.creatorOwnerUserId,
+          ...pendingOnlyFilter,
+        },
         {
           callId,
           ownerUserId: details.creatorOwnerUserId,
