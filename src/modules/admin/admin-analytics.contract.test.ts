@@ -17,6 +17,7 @@ test('admin routes register analytics BFF endpoints', () => {
     'utf8'
   );
   assert.ok(routes.includes('/analytics/users/summary'));
+  assert.ok(routes.includes('/analytics/users/login-series'));
   assert.ok(routes.includes('/analytics/revenue/summary'));
   assert.ok(routes.includes('/wallet/transactions'));
 });

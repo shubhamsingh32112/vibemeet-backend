@@ -10,6 +10,7 @@ import {
   momentsPaidUsersPayload,
   revenueSummaryPayload,
   usersSummaryPayload,
+  usersLoginSeriesPayload,
   vipPaidUsersPayload,
   walletTransactionsPayload,
 } from './admin-analytics.service';
@@ -39,6 +40,17 @@ export const getUsersSummary = async (req: Request, res: Response): Promise<void
     res.json({ success: true, data });
   } catch (error) {
     logError('getUsersSummary', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getUsersLoginSeries = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const data = await usersLoginSeriesPayload(req.query.granularity);
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getUsersLoginSeries', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

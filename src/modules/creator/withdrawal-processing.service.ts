@@ -150,10 +150,11 @@ export async function processWithdrawalApproval(
   }
 
   if (!options.isAdmin) {
-    const allowed = await withdrawalManagedByAgent(withdrawal, actingUser._id);
-    if (!allowed) {
-      return { ok: false, status: 403, error: 'This withdrawal is not assigned to you' };
-    }
+    return {
+      ok: false,
+      status: 403,
+      error: 'Creator withdrawal actions require super admin',
+    };
   }
 
   if (withdrawal.status !== 'pending') {
@@ -232,10 +233,11 @@ export async function processWithdrawalRejection(
       return { ok: false, status: 403, error: 'Staff withdrawals require super admin' };
     }
   } else if (!options.isAdmin) {
-    const allowed = await withdrawalManagedByAgent(withdrawal, actingUser._id);
-    if (!allowed) {
-      return { ok: false, status: 403, error: 'This withdrawal is not assigned to you' };
-    }
+    return {
+      ok: false,
+      status: 403,
+      error: 'Creator withdrawal actions require super admin',
+    };
   }
 
   if (withdrawal.status !== 'pending') {
@@ -286,10 +288,11 @@ export async function processWithdrawalMarkPaid(
   }
 
   if (!options.isAdmin) {
-    const allowed = await withdrawalManagedByAgent(withdrawal, actingUser._id);
-    if (!allowed) {
-      return { ok: false, status: 403, error: 'This withdrawal is not assigned to you' };
-    }
+    return {
+      ok: false,
+      status: 403,
+      error: 'Creator withdrawal actions require super admin',
+    };
   }
 
   if (withdrawal.status !== 'approved') {

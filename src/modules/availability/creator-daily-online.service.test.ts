@@ -14,3 +14,11 @@ test('allocateSecondsByPeriodStartMs counts in-window slice', () => {
   const total = [...m.values()].reduce((a, b) => a + b, 0);
   assert.equal(total, 65);
 });
+
+test('getOnlineTodaySecondsLive delegates to batch helper', async () => {
+  const src = await import('node:fs/promises').then((fs) =>
+    fs.readFile(new URL('./creator-daily-online.service.ts', import.meta.url), 'utf8')
+  );
+  assert.ok(src.includes('export async function getBatchOnlineTodaySecondsLive'));
+  assert.ok(src.includes('const map = await getBatchOnlineTodaySecondsLive([creatorFirebaseUid])'));
+});

@@ -124,6 +124,7 @@ import {
   getMomentsPaidUsers,
   getRevenueAnalyticsSummary,
   getUsersSummary,
+  getUsersLoginSeries,
   getVipPaidUsers,
   getWalletTransactions,
 } from './admin-analytics.controller';
@@ -144,6 +145,7 @@ router.get('/leaderboards/hosts', getLeaderboardHosts);
 router.get('/leaderboards/hosts/cached', getCachedLeaderboardHosts);
 router.get('/leaderboards/users', getLeaderboardUsers);
 router.get('/analytics/users/summary', getUsersSummary);
+router.get('/analytics/users/login-series', getUsersLoginSeries);
 router.get('/analytics/moments/paid-users', getMomentsPaidUsers);
 router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);

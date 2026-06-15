@@ -24,6 +24,7 @@ import { serializeCreatorGallery, serializeUserImages } from '../images/creator-
 import { serializeAvatar } from '../images/serialize-image-asset';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
+import { recordConsumerUserLogin } from '../user/user-login.service';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
@@ -341,6 +342,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       role: user.role,
       coins: coinsForResponse,
     });
+
+    try {
+      await recordConsumerUserLogin(user);
+    } catch (loginTrackErr) {
+      logError('recordConsumerUserLogin failed', loginTrackErr as Error, {
+        userId: user._id.toString(),
+      });
+    }
 
     // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
     const creator = await Creator.findOne({ userId: user._id }).lean();

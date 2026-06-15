@@ -8,9 +8,6 @@ import {
   getAgencyCreators,
   getAgencyCreatorDetail,
   getAgencyWithdrawals,
-  agencyApproveWithdrawal,
-  agencyRejectWithdrawal,
-  agencyMarkWithdrawalPaid,
   approveAgencyReferredUser,
   rejectAgencyReferredUser,
   postAgencyStaffWithdrawalRequest,
@@ -41,8 +38,5 @@ router.get('/creators', getAgencyCreators);
 router.get('/creators/:creatorId', getAgencyCreatorDetail);
 router.get('/withdrawals', getAgencyWithdrawals);
 router.post('/staff-withdrawals', postAgencyStaffWithdrawalRequest);
-router.post('/withdrawals/:id/approve', agencyApproveWithdrawal);
-router.post('/withdrawals/:id/reject', agencyRejectWithdrawal);
-router.post('/withdrawals/:id/mark-paid', agencyMarkWithdrawalPaid);
 
 export default router;

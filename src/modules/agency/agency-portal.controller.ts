@@ -7,11 +7,6 @@ import { ReferralEdge } from '../user/referral-edge.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { assertAgency } from '../../middlewares/staff.middleware';
 import { loadStaffUserByAuth } from '../../middlewares/staff.middleware';
-import {
-  processWithdrawalApproval,
-  processWithdrawalRejection,
-  processWithdrawalMarkPaid,
-} from '../creator/withdrawal-processing.service';
 import { CallHistory } from '../billing/call-history.model';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';
@@ -1238,72 +1233,6 @@ export const getAgencyWithdrawals = async (req: Request, res: Response): Promise
     });
   } catch (error) {
     logError('getAgencyWithdrawals', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const agencyApproveWithdrawal = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-    const { id } = req.params;
-    const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
-    const result = await processWithdrawalApproval(id, agency, { notes, isAdmin: false });
-    if (!result.ok) {
-      res.status(result.status).json({ success: false, error: result.error });
-      return;
-    }
-    res.json({ success: true, data: result.data });
-  } catch (error) {
-    logError('agencyApproveWithdrawal', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const agencyRejectWithdrawal = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-    const { id } = req.params;
-    const notes = typeof req.body?.notes === 'string' ? req.body.notes : '';
-    const result = await processWithdrawalRejection(id, agency, { notes, isAdmin: false });
-    if (!result.ok) {
-      res.status(result.status).json({ success: false, error: result.error });
-      return;
-    }
-    res.json({ success: true, data: result.data });
-  } catch (error) {
-    logError('agencyRejectWithdrawal', error as Error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-};
-
-export const agencyMarkWithdrawalPaid = async (req: Request, res: Response): Promise<void> => {
-  try {
-    if (!(await assertAgency(req, res))) return;
-    const agency = await loadStaffUserByAuth(req);
-    if (!agency) {
-      res.status(401).json({ success: false, error: 'Unauthorized' });
-      return;
-    }
-    const { id } = req.params;
-    const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
-    const result = await processWithdrawalMarkPaid(id, agency, { notes, isAdmin: false });
-    if (!result.ok) {
-      res.status(result.status).json({ success: false, error: result.error });
-      return;
-    }
-    res.json({ success: true, data: result.data });
-  } catch (error) {
-    logError('agencyMarkWithdrawalPaid', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

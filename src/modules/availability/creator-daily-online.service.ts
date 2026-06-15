@@ -80,54 +80,85 @@ export async function recordCreatorAvailabilityBecameBusy(
   }
 }
 
+export async function getBatchOnlineTodaySecondsLive(
+  creatorFirebaseUids: string[]
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  const unique = [...new Set(creatorFirebaseUids.filter((uid) => uid.length > 0))];
+  if (unique.length === 0) return result;
+
+  const { periodStart, periodEnd } = getDailyPeriodBounds();
+  const docs = await CreatorDailyOnline.find({
+    creatorFirebaseUid: { $in: unique },
+    periodStart,
+  })
+    .select('creatorFirebaseUid onlineSeconds')
+    .lean();
+
+  for (const doc of docs) {
+    result.set(doc.creatorFirebaseUid, doc.onlineSeconds ?? 0);
+  }
+  for (const uid of unique) {
+    if (!result.has(uid)) result.set(uid, 0);
+  }
+
+  const redis = getRedis();
+  const sinceKeys = unique.map(creatorAvailOnlineSinceKey);
+  const presenceKeys = unique.map(creatorPresenceKey);
+  const [sinceRaws, presenceRaws] = await Promise.all([
+    redis.mget(...sinceKeys),
+    redis.mget(...presenceKeys),
+  ]);
+
+  const now = Date.now();
+  const pStartMs = periodStart.getTime();
+  const pEndMs = periodEnd.getTime();
+
+  for (let i = 0; i < unique.length; i++) {
+    const uid = unique[i];
+    let seconds = result.get(uid) ?? 0;
+    const sinceRaw = sinceRaws[i];
+    const presenceRaw = presenceRaws[i];
+
+    let avail: 'online' | 'on_call' | 'offline' = 'offline';
+    if (presenceRaw) {
+      try {
+        const parsed = JSON.parse(presenceRaw) as { state?: string } | null;
+        if (parsed?.state === 'online') {
+          avail = 'online';
+        }
+      } catch {
+        // No-op: malformed canonical payload should not break online-time stats.
+      }
+    }
+
+    if (sinceRaw && avail === 'online') {
+      const startMs = parseInt(sinceRaw, 10);
+      if (!Number.isNaN(startMs)) {
+        const overlapStart = Math.max(startMs, pStartMs);
+        const overlapEnd = Math.min(now, pEndMs);
+        if (overlapEnd > overlapStart) {
+          seconds += Math.floor((overlapEnd - overlapStart) / 1000);
+        }
+      }
+    }
+
+    result.set(uid, seconds);
+  }
+
+  return result;
+}
+
 /**
  * Stored seconds for current task period + live tail if Redis says online and session key is set.
  */
 export async function getOnlineTodaySecondsLive(
   creatorFirebaseUid: string
 ): Promise<{ onlineTodaySeconds: number; onlineTodayResetsAt: string }> {
-  const { periodStart, periodEnd, resetsAt } = getDailyPeriodBounds();
-  const redis = getRedis();
-
-  const doc = await CreatorDailyOnline.findOne({
-    creatorFirebaseUid,
-    periodStart,
-  })
-    .select('onlineSeconds')
-    .lean();
-
-  let seconds = doc?.onlineSeconds ?? 0;
-
-  const sinceRaw = await redis.get(creatorAvailOnlineSinceKey(creatorFirebaseUid));
-  const presenceRaw = await redis.get(creatorPresenceKey(creatorFirebaseUid));
-  let avail: 'online' | 'on_call' | 'offline' = 'offline';
-  if (presenceRaw) {
-    try {
-      const parsed = JSON.parse(presenceRaw) as { state?: string } | null;
-      if (parsed?.state === 'online') {
-        avail = 'online';
-      }
-    } catch {
-      // No-op: malformed canonical payload should not break online-time stats.
-    }
-  }
-
-  if (sinceRaw && avail === 'online') {
-    const startMs = parseInt(sinceRaw, 10);
-    if (!Number.isNaN(startMs)) {
-      const now = Date.now();
-      const pStartMs = periodStart.getTime();
-      const pEndMs = periodEnd.getTime();
-      const overlapStart = Math.max(startMs, pStartMs);
-      const overlapEnd = Math.min(now, pEndMs);
-      if (overlapEnd > overlapStart) {
-        seconds += Math.floor((overlapEnd - overlapStart) / 1000);
-      }
-    }
-  }
-
+  const { resetsAt } = getDailyPeriodBounds();
+  const map = await getBatchOnlineTodaySecondsLive([creatorFirebaseUid]);
   return {
-    onlineTodaySeconds: seconds,
+    onlineTodaySeconds: map.get(creatorFirebaseUid) ?? 0,
     onlineTodayResetsAt: resetsAt.toISOString(),
   };
 }

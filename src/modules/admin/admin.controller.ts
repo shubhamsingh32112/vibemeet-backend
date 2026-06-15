@@ -66,6 +66,7 @@ import {
   setDegradedHeader,
 } from '../images/images.controller';
 import { CreatorDailyOnline } from '../availability/creator-daily-online.model';
+import { getBatchOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
 import {
   CREATOR_GALLERY_MAX_IMAGES,
   CREATOR_GALLERY_MIN_IMAGES,
@@ -451,6 +452,29 @@ function parseCreatorsPerformancePaging(req: Request): {
   return { page, limit, search, agencyId, bdId, presenceStatus };
 }
 
+async function attachLiveOnlineTodaySeconds(
+  creators: Array<{ userId: string; onlineTodaySeconds?: number }>
+): Promise<void> {
+  const userIds = creators.map((c) => c.userId).filter(Boolean);
+  if (userIds.length === 0) return;
+
+  const users = await User.find({ _id: { $in: userIds } })
+    .select('_id firebaseUid')
+    .lean();
+  const uidByUserId = new Map(
+    users
+      .filter((u) => u.firebaseUid)
+      .map((u) => [u._id.toString(), u.firebaseUid as string] as const)
+  );
+  const firebaseUids = [...uidByUserId.values()];
+  const onlineMap = await getBatchOnlineTodaySecondsLive(firebaseUids);
+
+  for (const creator of creators) {
+    const firebaseUid = uidByUserId.get(creator.userId);
+    creator.onlineTodaySeconds = firebaseUid ? onlineMap.get(firebaseUid) ?? 0 : 0;
+  }
+}
+
 export const getCreatorsPerformance = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
@@ -462,6 +486,10 @@ export const getCreatorsPerformance = async (req: Request, res: Response): Promi
       : await getCachedOrCompute(`creators_performance:p${opts.page}:l${opts.limit}`, () =>
           computeCreatorsPerformance(opts)
         );
+
+    if (data?.creators?.length) {
+      await attachLiveOnlineTodaySeconds(data.creators);
+    }
 
     res.json({ success: true, data });
   } catch (error) {

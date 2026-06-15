@@ -12,8 +12,10 @@ import { MomentPurchase } from '../moments/models/moment-purchase.model';
 import { VipMembership } from '../vip/models/vip-membership.model';
 import { isBdRole, isAgencyRole } from '../../utils/staff-roles';
 import { getRedis } from '../../config/redis';
+import { UserLoginEvent } from '../user/user-login-event.model';
 
 export type AnalyticsPeriod = 'today' | '7d' | '30d';
+export type UserLoginGranularity = 'daily' | 'weekly' | 'monthly';
 
 function utcStartOfDay(d = new Date()): Date {
   const x = new Date(d);
@@ -54,6 +56,174 @@ export async function usersSummaryPayload() {
     signups30d,
     onboardedUsers,
     generatedAt: now.toISOString(),
+  };
+}
+
+function parseUserLoginGranularity(raw: unknown): UserLoginGranularity {
+  const g = String(raw ?? 'daily');
+  if (g === 'weekly' || g === 'monthly') return g;
+  return 'daily';
+}
+
+function loginSeriesLookback(granularity: UserLoginGranularity): { from: Date; to: Date } {
+  const to = new Date();
+  const from = utcStartOfDay(to);
+  if (granularity === 'daily') {
+    from.setUTCDate(from.getUTCDate() - 29);
+    return { from, to };
+  }
+  if (granularity === 'weekly') {
+    from.setUTCDate(from.getUTCDate() - 7 * 11);
+    return { from, to };
+  }
+  from.setUTCMonth(from.getUTCMonth() - 11);
+  from.setUTCDate(1);
+  return { from, to };
+}
+
+function iterUtcDateStrings(from: Date, to: Date): string[] {
+  const dates: string[] = [];
+  const cur = new Date(from);
+  cur.setUTCHours(0, 0, 0, 0);
+  const end = new Date(to);
+  end.setUTCHours(0, 0, 0, 0);
+  while (cur <= end) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+function isoWeekLabel(year: number, week: number): string {
+  return `${year}-W${String(week).padStart(2, '0')}`;
+}
+
+function isoWeekStartUtc(year: number, week: number): Date {
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const day = jan4.getUTCDay() || 7;
+  const mondayWeek1 = new Date(jan4);
+  mondayWeek1.setUTCDate(jan4.getUTCDate() - day + 1);
+  const start = new Date(mondayWeek1);
+  start.setUTCDate(mondayWeek1.getUTCDate() + (week - 1) * 7);
+  return start;
+}
+
+function iterWeeklyBuckets(from: Date, to: Date): Array<{ key: string; label: string; startDate: string }> {
+  const buckets: Array<{ key: string; label: string; startDate: string }> = [];
+  const cur = utcStartOfDay(from);
+  const end = utcStartOfDay(to);
+  while (cur <= end) {
+    const year = cur.getUTCFullYear();
+    const week = getUtcIsoWeek(cur);
+    const key = isoWeekLabel(year, week);
+    if (!buckets.some((b) => b.key === key)) {
+      buckets.push({
+        key,
+        label: key,
+        startDate: isoWeekStartUtc(year, week).toISOString().slice(0, 10),
+      });
+    }
+    cur.setUTCDate(cur.getUTCDate() + 7);
+  }
+  return buckets.slice(-12);
+}
+
+function getUtcIsoWeek(date: Date): number {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+}
+
+function iterMonthlyBuckets(from: Date, to: Date): Array<{ key: string; label: string; startDate: string }> {
+  const buckets: Array<{ key: string; label: string; startDate: string }> = [];
+  const cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+  const end = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), 1));
+  while (cur <= end) {
+    const key = `${cur.getUTCFullYear()}-${String(cur.getUTCMonth() + 1).padStart(2, '0')}`;
+    buckets.push({
+      key,
+      label: key,
+      startDate: cur.toISOString().slice(0, 10),
+    });
+    cur.setUTCMonth(cur.getUTCMonth() + 1);
+  }
+  return buckets.slice(-12);
+}
+
+export async function usersLoginSeriesPayload(granularityInput: unknown) {
+  const granularity = parseUserLoginGranularity(granularityInput);
+  const { from, to } = loginSeriesLookback(granularity);
+
+  const bucketGroupId =
+    granularity === 'daily'
+      ? { $dateToString: { format: '%Y-%m-%d', date: '$loggedInAt', timezone: 'UTC' } }
+      : granularity === 'weekly'
+        ? {
+            year: { $isoWeekYear: '$loggedInAt' },
+            week: { $isoWeek: '$loggedInAt' },
+          }
+        : { $dateToString: { format: '%Y-%m', date: '$loggedInAt', timezone: 'UTC' } };
+
+  const agg = await UserLoginEvent.aggregate<{
+    _id: string | { year: number; week: number };
+    uniqueLogins: number;
+    loginEvents: number;
+  }>([
+    { $match: { role: 'user', loggedInAt: { $gte: from, $lte: to } } },
+    {
+      $group: {
+        _id: bucketGroupId,
+        users: { $addToSet: '$userId' },
+        loginEvents: { $sum: 1 },
+      },
+    },
+    {
+      $project: {
+        uniqueLogins: { $size: '$users' },
+        loginEvents: 1,
+      },
+    },
+  ]);
+
+  const statsByBucket = new Map<string, { uniqueLogins: number; loginEvents: number }>();
+  for (const row of agg) {
+    const key =
+      typeof row._id === 'string'
+        ? row._id
+        : isoWeekLabel(row._id.year, row._id.week);
+    statsByBucket.set(key, {
+      uniqueLogins: row.uniqueLogins ?? 0,
+      loginEvents: row.loginEvents ?? 0,
+    });
+  }
+
+  const bucketDefs =
+    granularity === 'daily'
+      ? iterUtcDateStrings(from, to).map((date) => ({ key: date, label: date, startDate: date }))
+      : granularity === 'weekly'
+        ? iterWeeklyBuckets(from, to)
+        : iterMonthlyBuckets(from, to);
+
+  const points = bucketDefs.map(({ key, label, startDate }) => {
+    const stat = statsByBucket.get(key);
+    return {
+      label,
+      startDate,
+      uniqueLogins: stat?.uniqueLogins ?? 0,
+      loginEvents: stat?.loginEvents ?? 0,
+    };
+  });
+
+  return {
+    granularity,
+    from: from.toISOString(),
+    to: to.toISOString(),
+    points,
+    note:
+      'Unique end-users (role=user) who logged in per period. Data is recorded from deployment of login tracking onward.',
+    generatedAt: new Date().toISOString(),
   };
 }
 
