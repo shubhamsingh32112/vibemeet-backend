@@ -27,6 +27,9 @@ test('dashboard service keeps leaderboard numeric contract', () => {
   assert.ok(src.includes('bds: a.bdId ? 1 : 0'));
   assert.ok(src.includes('selectedRange: selectedRangePayload(range)'));
   assert.ok(src.includes('metricContract: buildOverviewMetricContract()'));
+  assert.ok(src.includes('dashboardWalletFlowSeries'));
+  assert.ok(src.includes('revenueDailyBalance'));
+  assert.ok(src.includes('creditCoins: credit'));
 });
 
 test('dashboardTopHosts does not use unbounded Creator.find({})', () => {

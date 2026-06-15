@@ -86,11 +86,18 @@ function selectedRangePayload(range?: DashboardDateFilter): { from: string; to: 
 function buildOverviewMetricContract(): Record<string, DashboardMetricDefinition> {
   return {
     revenueCoinsToday: {
-      label: 'Net wallet coin flow',
+      label: 'Net wallet coin flow (range total)',
       backendField: 'revenueCoinsToday',
       scope: 'selected_range',
       unit: 'coins',
       definition: 'Completed wallet credits minus completed wallet debits in the selected time window.',
+    },
+    revenueDailyBalance: {
+      label: 'Revenue daily balance',
+      backendField: 'revenueDailyBalance',
+      scope: 'selected_range',
+      unit: 'coins',
+      definition: 'Net completed wallet coin flow for today (UTC) only — credits minus debits.',
     },
     liveCallsProxy: {
       label: 'Live calls (5m proxy)',
@@ -120,6 +127,92 @@ function buildOverviewMetricContract(): Record<string, DashboardMetricDefinition
       unit: 'coins',
       definition: 'Sum of user-side coins deducted from call history in the selected time window.',
     },
+    pendingPayouts: {
+      label: 'Pending payouts',
+      backendField: 'pendingPayouts',
+      scope: 'selected_range',
+      unit: 'requests',
+      definition: 'Pending withdrawal requests with requestedAt in the selected time window.',
+    },
+  };
+}
+
+function iterUtcDateStrings(from: Date, to: Date): string[] {
+  const dates: string[] = [];
+  const cur = new Date(from);
+  cur.setUTCHours(0, 0, 0, 0);
+  const end = new Date(to);
+  end.setUTCHours(0, 0, 0, 0);
+  while (cur <= end) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+function walletFlowPointsFromMap(
+  byDate: Map<string, { credit: number; debit: number }>,
+  range?: DashboardDateFilter
+) {
+  const toPoint = (date: string, { credit, debit }: { credit: number; debit: number }) => ({
+    date,
+    creditCoins: credit,
+    debitCoins: debit,
+    netCoins: credit - debit,
+  });
+
+  if (range) {
+    return iterUtcDateStrings(range.from, range.to).map((date) =>
+      toPoint(date, byDate.get(date) ?? { credit: 0, debit: 0 })
+    );
+  }
+
+  return [...byDate.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, entry]) => toPoint(date, entry));
+}
+
+export async function dashboardWalletFlowSeries(days: number, range?: DashboardDateFilter) {
+  const d = Math.min(90, Math.max(1, days));
+  const from = range ? new Date(range.from) : new Date();
+  if (!range) {
+    from.setUTCHours(0, 0, 0, 0);
+    from.setUTCDate(from.getUTCDate() - (d - 1));
+  }
+  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
+
+  const agg = await CoinTransaction.aggregate<{
+    _id: { date: string; type: string };
+    total: number;
+  }>([
+    { $match: { createdAt, status: 'completed' } },
+    {
+      $group: {
+        _id: {
+          date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+          type: '$type',
+        },
+        total: { $sum: '$coins' },
+      },
+    },
+    { $sort: { '_id.date': 1 } },
+  ]);
+
+  const byDate = new Map<string, { credit: number; debit: number }>();
+  for (const row of agg) {
+    const date = row._id.date;
+    const entry = byDate.get(date) ?? { credit: 0, debit: 0 };
+    if (row._id.type === 'credit') entry.credit += row.total;
+    else if (row._id.type === 'debit') entry.debit += row.total;
+    byDate.set(date, entry);
+  }
+
+  return {
+    points: walletFlowPointsFromMap(byDate, range),
+    note: range
+      ? 'Net wallet coin flow per UTC day (credits minus debits) for each day in the selected range.'
+      : 'Net wallet coin flow per UTC day (credits minus debits).',
+    selectedRange: selectedRangePayload(range),
   };
 }
 
@@ -128,6 +221,11 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
   const selectedCreatedAt = range ? createdAtRangeMatch(range) : { $gte: today };
 
+  const pendingPayoutsMatch = {
+    status: 'pending' as const,
+    ...(range ? { requestedAt: createdAtRangeMatch(range) } : {}),
+  };
+
   const [
     onlineCreators,
     agencyCount,
@@ -135,13 +233,15 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     pendingWithdrawals,
     callTodayAgg,
     coinFlowToday,
+    todayCoinFlow,
     recentCalls5m,
     activeZeroDuration,
+    walletFlowSeries,
   ] = await Promise.all([
     countOnlineCreatorsPlatform(),
     User.countDocuments({ role: 'agency' }),
     User.countDocuments(TOP_BD_ROLE),
-    Withdrawal.countDocuments({ status: 'pending' }),
+    Withdrawal.countDocuments(pendingPayoutsMatch),
     CallHistory.aggregate([
       { $match: { createdAt: selectedCreatedAt, ownerRole: 'user' } },
       {
@@ -157,29 +257,44 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
       { $match: { createdAt: selectedCreatedAt, status: 'completed' } },
       { $group: { _id: '$type', total: { $sum: '$coins' }, count: { $sum: 1 } } },
     ]),
+    CoinTransaction.aggregate([
+      { $match: { createdAt: { $gte: today }, status: 'completed' } },
+      { $group: { _id: '$type', total: { $sum: '$coins' } } },
+    ]),
     CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
     CallHistory.countDocuments({
       createdAt: { $gte: fiveMinAgo },
       ownerRole: 'user',
       durationSeconds: 0,
     }),
+    dashboardWalletFlowSeries(90, range),
   ]);
 
   const callT = callTodayAgg[0] || { totalCalls: 0, totalDurationSec: 0, totalCoinsSpent: 0 };
   const credits = coinFlowToday.find((r: { _id: string }) => r._id === 'credit');
   const debits = coinFlowToday.find((r: { _id: string }) => r._id === 'debit');
   const revenueCoinsToday = (credits?.total ?? 0) - (debits?.total ?? 0);
+  const todayCredits = todayCoinFlow.find((r: { _id: string }) => r._id === 'credit');
+  const todayDebits = todayCoinFlow.find((r: { _id: string }) => r._id === 'debit');
+  const revenueDailyBalance = (todayCredits?.total ?? 0) - (todayDebits?.total ?? 0);
   const rangeLabel = range ? 'selected range' : 'today (UTC)';
+  const todayUtc = today.toISOString().slice(0, 10);
 
   return {
     revenueCoinsToday,
     revenueCoinsTodayNote: `Net completed wallet coin flow for ${rangeLabel} (credits minus debits).`,
+    revenueDailyBalance,
+    revenueDailyBalanceNote: `Net wallet flow for ${todayUtc} (UTC). Tap for per-day history in the selected range.`,
     liveCallsProxy: recentCalls5m,
     activeUnsettledUserCalls: activeZeroDuration,
     onlineHosts: onlineCreators,
     totalAgencies: agencyCount,
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,
+    pendingPayoutsNote: range
+      ? `Pending withdrawals requested in the selected range.`
+      : `All pending withdrawal requests (no date filter).`,
+    walletFlowSeries,
     totalCallMinutesToday: Math.round((callT.totalDurationSec / 60) * 100) / 100,
     totalCallsToday: callT.totalCalls,
     coinsSpentOnCallsToday: callT.totalCoinsSpent,
@@ -233,19 +348,39 @@ export async function dashboardLiveCalls(limit: number) {
   })
     .sort({ createdAt: -1 })
     .limit(lim)
-    .select('callId otherName otherAvatar durationSeconds coinsEarned createdAt otherCreatorId')
+    .select('callId ownerUserId otherName otherAvatar durationSeconds coinsEarned createdAt')
     .lean();
 
+  const ownerUserIds = [
+    ...new Set(
+      rows
+        .map((r) => r.ownerUserId?.toString())
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    ),
+  ];
+  const creators =
+    ownerUserIds.length === 0
+      ? []
+      : await Creator.find({ userId: { $in: ownerUserIds.map((id) => new mongoose.Types.ObjectId(id)) } })
+          .select('name userId _id')
+          .lean();
+  const creatorByUserId = new Map(creators.map((c) => [c.userId?.toString() ?? '', c]));
+
   return {
-    calls: rows.map((r) => ({
-      callId: r.callId,
-      hostName: r.otherName,
-      hostId: r.otherCreatorId?.toString() ?? null,
-      durationSeconds: r.durationSeconds,
-      revenueCoins: r.coinsEarned ?? 0,
-      startedAt: r.createdAt,
-    })),
-    note: 'Recent creator-side call rows (last 30m). Not a substitute for Stream session truth.',
+    calls: rows.map((r) => {
+      const ownerUserId = r.ownerUserId?.toString() ?? '';
+      const creator = creatorByUserId.get(ownerUserId);
+      return {
+        callId: r.callId,
+        hostName: creator?.name ?? 'Host',
+        hostId: creator?._id?.toString() ?? null,
+        callerName: r.otherName,
+        durationSeconds: r.durationSeconds,
+        revenueCoins: r.coinsEarned ?? 0,
+        startedAt: r.createdAt,
+      };
+    }),
+    note: 'Recent creator-side call rows (last 30m). Host name is the creator; caller is the user. Not a substitute for Stream session truth.',
   };
 }
 
