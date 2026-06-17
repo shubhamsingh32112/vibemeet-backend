@@ -16,6 +16,7 @@ import {
   completeMomentHandler,
   getCreatorSummaryHandler,
   getMyMomentsHandler,
+  recordMomentViewHandler,
 } from '../controllers/moments.controller';
 
 const router = Router();
@@ -31,6 +32,7 @@ router.get('/creators/:creatorId/summary', verifyFirebaseToken, getCreatorSummar
 router.post('/creators/:creatorId/follow', verifyFirebaseToken, followCreatorHandler);
 router.delete('/creators/:creatorId/follow', verifyFirebaseToken, unfollowCreatorHandler);
 router.get('/:momentId', verifyFirebaseToken, getMomentDetailHandler);
+router.post('/:momentId/view', verifyFirebaseToken, recordMomentViewHandler);
 router.post('/:momentId/purchase', verifyFirebaseToken, purchaseMomentHandler);
 router.post('/:momentId/playback', verifyFirebaseToken, refreshPlaybackHandler);
 router.post('/:momentId/complete', verifyFirebaseToken, completeMomentHandler);

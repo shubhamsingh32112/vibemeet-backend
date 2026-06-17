@@ -32,6 +32,8 @@ export interface IUser extends Document {
   introFreeCallCredits: number;
   /** Denormalized VIP expiry for fast reads; kept in sync by vip purchase finalization. */
   vipExpiresAt?: Date | null;
+  /** Denormalized Moments Premium expiry; kept in sync by moments premium purchase finalization. */
+  momentsPremiumExpiresAt?: Date | null;
   /** Set when the welcome intro program is atomically consumed after a qualifying billed session. */
   welcomeFreeCallConsumedAt?: Date | null;
   freeTextUsed: number; // Count of free text messages used (first 3 are free)
@@ -142,6 +144,11 @@ const userSchema = new Schema<IUser>(
       min: 0,
     },
     vipExpiresAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    momentsPremiumExpiresAt: {
       type: Date,
       default: null,
       index: true,

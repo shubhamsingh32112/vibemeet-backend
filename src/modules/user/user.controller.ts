@@ -68,13 +68,16 @@ import {
   type PermissionsDecision,
 } from './onboarding-transition.service';
 import { getVipStatus } from '../vip/vip-entitlement.service';
+import { getMomentsPremiumStatus } from '../moments-premium/moments-premium-entitlement.service';
 import { getPublicAppConfig } from '../app-config/app-config.service';
+import { isFreeCallEnabled } from '../../config/free-call.config';
 
 function welcomeFreeCallEligible(user: {
   role: string;
   welcomeFreeCallConsumedAt?: Date | null;
   introFreeCallCredits?: number;
 }): boolean {
+  if (!isFreeCallEnabled()) return false;
   return (
     user.role === 'user' &&
     !user.welcomeFreeCallConsumedAt &&
@@ -635,6 +638,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     const onboarding = buildOnboardingPayload(user);
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
     const vip = await getVipStatus(user._id);
+    const momentsPremium = await getMomentsPremiumStatus(user._id);
     const features = getPublicAppConfig().features;
 
     // If creator exists, return creator details as primary data
@@ -681,6 +685,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             : {}),
           hasAgencyAssignment,
           vip,
+          momentsPremium,
           features,
         },
       });
@@ -719,6 +724,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
           creator: null,
           hasAgencyAssignment: false,
           vip,
+          momentsPremium,
           features,
         },
       });

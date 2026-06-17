@@ -1,9 +1,11 @@
 import { featureFlags } from '../../config/feature-flags';
 import { isMomentsEnabled } from '../../config/moments';
 import {
-  MIN_COINS_TO_CALL,
-  WELCOME_INTRO_CALL_CREDITS,
-} from '../../config/pricing.config';
+  getFreeCallDurationSeconds,
+  getWelcomeIntroCallCreditsGrant,
+  isFreeCallEnabled,
+} from '../../config/free-call.config';
+import { MIN_COINS_TO_CALL } from '../../config/pricing.config';
 
 export interface PublicAppConfig {
   features: {
@@ -11,6 +13,8 @@ export interface PublicAppConfig {
     momentsEnabled: boolean;
   };
   pricing: {
+    freeCallEnabled: boolean;
+    freeCallDurationSeconds: number;
     welcomeIntroCallCredits: number;
     minCoinsToCall: number;
   };
@@ -23,7 +27,9 @@ export function getPublicAppConfig(): PublicAppConfig {
       momentsEnabled: isMomentsEnabled(),
     },
     pricing: {
-      welcomeIntroCallCredits: WELCOME_INTRO_CALL_CREDITS,
+      freeCallEnabled: isFreeCallEnabled(),
+      freeCallDurationSeconds: getFreeCallDurationSeconds(),
+      welcomeIntroCallCredits: getWelcomeIntroCallCreditsGrant(),
       minCoinsToCall: MIN_COINS_TO_CALL,
     },
   };

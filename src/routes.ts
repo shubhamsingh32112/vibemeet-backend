@@ -19,6 +19,7 @@ import storiesRoutes from './modules/stories/routes/stories.routes';
 import momentsRoutes from './modules/moments/routes/moments.routes';
 import streamRoutes from './modules/stream/stream.routes';
 import vipRoutes from './modules/vip/vip.routes';
+import momentsPremiumRoutes from './modules/moments-premium/moments-premium.routes';
 import appConfigRoutes from './modules/app-config/app-config.routes';
 
 const router = Router();
@@ -44,5 +45,6 @@ router.use('/stories', storiesRoutes);
 router.use('/moments', momentsRoutes);
 router.use('/stream', streamRoutes);
 router.use('/vip', vipRoutes);
+router.use('/moments-premium', momentsPremiumRoutes);
 
 export default router;

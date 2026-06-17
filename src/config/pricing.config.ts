@@ -53,14 +53,18 @@ export const MIN_COINS_TO_CALL: number = parseInt(
   10
 );
 
+import {
+  getFreeCallDurationSeconds,
+  getWelcomeIntroCallCreditsGrant,
+  isFreeCallEnabled,
+  validateFreeCallConfig,
+} from './free-call.config';
+
 /**
- * Welcome intro: promo-only credits for the first introductory call (never mixed into `coins`).
- * Environment variable: WELCOME_INTRO_CALL_CREDITS
+ * Welcome intro grant amount for eligible signups (seconds marker when enabled).
+ * Configure via FREE_CALL_ENABLED and FREE_CALL_DURATION_SECONDS.
  */
-export const WELCOME_INTRO_CALL_CREDITS: number = parseInt(
-  process.env.WELCOME_INTRO_CALL_CREDITS || '60',
-  10
-);
+export const WELCOME_INTRO_CALL_CREDITS = getWelcomeIntroCallCreditsGrant();
 
 /**
  * Maximum call duration in seconds (hard cap)
@@ -122,9 +126,7 @@ export function validatePricingConfig(): void {
     throw new Error('MIN_COINS_TO_CALL must be >= 0');
   }
 
-  if (WELCOME_INTRO_CALL_CREDITS < 0) {
-    throw new Error('WELCOME_INTRO_CALL_CREDITS must be >= 0');
-  }
+  validateFreeCallConfig();
   
   if (MAX_CALL_DURATION_SECONDS < 60) {
     throw new Error('MAX_CALL_DURATION_SECONDS must be >= 60');
@@ -149,6 +151,8 @@ export function validatePricingConfig(): void {
       logInfo('Pricing configuration validated', {
         creatorSharePercentage: (CREATOR_SHARE_PERCENTAGE * 100).toFixed(1) + '%',
         minCoinsToCall: MIN_COINS_TO_CALL,
+        freeCallEnabled: isFreeCallEnabled(),
+        freeCallDurationSeconds: getFreeCallDurationSeconds(),
         welcomeIntroCallCredits: WELCOME_INTRO_CALL_CREDITS,
         maxCallDurationSeconds: MAX_CALL_DURATION_SECONDS,
         defaultCreatorLimit: DEFAULT_CREATOR_CALL_DURATION_SECONDS,

@@ -16,7 +16,8 @@ import { isValidReferralCodeFormat } from '../../utils/referral-code';
 import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug, logWarning } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agency/creator-application-status.service';
-import { WELCOME_INTRO_CALL_CREDITS } from '../../config/pricing.config';
+import { isFreeCallEnabled, getFreeCallDurationSeconds } from '../../config/free-call.config';
+import { isFreeCallEnabled, getFreeCallDurationSeconds } from '../../config/free-call.config';
 import { getPublicAppConfig } from '../app-config/app-config.service';
 import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { makeImageAssetDoc } from '../images/image-asset.schema';
@@ -50,6 +51,7 @@ function welcomeFreeCallEligibleForUser(user: {
   welcomeFreeCallConsumedAt?: Date | null;
   introFreeCallCredits?: number;
 }): boolean {
+  if (!isFreeCallEnabled()) return false;
   return (
     user.role === 'user' &&
     !user.welcomeFreeCallConsumedAt &&
@@ -130,7 +132,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         logInfo('Creating new user (first login)', { firebaseUid });
         const firstLoginProfile = buildDefaultFirstLoginProfile();
 
-        const grantWelcomeIntro = !showWelcomeBackDialog;
+        const grantWelcomeIntro = !showWelcomeBackDialog && isFreeCallEnabled();
         user = await User.create({
           firebaseUid: req.auth.firebaseUid,
           phone: req.auth.phone,
@@ -142,7 +144,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           avatar: firstLoginProfile.avatar,
           categories: firstLoginProfile.categories,
           coins: 0,
-          introFreeCallCredits: grantWelcomeIntro ? WELCOME_INTRO_CALL_CREDITS : 0,
+          introFreeCallCredits: grantWelcomeIntro ? getFreeCallDurationSeconds() : 0,
           welcomeFreeCallConsumedAt: grantWelcomeIntro ? null : new Date(),
           freeTextUsed: 0, // Legacy field; chat free quota is per creator in ChatMessageQuota
           onboardingStage: 'welcome',

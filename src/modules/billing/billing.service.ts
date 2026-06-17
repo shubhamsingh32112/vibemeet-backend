@@ -27,6 +27,7 @@ import {
   CALL_DURATION_WARNING_SECONDS,
   MIN_COINS_TO_CALL,
 } from '../../config/pricing.config';
+import { getFreeCallDurationSeconds, isFreeCallEnabled } from '../../config/free-call.config';
 import { recordBillingMetric, monitoring } from '../../utils/monitoring';
 import { logWarning, logInfo, logError, logDebug } from '../../utils/logger';
 import { retryWithBackoff } from '../../utils/retry';
@@ -810,8 +811,15 @@ export async function promoteBootstrappingSession(
   const introCreditsLive = Number((user as { introFreeCallCredits?: number }).introFreeCallCredits) || 0;
   const consumedAt = (user as { welcomeFreeCallConsumedAt?: Date | null }).welcomeFreeCallConsumedAt;
   let introPromoActive =
-    user.role === 'user' && !consumedAt && introCreditsLive > 0;
-  let initialIntroMicros = introPromoActive ? coinsWholeToMicros(introCreditsLive) : 0;
+    isFreeCallEnabled() &&
+    user.role === 'user' &&
+    !consumedAt &&
+    introCreditsLive > 0;
+  const freeCallDurationSeconds = getFreeCallDurationSeconds();
+  let initialIntroMicros =
+    introPromoActive && pricePerSecondMicros > 0
+      ? freeCallDurationSeconds * pricePerSecondMicros
+      : 0;
   let initialWalletMicros = introPromoActive ? 0 : coinsWholeToMicros(user.coins || 0);
 
   const hasRuntimeActivity =
@@ -896,8 +904,10 @@ export async function promoteBootstrappingSession(
   const platformCapSeconds = Math.min(creatorLimit, userLimit, MAX_CALL_DURATION_SECONDS);
   let effectiveDurationLimitSeconds = platformCapSeconds;
   if (introPromoActive && pricePerSecondMicros > 0) {
-    const promoSeconds = Math.floor(initialIntroMicros / pricePerSecondMicros);
-    effectiveDurationLimitSeconds = Math.min(platformCapSeconds, promoSeconds);
+    effectiveDurationLimitSeconds = Math.min(
+      platformCapSeconds,
+      freeCallDurationSeconds,
+    );
   }
 
   const startTime =

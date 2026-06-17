@@ -1,5 +1,6 @@
 import type { Types } from 'mongoose';
 import { getRedis, isRedisConfigured } from '../../../config/redis';
+import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 import { MomentPurchase } from '../models/moment-purchase.model';
 import { CreatorMoment } from '../models/creator-moment.model';
 
@@ -21,6 +22,9 @@ export async function hasMomentAccess(
   if (!moment) return false;
   if (moment.isDeleted) return false;
   if (moment.accessType === 'free') return true;
+  if (moment.accessType === 'paid' && (await isMomentsPremiumActive(uid))) {
+    return true;
+  }
   return false;
 }
 

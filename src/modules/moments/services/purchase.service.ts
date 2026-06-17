@@ -20,6 +20,7 @@ import {
   isVipActive,
   resolveMomentPriceForUser,
 } from '../../vip/vip-entitlement.service';
+import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 
 export async function purchaseMoment(input: {
   userId: mongoose.Types.ObjectId;
@@ -39,6 +40,14 @@ export async function purchaseMoment(input: {
         mediaId: input.momentId,
       });
       if (existingPurchase) {
+        const moment = await CreatorMoment.findById(input.momentId);
+        if (!moment) throw new Error('Moment not found');
+        const dto = await toMomentPresentationDTO(moment, { userId: input.userId });
+        if (!dto) throw new Error('Moment unavailable');
+        return dto;
+      }
+
+      if (await isMomentsPremiumActive(input.userId)) {
         const moment = await CreatorMoment.findById(input.momentId);
         if (!moment) throw new Error('Moment not found');
         const dto = await toMomentPresentationDTO(moment, { userId: input.userId });

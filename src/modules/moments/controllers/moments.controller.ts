@@ -4,6 +4,7 @@ import { User } from '../../user/user.model';
 import { Creator } from '../../creator/creator.model';
 import { assertMomentsEnabled, respondMomentsDisabled } from '../../../config/moments';
 import { CreatorMoment } from '../models/creator-moment.model';
+import { MomentView } from '../models/moment-view.model';
 import { CreatorFollow } from '../models/creator-follow.model';
 import { MomentRevenue } from '../models/moment-revenue.model';
 import { commitImageAsset, CommitImageAssetError } from '../../images/commit-image-asset';
@@ -51,6 +52,32 @@ async function resolveUser(req: Request) {
 
 async function resolveCreator(userId: mongoose.Types.ObjectId) {
   return Creator.findOne({ userId });
+}
+
+async function recordUniqueMomentView(
+  userId: mongoose.Types.ObjectId,
+  moment: InstanceType<typeof CreatorMoment>,
+): Promise<number> {
+  const creator = await resolveCreator(userId);
+  if (creator && moment.creatorId.equals(creator._id)) {
+    return moment.viewsCount;
+  }
+
+  const existing = await MomentView.findOne({
+    momentId: moment._id,
+    viewerUserId: userId,
+  });
+  if (!existing) {
+    await MomentView.create({
+      momentId: moment._id,
+      viewerUserId: userId,
+    });
+    await CreatorMoment.updateOne({ _id: moment._id }, { $inc: { viewsCount: 1 } });
+    moment.viewsCount += 1;
+    await emitMomentViewed(userId.toString(), moment._id.toString());
+  }
+
+  return moment.viewsCount;
 }
 
 function publicMomentQuery(extra: Record<string, unknown> = {}) {
@@ -297,6 +324,33 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
   }
 }
 
+export async function recordMomentViewHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const rate = await checkMomentsRateLimit('storyView', user._id.toString());
+    if (!rate.allowed) {
+      res.status(429).json({ success: false, error: 'Rate limit exceeded' });
+      return;
+    }
+    const moment = await CreatorMoment.findById(req.params.momentId);
+    if (!moment || moment.isDeleted) {
+      res.status(404).json({ success: false, error: 'Not found' });
+      return;
+    }
+    const viewsCount = await recordUniqueMomentView(user._id, moment);
+    res.json({ success: true, data: { viewsCount } });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    logError('Record moment view failed', error);
+    res.status(500).json({ success: false, error: 'Failed to record view' });
+  }
+}
+
 export async function getMomentDetailHandler(req: Request, res: Response): Promise<void> {
   try {
     assertMomentsEnabled();
@@ -312,7 +366,7 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
       return;
     }
     if (user) {
-      await emitMomentViewed(user._id.toString(), moment._id.toString());
+      await recordUniqueMomentView(user._id, moment);
     }
     res.json({ success: true, data: dto });
   } catch (error) {

@@ -1920,7 +1920,7 @@ export const adjustUserCoins = async (req: Request, res: Response): Promise<void
     verifyUserBalance(user._id).catch(() => {});
 
     // Invalidate caches
-    await invalidateAdminCaches('overview', 'coins', 'users_analytics');
+    await invalidateAdminCaches('overview', 'coins', 'users_analytics', 'creators_performance');
 
     res.json({
       success: true,

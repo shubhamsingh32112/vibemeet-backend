@@ -146,6 +146,9 @@ export async function getStoriesFeedHandler(req: Request, res: Response): Promis
       byCreator.get(key)!.push(s);
     }
 
+    const viewerCreator = user ? await resolveCreator(user._id) : null;
+    const viewerCreatorId = viewerCreator?._id.toString();
+
     const groups = [];
     for (const [creatorId, creatorStories] of byCreator) {
       creatorStories.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
@@ -153,10 +156,14 @@ export async function getStoriesFeedHandler(req: Request, res: Response): Promis
       const unseen = user
         ? await isCreatorUnseen(user._id.toString(), creatorId, latest.createdAt)
         : true;
+      const isOwner = viewerCreatorId === creatorId;
       const items = (
         await Promise.all(
           creatorStories.map((s) =>
-            toStoryPresentationDTO(s, { userId: user?._id ?? null }),
+            toStoryPresentationDTO(s, {
+              userId: user?._id ?? null,
+              isCreatorOwner: isOwner,
+            }),
           ),
         )
       ).filter(Boolean);
@@ -262,17 +269,22 @@ export async function recordStoryViewHandler(req: Request, res: Response): Promi
       return;
     }
 
-    const existing = await StoryView.findOne({
-      storyId: story._id,
-      viewerUserId: user._id,
-    });
-    if (!existing) {
-      await StoryView.create({
+    const viewerCreator = await resolveCreator(user._id);
+    const isOwner = viewerCreator != null && story.creatorId.equals(viewerCreator._id);
+
+    if (!isOwner) {
+      const existing = await StoryView.findOne({
         storyId: story._id,
         viewerUserId: user._id,
       });
-      story.viewsCount += 1;
-      await story.save();
+      if (!existing) {
+        await StoryView.create({
+          storyId: story._id,
+          viewerUserId: user._id,
+        });
+        story.viewsCount += 1;
+        await story.save();
+      }
     }
 
     await markStorySeen(user._id.toString(), story.creatorId.toString(), story.createdAt);

@@ -8,8 +8,11 @@ test('getPublicAppConfig exposes feature and pricing fields', () => {
   const config = getPublicAppConfig();
   assert.equal(typeof config.features.vipEnabled, 'boolean');
   assert.equal(typeof config.features.momentsEnabled, 'boolean');
+  assert.equal(typeof config.pricing.freeCallEnabled, 'boolean');
+  assert.equal(typeof config.pricing.freeCallDurationSeconds, 'number');
   assert.equal(typeof config.pricing.welcomeIntroCallCredits, 'number');
   assert.equal(typeof config.pricing.minCoinsToCall, 'number');
+  assert.ok([15, 30, 45].includes(config.pricing.freeCallDurationSeconds));
   assert.ok(config.pricing.welcomeIntroCallCredits >= 0);
   assert.ok(config.pricing.minCoinsToCall >= 0);
 });
