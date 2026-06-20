@@ -17,7 +17,6 @@ import { referralUserFacingMessage } from '../../utils/referral-messages';
 import { logInfo, logError, logDebug, logWarning } from '../../utils/logger';
 import { getCreatorApplicationFlagsForUser } from '../agency/creator-application-status.service';
 import { isFreeCallEnabled, getFreeCallDurationSeconds } from '../../config/free-call.config';
-import { isFreeCallEnabled, getFreeCallDurationSeconds } from '../../config/free-call.config';
 import { getPublicAppConfig } from '../app-config/app-config.service';
 import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { makeImageAssetDoc } from '../images/image-asset.schema';

@@ -10,6 +10,7 @@ import {
 import { CreatorStory } from '../models/creator-story.model';
 import { StoryView } from '../models/story-view.model';
 import { commitImageAsset, CommitImageAssetError } from '../../images/commit-image-asset';
+import { CloudflareImagesError } from '../../images/cloudflare.client';
 import { consumeStreamUploadSession } from '../../stream/stream-upload-session.service';
 import { deleteStreamVideo } from '../../stream/cloudflare-stream.client';
 import { deleteImage } from '../../images/cloudflare.client';
@@ -120,6 +121,14 @@ export async function createStoryHandler(req: Request, res: Response): Promise<v
     if (respondMomentsDisabled(error, res)) return;
     if (error instanceof CommitImageAssetError) {
       res.status(error.status).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof CloudflareImagesError) {
+      res.status(error.status >= 500 ? 502 : error.status).json({
+        success: false,
+        error: 'Image processing failed',
+        code: 'CLOUDFLARE_IMAGES_ERROR',
+      });
       return;
     }
     logError('Create story failed', error);

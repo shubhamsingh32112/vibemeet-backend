@@ -13,7 +13,8 @@
  *   - createDirectUpload   POST /accounts/{id}/images/v2/direct_upload
  *   - getImageMetadata     GET  /accounts/{id}/images/v1/{imageId}
  *   - deleteImage          DEL  /accounts/{id}/images/v1/{imageId}
- *   - downloadImageBytes   GET  /accounts/{id}/images/v1/{imageId}/blob
+ *   - downloadImageBytes   GET  https://imagedelivery.net/{hash}/{imageId}/{variant}
+ *                            (public CDN; avoids API /blob which needs Images Read)
  */
 
 import axios, { type AxiosError, type AxiosInstance } from 'axios';
@@ -22,6 +23,7 @@ import CircuitBreaker from 'opossum';
 import { getCloudflareConfig } from '../../config/cloudflare';
 import { logError, logWarning } from '../../utils/logger';
 import { bumpImageCounter, recordImageMetric } from './image-metrics';
+import { buildCloudflareImageUrl, type ImageVariant } from './image-url';
 
 interface DirectUploadResult {
   imageId: string;
@@ -53,6 +55,15 @@ function isRetryable(error: unknown): boolean {
   if (!ax.response) return true; // network / timeout
   const status = ax.response.status;
   return status >= 500 || status === 429;
+}
+
+/** CDN may lag briefly after direct upload — retry transient delivery misses. */
+function isCdnDeliveryRetryable(error: unknown): boolean {
+  const ax = error as AxiosError;
+  if (!ax.isAxiosError) return false;
+  if (!ax.response) return true;
+  const status = ax.response.status;
+  return status === 404 || status >= 500 || status === 429;
 }
 
 function describe(error: AxiosError): string {
@@ -259,29 +270,59 @@ export async function deleteImage(imageId: string): Promise<void> {
 }
 
 /**
- * Pull raw image bytes (for blurhash generation, perceptual hashing).
- * Returns the public-variant bytes, capped at ~10 MB by Cloudflare itself.
+ * Pull raw image bytes (for MIME sniffing, blurhash generation).
+ * Fetches the public CDN variant — no Images Read permission on the API token.
  */
 export async function downloadImageBytes(imageId: string, variant: string = 'public'): Promise<Buffer> {
   const operation = 'download_image_bytes';
   const startedAt = Date.now();
-  const { apiToken } = getCloudflareConfig();
+  const deliveryVariant = (variant === 'public' ? 'public' : variant) as ImageVariant;
+  const url = buildCloudflareImageUrl(imageId, deliveryVariant);
+
   try {
-    return await callBreaker(operation, async () => {
-      const url = accountUrl(`/images/v1/${encodeURIComponent(imageId)}/blob`);
-      const response = await axios.get<ArrayBuffer>(url, {
-        timeout: 60_000,
-        responseType: 'arraybuffer',
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-        },
-      });
-      // Variant param is only required for non-default downloads
-      void variant;
-      return Buffer.from(response.data);
-    });
-  } catch (error) {
-    wrapAxiosError(operation, error);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const response = await axios.get<ArrayBuffer>(url, {
+          timeout: 60_000,
+          responseType: 'arraybuffer',
+        });
+        bumpImageCounter('cloudflare.ok', { operation, attempt, source: 'cdn' });
+        return Buffer.from(response.data);
+      } catch (error) {
+        lastError = error;
+        const retryable = isCdnDeliveryRetryable(error);
+        bumpImageCounter('cloudflare.fail', {
+          operation,
+          attempt,
+          retryable: retryable ? 'true' : 'false',
+          source: 'cdn',
+        });
+        if (!retryable || attempt === MAX_ATTEMPTS) break;
+        const delay = BASE_BACKOFF_MS * 2 ** (attempt - 1);
+        logWarning('CDN image delivery fetch failed; retrying', {
+          imageId,
+          attempt,
+          delay,
+          error: (error as Error).message,
+        });
+        await sleep(delay);
+      }
+    }
+
+    logError(
+      'CDN image delivery fetch failed',
+      lastError instanceof Error ? lastError : new Error(String(lastError)),
+      { imageId, deliveryUrl: url, deliveryHost: 'imagedelivery.net' },
+    );
+    if (lastError instanceof Error) {
+      const ax = lastError as AxiosError;
+      if (ax.isAxiosError) {
+        wrapAxiosError(operation, ax);
+      }
+      throw lastError;
+    }
+    throw new Error('CDN image delivery fetch failed');
   } finally {
     recordImageMetric('cloudflare.duration_ms', Date.now() - startedAt, { operation });
   }

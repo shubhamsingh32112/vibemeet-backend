@@ -5,7 +5,7 @@
  * On commit, the backend either:
  *   1) Asks Cloudflare for its metadata (which already enforces image-only),
  *      then double-checks the bytes via `file-type`'s magic-number sniff.
- *   2) Streams the public-variant bytes (via cloudflare.client.downloadImageBytes)
+ *   2) Streams the public-variant bytes (via imagedelivery.net CDN URL)
  *      and runs the sniff locally.
  *
  * Accepted MIME types: image/jpeg, image/png, image/webp, image/avif, image/heic.

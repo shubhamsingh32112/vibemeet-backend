@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { allocateSecondsByPeriodStartMs } from './creator-daily-online.service';
 
 test('allocateSecondsByPeriodStartMs returns empty for non-positive range', () => {
@@ -16,9 +18,8 @@ test('allocateSecondsByPeriodStartMs counts in-window slice', () => {
 });
 
 test('getOnlineTodaySecondsLive delegates to batch helper', async () => {
-  const src = await import('node:fs/promises').then((fs) =>
-    fs.readFile(new URL('./creator-daily-online.service.ts', import.meta.url), 'utf8')
-  );
+  const servicePath = path.join(__dirname, 'creator-daily-online.service.ts');
+  const src = await fs.readFile(servicePath, 'utf8');
   assert.ok(src.includes('export async function getBatchOnlineTodaySecondsLive'));
   assert.ok(src.includes('const map = await getBatchOnlineTodaySecondsLive([creatorFirebaseUid])'));
 });

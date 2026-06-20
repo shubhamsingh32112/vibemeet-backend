@@ -14,6 +14,7 @@ import {
   createStreamUploadSession,
   getStreamUploadSession,
 } from './stream-upload-session.service';
+import { syncStreamUploadSessionFromCloudflare } from './stream-session-sync.service';
 import { verifyStreamWebhook } from './stream.webhook';
 import {
   findStreamSessionByVideoId,
@@ -105,12 +106,13 @@ export async function getUploadStatusHandler(req: Request, res: Response): Promi
       res.status(404).json({ success: false, error: 'Session not found' });
       return;
     }
+    const synced = await syncStreamUploadSessionFromCloudflare(session);
     res.json({
       success: true,
       data: {
-        sessionId: session.sessionId,
-        processingStatus: session.processingStatus,
-        contentClass: session.contentClass,
+        sessionId: synced.sessionId,
+        processingStatus: synced.processingStatus,
+        contentClass: synced.contentClass,
       },
     });
   } catch (error) {

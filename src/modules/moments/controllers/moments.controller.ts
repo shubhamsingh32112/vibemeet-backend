@@ -8,6 +8,7 @@ import { MomentView } from '../models/moment-view.model';
 import { CreatorFollow } from '../models/creator-follow.model';
 import { MomentRevenue } from '../models/moment-revenue.model';
 import { commitImageAsset, CommitImageAssetError } from '../../images/commit-image-asset';
+import { CloudflareImagesError } from '../../images/cloudflare.client';
 import { consumeStreamUploadSession } from '../../stream/stream-upload-session.service';
 import {
   defaultModerationStatus,
@@ -221,6 +222,14 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
     if (respondMomentsDisabled(error, res)) return;
     if (error instanceof CommitImageAssetError) {
       res.status(error.status).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof CloudflareImagesError) {
+      res.status(error.status >= 500 ? 502 : error.status).json({
+        success: false,
+        error: 'Image processing failed',
+        code: 'CLOUDFLARE_IMAGES_ERROR',
+      });
       return;
     }
     logError('Create moment failed', error);
