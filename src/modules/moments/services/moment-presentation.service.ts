@@ -6,7 +6,6 @@ import {
   buildSignedThumbnailUrl,
   getPlaybackTokenExpiresAtMs,
 } from '../../stream/signed-token.service';
-import { buildStreamThumbnailUrl } from '../../stream/cloudflare-stream.client';
 import type { ICreatorMoment } from '../models/creator-moment.model';
 import type { ICreatorStory } from '../../stories/models/creator-story.model';
 import { Creator } from '../../creator/creator.model';
@@ -83,13 +82,13 @@ async function buildMomentMedia(
 
   const videoId = moment.streamVideoId;
   let thumbnailUrl = moment.thumbnailFallbackUrl || PLACEHOLDER_THUMB;
-  if (videoId) {
-    thumbnailUrl = locked
-      ? await buildSignedThumbnailUrl(videoId, 400)
-      : buildStreamThumbnailUrl(videoId, 600);
-  }
   if (moment.thumbnailAsset?.imageId) {
     thumbnailUrl = thumbFromImageAsset(moment.thumbnailAsset, 'feed');
+  } else if (videoId) {
+    const signedThumb = await buildSignedThumbnailUrl(videoId, locked ? 400 : 600);
+    thumbnailUrl = moment.thumbnailValidated === false && moment.thumbnailFallbackUrl
+      ? moment.thumbnailFallbackUrl
+      : signedThumb;
   }
 
   let playbackUrl: string | undefined;

@@ -21,6 +21,8 @@ import {
   resolveMomentPriceForUser,
 } from '../../vip/vip-entitlement.service';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
+import { getIO } from '../../availability/availability.socket';
+import { logError } from '../../../utils/logger';
 
 export async function purchaseMoment(input: {
   userId: mongoose.Types.ObjectId;
@@ -58,6 +60,11 @@ export async function purchaseMoment(input: {
       const session = await mongoose.startSession();
       try {
         let result: PresentationDTO | null = null;
+        let buyerFirebaseUid: string | undefined;
+        let buyerCoins: number | undefined;
+        let creatorFirebaseUid: string | undefined;
+        let creatorUserId: string | undefined;
+        let creatorCoins: number | undefined;
         await session.withTransaction(async () => {
           const moment = await CreatorMoment.findById(input.momentId).session(session);
           if (!moment || moment.isDeleted) {
@@ -87,6 +94,10 @@ export async function purchaseMoment(input: {
           if (!creator) throw new Error('Creator not found');
           const creatorUser = await User.findById(creator.userId).session(session);
           if (!creatorUser) throw new Error('Creator user not found');
+
+          if (creator.userId.equals(buyer._id)) {
+            throw new Error('Cannot purchase your own moment');
+          }
 
           if (isVipFree) {
             const remaining = await getRemainingFreeMoments(buyer._id);
@@ -206,6 +217,13 @@ export async function purchaseMoment(input: {
           await moment.save({ session });
 
           result = await toMomentPresentationDTO(moment, { userId: input.userId });
+          buyerFirebaseUid = buyer.firebaseUid ?? undefined;
+          buyerCoins = buyer.coins;
+          if (creatorShare > 0) {
+            creatorFirebaseUid = creatorUser.firebaseUid ?? undefined;
+            creatorUserId = creatorUser._id.toString();
+            creatorCoins = creatorUser.coins;
+          }
         });
         if (!result) throw new Error('Purchase failed');
         await enqueueAnalyticsEvent({
@@ -213,6 +231,23 @@ export async function purchaseMoment(input: {
           userId: input.userId.toString(),
           targetId: input.momentId,
         });
+        try {
+          const io = getIO();
+          if (buyerFirebaseUid && buyerCoins != null) {
+            io?.to(`user:${buyerFirebaseUid}`).emit('coins_updated', {
+              userId: input.userId.toString(),
+              coins: buyerCoins,
+            });
+          }
+          if (creatorFirebaseUid && creatorCoins != null && creatorUserId) {
+            io?.to(`user:${creatorFirebaseUid}`).emit('coins_updated', {
+              userId: creatorUserId,
+              coins: creatorCoins,
+            });
+          }
+        } catch (err) {
+          logError('Failed to emit coins_updated for moment purchase', err);
+        }
         return result;
       } finally {
         await session.endSession();

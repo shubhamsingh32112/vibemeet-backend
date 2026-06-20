@@ -16,12 +16,38 @@ export function emitStoryUploaded(creatorId: string): void {
   ioRef?.emit('story:uploaded', { creatorId });
 }
 
-export function emitMomentPurchased(momentId: string, purchaseCount: number): void {
-  ioRef?.emit('moment:purchased', { momentId, purchaseCount });
+export function emitMomentPurchased(
+  buyerFirebaseUid: string,
+  payload: {
+    momentId: string;
+    buyerUserId: string;
+    purchaseCount: number;
+    item: Record<string, unknown>;
+  },
+): void {
+  ioRef?.to(`user:${buyerFirebaseUid}`).emit('moment:purchased', payload);
 }
 
-export function emitCreatorFollowed(creatorId: string, followerCount?: number): void {
-  ioRef?.emit('creator:followed', { creatorId, followerCount });
+export function emitMomentPurchaseCountToCreator(
+  creatorFirebaseUid: string,
+  payload: {
+    momentId: string;
+    purchaseCount: number;
+  },
+): void {
+  ioRef?.to(`user:${creatorFirebaseUid}`).emit('moment:purchase_count', payload);
+}
+
+export function emitCreatorFollowed(
+  firebaseUid: string,
+  payload: {
+    followerUserId: string;
+    creatorId: string;
+    followerCount: number;
+    isFollowing: boolean;
+  },
+): void {
+  ioRef?.to(`user:${firebaseUid}`).emit('creator:followed', payload);
 }
 
 export function emitMediaReady(firebaseUid: string, sessionId: string): void {

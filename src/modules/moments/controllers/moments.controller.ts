@@ -17,6 +17,7 @@ import {
   toMomentFeedDTO,
   toMomentPresentationDTO,
 } from '../services/moment-presentation.service';
+import { toFeedDTO } from '../dto/moment.dto';
 import { purchaseMoment, PurchaseInProgressError } from '../services/purchase.service';
 import { checkMomentsRateLimit } from '../services/moments-rate-limit.service';
 import { emitMomentViewed, emitMomentCompleted } from '../services/analytics-emitter.service';
@@ -30,9 +31,11 @@ import {
   orderMomentsByIds,
   removeCreatorFromFollowingFeedCache,
   removeMomentFromFollowerFeeds,
+  bustPopularFeedCacheForUser,
+  bustFollowingWarmCacheForUser,
 } from '../services/feed-fanout.service';
 import { logError } from '../../../utils/logger';
-import { emitMomentUploaded, emitMomentPurchased, emitCreatorFollowed } from '../moments.gateway';
+import { emitMomentUploaded, emitMomentPurchased, emitMomentPurchaseCountToCreator, emitCreatorFollowed } from '../moments.gateway';
 import {
   getPlaybackTokenExpiresAtMs,
   isStreamSigningConfigured,
@@ -404,8 +407,25 @@ export async function purchaseMomentHandler(req: Request, res: Response): Promis
       transactionId: req.body?.transactionId,
     });
     const moment = await CreatorMoment.findById(req.params.momentId);
+    if (user.firebaseUid) {
+      emitMomentPurchased(user.firebaseUid, {
+        momentId: req.params.momentId,
+        buyerUserId: user._id.toString(),
+        purchaseCount: moment?.purchaseCount ?? 0,
+        item: toFeedDTO(dto) as unknown as Record<string, unknown>,
+      });
+    }
     if (moment) {
-      emitMomentPurchased(moment._id.toString(), moment.purchaseCount);
+      const creator = await Creator.findById(moment.creatorId);
+      if (creator) {
+        const creatorUser = await User.findById(creator.userId);
+        if (creatorUser?.firebaseUid) {
+          emitMomentPurchaseCountToCreator(creatorUser.firebaseUid, {
+            momentId: moment._id.toString(),
+            purchaseCount: moment.purchaseCount,
+          });
+        }
+      }
     }
     res.json({ success: true, data: dto });
   } catch (error) {
@@ -416,6 +436,10 @@ export async function purchaseMomentHandler(req: Request, res: Response): Promis
     }
     const msg = error instanceof Error ? error.message : 'Purchase failed';
     if (msg.includes('Insufficient')) {
+      res.status(400).json({ success: false, error: msg });
+      return;
+    }
+    if (msg.includes('Cannot purchase your own')) {
       res.status(400).json({ success: false, error: msg });
       return;
     }
@@ -544,13 +568,31 @@ export async function followCreatorHandler(req: Request, res: Response): Promise
       res.status(400).json({ success: false, error: 'Invalid creator id' });
       return;
     }
+    const creator = await Creator.findById(creatorId);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+    if (creator.userId.equals(user._id)) {
+      res.status(400).json({ success: false, error: 'Cannot follow yourself' });
+      return;
+    }
     await CreatorFollow.findOneAndUpdate(
       { followerUserId: user._id, creatorId },
       { $setOnInsert: { createdAt: new Date() } },
       { upsert: true },
     );
     const followerCount = await countCreatorFollowers(creatorId);
-    emitCreatorFollowed(creatorId, followerCount);
+    await bustPopularFeedCacheForUser(user._id.toString());
+    await bustFollowingWarmCacheForUser(user._id.toString());
+    if (user.firebaseUid) {
+      emitCreatorFollowed(user.firebaseUid, {
+        followerUserId: user._id.toString(),
+        creatorId,
+        followerCount,
+        isFollowing: true,
+      });
+    }
     const recent = await CreatorMoment.find({
       creatorId,
       ...publicMomentQuery(),
@@ -583,7 +625,16 @@ export async function unfollowCreatorHandler(req: Request, res: Response): Promi
     await removeCreatorFromFollowingFeedCache(user._id.toString(), req.params.creatorId);
     const creatorId = req.params.creatorId;
     const followerCount = await countCreatorFollowers(creatorId);
-    emitCreatorFollowed(creatorId, followerCount);
+    await bustPopularFeedCacheForUser(user._id.toString());
+    await bustFollowingWarmCacheForUser(user._id.toString());
+    if (user.firebaseUid) {
+      emitCreatorFollowed(user.firebaseUid, {
+        followerUserId: user._id.toString(),
+        creatorId,
+        followerCount,
+        isFollowing: false,
+      });
+    }
     res.json({ success: true, data: { followerCount, isFollowing: false } });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;

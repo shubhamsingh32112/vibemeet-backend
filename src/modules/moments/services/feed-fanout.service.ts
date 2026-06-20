@@ -62,6 +62,25 @@ export async function getCachedFeedResponse(cacheKey: string): Promise<string | 
   return getRedis().get(cacheKey);
 }
 
+async function deleteKeysByPattern(pattern: string): Promise<void> {
+  if (!isRedisConfigured()) return;
+  const redis = getRedis();
+  let cursor = '0';
+  do {
+    const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = next;
+    if (keys.length) await redis.del(...keys);
+  } while (cursor !== '0');
+}
+
+export async function bustPopularFeedCacheForUser(userId: string): Promise<void> {
+  await deleteKeysByPattern(`moments:feed:${userId}:*`);
+}
+
+export async function bustFollowingWarmCacheForUser(userId: string): Promise<void> {
+  await deleteKeysByPattern(`moments:following:warm:${userId}:*`);
+}
+
 export async function removeMomentFromFollowerFeeds(
   momentId: string,
   creatorId: string,

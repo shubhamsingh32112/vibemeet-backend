@@ -10,7 +10,7 @@ import {
 import { expireStoriesJob } from '../stories/controllers/stories.controller';
 import { headUrlOk, isCloudflareStreamCircuitOpen } from '../stream/cloudflare-stream.client';
 import { CreatorMoment } from '../moments/models/creator-moment.model';
-import { buildStreamThumbnailUrl } from '../stream/cloudflare-stream.client';
+import { buildSignedThumbnailUrl } from '../stream/signed-token.service';
 
 let intervals: NodeJS.Timeout[] = [];
 let started = false;
@@ -33,7 +33,7 @@ async function validateThumbnailsBatch(): Promise<void> {
     .lean();
   for (const m of pending) {
     if (!m.streamVideoId) continue;
-    const url = buildStreamThumbnailUrl(m.streamVideoId, 400);
+    const url = await buildSignedThumbnailUrl(m.streamVideoId, 400);
     const ok = await headUrlOk(url);
     await CreatorMoment.updateOne(
       { _id: m._id },
