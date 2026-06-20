@@ -31,6 +31,8 @@ import {
 import { CallHistory } from './call-history.model';
 import { Call } from '../video/call.model';
 import { BILLING_MAX_SETTLING_MS, BILLING_SETTLEMENT_PENDING_MAX_MS } from './billing.constants';
+import { isDurableCallSessionEnabled } from './billing-phase-flags';
+import { DurableCallSession } from './call-session.model';
 import {
   isBullmqBillingEnabled,
   scheduleNextBillingCycleAfterTickOk,
@@ -156,7 +158,7 @@ export function startReconciliationJob(io: Server): void {
       await processTerminationRedisRetries(io, startedAt, RUN_BUDGET_MS);
       await runBullmqBillingWatchdog(startedAt);
       const { runCallSessionReconciliationPass } = await import('./billing-call-session-reconciliation');
-      await runCallSessionReconciliationPass();
+      await runCallSessionReconciliationPass(io);
       recordBillingMetric('reconciliation_run_ms', Date.now() - startedAt, {});
     }).catch((err) => {
       logError('Error in reconciliation run', err);
@@ -346,6 +348,52 @@ async function runSettlementOrphanRepair(io: Server, startedAt: number): Promise
     .select('callId')
     .limit(30)
     .lean();
+
+  if (isDurableCallSessionEnabled()) {
+    const staleThreshold = new Date(now - BILLING_MAX_SETTLING_MS);
+    const durableStale = await DurableCallSession.find({
+      finalized: false,
+      state: { $in: ['settling', 'ending'] },
+      updatedAt: { $lt: staleThreshold },
+    })
+      .select('_id state')
+      .limit(30)
+      .lean();
+
+    for (const row of durableStale) {
+      if (Date.now() - startedAt > RUN_BUDGET_MS) break;
+      recordBillingMetric('billing_orphaned_sessions_total', 1, {
+        callId: row._id,
+        type: `durable_stale_${row.state}`,
+      });
+      logInfo('billing_reconciliation_repair', {
+        callId: row._id,
+        orphanType: `durable_stale_${row.state}`,
+      });
+      await finalizeCallSession(io, {
+        callId: row._id,
+        reason: 'reconciliation',
+        source: 'reconciliation_worker',
+      }).catch((e) => logError('Durable stale repair failed', e, { callId: row._id }));
+    }
+
+    const { attemptFailedSettlementRecovery } = await import('./billing-session-finalization.service');
+    const failedRecoverable = await DurableCallSession.find({
+      finalized: false,
+      state: 'failed_settlement',
+      billingSequence: { $gt: 0 },
+    })
+      .select('_id')
+      .limit(20)
+      .lean();
+
+    for (const row of failedRecoverable) {
+      if (Date.now() - startedAt > RUN_BUDGET_MS) break;
+      await attemptFailedSettlementRecovery(row._id, 'reconciliation_worker').catch((e) =>
+        logError('Failed settlement recovery failed', e, { callId: row._id })
+      );
+    }
+  }
 
   for (const row of staleSettling) {
     if (Date.now() - startedAt > RUN_BUDGET_MS) break;

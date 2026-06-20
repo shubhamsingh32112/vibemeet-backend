@@ -69,7 +69,7 @@ test('watchdog enforces ACTIVE, SETTLING, and RECOVERING stuck-state paths', () 
 
 test('finalizer still guards duplicate settlement and retries', () => {
   const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
-  assert.ok(src.includes('isAlreadySettled(callId)'));
+  assert.ok(src.includes('isCallBillingAlreadySettled(callId)'));
   assert.ok(src.includes('enqueueSettlementRetry(params)'));
   assert.ok(src.includes('settlementClaimKey(callId)'));
   assert.ok(src.includes('finalizeAttemptId'));

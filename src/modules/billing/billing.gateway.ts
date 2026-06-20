@@ -6,18 +6,21 @@ import {
   pendingCallEndKey,
   PENDING_CALL_END_TTL,
 } from '../../config/redis';
-import { billingService, type BillingSessionStartSource } from './billing.service';
+import { billingService, type BillingSessionStartSource, waitForBillingSessionReady } from './billing.service';
 import { assertNotShuttingDown } from './billing-shutdown.service';
 import { logInfo, logDebug, logError } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { isBullmqBillingEnabled, closeBillingBullMq } from './billing.queue';
 import { closeTerminationRetryQueue } from './billing-termination.queue';
-import { isCallActive } from './billing-active-call.service';
+import { isCallActive, isNonTerminalLifecycle } from './billing-active-call.service';
 import { setupBillingGateway } from './billing-socket.gateway';
 import {
   finalizeCallEnd,
   restoreCreatorPresenceForEndedCall,
+  markCallEndingForDeferredEnd,
+  delegateCallEndSettlementToRetry,
 } from '../video/call-finalization.service';
+import { billingInstanceIdsMatch, getBillingInstanceId } from './billing-instance-id';
 import {
   startGlobalBillingProcessor,
   stopGlobalBillingProcessor,
@@ -95,17 +98,29 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
   logInfo('settleCallHttp', { callId });
 
   const redis = getRedis();
-  const sessionRaw = await redis.get(callSessionKey(callId));
+  let sessionRaw = await redis.get(callSessionKey(callId));
+  if (!sessionRaw) {
+    const waited = await waitForBillingSessionReady(callId, { timeoutMs: 2000 });
+    if (waited) {
+      sessionRaw = JSON.stringify(waited);
+    }
+  }
   let userFirebaseUid: string | undefined;
   let creatorFirebaseUid: string | undefined;
+  let sessionInstanceId: string | undefined;
+  let sessionLifecycle: string | undefined;
   if (sessionRaw) {
     try {
       const session = JSON.parse(sessionRaw) as {
         userFirebaseUid?: string;
         creatorFirebaseUid?: string;
+        instanceId?: string;
+        lifecycleState?: string;
       };
       userFirebaseUid = session.userFirebaseUid;
       creatorFirebaseUid = session.creatorFirebaseUid;
+      sessionInstanceId = session.instanceId;
+      sessionLifecycle = session.lifecycleState;
     } catch {
       // Ignore parse failures; helper still checks call session existence.
     }
@@ -118,6 +133,7 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
   });
 
   if (!active) {
+    await markCallEndingForDeferredEnd(callId, 'http_settle_call');
     await redis.setex(
       pendingCallEndKey(callId),
       PENDING_CALL_END_TTL,
@@ -139,6 +155,17 @@ export async function settleCallHttp(io: Server, callId: string): Promise<void> 
     } catch (presenceErr) {
       logError('Deferred HTTP call-ended presence restore failed', presenceErr, { callId });
     }
+    return;
+  }
+
+  const workerInstanceId = getBillingInstanceId();
+  if (
+    sessionInstanceId &&
+    sessionLifecycle &&
+    isNonTerminalLifecycle(sessionLifecycle) &&
+    !billingInstanceIdsMatch(sessionInstanceId, workerInstanceId)
+  ) {
+    await delegateCallEndSettlementToRetry(io, callId, 'http_settle_call', 'http_call_ended');
     return;
   }
 

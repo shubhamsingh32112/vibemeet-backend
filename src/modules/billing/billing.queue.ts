@@ -17,7 +17,7 @@ import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordBillingMetric } from '../../utils/monitoring';
 import { getRedis, callSessionKey, isRedisConfigured } from '../../config/redis';
 import { isBullmqBillingEnabled } from './billing-driver';
-import { updateBackpressureStage } from './billing-backpressure';
+import { isLiveBillingLifecycle, updateBackpressureStage } from './billing-backpressure';
 import { featureFlags } from '../../config/feature-flags';
 import { logBillingHealth } from './billing-health-log';
 
@@ -477,7 +477,22 @@ export function startBillingBullWorker(): Worker | null {
       await redis.del(billingCycleScheduleGateKey(callId)).catch(() => 0);
       const queueLagMs = Math.max(0, Date.now() - (job.timestamp + (job.opts.delay || 0)));
       recordBillingMetric('bullmq_queue_lag_ms', queueLagMs, { callId });
-      updateBackpressureStage({ queueLagMs });
+      let lifecycleState: string | undefined;
+      try {
+        const sessionRaw = await redis.get(callSessionKey(callId));
+        if (sessionRaw) {
+          lifecycleState = (JSON.parse(sessionRaw) as { lifecycleState?: string }).lifecycleState;
+        }
+      } catch {
+        lifecycleState = undefined;
+      }
+      const countsForAdmission = isLiveBillingLifecycle(lifecycleState);
+      if (!countsForAdmission && queueLagMs > 0) {
+        recordBillingMetric('billing_bp_queue_lag_ignored_recovery', 1, { callId });
+      }
+      updateBackpressureStage({
+        queueLagMs: countsForAdmission ? queueLagMs : 0,
+      });
       let result: Awaited<ReturnType<typeof billingService.processBillingTick>>;
       try {
         result = await billingService.processBillingTick(io, callId);

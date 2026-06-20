@@ -1,3 +1,4 @@
+import { Server } from 'socket.io';
 import { DurableCallSession } from './call-session.model';
 import { sumLedgerForCall } from './billing-ledger.model';
 import {
@@ -8,6 +9,8 @@ import { recordDualWriteDrift, recordReconciliationDrift } from './billing-phase
 import { getRedis, callSessionKey } from '../../config/redis';
 import { logInfo, logWarning } from '../../utils/logger';
 import type { CallSession as RedisCallSession } from './billing.service';
+import { BILLING_MAX_SETTLING_MS, isFailedSettlementAutoRecoveryEnabled } from './billing.constants';
+import { enqueueImmediateSettlementRetry } from './billing-session-finalization.service';
 
 export async function reconcileCallSessionDrift(callId: string): Promise<boolean> {
   if (!isDurableCallSessionEnabled()) return true;
@@ -58,13 +61,14 @@ export async function reconcileCallSessionDrift(callId: string): Promise<boolean
   return true;
 }
 
-export async function runCallSessionReconciliationPass(): Promise<void> {
+export async function runCallSessionReconciliationPass(_io: Server): Promise<void> {
   if (!isDurableCallSessionEnabled()) return;
 
+  const staleThreshold = new Date(Date.now() - BILLING_MAX_SETTLING_MS);
   const stale = await DurableCallSession.find({
     finalized: false,
     state: { $in: ['settling', 'ending'] },
-    updatedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+    updatedAt: { $lt: staleThreshold },
   })
     .select('_id state')
     .limit(50)
@@ -72,6 +76,34 @@ export async function runCallSessionReconciliationPass(): Promise<void> {
 
   for (const row of stale) {
     await reconcileCallSessionDrift(row._id);
-    logInfo('call_session_reconciliation_checked', { callId: row._id, state: row.state });
+    if (row.state === 'settling') {
+      await enqueueImmediateSettlementRetry({
+        callId: row._id,
+        reason: 'reconciliation',
+        source: 'reconciliation_worker',
+      });
+      logInfo('call_session_reconciliation_finalize_enqueued', {
+        callId: row._id,
+        state: row.state,
+      });
+    } else {
+      logInfo('call_session_reconciliation_checked', { callId: row._id, state: row.state });
+    }
+  }
+
+  if (isFailedSettlementAutoRecoveryEnabled()) {
+    const { attemptFailedSettlementRecovery } = await import('./billing-session-finalization.service');
+    const failedRecoverable = await DurableCallSession.find({
+      finalized: false,
+      state: 'failed_settlement',
+      billingSequence: { $gt: 0 },
+    })
+      .select('_id')
+      .limit(20)
+      .lean();
+
+    for (const row of failedRecoverable) {
+      await attemptFailedSettlementRecovery(row._id, 'reconciliation_worker');
+    }
   }
 }

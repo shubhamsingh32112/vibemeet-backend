@@ -1,4 +1,11 @@
-import { getRedis, activeCallByUserKey, callSessionKey, callSessionTerminalKey } from '../../config/redis';
+import {
+  getRedis,
+  activeCallByUserKey,
+  callSessionKey,
+  callSessionTerminalKey,
+  pendingCallEndKey,
+  callEndingKey,
+} from '../../config/redis';
 import { Call } from '../video/call.model';
 import { logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
@@ -81,6 +88,14 @@ export async function isCreatorActiveCallSlotLive(
   }
 
   const redis = getRedis();
+  const [endingFlag, pendingEnd] = await Promise.all([
+    redis.get(callEndingKey(slotCallId)).catch(() => null),
+    redis.get(pendingCallEndKey(slotCallId)).catch(() => null),
+  ]);
+  if (endingFlag || pendingEnd) {
+    return false;
+  }
+
   const terminalRaw = await redis.get(callSessionTerminalKey(slotCallId)).catch(() => null);
   if (terminalRaw) {
     return false;

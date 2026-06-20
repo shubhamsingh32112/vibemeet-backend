@@ -2,6 +2,7 @@ import type { Server } from 'socket.io';
 import { startGlobalBillingProcessor } from '../modules/billing/billing.gateway';
 import { startTerminationRetryWorker } from '../modules/billing/billing-termination.queue';
 import { startReconciliationJob } from '../modules/billing/billing-reconciliation';
+import { startSettlementFastRetryWorker } from '../modules/billing/billing-settlement-retry.worker';
 import { startBillingWatchdog } from '../modules/billing/billing-watchdog.service';
 import {
   startStaffWalletReconciliationScheduler,
@@ -21,6 +22,7 @@ export function bootstrapBillingWorkers(io: Server): void {
   startGlobalBillingProcessor(io);
   startTerminationRetryWorker();
   startReconciliationJob(io);
+  startSettlementFastRetryWorker(io);
   startBillingWatchdog(io);
   startStaffWalletReconciliationScheduler();
   startDomainEventWorker();

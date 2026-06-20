@@ -13,12 +13,23 @@ import {
 } from './billing-phase-flags';
 import { getBillingInstanceId } from './billing-instance-id';
 import { recordDualWriteDrift, recordLeaseTakeover, recordStaleFencingReject } from './billing-phase-metrics';
-import { logInfo } from '../../utils/logger';
+import { logInfo, logWarning } from '../../utils/logger';
+import { BILLING_MAX_SETTLING_MS } from './billing.constants';
+import { getRedis, settlementClaimKey } from '../../config/redis';
+import { recordBillingMetric } from '../../utils/monitoring';
 import type { CallSession as RedisCallSession } from './billing.service';
+import { Call } from '../video/call.model';
+
+export type ClaimLostDetail =
+  | 'settling_active'
+  | 'settling_stale_race'
+  | 'state_blocked';
 
 export type ClaimSettlementResult =
   | { ok: true; settlementVersion: number }
-  | { ok: false; reason: 'already_finalized' | 'claim_lost' | 'disabled' };
+  | { ok: false; reason: 'already_finalized' }
+  | { ok: false; reason: 'claim_lost'; detail: ClaimLostDetail }
+  | { ok: false; reason: 'disabled' };
 
 export type PersistGuardContext = {
   instanceId: string;
@@ -38,6 +49,61 @@ function mapSettlementReasonToFinalization(
   if (reason === 'timeout') return 'disconnect_timeout';
   if (reason === 'force_end') return 'force_terminated';
   return 'normal_end';
+}
+
+export function isDurableSettlingStale(
+  doc: Pick<IDurableCallSession, 'finalizationStartedAt' | 'updatedAt'>,
+  nowMs: number = Date.now()
+): boolean {
+  const staleThreshold = nowMs - BILLING_MAX_SETTLING_MS;
+  if (doc.finalizationStartedAt) {
+    return new Date(doc.finalizationStartedAt).getTime() < staleThreshold;
+  }
+  return new Date(doc.updatedAt).getTime() < staleThreshold;
+}
+
+function resolveClaimLostDetail(
+  existing: Pick<IDurableCallSession, 'state' | 'finalizationStartedAt' | 'updatedAt'> | null
+): ClaimLostDetail {
+  if (!existing) {
+    return 'state_blocked';
+  }
+  if (existing.state === 'settling') {
+    return isDurableSettlingStale(existing) ? 'settling_stale_race' : 'settling_active';
+  }
+  return 'state_blocked';
+}
+
+export async function getDurableClaimLostDetail(callId: string): Promise<ClaimLostDetail | null> {
+  if (!isDurableCallSessionEnabled()) return null;
+  const existing = await DurableCallSession.findById(callId).lean();
+  if (!existing || existing.finalized || existing.state === 'settled') {
+    return null;
+  }
+  return resolveClaimLostDetail(existing);
+}
+
+export async function mirrorCallSettlementSettling(params: {
+  callId: string;
+  source: string;
+  reason: string;
+  ownerInstanceId: string;
+  settlementVersion: number;
+}): Promise<void> {
+  await Call.findOneAndUpdate(
+    { callId: params.callId, 'settlement.status': { $ne: 'settled' } },
+    {
+      $set: {
+        'settlement.status': 'settling',
+        'settlement.source': params.source,
+        'settlement.reason': params.reason,
+        'settlement.version': params.settlementVersion,
+        'settlement.updatedAt': new Date(),
+        'settlement.ownerInstanceId': params.ownerInstanceId,
+      },
+    },
+    { upsert: false }
+  ).catch(() => {});
 }
 
 export async function createDurableCallSessionAtStart(params: {
@@ -146,8 +212,60 @@ export async function claimDurableCallSessionForSettlement(params: {
     if (existing?.finalized || existing?.state === 'settled') {
       return { ok: false, reason: 'already_finalized' };
     }
-    return { ok: false, reason: 'claim_lost' };
+
+    if (existing?.state === 'settling') {
+      const staleThreshold = new Date(Date.now() - BILLING_MAX_SETTLING_MS);
+      const staleTakeover = await DurableCallSession.findOneAndUpdate(
+        {
+          _id: params.callId,
+          finalized: false,
+          state: 'settling',
+          $or: [
+            { finalizationStartedAt: { $lt: staleThreshold } },
+            { finalizationStartedAt: { $exists: false }, updatedAt: { $lt: staleThreshold } },
+          ],
+        },
+        {
+          $set: {
+            finalizationReason,
+            finalizationOwnerId: ownerId,
+            finalizationStartedAt: now,
+          },
+          $inc: { settlementVersion: 1 },
+        },
+        { new: true }
+      );
+
+      if (staleTakeover) {
+        recordBillingMetric('billing_finalize_stale_claim_total', 1, { callId: params.callId });
+        logWarning('billing_finalize_stale_takeover', {
+          callId: params.callId,
+          previousOwner: existing.finalizationOwnerId,
+          version: staleTakeover.settlementVersion,
+          source: params.source,
+        });
+        await getRedis().del(settlementClaimKey(params.callId)).catch(() => {});
+        await mirrorCallSettlementSettling({
+          callId: params.callId,
+          source: params.source,
+          reason: params.reason,
+          ownerInstanceId: ownerId,
+          settlementVersion: staleTakeover.settlementVersion,
+        });
+        return { ok: true, settlementVersion: staleTakeover.settlementVersion };
+      }
+    }
+
+    return { ok: false, reason: 'claim_lost', detail: resolveClaimLostDetail(existing) };
   }
+
+  await mirrorCallSettlementSettling({
+    callId: params.callId,
+    source: params.source,
+    reason: params.reason,
+    ownerInstanceId: ownerId,
+    settlementVersion: result.settlementVersion,
+  });
 
   return { ok: true, settlementVersion: result.settlementVersion };
 }
@@ -155,7 +273,7 @@ export async function claimDurableCallSessionForSettlement(params: {
 export async function markDurableCallSessionEnding(callId: string, endedAt?: Date): Promise<void> {
   if (!isDurableCallSessionEnabled()) return;
 
-  await DurableCallSession.updateOne(
+  const updated = await DurableCallSession.updateOne(
     { _id: callId, finalized: false, state: { $in: ['active', 'reconnecting'] } },
     {
       $set: {
@@ -164,6 +282,11 @@ export async function markDurableCallSessionEnding(callId: string, endedAt?: Dat
       },
     }
   );
+
+  if (updated.modifiedCount > 0) {
+    const { cancelBillingCycleJob } = await import('./billing.queue');
+    await cancelBillingCycleJob(callId).catch(() => {});
+  }
 }
 
 export async function markDurableCallSessionSettled(params: {
@@ -192,6 +315,26 @@ export async function markDurableCallSessionFailedSettlement(callId: string): Pr
     { _id: callId, finalized: false },
     { $set: { state: 'failed_settlement' } }
   );
+}
+
+export async function resetDurableCallSessionForSettlementRetry(callId: string): Promise<boolean> {
+  if (!isDurableCallSessionEnabled()) return false;
+
+  const result = await DurableCallSession.findOneAndUpdate(
+    {
+      _id: callId,
+      finalized: false,
+      state: 'failed_settlement',
+    },
+    {
+      $set: { state: 'ending' },
+      $unset: { finalizationOwnerId: '', finalizationStartedAt: '' },
+      $inc: { settlementVersion: 1 },
+    },
+    { new: true }
+  );
+
+  return result != null;
 }
 
 export async function mirrorRedisSessionToDurableCallSession(

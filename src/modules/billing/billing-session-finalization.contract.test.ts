@@ -7,7 +7,9 @@ test('finalizeCallSession module exports canonical orchestration API', async () 
   const mod = await import('./billing-session-finalization.service');
   assert.equal(typeof mod.finalizeCallSession, 'function');
   assert.equal(typeof mod.enqueueSettlementRetry, 'function');
+  assert.equal(typeof mod.enqueueImmediateSettlementRetry, 'function');
   assert.equal(typeof mod.processSettlementRetryQueue, 'function');
+  assert.equal(typeof mod.isCallBillingAlreadySettled, 'function');
 });
 
 test('settleCall legacy path flushes only when not from finalizer', () => {
@@ -53,9 +55,12 @@ test('bullmq worker uses finalizeCallSession on stop_needs_settlement', () => {
 
 test('finalizer keeps duplicate suppression and retry safeguards', () => {
   const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
-  assert.ok(src.includes('isAlreadySettled(callId)'));
+  assert.ok(src.includes('isCallBillingAlreadySettled(callId)'));
   assert.ok(src.includes("return { status: 'duplicate', callId }"));
   assert.ok(src.includes('enqueueSettlementRetry(params)'));
+  assert.ok(src.includes('enqueueImmediateSettlementRetry(params)'));
+  assert.ok(src.includes("return { status: 'pending_retry', callId }"));
+  assert.ok(src.includes("rejectionReason: 'stale_worker_active_runtime'"));
   assert.ok(src.includes('settlementClaimKey(callId)'));
   assert.ok(src.includes('RELEASE_IF_MATCH_LUA'));
   assert.ok(src.includes('finalizeInflightKey(callId)'));
@@ -116,4 +121,37 @@ test('duplicate finalize paths invoke terminal billing teardown', () => {
   const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
   assert.ok(src.includes('ensureTerminalBillingTeardown'));
   assert.ok(src.includes('await ensureTerminalBillingTeardown(callId)'));
+});
+
+test('settlement retry queue forwards attempt and enqueuedAt to finalizeCallSession', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('retryParamsFromFinalize(parsed)'));
+  assert.ok(src.includes('attempt?: number'));
+  assert.ok(src.includes('enqueuedAt?: number'));
+});
+
+test('dead-letter path clears billing redis keys and creator active call slot', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('clearCreatorActiveCallSlotIfStale'));
+  assert.ok(src.includes("source: 'billing.dead_letter'"));
+  assert.ok(src.includes('getDurableCallSession'));
+});
+
+test('fast retry worker pauses on backpressure stage 3', () => {
+  const src = readFileSync(join(__dirname, 'billing-settlement-retry.worker.ts'), 'utf8');
+  assert.ok(src.includes('getBillingBackpressureStage'));
+  assert.ok(src.includes('billing_settlement_fast_retry_paused_backpressure'));
+});
+
+test('admission hysteresis decouples block from single severe sample', () => {
+  const src = readFileSync(join(__dirname, 'billing-backpressure.ts'), 'utf8');
+  assert.ok(src.includes('consecutiveSevereSamples'));
+  assert.ok(src.includes('getAdmissionBlockSevereSamples'));
+  assert.ok(src.includes('billing_admission_hysteresis'));
+});
+
+test('handleDurableClaimLost and failed settlement recovery exported paths', () => {
+  const src = readFileSync(join(__dirname, 'billing-session-finalization.service.ts'), 'utf8');
+  assert.ok(src.includes('async function handleDurableClaimLost'));
+  assert.ok(src.includes('export async function attemptFailedSettlementRecovery'));
 });

@@ -171,6 +171,15 @@ export function getBackpressureStage2EmitIntervalMs(): number {
   return readEnvInt('BILLING_BP_STAGE2_EMIT_INTERVAL_MS', 2000, 500, 30_000);
 }
 
+/** Consecutive severe backpressure samples required before blocking new call admission. */
+export function getAdmissionBlockSevereSamples(): number {
+  return readEnvInt('BILLING_ADMISSION_BLOCK_SEVERE_SAMPLES', 2, 1, 10);
+}
+
+export function isFailedSettlementAutoRecoveryEnabled(): boolean {
+  return process.env.BILLING_FAILED_SETTLEMENT_AUTO_RECOVERY_ENABLED !== 'false';
+}
+
 /** Minimum checkpoint interval clamp (ms). */
 const MIN_BILLING_CHECKPOINT_INTERVAL_MS = 10_000;
 const DEFAULT_BILLING_CHECKPOINT_INTERVAL_MS = 15_000;

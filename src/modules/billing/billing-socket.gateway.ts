@@ -9,7 +9,7 @@ import {
   billingSyncWarningCountKey,
 } from '../../config/redis';
 import { recordBillingMetric } from '../../utils/monitoring';
-import { billingService, ensureBillingStartedReplayFreshness } from './billing.service';
+import { billingService, ensureBillingStartedReplayFreshness, waitForBillingSessionReady } from './billing.service';
 import {
   isCallActiveForParticipant,
   isNonTerminalLifecycle,
@@ -36,7 +36,10 @@ import {
 import {
   finalizeCallEnd,
   restoreCreatorPresenceForEndedCall,
+  markCallEndingForDeferredEnd,
+  delegateCallEndSettlementToRetry,
 } from '../video/call-finalization.service';
+import { billingInstanceIdsMatch, getBillingInstanceId } from './billing-instance-id';
 import {
   resolveActiveRuntimeStateForUser,
   resolveBillingRuntimeState,
@@ -347,7 +350,14 @@ export function setupBillingGateway(io: Server): void {
         }
 
         const redis = getRedis();
-        const sessionForEnd = (await resolveBillingRuntimeState(data.callId)).session;
+        let sessionForEnd = (await resolveBillingRuntimeState(data.callId)).session;
+        if (!sessionForEnd) {
+          const waited = await waitForBillingSessionReady(data.callId, { timeoutMs: 2000 });
+          if (waited) {
+            sessionForEnd = waited;
+          }
+        }
+
         const active = sessionForEnd
           ? isNonTerminalLifecycle(sessionForEnd.lifecycleState) &&
             (sessionForEnd.userFirebaseUid === firebaseUid ||
@@ -358,6 +368,7 @@ export function setupBillingGateway(io: Server): void {
             });
 
         if (!active) {
+          await markCallEndingForDeferredEnd(data.callId, 'socket_call_ended');
           await redis.setex(
             pendingCallEndKey(data.callId),
             PENDING_CALL_END_TTL,
@@ -387,6 +398,22 @@ export function setupBillingGateway(io: Server): void {
               firebaseUid,
             });
           }
+          return;
+        }
+
+        const workerInstanceId = getBillingInstanceId();
+        if (
+          sessionForEnd &&
+          isNonTerminalLifecycle(sessionForEnd.lifecycleState) &&
+          sessionForEnd.instanceId &&
+          !billingInstanceIdsMatch(sessionForEnd.instanceId, workerInstanceId)
+        ) {
+          await delegateCallEndSettlementToRetry(
+            io,
+            data.callId,
+            'socket_call_ended',
+            'socket_call_ended'
+          );
           return;
         }
 

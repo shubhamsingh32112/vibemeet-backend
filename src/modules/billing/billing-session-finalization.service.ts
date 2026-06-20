@@ -27,6 +27,7 @@ import {
   billingWatchdogAttemptsKey,
   billingWatchdogCooldownKey,
   billingRecoveryDeadLetterKey,
+  billingFailedSettlementRecoveryCooldownKey,
 } from '../../config/redis';
 import { getBillingCheckpoint, upsertBillingCheckpointSnapshot } from './billing-checkpoint.service';
 import { Call } from '../video/call.model';
@@ -37,6 +38,7 @@ import {
   BILLING_SETTLEMENT_POLL_MS,
   BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS,
   isUnifiedBillingFinalizerEnabled,
+  isFailedSettlementAutoRecoveryEnabled,
 } from './billing.constants';
 import {
   deleteBillingSessionRedisKeys,
@@ -52,14 +54,19 @@ import { cancelBillingCycleJob } from './billing.queue';
 import { featureFlags } from '../../config/feature-flags';
 import {
   claimDurableCallSessionForSettlement,
+  getDurableCallSession,
   isDurableCallSessionFinalized,
+  isDurableSettlingStale,
   markDurableCallSessionFailedSettlement,
   markDurableCallSessionSettled,
+  resetDurableCallSessionForSettlementRetry,
+  type ClaimLostDetail,
 } from './call-session.service';
 import { isDurableCallSessionEnabled, isBillingOutboxProjectionEnabled } from './billing-phase-flags';
 import { recordFinalizeDuplicatePrevented, recordSettlementRetry } from './billing-phase-metrics';
 import { enqueueCallBillingProjectionEvent } from './call-history-projector.service';
 import { resolveBillingRuntimeState } from './billing-runtime-resolver.service';
+import { clearCreatorActiveCallSlotIfStale } from '../availability/creator-active-call-slot.service';
 
 export type SettlementReason =
   | 'insufficient_coins'
@@ -85,6 +92,8 @@ export interface FinalizeCallSessionParams {
   callId: string;
   reason: SettlementReason;
   source: SettlementSource;
+  attempt?: number;
+  enqueuedAt?: number;
 }
 
 export interface FinalizeResult {
@@ -207,6 +216,18 @@ type DrainArtifactsReason =
   | 'convergence_impossible'
   | 'manual_cleanup';
 
+function retryParamsFromFinalize(
+  params: FinalizeCallSessionParams
+): FinalizeCallSessionParams & { attempt?: number; enqueuedAt?: number } {
+  return {
+    callId: params.callId,
+    reason: params.reason,
+    source: params.source,
+    ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+    ...(params.enqueuedAt !== undefined ? { enqueuedAt: params.enqueuedAt } : {}),
+  };
+}
+
 export async function drainSettlementArtifacts(
   callId: string,
   reason: DrainArtifactsReason
@@ -229,7 +250,8 @@ type DeadLetterReason =
   | 'retry_cap_reached'
   | 'retry_age_exhausted'
   | 'cooldown_exhausted'
-  | 'convergence_impossible';
+  | 'convergence_impossible'
+  | 'manual_cleanup';
 
 export async function moveCallToRecoveryDeadLetter(
   callId: string,
@@ -297,6 +319,28 @@ export async function moveCallToRecoveryDeadLetter(
     error: `dead_letter:${reason}`,
   });
   await drainSettlementArtifacts(callId, 'dead_letter_transition');
+
+  const partyContext = await readFinalizePartyContext(callId);
+  let userFirebaseUid = partyContext.payerFirebaseUid;
+  let creatorFirebaseUid = partyContext.creatorFirebaseUid;
+  if (!userFirebaseUid || !creatorFirebaseUid) {
+    const durable = await getDurableCallSession(callId);
+    userFirebaseUid = userFirebaseUid ?? durable?.callerFirebaseUid;
+    creatorFirebaseUid = creatorFirebaseUid ?? durable?.creatorFirebaseUid;
+  }
+  if (userFirebaseUid && creatorFirebaseUid) {
+    await deleteBillingSessionRedisKeys(redis, callId, userFirebaseUid, creatorFirebaseUid).catch(
+      () => {}
+    );
+  }
+  if (creatorFirebaseUid) {
+    await clearCreatorActiveCallSlotIfStale(creatorFirebaseUid, {
+      endingCallId: callId,
+      force: true,
+      source: 'billing.dead_letter',
+    }).catch(() => {});
+  }
+
   if (isDurableCallSessionEnabled()) {
     await markDurableCallSessionFailedSettlement(callId).catch(() => {});
   }
@@ -330,7 +374,7 @@ export async function moveCallToRecoveryDeadLetter(
   });
 }
 
-async function isAlreadySettled(callId: string): Promise<boolean> {
+export async function isCallBillingAlreadySettled(callId: string): Promise<boolean> {
   const redis = getRedis();
   if (await redis.get(settledCallKey(callId))) {
     return true;
@@ -355,7 +399,7 @@ async function isAlreadySettled(callId: string): Promise<boolean> {
 
 /** Cancel BullMQ cycles and remove residual runtime keys when settlement already completed. */
 async function ensureTerminalBillingTeardown(callId: string): Promise<void> {
-  if (!(await isAlreadySettled(callId))) {
+  if (!(await isCallBillingAlreadySettled(callId))) {
     return;
   }
   await cancelBillingCycleJob(callId).catch(() => {});
@@ -448,12 +492,12 @@ async function readFinalizationSnapshotMeta(callId: string): Promise<Finalizatio
 async function pollUntilSettled(callId: string): Promise<boolean> {
   const deadline = Date.now() + BILLING_SETTLEMENT_POLL_MS;
   while (Date.now() < deadline) {
-    if (await isAlreadySettled(callId)) {
+    if (await isCallBillingAlreadySettled(callId)) {
       return true;
     }
     await sleep(500);
   }
-  return isAlreadySettled(callId);
+  return isCallBillingAlreadySettled(callId);
 }
 
 export async function enqueueSettlementRetry(
@@ -521,41 +565,243 @@ export async function enqueueSettlementRetry(
   });
 }
 
+/** Enqueue settlement retry with score=now for explicit call-end sources (no exponential backoff). */
+export async function enqueueImmediateSettlementRetry(
+  params: FinalizeCallSessionParams & { attempt?: number }
+): Promise<void> {
+  const redis = getRedis();
+  const now = Date.now();
+  const attempt = (params.attempt ?? 0) + 1;
+  const enqueuedAt = (params as { enqueuedAt?: number }).enqueuedAt ?? now;
+  const ageMs = Math.max(0, now - enqueuedAt);
+  const recoveryOwnerInstanceId = getBillingInstanceId();
+
+  if (ageMs > RETRY_MAX_AGE_MS) {
+    await moveCallToRecoveryDeadLetter(params.callId, 'retry_age_exhausted', params.source);
+    return;
+  }
+
+  if (attempt > BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS) {
+    recordBillingMetric('billing_finalize_failure', 1, {
+      callId: params.callId,
+      source: params.source,
+    });
+    await moveCallToRecoveryDeadLetter(params.callId, 'retry_cap_reached', params.source);
+    return;
+  }
+
+  const dedupKey = billingSettlementRetryDedupKey(params.callId);
+  const dedupeSet = await redis.set(
+    dedupKey,
+    JSON.stringify({ attempt, at: now, immediate: true }),
+    'EX',
+    RETRY_DEDUP_TTL_SECONDS,
+    'NX'
+  );
+  if (dedupeSet !== 'OK') {
+    recordBillingMetric('billing_finalize_retry_deduped', 1, {
+      callId: params.callId,
+      source: params.source,
+      attempt: String(attempt),
+    });
+    return;
+  }
+
+  const payload = JSON.stringify({
+    ...params,
+    attempt,
+    enqueuedAt,
+    lastEnqueuedAt: now,
+    recoveryOwnerInstanceId,
+    immediate: true,
+  });
+  await redis.setex(
+    billingSettlementRetryPayloadKey(params.callId),
+    Math.max(120, Math.floor(RETRY_MAX_AGE_MS / 1000)),
+    payload
+  );
+  await redis.zadd(BILLING_SETTLEMENT_RETRY_KEY, now, params.callId);
+  recordSettlementRetry(params.callId, params.source);
+  recordBillingMetric('billing_finalize_immediate_retry_total', 1, {
+    callId: params.callId,
+    source: params.source,
+    attempt: String(attempt),
+    recoveryOwnerInstanceId,
+  });
+}
+
 export async function processSettlementRetryQueue(io: Server, maxItems = 20): Promise<void> {
   const redis = getRedis();
   const now = Date.now();
   const items = await redis.zrangebyscore(BILLING_SETTLEMENT_RETRY_KEY, 0, now, 'LIMIT', 0, maxItems);
   for (const item of items) {
     await redis.zrem(BILLING_SETTLEMENT_RETRY_KEY, item);
+    let parsed: (FinalizeCallSessionParams & { attempt?: number; enqueuedAt?: number }) | null =
+      null;
     try {
       const payloadKey = billingSettlementRetryPayloadKey(item);
       const payloadRaw = await redis.get(payloadKey);
       if (!payloadRaw) {
         if (item.startsWith('{')) {
-          const legacy = JSON.parse(item) as FinalizeCallSessionParams;
-          await finalizeCallSession(io, {
-            callId: legacy.callId,
-            reason: legacy.reason,
-            source: legacy.source,
-          });
+          parsed = JSON.parse(item) as FinalizeCallSessionParams & {
+            attempt?: number;
+            enqueuedAt?: number;
+          };
+          await finalizeCallSession(io, retryParamsFromFinalize(parsed));
         }
         await redis.del(billingSettlementRetryDedupKey(item)).catch(() => 0);
         continue;
       }
-      const parsed = JSON.parse(payloadRaw) as FinalizeCallSessionParams & { attempt?: number };
-      await Promise.all([
-        redis.del(payloadKey).catch(() => 0),
-        redis.del(billingSettlementRetryDedupKey(item)).catch(() => 0),
-      ]);
-      await finalizeCallSession(io, {
-        callId: parsed.callId,
-        reason: parsed.reason,
-        source: parsed.source,
-      });
+      parsed = JSON.parse(payloadRaw) as FinalizeCallSessionParams & {
+        attempt?: number;
+        enqueuedAt?: number;
+      };
+      await redis.del(billingSettlementRetryDedupKey(item)).catch(() => 0);
+      const result = await finalizeCallSession(io, retryParamsFromFinalize(parsed));
+      if (result.status !== 'pending_retry') {
+        await redis.del(payloadKey).catch(() => 0);
+      }
     } catch (e) {
       logError('Settlement retry consumer failed', e, { item });
+      if (parsed) {
+        await enqueueSettlementRetry(retryParamsFromFinalize(parsed)).catch((retryErr) => {
+          logError('Settlement retry re-enqueue failed', retryErr, { item, callId: parsed?.callId });
+        });
+      }
     }
   }
+}
+
+async function tryStaleDurableSettlingTakeover(callId: string): Promise<boolean> {
+  const doc = await getDurableCallSession(callId);
+  if (!doc || doc.state !== 'settling' || !isDurableSettlingStale(doc)) {
+    return false;
+  }
+  await getRedis().del(settlementClaimKey(callId)).catch(() => {});
+  recordBillingMetric('billing_finalize_stale_claim_total', 1, { callId });
+  logWarning('billing_finalize_stale_takeover_preclear', { callId });
+  return true;
+}
+
+async function handleDurableClaimLost(
+  _io: Server,
+  params: FinalizeCallSessionParams,
+  detail: ClaimLostDetail,
+  inflightToken: string
+): Promise<FinalizeResult> {
+  const { callId, source } = params;
+  const redis = getRedis();
+
+  if (detail === 'settling_active') {
+    recordBillingMetric('billing_finalize_claim_lost_settling_active', 1, { callId, source });
+    const settled = await pollUntilSettled(callId);
+    if (settled) {
+      await ensureTerminalBillingTeardown(callId);
+      await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+      return { status: 'duplicate', callId };
+    }
+    await enqueueSettlementRetry(retryParamsFromFinalize(params));
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+    return { status: 'pending_retry', callId };
+  }
+
+  if (detail === 'settling_stale_race') {
+    recordBillingMetric('billing_finalize_claim_lost_stale_race', 1, { callId, source });
+    const nextAttempt = (params.attempt ?? 0) + 1;
+    if (nextAttempt >= BILLING_SETTLEMENT_RETRY_MAX_ATTEMPTS) {
+      await moveCallToRecoveryDeadLetter(callId, 'retry_cap_reached', source);
+      await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+      return { status: 'dead_lettered', callId };
+    }
+    await enqueueSettlementRetry(retryParamsFromFinalize(params));
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+    return { status: 'pending_retry', callId };
+  }
+
+  recordBillingMetric('billing_finalize_claim_lost_state_blocked', 1, { callId, source });
+  const durable = await getDurableCallSession(callId);
+  if (durable?.state === 'failed_settlement') {
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+    const recovery = await attemptFailedSettlementRecovery(callId, source);
+    if (recovery === 'skipped') {
+      await enqueueSettlementRetry(retryParamsFromFinalize(params));
+      return { status: 'pending_retry', callId };
+    }
+    return { status: 'pending_retry', callId };
+  }
+
+  await enqueueSettlementRetry(retryParamsFromFinalize(params));
+  await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+  return { status: 'pending_retry', callId };
+}
+
+export async function attemptFailedSettlementRecovery(
+  callId: string,
+  source: SettlementSource,
+  opts?: { forceAllowZeroSequence?: boolean }
+): Promise<'recovered' | 'skipped' | 'dead_lettered'> {
+  if (!isDurableCallSessionEnabled()) {
+    return 'skipped';
+  }
+  if (!opts?.forceAllowZeroSequence && !isFailedSettlementAutoRecoveryEnabled()) {
+    return 'skipped';
+  }
+
+  const redis = getRedis();
+  const deadLetterRaw = await redis.get(billingRecoveryDeadLetterKey(callId));
+  if (!deadLetterRaw && !opts?.forceAllowZeroSequence) {
+    return 'skipped';
+  }
+
+  const history = await CallHistory.findOne({ callId, ownerRole: 'user' })
+    .select('settlementStatus settledAt')
+    .lean();
+  if (history?.settlementStatus === 'settled' || history?.settledAt) {
+    return 'skipped';
+  }
+
+  const durable = await getDurableCallSession(callId);
+  if (!durable || durable.state !== 'failed_settlement') {
+    return 'skipped';
+  }
+  if (durable.billingSequence <= 0 && !opts?.forceAllowZeroSequence) {
+    return 'skipped';
+  }
+
+  const cooldownKey = billingFailedSettlementRecoveryCooldownKey(callId);
+  if (!opts?.forceAllowZeroSequence) {
+    const cooldown = await redis.get(cooldownKey);
+    if (cooldown) {
+      return 'skipped';
+    }
+  }
+
+  await redis
+    .setex(cooldownKey, 900, JSON.stringify({ at: Date.now(), source }))
+    .catch(() => {});
+  await redis.del(billingRecoveryDeadLetterKey(callId)).catch(() => 0);
+
+  const reset = await resetDurableCallSessionForSettlementRetry(callId);
+  if (!reset) {
+    return 'skipped';
+  }
+
+  await drainSettlementArtifacts(callId, 'manual_cleanup');
+  await enqueueImmediateSettlementRetry({
+    callId,
+    reason: 'reconciliation',
+    source,
+    attempt: 0,
+    enqueuedAt: Date.now(),
+  });
+
+  recordBillingMetric('billing_failed_settlement_recovery_total', 1, {
+    callId,
+    source,
+    status: 'enqueued',
+  });
+
+  return 'recovered';
 }
 
 async function tryStaleSettlingTakeover(callId: string): Promise<boolean> {
@@ -1046,18 +1292,20 @@ export async function finalizeCallSession(
           workerInstanceId: recoveryOwnerInstanceId,
           lastSequenceAdvanceAt,
           lifecycleState,
+          rejectionReason: 'stale_worker_active_runtime',
         });
         await redis
           .eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken)
           .catch(() => {});
-        return { status: 'duplicate', callId };
+        await enqueueImmediateSettlementRetry(retryParamsFromFinalize(params));
+        return { status: 'pending_retry', callId };
       }
     } catch {
       // best-effort guard only
     }
   }
 
-  if (await isAlreadySettled(callId)) {
+  if (await isCallBillingAlreadySettled(callId)) {
     recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
     await appendSettlementAttempt(callId, {
       source,
@@ -1076,7 +1324,11 @@ export async function finalizeCallSession(
     return { status: 'duplicate', callId };
   }
 
-  await tryStaleSettlingTakeover(callId);
+  if (isDurableCallSessionEnabled()) {
+    await tryStaleDurableSettlingTakeover(callId);
+  } else {
+    await tryStaleSettlingTakeover(callId);
+  }
 
   const ownerToken = crypto.randomUUID();
   const ownerInstanceId = getBillingInstanceId();
@@ -1112,7 +1364,7 @@ export async function finalizeCallSession(
         .catch(() => {});
       return { status: 'duplicate', callId };
     }
-    await enqueueSettlementRetry(params);
+    await enqueueSettlementRetry(retryParamsFromFinalize(params));
     await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'pending_retry', callId };
   }
@@ -1146,7 +1398,7 @@ export async function finalizeCallSession(
       return { status: 'duplicate', callId };
     }
     recordBillingMetric('billing_finalize_claim_timeout_total', 1, { callId, source });
-    await enqueueSettlementRetry(params);
+    await enqueueSettlementRetry(retryParamsFromFinalize(params));
     await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
     return { status: 'pending_retry', callId };
   }
@@ -1173,7 +1425,10 @@ export async function finalizeCallSession(
           await ensureTerminalBillingTeardown(callId);
           return { status: 'duplicate', callId };
         }
-        await enqueueSettlementRetry(params);
+        if (claim.reason === 'claim_lost') {
+          return handleDurableClaimLost(io, params, claim.detail, inflightToken);
+        }
+        await enqueueSettlementRetry(retryParamsFromFinalize(params));
         return { status: 'pending_retry', callId };
       }
       settlementVersion = claim.settlementVersion;
@@ -1195,7 +1450,7 @@ export async function finalizeCallSession(
           finalizeAttemptId,
           recoveryOwnerInstanceId,
         });
-        await enqueueSettlementRetry(params);
+        await enqueueSettlementRetry(retryParamsFromFinalize(params));
         return { status: 'pending_retry', callId };
       }
       await moveCallToRecoveryDeadLetter(callId, 'convergence_impossible', source, {
@@ -1213,7 +1468,7 @@ export async function finalizeCallSession(
       logWarning('billing_finalize proceeding without final flush marker', { callId });
     }
 
-    if (await isAlreadySettled(callId)) {
+    if (await isCallBillingAlreadySettled(callId)) {
       recordBillingMetric('billing_finalize_duplicate', 1, { callId, source });
       logInfo('billing_finalize_duplicate_suppressed', {
         callId,
@@ -1237,11 +1492,11 @@ export async function finalizeCallSession(
     });
 
     if (!persistResult) {
-      if (await isAlreadySettled(callId)) {
+      if (await isCallBillingAlreadySettled(callId)) {
         await ensureTerminalBillingTeardown(callId);
         return { status: 'duplicate', callId };
       }
-      await enqueueSettlementRetry(params);
+      await enqueueSettlementRetry(retryParamsFromFinalize(params));
       return { status: 'pending_retry', callId };
     }
 
@@ -1361,7 +1616,7 @@ export async function finalizeCallSession(
       ownerToken,
       settlementVersion,
     });
-    await enqueueSettlementRetry(params);
+    await enqueueSettlementRetry(retryParamsFromFinalize(params));
     return { status: 'pending_retry', callId };
   } finally {
     clearInterval(lockHeartbeat);

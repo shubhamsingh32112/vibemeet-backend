@@ -16,6 +16,8 @@ import {
   ACTIVE_CALL_BY_USER_TTL,
   availabilityKey,
   AVAILABILITY_KEY_PREFIX,
+  pendingCallEndKey,
+  callEndingKey,
 } from '../../config/redis';
 import { featureFlags } from '../../config/feature-flags';
 import { logInfo, logError, logDebug } from '../../utils/logger';
@@ -776,13 +778,22 @@ async function ensureCreatorsWithActiveCallsAreBusy(): Promise<void> {
           if (!isCallDbRecordStillLive(call.status)) {
             continue;
           }
+
+          const redis = getRedis();
+          const [pendingEnd, endingFlag] = await Promise.all([
+            redis.get(pendingCallEndKey(call.callId)),
+            redis.get(callEndingKey(call.callId)),
+          ]);
+          if (pendingEnd || endingFlag || call.status === 'ended') {
+            continue;
+          }
+
           const creatorUser = await User.findById(call.creatorUserId);
           if (creatorUser?.firebaseUid) {
             const currentStatus = await getAvailability(creatorUser.firebaseUid);
 
             if (currentStatus !== 'on_call') {
               if (featureFlags.creatorPresenceUserModelEnabled) {
-                const redis = getRedis();
                 await redis.set(
                   activeCallByUserKey(creatorUser.firebaseUid),
                   call.callId,

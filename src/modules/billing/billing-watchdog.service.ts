@@ -140,6 +140,47 @@ async function runWatchdogPass(io: Server): Promise<void> {
         watchdogPassId,
         autoFinalize: isWatchdogAutoFinalizeEnabled(),
       });
+
+      if (row.state !== 'settling' || !isWatchdogAutoFinalizeEnabled()) {
+        continue;
+      }
+      if (await redis.get(billingRecoveryDeadLetterKey(row._id))) {
+        continue;
+      }
+      if (await redis.get(billingWatchdogCooldownKey(row._id))) {
+        recordBillingMetric('billing_watchdog_trigger_suppressed', 1, {
+          callId: row._id,
+          reason: 'cooldown_skip',
+        });
+        continue;
+      }
+      const attempt = await redis.incr(billingWatchdogAttemptsKey(row._id));
+      await redis.expire(billingWatchdogAttemptsKey(row._id), WATCHDOG_ATTEMPT_TTL_SECONDS).catch(() => 0);
+      if (attempt > WATCHDOG_ATTEMPT_CAP) {
+        await moveCallToRecoveryDeadLetter(
+          row._id,
+          'watchdog_attempt_cap_reached',
+          'reconciliation_worker'
+        );
+        continue;
+      }
+      await redis.setex(
+        billingWatchdogCooldownKey(row._id),
+        WATCHDOG_COOLDOWN_SECONDS,
+        JSON.stringify({ attempt, watchdogPassId, recoveryOwnerInstanceId, at: now })
+      );
+      recordBillingMetric('billing_watchdog_stalled_settling', 1, { callId: row._id });
+      logWarning('Watchdog auto-finalize for mongo stale settling durable session', {
+        callId: row._id,
+        watchdogAttempt: attempt,
+        watchdogPassId,
+        recoveryOwnerInstanceId,
+      });
+      await finalizeCallSession(io, {
+        callId: row._id,
+        reason: 'timeout',
+        source: 'reconciliation_worker',
+      });
     }
   }
 

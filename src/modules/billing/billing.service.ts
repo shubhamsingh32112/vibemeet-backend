@@ -64,6 +64,7 @@ import {
   getEmitIntervalForStage,
   getBillingBackpressureStage,
   isNewCallAdmissionBlocked,
+  isLiveBillingLifecycle,
   updateBackpressureStage,
 } from './billing-backpressure';
 import { featureFlags } from '../../config/feature-flags';
@@ -535,6 +536,13 @@ async function consumePendingCallEndIfAny(
     callId,
     source,
   });
+  if (deferredAgeMs > 5000) {
+    recordBillingMetric('deferred_call_end_slow_flush', 1, {
+      callId,
+      source,
+      deferredAgeMs: String(deferredAgeMs),
+    });
+  }
   return true;
 }
 
@@ -559,6 +567,14 @@ async function waitForSessionSnapshot(
     await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
   }
   return null;
+}
+
+/** Poll Redis until a billing session snapshot exists (used before deferring call:ended). */
+export async function waitForBillingSessionReady(
+  callId: string,
+  opts?: { timeoutMs?: number; intervalMs?: number }
+): Promise<CallSession | null> {
+  return waitForSessionSnapshot(getRedis(), callId, opts);
 }
 
 async function tryReserveActiveCallSlotsWithOrphanRetry(
@@ -2751,7 +2767,11 @@ export class BillingService {
         }
       }
 
-      if (session.expectedNextTickAtMs && Number.isFinite(session.expectedNextTickAtMs)) {
+      if (
+        session.expectedNextTickAtMs &&
+        Number.isFinite(session.expectedNextTickAtMs) &&
+        isLiveBillingLifecycle(session.lifecycleState)
+      ) {
         const tickDriftMs = Math.max(0, now - session.expectedNextTickAtMs);
         recordBillingMetric('tick_drift_ms', tickDriftMs, { callId });
         updateBackpressureStage({ tickDriftMs });
@@ -3078,7 +3098,9 @@ export class BillingService {
       }
       const redisWriteMs = Date.now() - redisWriteStartedAt;
       recordBillingMetric('redis_write_ms', redisWriteMs, { callId });
-      const activeStage = updateBackpressureStage({ redisWriteMs });
+      const activeStage = isLiveBillingLifecycle(session.lifecycleState)
+        ? updateBackpressureStage({ redisWriteMs })
+        : getBillingBackpressureStage();
 
       recordBillingMetric('tick_processed', 1, { callId });
       recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });

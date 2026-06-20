@@ -296,6 +296,10 @@ export const PENDING_CALL_ENDS_KEY = 'pending:call:ends';
 export const pendingCallEndKey = (callId: string): string =>
   `${PENDING_CALL_ENDS_KEY}:${callId}`;
 
+// Call is ending (billing session not ready or settlement delegated to retry)
+export const CALL_ENDING_PREFIX = 'call:ending:';
+export const callEndingKey = (callId: string): string => `${CALL_ENDING_PREFIX}${callId}`;
+
 // Settled calls tracking (to prevent duplicate settlements)
 export const SETTLED_CALL_PREFIX = 'settled:call:';
 export const settledCallKey = (callId: string): string =>
@@ -307,6 +311,7 @@ export const PENDING_CALL_END_TTL = Math.min(
   3600,
   Math.max(60, parseInt(process.env.BILLING_PENDING_CALL_END_TTL_SECONDS || '600', 10) || 600)
 ); // defaults to 10 minutes
+export const CALL_ENDING_TTL = PENDING_CALL_END_TTL;
 export const SETTLED_CALL_TTL = 300; // 5 minutes
 export const BILLING_TERMINAL_TOMBSTONE_TTL_SECONDS = Math.min(
   3600,
@@ -348,6 +353,11 @@ export const billingWatchdogAttemptsKey = (callId: string): string =>
   `${BILLING_WATCHDOG_ATTEMPTS_PREFIX}${callId}`;
 export const billingRecoveryDeadLetterKey = (callId: string): string =>
   `${BILLING_RECOVERY_DEADLETTER_PREFIX}${callId}`;
+
+export const BILLING_FAILED_SETTLEMENT_RECOVERY_COOLDOWN_PREFIX =
+  'billing:failed-settlement-recovery:cooldown:';
+export const billingFailedSettlementRecoveryCooldownKey = (callId: string): string =>
+  `${BILLING_FAILED_SETTLEMENT_RECOVERY_COOLDOWN_PREFIX}${callId}`;
 
 export const BILLING_START_ORCHESTRATOR_PREFIX = 'billing:start:orchestrator:';
 export const BILLING_START_REPLAY_GUARD_PREFIX = 'billing:start:replay_guard:';
