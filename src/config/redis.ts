@@ -368,6 +368,9 @@ export const billingRecoveryGateKey = (firebaseUid: string): string =>
   `${BILLING_RECOVERY_GATE_PREFIX}${firebaseUid}`;
 export const billingRecoveryGateInflightKey = (firebaseUid: string): string =>
   `${BILLING_RECOVERY_GATE_PREFIX}${firebaseUid}:inflight`;
+export const BILLING_RECOVERY_EMPTY_CACHE_PREFIX = 'billing:recovery:empty:';
+export const billingRecoveryEmptyCacheKey = (firebaseUid: string): string =>
+  `${BILLING_RECOVERY_EMPTY_CACHE_PREFIX}${firebaseUid}`;
 export const billingStartOrchestratorKey = (callId: string): string =>
   `${BILLING_START_ORCHESTRATOR_PREFIX}${callId}`;
 export const billingStartReplayGuardKey = (callId: string): string =>

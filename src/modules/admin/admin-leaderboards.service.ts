@@ -9,6 +9,7 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { User } from '../user/user.model';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
+import { CreatorFollow } from '../moments/models/creator-follow.model';
 import { clampDashboardLimit } from './admin-dashboard.service';
 
 export type LeaderboardPeriod = '7d' | '30d' | '90d' | 'all';
@@ -194,6 +195,20 @@ export async function leaderboardHosts(params: {
 
   const creatorByUserId = new Map(creators.map((c) => [c.userId?.toString() ?? '', c]));
 
+  const creatorObjectIds = creators
+    .map((c) => c._id)
+    .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+  const followerCountByCreatorId = new Map<string, number>();
+  if (creatorObjectIds.length > 0) {
+    const followerAgg = await CreatorFollow.aggregate<{ _id: mongoose.Types.ObjectId; followerCount: number }>([
+      { $match: { creatorId: { $in: creatorObjectIds } } },
+      { $group: { _id: '$creatorId', followerCount: { $sum: 1 } } },
+    ]);
+    for (const row of followerAgg) {
+      followerCountByCreatorId.set(row._id.toString(), row.followerCount);
+    }
+  }
+
   return {
     period: params.period,
     sort: params.sort,
@@ -215,6 +230,9 @@ export async function leaderboardHosts(params: {
         earningsCoins: row.earningsCoins,
         grossSpendCoins: row.grossSpendCoins,
         lifetimeEarningsCoins: c?.earningsCoins ?? 0,
+        followerCount: c?._id
+          ? followerCountByCreatorId.get(c._id.toString()) ?? 0
+          : 0,
       };
     }),
     note:

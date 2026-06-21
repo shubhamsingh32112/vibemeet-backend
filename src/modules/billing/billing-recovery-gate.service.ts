@@ -1,4 +1,5 @@
 import {
+  billingRecoveryEmptyCacheKey,
   billingRecoveryGateInflightKey,
   billingRecoveryGateKey,
   getRedis,
@@ -12,13 +13,25 @@ const RECOVERY_INFLIGHT_TTL_SECONDS = Math.min(
   60,
   Math.max(10, parseInt(process.env.BILLING_RECOVERY_INFLIGHT_TTL_SECONDS || '30', 10) || 30)
 );
+const RECOVERY_EMPTY_CACHE_TTL_SECONDS = Math.min(
+  10,
+  Math.max(1, parseInt(process.env.BILLING_RECOVERY_EMPTY_CACHE_TTL_SECONDS || '3', 10) || 3)
+);
 
 type RecoveryGateState = {
   inFlight: boolean;
   lastRecoveryAtMs: number;
+  lastEmptyAtMs?: number;
 };
 
 export type RecoveryGateAcquireResult = 'ok' | 'in_flight' | 'debounce';
+
+export function getRecoveryEmptyDebounceMs(): number {
+  return Math.min(
+    5000,
+    Math.max(500, parseInt(process.env.BILLING_RECOVERY_EMPTY_DEBOUNCE_MS || '2000', 10) || 2000)
+  );
+}
 
 async function readGate(firebaseUid: string): Promise<RecoveryGateState> {
   const raw = await getRedis().get(billingRecoveryGateKey(firebaseUid));
@@ -30,10 +43,41 @@ async function readGate(firebaseUid: string): Promise<RecoveryGateState> {
     return {
       inFlight: Boolean(parsed.inFlight),
       lastRecoveryAtMs: Math.max(0, Number(parsed.lastRecoveryAtMs) || 0),
+      lastEmptyAtMs: Math.max(0, Number(parsed.lastEmptyAtMs) || 0) || undefined,
     };
   } catch {
     return { inFlight: false, lastRecoveryAtMs: 0 };
   }
+}
+
+function effectiveDebounceMs(gate: RecoveryGateState, debounceMs: number, now: number): number {
+  const emptyDebounceMs = getRecoveryEmptyDebounceMs();
+  if (gate.lastEmptyAtMs && now - gate.lastEmptyAtMs < emptyDebounceMs) {
+    return emptyDebounceMs;
+  }
+  return debounceMs;
+}
+
+export async function isRecoveryEmptyCached(firebaseUid: string): Promise<boolean> {
+  return (await getRedis().exists(billingRecoveryEmptyCacheKey(firebaseUid))) === 1;
+}
+
+export async function markRecoveryEmptyOutcome(firebaseUid: string): Promise<void> {
+  const redis = getRedis();
+  const now = Date.now();
+  await redis
+    .setex(billingRecoveryEmptyCacheKey(firebaseUid), RECOVERY_EMPTY_CACHE_TTL_SECONDS, '1')
+    .catch(() => 0);
+  const gate = await readGate(firebaseUid);
+  gate.inFlight = false;
+  gate.lastEmptyAtMs = now;
+  gate.lastRecoveryAtMs = now;
+  await redis.setex(
+    billingRecoveryGateKey(firebaseUid),
+    RECOVERY_GATE_TTL_SECONDS,
+    JSON.stringify(gate)
+  );
+  await redis.del(billingRecoveryGateInflightKey(firebaseUid)).catch(() => 0);
 }
 
 export async function tryAcquireRecoveryGate(
@@ -47,7 +91,8 @@ export async function tryAcquireRecoveryGate(
   if (gate.inFlight) {
     return 'in_flight';
   }
-  if (now - gate.lastRecoveryAtMs < debounceMs) {
+  const debounce = effectiveDebounceMs(gate, debounceMs, now);
+  if (now - gate.lastRecoveryAtMs < debounce) {
     return 'debounce';
   }
 
@@ -63,6 +108,9 @@ export async function tryAcquireRecoveryGate(
   }
 
   const next: RecoveryGateState = { inFlight: true, lastRecoveryAtMs: now };
+  if (gate.lastEmptyAtMs) {
+    next.lastEmptyAtMs = gate.lastEmptyAtMs;
+  }
   await redis.setex(
     billingRecoveryGateKey(firebaseUid),
     RECOVERY_GATE_TTL_SECONDS,

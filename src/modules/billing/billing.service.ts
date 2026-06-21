@@ -67,6 +67,7 @@ import {
   isLiveBillingLifecycle,
   updateBackpressureStage,
 } from './billing-backpressure';
+import { runsBillingWorkers } from '../../config/service-role';
 import { featureFlags } from '../../config/feature-flags';
 import {
   BillingLifecycleState,
@@ -2774,7 +2775,9 @@ export class BillingService {
       ) {
         const tickDriftMs = Math.max(0, now - session.expectedNextTickAtMs);
         recordBillingMetric('tick_drift_ms', tickDriftMs, { callId });
-        updateBackpressureStage({ tickDriftMs });
+        if (runsBillingWorkers()) {
+          updateBackpressureStage({ tickDriftMs });
+        }
       }
       let rawWallLagMs = now - session.lastProcessedAt;
       if (rawWallLagMs < 0) rawWallLagMs = 0;
@@ -3098,9 +3101,10 @@ export class BillingService {
       }
       const redisWriteMs = Date.now() - redisWriteStartedAt;
       recordBillingMetric('redis_write_ms', redisWriteMs, { callId });
-      const activeStage = isLiveBillingLifecycle(session.lifecycleState)
-        ? updateBackpressureStage({ redisWriteMs })
-        : getBillingBackpressureStage();
+      const activeStage =
+        isLiveBillingLifecycle(session.lifecycleState) && runsBillingWorkers()
+          ? updateBackpressureStage({ redisWriteMs })
+          : getBillingBackpressureStage();
 
       recordBillingMetric('tick_processed', 1, { callId });
       recordBillingMetric('elapsed_seconds', session.elapsedSeconds, { callId });

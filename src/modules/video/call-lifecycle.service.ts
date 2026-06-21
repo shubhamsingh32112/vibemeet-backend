@@ -19,6 +19,7 @@ import { transitionCallStatus } from './call-state.service';
 import {
   markCreatorBusyForCall,
 } from './creator-call-lock.service';
+import { getAvailability } from '../availability/availability.service';
 import { recordCallMetric } from '../../utils/monitoring';
 import { finalizeCallEnd } from './call-finalization.service';
 import { parseAppVideoCallId } from '../billing/billing-call-id.util';
@@ -614,6 +615,31 @@ export class CallLifecycleService {
           payloadCallId: payload.call?.id,
         }
       );
+      return;
+    }
+
+    const creatorAvailability = await getAvailability(creatorFirebaseUid);
+    if (creatorAvailability !== 'online') {
+      const dedupeKey = `call:offline:reject:${callId}`;
+      const dedupeResult = await getRedis().set(dedupeKey, '1', 'EX', 15 * 60, 'NX');
+      if (dedupeResult === 'OK') {
+        logInfo('call_rejected_creator_offline', {
+          callId,
+          creatorFirebaseUid,
+          status: creatorAvailability,
+        });
+        recordCallMetric('call_rejected_creator_offline', 1, {
+          status: creatorAvailability,
+        });
+        try {
+          await markStreamCallEnded(callId, 'creator_offline');
+        } catch (error) {
+          logError('call_offline_reject_mark_ended_failed', error, {
+            callId,
+            creatorFirebaseUid,
+          });
+        }
+      }
       return;
     }
 

@@ -732,7 +732,7 @@ async function computeCreatorsPerformance(options: {
   const users =
     pageUserIds.length > 0
       ? await User.find({ _id: { $in: pageUserIds } })
-          .select('username email phone firebaseUid')
+          .select('username email phone firebaseUid coins')
           .lean()
       : [];
   const userMap = new Map(users.map((u) => [u._id.toString(), u]));

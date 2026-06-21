@@ -2,6 +2,7 @@ import { Creator } from '../creator/creator.model';
 import { User } from '../user/user.model';
 import { getStreamClient } from '../../config/stream';
 import { getAvailability } from '../availability/availability.service';
+import { getCreatorBaseAvailability } from '../availability/presence.service';
 import { getRedis, activeCallByUserKey } from '../../config/redis';
 import { logError, logInfo } from '../../utils/logger';
 import { recordCallMetric } from '../../utils/monitoring';
@@ -101,13 +102,30 @@ type CreatorBaseAvailability = 'online' | 'offline';
  */
 async function resolveRestoredBaseAfterCall(
   snapshot: string | null,
-  creatorUserId: string
+  creatorUserId: string,
+  creatorFirebaseUid: string | null
 ): Promise<CreatorBaseAvailability> {
   if (snapshot === 'offline') {
     return 'offline';
   }
   if (snapshot === 'online' || snapshot === 'on_call') {
     return 'online';
+  }
+
+  if (creatorFirebaseUid) {
+    try {
+      const redisBase = await getCreatorBaseAvailability(creatorFirebaseUid);
+      if (redisBase === 'offline') {
+        logInfo('Post-call restore using Redis base availability (snapshot missing)', {
+          creatorUserId,
+          creatorFirebaseUid,
+          redisBase,
+        });
+        return 'offline';
+      }
+    } catch {
+      // Fall through to Mongo intent.
+    }
   }
 
   try {
@@ -383,7 +401,11 @@ export async function finalizeCreatorAvailabilityForCall(
     }
 
     const snapshot = await redis.get(precallSnapshotKey(callId, creatorFirebaseUid));
-    const restoredBase = await resolveRestoredBaseAfterCall(snapshot, creatorUserId);
+    const restoredBase = await resolveRestoredBaseAfterCall(
+      snapshot,
+      creatorUserId,
+      creatorFirebaseUid
+    );
 
     if (shouldEnforceAvailabilityWrites()) {
       const restoreEvent =

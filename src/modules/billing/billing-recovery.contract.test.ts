@@ -145,9 +145,29 @@ test('BullMQ stale watchdog skips terminal sessions before reschedule', () => {
 test('sync-warning autoheal reschedules billing ticks', () => {
   const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
   const healSrc = readFileSync(join(__dirname, 'billing-heal.service.ts'), 'utf8');
-  assert.ok(socketSrc.includes('healActiveCallBilling'));
+  assert.ok(socketSrc.includes('healActiveCallBillingLight'));
   assert.ok(healSrc.includes('recoverBillingScheduleForCall'));
+  assert.ok(healSrc.includes('healActiveCallBillingLight'));
   assert.ok(healSrc.includes('processBillingTick(io, callId)'));
+});
+
+test('recover-state uses lightweight resolver and empty cache on api-ws', () => {
+  const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
+  const resolverSrc = readFileSync(join(__dirname, 'billing-runtime-resolver.service.ts'), 'utf8');
+  const gateSrc = readFileSync(join(__dirname, 'billing-recovery-gate.service.ts'), 'utf8');
+  assert.ok(socketSrc.includes('allowScan: false'));
+  assert.ok(socketSrc.includes('isRecoveryEmptyCached'));
+  assert.ok(socketSrc.includes('markRecoveryEmptyOutcome'));
+  assert.ok(resolverSrc.includes('allowScan?: boolean'));
+  assert.ok(gateSrc.includes('BILLING_RECOVERY_EMPTY_DEBOUNCE_MS'));
+  assert.ok(gateSrc.includes('billingRecoveryEmptyCacheKey'));
+});
+
+test('api-ws heal ticks do not drive admission backpressure', () => {
+  const serviceSrc = readFileSync(join(__dirname, 'billing.service.ts'), 'utf8');
+  assert.ok(serviceSrc.includes('runsBillingWorkers()'));
+  assert.ok(serviceSrc.includes('updateBackpressureStage({ tickDriftMs })'));
+  assert.ok(serviceSrc.includes('updateBackpressureStage({ redisWriteMs })'));
 });
 
 test('startup recovery reclaims stale runtime ownership', () => {

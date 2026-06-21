@@ -59,6 +59,19 @@ test('creators performance uses Redis batch presence', () => {
   assert.ok(block.includes('presenceStatus'));
 });
 
+test('creators performance selects user coins for balance column', () => {
+  const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
+  const start = src.indexOf('async function computeCreatorsPerformance');
+  const end = src.indexOf('// GET /admin/users/analytics');
+  assert.ok(start > 0 && end > start);
+  const block = src.slice(start, end);
+  assert.ok(
+    block.includes(".select('username email phone firebaseUid coins')"),
+    'user query must include coins for Balance column'
+  );
+  assert.ok(block.includes('coins: user?.coins ?? 0'));
+});
+
 test('computeCreatorsPerformance does not use unbounded CallHistory.find for abuse refunds', () => {
   const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
   const start = src.indexOf('async function computeCreatorsPerformance');

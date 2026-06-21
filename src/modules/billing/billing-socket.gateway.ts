@@ -32,6 +32,8 @@ import { recordReconnectGenerationMismatch } from './billing-phase-metrics';
 import {
   releaseRecoveryGate,
   tryAcquireRecoveryGate,
+  isRecoveryEmptyCached,
+  markRecoveryEmptyOutcome,
 } from './billing-recovery-gate.service';
 import {
   finalizeCallEnd,
@@ -50,7 +52,11 @@ import {
   emitBillingRecoverStateFromSnapshot,
   emitBillingRecoverStateResponse,
 } from './billing-emitter.service';
-import { healActiveCallBilling } from './billing-heal.service';
+import {
+  healActiveCallBillingLight,
+  isBillingSequenceStalledOnSession,
+} from './billing-heal.service';
+import { needsBillingCycleReschedule } from './billing.queue';
 import { logBillingHealth, logBillingHealthWarn } from './billing-health-log';
 import { randomUUID } from 'crypto';
 
@@ -437,7 +443,9 @@ export function setupBillingGateway(io: Server): void {
           ? payload.callId.trim()
           : undefined;
       const emitSuppressedRecoverySnapshot = async (reason: 'in_flight' | 'debounce') => {
-        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
+        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid, {
+          allowScan: false,
+        });
         const callId = activeRuntime.callId;
         const recoverySession = activeRuntime.runtime.session;
         const terminalSnapshot = activeRuntime.runtime.terminalSnapshot;
@@ -571,7 +579,40 @@ export function setupBillingGateway(io: Server): void {
         });
         const redis = getRedis();
 
-        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid);
+        if (await isRecoveryEmptyCached(firebaseUid)) {
+          logInfo('billing_state_recovery_empty', {
+            firebaseUid,
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            lookupSource: 'empty_cache',
+            runtimeSource: 'missing',
+            reason: 'runtime_missing_cached',
+            requestedCallId,
+          });
+          recordRecoveryOutcome(firebaseUid, 'recover_runtime_missing', {
+            reason: 'runtime_missing_cached',
+          });
+          recordBillingMetric('recovery_runtime_missing', 1, {
+            firebaseUid,
+            reason: 'runtime_missing_cached',
+          });
+          emitBillingRecoverStateResponse(socket, {
+            success: true,
+            activeCalls: [],
+            recoveryRequestId,
+            clientRecoveryRequestId,
+            generatedAtMs: Date.now(),
+            runtimeSource: 'missing',
+            status: 'no_active_call',
+            reason: 'runtime_missing_cached',
+            recoveryOutcome: 'recover_runtime_missing',
+          });
+          return;
+        }
+
+        const activeRuntime = await resolveActiveRuntimeStateForUser(firebaseUid, {
+          allowScan: false,
+        });
         const fallbackRuntime =
           !activeRuntime.callId && requestedCallId
             ? await resolveBillingRuntimeState(requestedCallId)
@@ -599,6 +640,7 @@ export function setupBillingGateway(io: Server): void {
             firebaseUid,
             reason: 'runtime_missing',
           });
+          await markRecoveryEmptyOutcome(firebaseUid);
           emitBillingRecoverStateResponse(socket, {
             success: true,
             activeCalls: [],
@@ -634,7 +676,7 @@ export function setupBillingGateway(io: Server): void {
               slotStillActive,
               participantStillInCall,
             });
-            await healActiveCallBilling(io, callId, 'recovery_terminal_active_call');
+            await healActiveCallBillingLight(io, callId, 'recovery_terminal_active_call');
             runtimeToEmit = await resolveBillingRuntimeState(callId);
           }
         }
@@ -713,13 +755,21 @@ export function setupBillingGateway(io: Server): void {
           return;
         }
 
-        logBillingHealth('RECOVERY_HEAL_START', {
-          callId,
-          firebaseUid,
-          recoveryRequestId,
-          source: 'recovery_pre_emit',
-        });
-        await healActiveCallBilling(io, callId, 'recovery_pre_emit');
+        const recoverySessionForHeal = runtimeToEmit.session;
+        const shouldHealBeforeEmit =
+          recoverySessionForHeal != null &&
+          (isBillingSequenceStalledOnSession(recoverySessionForHeal) ||
+            (await needsBillingCycleReschedule(callId)));
+
+        if (shouldHealBeforeEmit) {
+          logBillingHealth('RECOVERY_HEAL_START', {
+            callId,
+            firebaseUid,
+            recoveryRequestId,
+            source: 'recovery_pre_emit',
+          });
+          await healActiveCallBillingLight(io, callId, 'recovery_pre_emit');
+        }
 
         const runtime = await resolveBillingRuntimeState(callId);
         if (!runtime.session) {
@@ -952,7 +1002,7 @@ export function setupBillingGateway(io: Server): void {
               firebaseUid,
               phase,
             });
-            const healResult = await healActiveCallBilling(io, callId, `sync_warning_${phase}`).catch(
+            const healResult = await healActiveCallBillingLight(io, callId, `sync_warning_${phase}`).catch(
               (healErr) => {
                 logError('billing_sync_autoheal heal failed', healErr, { callId });
                 return { healed: false, hadSession: false };

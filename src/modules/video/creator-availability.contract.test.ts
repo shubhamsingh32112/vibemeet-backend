@@ -48,11 +48,20 @@ test('pre-call snapshot restoration preserves offline creators after call end', 
   assert.ok(src.includes('resolveRestoredBaseAfterCall'));
   assert.ok(src.includes("snapshot === 'offline'"));
   assert.ok(src.includes("snapshot === 'online' || snapshot === 'on_call'"));
+  assert.ok(src.includes('getCreatorBaseAvailability'));
+  assert.ok(src.includes('Post-call restore using Redis base availability (snapshot missing)'));
   assert.ok(src.includes('creator?.isOnline === true'));
   assert.ok(src.includes(": 'DISCONNECTED'"));
   assert.ok(src.includes('Never restore on_call after call end'));
   assert.ok(!src.includes("restoredStatus === 'on_call'"));
   assert.ok(src.includes('clearCreatorActiveCallSlotIfStale'));
+});
+
+test('call ringing rejects creators who are not online', () => {
+  const src = readFileSync(join(__dirname, 'call-lifecycle.service.ts'), 'utf8');
+  assert.ok(src.includes('call_rejected_creator_offline'));
+  assert.ok(src.includes("creatorAvailability !== 'online'"));
+  assert.ok(src.includes("markStreamCallEnded(callId, 'creator_offline')"));
 });
 
 test('presence layer clears stale active-call slots on read and terminal transitions', () => {

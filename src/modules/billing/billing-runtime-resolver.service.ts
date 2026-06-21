@@ -368,9 +368,16 @@ export async function resolveBillingRuntimeState(callId: string): Promise<Resolv
   };
 }
 
+export type ResolveActiveRuntimeOptions = {
+  /** When false, skip Redis SCAN fallback if active-call slot is missing. */
+  allowScan?: boolean;
+};
+
 export async function resolveActiveRuntimeStateForUser(
-  firebaseUid: string
+  firebaseUid: string,
+  options?: ResolveActiveRuntimeOptions
 ): Promise<ResolvedUserActiveRuntime> {
+  const allowScan = options?.allowScan !== false;
   const redis = getRedis();
   const slotCallId = await redis.get(activeCallByUserKey(firebaseUid));
   if (slotCallId) {
@@ -381,8 +388,8 @@ export async function resolveActiveRuntimeStateForUser(
         callId: slotCallId,
         source: 'active_slot',
       });
-      const { healActiveCallBillingWithDefaultIo } = await import('./billing-heal.service');
-      await healActiveCallBillingWithDefaultIo(slotCallId, 'active_slot_terminal_conflict');
+      const { healActiveCallBillingLightWithDefaultIo } = await import('./billing-heal.service');
+      await healActiveCallBillingLightWithDefaultIo(slotCallId, 'active_slot_terminal_conflict');
       const healedRuntime = await resolveBillingRuntimeState(slotCallId);
       if (healedRuntime.session) {
         logInfo('billing_active_slot_healed_from_terminal', {
@@ -438,6 +445,31 @@ export async function resolveActiveRuntimeStateForUser(
       activeCallKeyDeleted: true,
       activeCallKeyExistsAfterDelete: staleSlotStillExists,
     });
+  }
+
+  if (!allowScan) {
+    logDebug('billing_active_runtime_lookup', {
+      firebaseUid,
+      lookupSource: 'none',
+      scannedKeys: 0,
+      allowScan: false,
+    });
+    recordBillingMetric('billing_recovery_active_user_lookup', 1, {
+      source: 'none',
+      firebaseUid,
+    });
+    return {
+      callId: null,
+      runtime: {
+        source: 'missing',
+        session: null,
+        introMicros: 0,
+        walletMicros: 0,
+        balanceMicros: 0,
+        earningsMicros: 0,
+      },
+      source: 'none',
+    };
   }
 
   let cursor = '0';
