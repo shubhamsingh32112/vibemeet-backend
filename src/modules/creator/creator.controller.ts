@@ -1313,18 +1313,24 @@ async function deleteCreatorCore(
   userId: mongoose.Types.ObjectId | undefined,
   session?: mongoose.ClientSession
 ): Promise<void> {
-  await Creator.findByIdAndDelete(id, session ? { session } : {});
+  const deleteOpts = session ? { session } : {};
+  const deleted = await Creator.findByIdAndDelete(id, deleteOpts);
+  if (!deleted) return;
+
   if (!userId) return;
-  const user = session ? await User.findById(userId).session(session) : await User.findById(userId);
-  if (user && user.role === 'creator') {
-    user.role = 'user';
-    await user.save(session ? { session } : {});
-  }
+  // Use updateOne (not save) so legacy negative creator coin balances do not fail User validation.
+  await User.updateOne(
+    { _id: userId, role: 'creator' },
+    { $set: { role: 'user', hostOnboardingStatus: 'none' } },
+    deleteOpts
+  );
 }
 
 function isMongoTransactionUnsupported(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /replica set|Transaction numbers are only allowed|transactions are not supported/i.test(msg);
+  return /replica set|Transaction numbers are only allowed|transactions are not supported|Transaction aborted|IllegalOperation/i.test(
+    msg
+  );
 }
 
 // Business Rule: Deleting a creator profile ALWAYS downgrades the user role back to 'user'
@@ -1394,7 +1400,7 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
         );
         await deleteCreatorCore(id, userId);
       } finally {
-        session.endSession();
+        await session.endSession();
       }
 
       const actorLabel =
