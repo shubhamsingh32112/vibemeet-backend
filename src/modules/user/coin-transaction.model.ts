@@ -25,6 +25,8 @@ export interface ICoinTransaction extends Document {
   paymentGatewayTransactionId?: string; // External payment gateway transaction ID (if applicable)
   paymentGatewayOrderId?: string; // External payment gateway order ID (if applicable)
   paymentGatewayProvider?: 'razorpay'; // Provider responsible for this transaction
+  /** INR charged for payment_gateway recharges (set at checkout). */
+  priceInr?: number;
   status: 'completed' | 'pending' | 'failed'; // Transaction status
   createdAt: Date;
   updatedAt: Date;
@@ -83,6 +85,11 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
       enum: ['razorpay'],
       sparse: true,
       index: true,
+    },
+    priceInr: {
+      type: Number,
+      min: 0,
+      sparse: true,
     },
     status: {
       type: String,

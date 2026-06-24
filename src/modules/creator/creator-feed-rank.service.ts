@@ -9,7 +9,7 @@
  * - Fallback: legacy in-memory sort in creator.controller (Mongo authoritative)
  */
 import mongoose from 'mongoose';
-import { Creator } from './creator.model';
+import { Creator, CREATOR_LISTABLE_FILTER } from './creator.model';
 import { User } from '../user/user.model';
 import { getBatchCreatorPresence } from '../availability/presence.service';
 import {
@@ -53,7 +53,7 @@ export async function rebuildCreatorFeedRankIndex(): Promise<number> {
 
   const allowFallbackJoin = process.env.ENABLE_CREATOR_UID_FALLBACK_JOIN === 'true';
   let processed = 0;
-  const cursor = Creator.find({})
+  const cursor = Creator.find(CREATOR_LISTABLE_FILTER)
     .select('_id firebaseUid userId createdAt')
     .lean()
     .cursor();

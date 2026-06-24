@@ -38,6 +38,9 @@ export interface ICreator extends Document {
   age?: number;
   location?: string;
   isOnline: boolean;
+  isDisabled?: boolean;
+  disabledAt?: Date;
+  disabledBy?: mongoose.Types.ObjectId;
   currentCallId?: string;
   earningsCoins: number;
   assignedAgencyId?: mongoose.Types.ObjectId;
@@ -143,6 +146,20 @@ const creatorSchema = new Schema<ICreator>(
       default: false,
       index: true, // Index for efficient filtering
     },
+    isDisabled: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    disabledAt: {
+      type: Date,
+      sparse: true,
+    },
+    disabledBy: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      sparse: true,
+    },
     currentCallId: {
       type: String,
       sparse: true,
@@ -168,10 +185,14 @@ const creatorSchema = new Schema<ICreator>(
 creatorSchema.index({ assignedAgencyId: 1, updatedAt: -1 });
 creatorSchema.index({ createdAt: -1 });
 creatorSchema.index({ isOnline: 1, createdAt: -1 });
+creatorSchema.index({ isDisabled: 1, createdAt: -1 });
 // Cloudflare-Images indexes (Phase 2 §2 — orphan-cleanup, moderation lookups, ownership scans).
 creatorSchema.index({ 'avatar.imageId': 1 }, { sparse: true });
 creatorSchema.index({ 'avatar.moderationStatus': 1 }, { sparse: true });
 creatorSchema.index({ 'galleryImages.asset.imageId': 1 }, { sparse: true });
 creatorSchema.index({ 'galleryImages.asset.moderationStatus': 1 }, { sparse: true });
+
+/** Creators visible in consumer feed / discovery. */
+export const CREATOR_LISTABLE_FILTER = { isDisabled: { $ne: true } } as const;
 
 export const Creator = mongoose.model<ICreator>('Creator', creatorSchema);

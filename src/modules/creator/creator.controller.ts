@@ -1,13 +1,14 @@
 import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
-import { Creator, type ICreator } from './creator.model';
+import { Creator, type ICreator, CREATOR_LISTABLE_FILTER } from './creator.model';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
 import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds } from './creator-tasks.config';
 import { getIO } from '../../config/socket';
+import { transitionCreatorPresence } from '../availability/presence.service';
 import { emitCreatorDataUpdated } from './creator-notify';
 import { applyCreatorAvailabilityIntent } from '../availability/availability.gateway';
 import { getOnlineTodaySecondsLive } from '../availability/creator-daily-online.service';
@@ -216,7 +217,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
         const rankPage = await getAvailabilityFeedPageFromRank(skip, limit);
 
         const buildLegacyAvailabilityPage = async (): Promise<mongoose.Types.ObjectId[]> => {
-          const minimal = await Creator.find({})
+          const minimal = await Creator.find(CREATOR_LISTABLE_FILTER)
             .select('_id userId firebaseUid createdAt')
             .lean();
           total = minimal.length;
@@ -356,7 +357,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
           });
       } else {
         const [creators, count] = await Promise.all([
-          Creator.find({})
+          Creator.find(CREATOR_LISTABLE_FILTER)
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit)
@@ -1307,8 +1308,26 @@ export const updateCreator = async (req: Request, res: Response): Promise<void> 
 };
 
 // Delete creator — admin may delete any; owning agent may delete assigned creators only.
+async function deleteCreatorCore(
+  id: string,
+  userId: mongoose.Types.ObjectId | undefined,
+  session?: mongoose.ClientSession
+): Promise<void> {
+  await Creator.findByIdAndDelete(id, session ? { session } : {});
+  if (!userId) return;
+  const user = session ? await User.findById(userId).session(session) : await User.findById(userId);
+  if (user && user.role === 'creator') {
+    user.role = 'user';
+    await user.save(session ? { session } : {});
+  }
+}
+
+function isMongoTransactionUnsupported(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /replica set|Transaction numbers are only allowed|transactions are not supported/i.test(msg);
+}
+
 // Business Rule: Deleting a creator profile ALWAYS downgrades the user role back to 'user'
-// This ensures data consistency - if creator profile is gone, user should not have creator role
 export const deleteCreator = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
@@ -1352,32 +1371,32 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
     }
     
     const userId = creator.userId;
-    const deletedFirebaseUid =
+    let deletedFirebaseUid =
       creator.firebaseUid && String(creator.firebaseUid).trim()
         ? String(creator.firebaseUid).trim()
         : '';
-    
-    // Atomic operation: Delete creator profile + Downgrade user role (using transaction)
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    if (!deletedFirebaseUid && userId) {
+      const linked = await User.findById(userId).select('firebaseUid').lean();
+      if (linked?.firebaseUid?.trim()) deletedFirebaseUid = linked.firebaseUid.trim();
+    }
 
     try {
-      // Delete creator profile within transaction
-      await Creator.findByIdAndDelete(id, { session });
-      
-      // Business Rule: Always downgrade user role back to 'user' (unless they're admin)
-      // This maintains consistency - no creator profile = no creator role
-      if (userId) {
-        const user = await User.findById(userId).session(session);
-        if (user && user.role === 'creator') {
-          user.role = 'user';
-          await user.save({ session });
-        }
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        await deleteCreatorCore(id, userId, session);
+        await session.commitTransaction();
+      } catch (txErr) {
+        await session.abortTransaction().catch(() => {});
+        if (!isMongoTransactionUnsupported(txErr)) throw txErr;
+        console.warn(
+          '⚠️ [CREATOR] Mongo transactions unavailable — falling back to non-transactional delete'
+        );
+        await deleteCreatorCore(id, userId);
+      } finally {
+        session.endSession();
       }
-      
-      // Commit transaction
-      await session.commitTransaction();
-      
+
       const actorLabel =
         isSuperAdminRole(staffUser.role)
           ? `Admin: ${staffUser._id} (${staffUser.email || staffUser.phone})`
@@ -1387,32 +1406,40 @@ export const deleteCreator = async (req: Request, res: Response): Promise<void> 
       console.log(`   Creator Profile: ${id}`);
       console.log(`   User: ${userId} (downgraded to 'user')`);
       console.log(`   Timestamp: ${new Date().toISOString()}`);
-      
+
       console.log(`✅ [CREATOR] Creator deleted: ${id}`);
       if (userId) {
         console.log(`   ✅ User ${userId} downgraded to 'user' role`);
       }
 
-      // Invalidate admin caches after creator deletion
-      invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
+      if (deletedFirebaseUid) {
+        try {
+          const io = getIO();
+          await transitionCreatorPresence(io, deletedFirebaseUid, 'FORCE_OFFLINE', 'admin.deleteCreator');
+        } catch (presenceErr) {
+          console.warn('⚠️ [CREATOR] Presence cleanup after delete (non-critical):', presenceErr);
+        }
+      }
 
+      invalidateAdminCaches('overview', 'creators_performance', 'users_analytics').catch(() => {});
       invalidateCreatorCatalogCaches().catch(() => {});
       invalidateCreatorDetailCache(id).catch(() => {});
       if (deletedFirebaseUid) {
         removeCreatorFirebaseUidFromCache(deletedFirebaseUid).catch(() => {});
       }
       removeCreatorFromFeedRank(id).catch(() => {});
-      
+
       res.json({
         success: true,
         message: 'Creator deleted successfully. User role has been downgraded to "user".',
       });
     } catch (error) {
-      // Rollback transaction on error
-      await session.abortTransaction();
-      throw error;
-    } finally {
-      session.endSession();
+      console.error('❌ [CREATOR] Delete creator transaction error:', error);
+      const msg = error instanceof Error ? error.message : 'Internal server error';
+      res.status(500).json({
+        success: false,
+        error: msg.includes('replica') ? 'Database does not support transactions' : 'Internal server error',
+      });
     }
   } catch (error) {
     console.error('❌ [CREATOR] Delete creator error:', error);

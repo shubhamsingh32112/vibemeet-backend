@@ -11,11 +11,13 @@ import { Withdrawal } from '../creator/withdrawal.model';
 import { MomentPurchase } from '../moments/models/moment-purchase.model';
 import { VipMembership } from '../vip/models/vip-membership.model';
 import { isBdRole, isAgencyRole } from '../../utils/staff-roles';
+import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRedis } from '../../config/redis';
 import { UserLoginEvent } from '../user/user-login-event.model';
 
 export type AnalyticsPeriod = 'today' | '7d' | '30d';
 export type UserLoginGranularity = 'daily' | 'weekly' | 'monthly';
+export type UserSignupGranularity = 'hourly' | 'daily';
 
 function utcStartOfDay(d = new Date()): Date {
   const x = new Date(d);
@@ -227,6 +229,84 @@ export async function usersLoginSeriesPayload(granularityInput: unknown) {
   };
 }
 
+function parseUserSignupGranularity(raw: unknown): UserSignupGranularity {
+  const g = String(raw ?? 'hourly');
+  return g === 'daily' ? 'daily' : 'hourly';
+}
+
+function iterUtcHourBuckets(from: Date, to: Date): Array<{ key: string; label: string; startDate: string }> {
+  const buckets: Array<{ key: string; label: string; startDate: string }> = [];
+  const cur = new Date(from);
+  cur.setUTCMinutes(0, 0, 0);
+  const end = new Date(to);
+  while (cur <= end) {
+    const key = cur.toISOString().slice(0, 13).replace('T', ' ');
+    buckets.push({
+      key,
+      label: `${String(cur.getUTCHours()).padStart(2, '0')}:00`,
+      startDate: cur.toISOString(),
+    });
+    cur.setUTCHours(cur.getUTCHours() + 1);
+  }
+  return buckets;
+}
+
+export async function usersSignupSeriesPayload(
+  granularityInput: unknown,
+  fromInput?: string,
+  toInput?: string
+) {
+  const granularity = parseUserSignupGranularity(granularityInput);
+  const to = toInput ? new Date(toInput) : new Date();
+  let from: Date;
+  if (fromInput) {
+    from = new Date(fromInput);
+  } else if (granularity === 'hourly') {
+    from = new Date(to.getTime() - 48 * 60 * 60 * 1000);
+  } else {
+    from = utcStartOfDay(to);
+    from.setUTCDate(from.getUTCDate() - 29);
+  }
+
+  const bucketGroupId =
+    granularity === 'hourly'
+      ? { $dateToString: { format: '%Y-%m-%d %H:00', date: '$createdAt', timezone: 'UTC' } }
+      : { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } };
+
+  const agg = await User.aggregate<{ _id: string; signups: number }>([
+    { $match: { role: 'user', createdAt: { $gte: from, $lte: to } } },
+    { $group: { _id: bucketGroupId, signups: { $sum: 1 } } },
+  ]);
+
+  const statsByBucket = new Map<string, number>();
+  for (const row of agg) {
+    statsByBucket.set(row._id, row.signups ?? 0);
+  }
+
+  const bucketDefs =
+    granularity === 'hourly'
+      ? iterUtcHourBuckets(from, to)
+      : iterUtcDateStrings(from, to).map((date) => ({ key: date, label: date, startDate: date }));
+
+  const points = bucketDefs.map(({ key, label, startDate }) => ({
+    label,
+    startDate,
+    signups: statsByBucket.get(key) ?? 0,
+  }));
+
+  return {
+    granularity,
+    from: from.toISOString(),
+    to: to.toISOString(),
+    points,
+    note:
+      granularity === 'hourly'
+        ? 'New end-user signups (role=user) per UTC hour — proxy for app downloads/installs.'
+        : 'New end-user signups (role=user) per UTC day.',
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 const PAID_MOMENT_SOURCES = ['coin_purchase', 'vip_discounted'] as const;
 
 export async function momentsPaidUsersPayload(page: number, limit: number) {
@@ -414,6 +494,157 @@ export async function vipPaidUsersPayload(page: number, limit: number) {
       };
     }),
     pagination: { page, limit: lim, total, totalPages: Math.ceil(total / lim) },
+  };
+}
+
+export async function coinRechargePaidUsersPayload(page: number, limit: number) {
+  const lim = Math.min(100, Math.max(1, limit));
+  const skip = (page - 1) * lim;
+  const now = new Date();
+  const todayStart = utcStartOfDay(now);
+  const d7 = new Date(now.getTime() - 7 * 86400000);
+  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const rechargeMatch = {
+    type: 'credit' as const,
+    source: 'payment_gateway' as const,
+    status: 'completed' as const,
+  };
+
+  const [summaryAgg, buyerRows, totalAgg] = await Promise.all([
+    CoinTransaction.aggregate<{
+      buyersToday: number;
+      buyers7d: number;
+      buyers30d: number;
+      revenueInr30d: number;
+    }>([
+      { $match: rechargeMatch },
+      {
+        $group: {
+          _id: '$userId',
+          firstAt: { $min: '$createdAt' },
+          lastAt: { $max: '$createdAt' },
+          purchaseCount: { $sum: 1 },
+          totalCoins: { $sum: '$coins' },
+          totalInr: {
+            $sum: {
+              $cond: [
+                { $gt: ['$priceInr', 0] },
+                '$priceInr',
+                0,
+              ],
+            },
+          },
+          descriptions: { $push: '$description' },
+        },
+      },
+      {
+        $project: {
+          firstAt: 1,
+          lastAt: 1,
+          purchaseCount: 1,
+          totalCoins: 1,
+          totalInr: 1,
+          descriptions: 1,
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          buyersToday: {
+            $sum: { $cond: [{ $gte: ['$firstAt', todayStart] }, 1, 0] },
+          },
+          buyers7d: {
+            $sum: { $cond: [{ $gte: ['$firstAt', d7] }, 1, 0] },
+          },
+          buyers30d: {
+            $sum: { $cond: [{ $gte: ['$firstAt', d30] }, 1, 0] },
+          },
+          revenueInr30d: {
+            $sum: {
+              $cond: [{ $gte: ['$lastAt', d30] }, '$totalInr', 0],
+            },
+          },
+        },
+      },
+    ]),
+    CoinTransaction.aggregate<{
+      _id: mongoose.Types.ObjectId;
+      purchaseCount: number;
+      totalCoins: number;
+      totalInrFromField: number;
+      descriptions: string[];
+      lastPurchaseAt: Date;
+    }>([
+      { $match: rechargeMatch },
+      {
+        $group: {
+          _id: '$userId',
+          purchaseCount: { $sum: 1 },
+          totalCoins: { $sum: '$coins' },
+          totalInrFromField: {
+            $sum: {
+              $cond: [{ $gt: ['$priceInr', 0] }, '$priceInr', 0],
+            },
+          },
+          descriptions: { $push: '$description' },
+          lastPurchaseAt: { $max: '$createdAt' },
+        },
+      },
+      { $sort: { lastPurchaseAt: -1 } },
+      { $skip: skip },
+      { $limit: lim },
+    ]),
+    CoinTransaction.aggregate<{ _id: null; total: number }>([
+      { $match: rechargeMatch },
+      { $group: { _id: '$userId' } },
+      { $count: 'total' },
+    ]),
+  ]);
+
+  const userIds = buyerRows.map((r) => r._id);
+  const users =
+    userIds.length > 0
+      ? await User.find({ _id: { $in: userIds } }).select('username email phone').lean()
+      : [];
+  const userById = new Map(users.map((u) => [u._id.toString(), u]));
+
+  const summaryRow = summaryAgg[0];
+  const uniqueBuyers = totalAgg[0]?.total ?? 0;
+
+  return {
+    summary: {
+      uniqueBuyersAllTime: uniqueBuyers,
+      buyersToday: summaryRow?.buyersToday ?? 0,
+      buyers7d: summaryRow?.buyers7d ?? 0,
+      buyers30d: summaryRow?.buyers30d ?? 0,
+      revenueInr30d: summaryRow?.revenueInr30d ?? 0,
+    },
+    rows: buyerRows.map((r, i) => {
+      const u = userById.get(r._id.toString());
+      let totalInr = r.totalInrFromField ?? 0;
+      if (totalInr <= 0) {
+        for (const desc of r.descriptions ?? []) {
+          totalInr += parseInrFromPurchaseDescription(desc);
+        }
+      }
+      return {
+        rank: skip + i + 1,
+        userId: r._id.toString(),
+        username: u?.username || u?.email || u?.phone || 'Unknown',
+        email: u?.email ?? null,
+        phone: u?.phone ?? null,
+        purchaseCount: r.purchaseCount,
+        totalRechargeCoins: r.totalCoins,
+        totalRechargeInr: totalInr,
+        lastPurchaseAt: r.lastPurchaseAt,
+      };
+    }),
+    pagination: {
+      page,
+      limit: lim,
+      total: uniqueBuyers,
+      totalPages: Math.ceil(uniqueBuyers / lim),
+    },
   };
 }
 

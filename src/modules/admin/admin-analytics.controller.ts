@@ -11,6 +11,8 @@ import {
   revenueSummaryPayload,
   usersSummaryPayload,
   usersLoginSeriesPayload,
+  usersSignupSeriesPayload,
+  coinRechargePaidUsersPayload,
   vipPaidUsersPayload,
   walletTransactionsPayload,
 } from './admin-analytics.service';
@@ -51,6 +53,31 @@ export const getUsersLoginSeries = async (req: Request, res: Response): Promise<
     res.json({ success: true, data });
   } catch (error) {
     logError('getUsersLoginSeries', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getUsersSignupSeries = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const from = typeof req.query.from === 'string' ? req.query.from : undefined;
+    const to = typeof req.query.to === 'string' ? req.query.to : undefined;
+    const data = await usersSignupSeriesPayload(req.query.granularity, from, to);
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getUsersSignupSeries', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getCoinsPaidUsers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { page, limit } = parsePageLimit(req);
+    const data = await coinRechargePaidUsersPayload(page, limit);
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getCoinsPaidUsers', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

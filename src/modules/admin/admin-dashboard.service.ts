@@ -13,7 +13,8 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import axios from 'axios';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
-import { countOnlineCreatorsPlatform } from '../availability/presence-dashboard.service';
+import { countCreatorPresenceBreakdownPlatform } from '../availability/presence-dashboard.service';
+import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 import { logError } from '../../utils/logger';
 
@@ -172,6 +173,74 @@ function walletFlowPointsFromMap(
     .map(([date, entry]) => toPoint(date, entry));
 }
 
+function rechargeInrFromRow(row: {
+  priceInr?: number | null;
+  description?: string | null;
+  coins?: number;
+}): number {
+  if (typeof row.priceInr === 'number' && row.priceInr > 0) return row.priceInr;
+  const parsed = parseInrFromPurchaseDescription(row.description);
+  if (parsed > 0) return parsed;
+  return 0;
+}
+
+const RECHARGE_MATCH = {
+  type: 'credit' as const,
+  source: 'payment_gateway' as const,
+  status: 'completed' as const,
+};
+
+export async function dashboardRechargeDailySeries(days: number, range?: DashboardDateFilter) {
+  const d = Math.min(90, Math.max(1, days));
+  const from = range ? new Date(range.from) : new Date();
+  if (!range) {
+    from.setUTCHours(0, 0, 0, 0);
+    from.setUTCDate(from.getUTCDate() - (d - 1));
+  }
+  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
+
+  const rows = await CoinTransaction.find({
+    ...RECHARGE_MATCH,
+    createdAt,
+  })
+    .select('createdAt coins priceInr description')
+    .lean();
+
+  const byDate = new Map<string, { rechargeInr: number; rechargeCoins: number; transactionCount: number }>();
+  for (const row of rows) {
+    const date = row.createdAt.toISOString().slice(0, 10);
+    const entry = byDate.get(date) ?? { rechargeInr: 0, rechargeCoins: 0, transactionCount: 0 };
+    entry.rechargeInr += rechargeInrFromRow(row);
+    entry.rechargeCoins += row.coins ?? 0;
+    entry.transactionCount += 1;
+    byDate.set(date, entry);
+  }
+
+  const points = (range
+    ? iterUtcDateStrings(range.from, range.to)
+    : [...byDate.keys()].sort()
+  ).map((date) => {
+    const entry = byDate.get(date) ?? { rechargeInr: 0, rechargeCoins: 0, transactionCount: 0 };
+    return { date, ...entry };
+  });
+
+  return {
+    points,
+    note: 'Successful wallet recharges (payment_gateway credits) per UTC day in INR.',
+    selectedRange: selectedRangePayload(range),
+  };
+}
+
+async function sumRechargeInrForUtcDay(dayStart: Date, dayEnd: Date): Promise<number> {
+  const rows = await CoinTransaction.find({
+    ...RECHARGE_MATCH,
+    createdAt: { $gte: dayStart, $lt: dayEnd },
+  })
+    .select('priceInr description')
+    .lean();
+  return rows.reduce((sum, row) => sum + rechargeInrFromRow(row), 0);
+}
+
 export async function dashboardWalletFlowSeries(days: number, range?: DashboardDateFilter) {
   const d = Math.min(90, Math.max(1, days));
   const from = range ? new Date(range.from) : new Date();
@@ -227,18 +296,17 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
   };
 
   const [
-    onlineCreators,
+    presenceBreakdown,
     agencyCount,
     bdCount,
     pendingWithdrawals,
     callTodayAgg,
     coinFlowToday,
-    todayCoinFlow,
     recentCalls5m,
     activeZeroDuration,
-    walletFlowSeries,
+    rechargeDailySeries,
   ] = await Promise.all([
-    countOnlineCreatorsPlatform(),
+    countCreatorPresenceBreakdownPlatform(),
     User.countDocuments({ role: 'agency' }),
     User.countDocuments(TOP_BD_ROLE),
     Withdrawal.countDocuments(pendingPayoutsMatch),
@@ -257,44 +325,56 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
       { $match: { createdAt: selectedCreatedAt, status: 'completed' } },
       { $group: { _id: '$type', total: { $sum: '$coins' }, count: { $sum: 1 } } },
     ]),
-    CoinTransaction.aggregate([
-      { $match: { createdAt: { $gte: today }, status: 'completed' } },
-      { $group: { _id: '$type', total: { $sum: '$coins' } } },
-    ]),
     CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
     CallHistory.countDocuments({
       createdAt: { $gte: fiveMinAgo },
       ownerRole: 'user',
       durationSeconds: 0,
     }),
-    dashboardWalletFlowSeries(90, range),
+    dashboardRechargeDailySeries(90, range),
+  ]);
+
+  const yesterday = new Date(today);
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const tomorrow = new Date(today);
+  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+
+  const [rechargeCollectionTodayInr, rechargeCollectionYesterdayInr] = await Promise.all([
+    sumRechargeInrForUtcDay(today, tomorrow),
+    sumRechargeInrForUtcDay(yesterday, today),
   ]);
 
   const callT = callTodayAgg[0] || { totalCalls: 0, totalDurationSec: 0, totalCoinsSpent: 0 };
   const credits = coinFlowToday.find((r: { _id: string }) => r._id === 'credit');
   const debits = coinFlowToday.find((r: { _id: string }) => r._id === 'debit');
   const revenueCoinsToday = (credits?.total ?? 0) - (debits?.total ?? 0);
-  const todayCredits = todayCoinFlow.find((r: { _id: string }) => r._id === 'credit');
-  const todayDebits = todayCoinFlow.find((r: { _id: string }) => r._id === 'debit');
-  const revenueDailyBalance = (todayCredits?.total ?? 0) - (todayDebits?.total ?? 0);
   const rangeLabel = range ? 'selected range' : 'today (UTC)';
   const todayUtc = today.toISOString().slice(0, 10);
 
   return {
     revenueCoinsToday,
     revenueCoinsTodayNote: `Net completed wallet coin flow for ${rangeLabel} (credits minus debits).`,
-    revenueDailyBalance,
-    revenueDailyBalanceNote: `Net wallet flow for ${todayUtc} (UTC). Tap for per-day history in the selected range.`,
+    revenueDailyBalance: rechargeCollectionTodayInr,
+    revenueDailyBalanceNote: `Successful recharges today (${todayUtc} UTC). Yesterday: ₹${rechargeCollectionYesterdayInr.toLocaleString('en-IN')}. Tap for daily INR history.`,
+    rechargeCollectionTodayInr,
+    rechargeCollectionYesterdayInr,
+    rechargeDailySeries,
     liveCallsProxy: recentCalls5m,
     activeUnsettledUserCalls: activeZeroDuration,
-    onlineHosts: onlineCreators,
+    onlineHosts: presenceBreakdown.online,
+    hostsOnline: presenceBreakdown.online,
+    hostsOnCall: presenceBreakdown.onCall,
+    hostsOffline: presenceBreakdown.offline,
+    hostsTotal: presenceBreakdown.total,
+    presenceNote:
+      'Live Redis presence: online = available for calls, on_call = active video call, offline = unavailable.',
     totalAgencies: agencyCount,
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,
     pendingPayoutsNote: range
       ? `Pending withdrawals requested in the selected range.`
       : `All pending withdrawal requests (no date filter).`,
-    walletFlowSeries,
+    walletFlowSeries: rechargeDailySeries,
     totalCallMinutesToday: Math.round((callT.totalDurationSec / 60) * 100) / 100,
     totalCallsToday: callT.totalCalls,
     coinsSpentOnCallsToday: callT.totalCoinsSpent,
@@ -386,9 +466,9 @@ export async function dashboardLiveCalls(limit: number) {
 
 export async function dashboardRealtimePayload() {
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-  const [onlineCreators, pendingWithdrawals, openSupportTickets, recentCalls5m, activeBillingSessions] =
+  const [presenceBreakdown, pendingWithdrawals, openSupportTickets, recentCalls5m, activeBillingSessions] =
     await Promise.all([
-      countOnlineCreatorsPlatform(),
+      countCreatorPresenceBreakdownPlatform(),
       Withdrawal.countDocuments({ status: 'pending' }),
       SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } }),
       CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
@@ -402,7 +482,11 @@ export async function dashboardRealtimePayload() {
   return {
     activeCalls: recentCalls5m,
     activeBillingSessions,
-    onlineCreators,
+    onlineCreators: presenceBreakdown.online,
+    hostsOnline: presenceBreakdown.online,
+    hostsOnCall: presenceBreakdown.onCall,
+    hostsOffline: presenceBreakdown.offline,
+    hostsTotal: presenceBreakdown.total,
     pendingWithdrawals,
     openSupportTickets,
     timestamp: new Date().toISOString(),

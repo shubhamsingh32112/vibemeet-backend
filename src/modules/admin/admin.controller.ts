@@ -35,6 +35,11 @@ import {
   readCreatorPresenceState,
   transitionCreatorPresence,
 } from '../availability/presence.service';
+import {
+  countCreatorPresenceBreakdownPlatform,
+  countCreatorPresenceBreakdownForQuery,
+  filterCreatorIdsByPresence,
+} from '../availability/presence-dashboard.service';
 import { Call } from '../video/call.model';
 import { releaseCreatorCallLock } from '../video/creator-call-lock.service';
 import { getStreamClient } from '../../config/stream';
@@ -220,7 +225,7 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
   const [
     totalUsers,
     totalCreators,
-    onlineCreators,
+    presenceBreakdown,
     totalAdmins,
     usersByRole,
     coinCirculation,
@@ -244,7 +249,7 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
   ] = await Promise.all([
     User.countDocuments({ role: 'user' }),
     Creator.countDocuments({}),
-    Creator.countDocuments({ isOnline: true }),
+    countCreatorPresenceBreakdownPlatform(),
     User.countDocuments({ role: { $in: ['admin', 'super_admin'] } }),
     User.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]),
     User.aggregate([{ $group: { _id: null, total: { $sum: '$coins' } } }]),
@@ -360,7 +365,12 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
       total: totalUsers,
       creators: totalCreators,
       admins: totalAdmins,
-      onlineCreators,
+      onlineCreators: presenceBreakdown.online,
+      hostsOnCall: presenceBreakdown.onCall,
+      hostsOffline: presenceBreakdown.offline,
+      hostsTotal: presenceBreakdown.total,
+      presenceNote:
+        'Live Redis presence: online = available, on_call = on video call, offline = unavailable.',
       recentSignups7d,
       onboarded: onboardedUsers,
       byRole: usersByRole.reduce((acc: Record<string, number>, r: any) => { acc[r._id || 'unknown'] = r.count; return acc; }, {}),
@@ -719,12 +729,45 @@ async function computeCreatorsPerformance(options: {
   }
 
   const totalCreators = await Creator.countDocuments(creatorQuery);
+  const presenceCountsRaw = await countCreatorPresenceBreakdownForQuery(creatorQuery);
+  const presenceCounts = {
+    online: presenceCountsRaw.online,
+    on_call: presenceCountsRaw.onCall,
+    offline: presenceCountsRaw.offline,
+    total: presenceCountsRaw.total,
+  };
+
   const skip = (page - 1) * limit;
-  let creators = await Creator.find(creatorQuery)
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit)
-    .lean();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let creators: any[] = [];
+
+  const validPresence =
+    presenceStatus && ['online', 'on_call', 'offline'].includes(presenceStatus)
+      ? (presenceStatus as 'online' | 'on_call' | 'offline')
+      : null;
+
+  let filteredTotal = totalCreators;
+
+  if (validPresence) {
+    const matchingIds = await filterCreatorIdsByPresence(creatorQuery, validPresence);
+    filteredTotal = matchingIds.length;
+    const pageIds = matchingIds.slice(skip, skip + limit).map((id) => new mongoose.Types.ObjectId(id));
+    if (pageIds.length > 0) {
+      creators = await Creator.find({ _id: { $in: pageIds } })
+        .sort({ createdAt: -1 })
+        .lean();
+      const order = new Map(pageIds.map((id, i) => [id.toString(), i]));
+      creators.sort(
+        (a, b) => (order.get(a._id.toString()) ?? 0) - (order.get(b._id.toString()) ?? 0)
+      );
+    }
+  } else {
+    creators = await Creator.find(creatorQuery)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+  }
 
   const pageUserIds = creators
     .map((c) => c.userId)
@@ -741,14 +784,6 @@ async function computeCreatorsPerformance(options: {
     .map((c) => userMap.get(c.userId?.toString() ?? '')?.firebaseUid)
     .filter((uid): uid is string => typeof uid === 'string' && uid.length > 0);
   const presenceByUid = await getBatchCreatorPresence(firebaseUids);
-
-  if (presenceStatus && ['online', 'on_call', 'offline'].includes(presenceStatus)) {
-    creators = creators.filter((creator) => {
-      const uid = userMap.get(creator.userId?.toString() ?? '')?.firebaseUid;
-      const state = uid ? presenceByUid[uid]?.state ?? 'offline' : 'offline';
-      return state === presenceStatus;
-    });
-  }
 
   const assignedAgencyIds = [
     ...new Set(
@@ -839,6 +874,7 @@ async function computeCreatorsPerformance(options: {
       categories: creator.categories,
       price: creator.price,
       isOnline: creator.isOnline,
+      isDisabled: creator.isDisabled === true,
       presenceStatus: presenceStatusValue,
       presenceUpdatedAt: presenceRecord?.updatedAt
         ? new Date(presenceRecord.updatedAt).toISOString()
@@ -882,9 +918,10 @@ async function computeCreatorsPerformance(options: {
 
   return {
     creators: performance,
-    total: presenceStatus ? performance.length : totalCreators,
+    total: validPresence ? filteredTotal : totalCreators,
     page,
     limit,
+    presenceCounts,
     note:
       'Host list paginated from Creator collection. presenceStatus is Redis live state (online / on_call / offline).',
   };
@@ -1719,8 +1756,8 @@ export const getSystemHealth = async (req: Request, res: Response): Promise<void
     const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
 
-    const [onlineCreators, recentTransactions, recentCalls, failedTransactions] = await Promise.all([
-      Creator.countDocuments({ isOnline: true }),
+    const [presenceBreakdown, recentTransactions, recentCalls, failedTransactions] = await Promise.all([
+      countCreatorPresenceBreakdownPlatform(),
       CoinTransaction.countDocuments({ createdAt: { $gte: fiveMinAgo } }),
       CallHistory.countDocuments({ createdAt: { $gte: oneHourAgo }, ownerRole: 'user' }),
       CoinTransaction.countDocuments({ status: 'failed', createdAt: { $gte: oneHourAgo } }),
@@ -1743,7 +1780,10 @@ export const getSystemHealth = async (req: Request, res: Response): Promise<void
       data: {
         services: checks,
         platform: {
-          onlineCreators,
+          onlineCreators: presenceBreakdown.online,
+          hostsOnCall: presenceBreakdown.onCall,
+          hostsOffline: presenceBreakdown.offline,
+          hostsTotal: presenceBreakdown.total,
           recentTransactions5m: recentTransactions,
           recentCalls1h: recentCalls,
           failedTransactions1h: failedTransactions,
@@ -1788,13 +1828,9 @@ export const getRealtimeMetrics = async (req: Request, res: Response): Promise<v
       console.warn('⚠️ [ADMIN] Failed to count active billing sessions:', err);
     }
 
-    const [
-      onlineCreators,
-      pendingWithdrawals,
-      openSupportTickets,
-      recentCalls5m,
-    ] = await Promise.all([
-      Creator.countDocuments({ isOnline: true }),
+    const [presenceBreakdown, pendingWithdrawals, openSupportTickets, recentCalls5m] =
+      await Promise.all([
+      countCreatorPresenceBreakdownPlatform(),
       Withdrawal.countDocuments({ status: 'pending' }),
       SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } }),
       CallHistory.countDocuments({ createdAt: { $gte: fiveMinAgo }, ownerRole: 'user' }),
@@ -1805,7 +1841,10 @@ export const getRealtimeMetrics = async (req: Request, res: Response): Promise<v
       data: {
         activeCalls: recentCalls5m,
         activeBillingSessions,
-        onlineCreators,
+        onlineCreators: presenceBreakdown.online,
+        hostsOnCall: presenceBreakdown.onCall,
+        hostsOffline: presenceBreakdown.offline,
+        hostsTotal: presenceBreakdown.total,
         pendingWithdrawals,
         openSupportTickets,
         timestamp: new Date().toISOString(),
@@ -2007,6 +2046,94 @@ export const resetCreatorPresence = async (req: Request, res: Response): Promise
     });
   } catch (error) {
     console.error('❌ [ADMIN] Reset presence error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const deactivateCreator = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const { id } = req.params;
+    const creator = await Creator.findById(id);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const adminUser = await getAdminUser(req);
+    creator.isDisabled = true;
+    creator.disabledAt = new Date();
+    creator.disabledBy = adminUser?._id;
+    creator.isOnline = false;
+    await creator.save();
+
+    const creatorUser = await User.findById(creator.userId);
+    const firebaseUid = creator.firebaseUid?.trim() || creatorUser?.firebaseUid?.trim();
+    if (firebaseUid) {
+      const io = getIO();
+      await transitionCreatorPresence(io, firebaseUid, 'FORCE_OFFLINE', 'admin.deactivateCreator');
+    }
+
+    invalidateAdminCaches('overview', 'creators_performance').catch(() => {});
+    invalidateCreatorCatalogCaches().catch(() => {});
+    invalidateCreatorDetailCache(id).catch(() => {});
+
+    await logAdminAction(adminUser, 'DEACTIVATE_CREATOR', 'creator', id, 'Host deactivated by admin', {
+      creatorName: creator.name,
+    });
+
+    res.json({
+      success: true,
+      data: { creatorId: id, isDisabled: true },
+      message: 'Host deactivated and hidden from the app.',
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] Deactivate creator error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const reactivateCreator = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const { id } = req.params;
+    const creator = await Creator.findById(id);
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const adminUser = await getAdminUser(req);
+    creator.isDisabled = false;
+    creator.disabledAt = undefined;
+    creator.disabledBy = undefined;
+    await creator.save();
+
+    const creatorUser = await User.findById(creator.userId);
+    const firebaseUid = creator.firebaseUid?.trim() || creatorUser?.firebaseUid?.trim();
+    if (firebaseUid) {
+      const io = getIO();
+      const restoreEvent = creator.isOnline === true ? 'RECONCILED' : 'DISCONNECTED';
+      await transitionCreatorPresence(io, firebaseUid, restoreEvent, 'admin.reactivateCreator');
+    }
+
+    invalidateAdminCaches('overview', 'creators_performance').catch(() => {});
+    invalidateCreatorCatalogCaches().catch(() => {});
+    invalidateCreatorDetailCache(id).catch(() => {});
+
+    await logAdminAction(adminUser, 'REACTIVATE_CREATOR', 'creator', id, 'Host reactivated by admin', {
+      creatorName: creator.name,
+    });
+
+    res.json({
+      success: true,
+      data: { creatorId: id, isDisabled: false },
+      message: 'Host reactivated.',
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] Reactivate creator error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -2593,45 +2720,66 @@ export const markWithdrawalPaid = async (req: Request, res: Response): Promise<v
  * GET /admin/support
  *
  * List all support tickets with filtering.
- * Query params:
- *   ?role=user|creator
- *   &status=open|in_progress|resolved|closed
- *   &priority=low|medium|high|urgent
- *   &source=chat|post_call|other
- *   &creatorReports=true|false
  */
+function buildSupportTicketsMongoFilter(req: Request): Record<string, unknown> {
+  const roleFilter = req.query.role as string | undefined;
+  const statusFilter = req.query.status as string | undefined;
+  const priorityFilter = req.query.priority as string | undefined;
+  const sourceFilter = req.query.source as string | undefined;
+  const creatorReportsOnly = String(req.query.creatorReports || '').toLowerCase() === 'true';
+  const staffPortalOnly = String(req.query.staffPortal || '').toLowerCase() === 'true';
+  const becomeCreatorOnly = String(req.query.becomeCreatorOnly || '').toLowerCase() === 'true';
+  const subjectExact = req.query.subject as string | undefined;
+  const subjectContains = req.query.subjectContains as string | undefined;
+  const range = parseAdminDateRange(req);
+
+  const filter: Record<string, unknown> = {};
+  if (roleFilter && ['user', 'creator', 'agency', 'bd'].includes(roleFilter)) filter.role = roleFilter;
+  if (statusFilter && ['open', 'in_progress', 'resolved', 'closed'].includes(statusFilter)) {
+    filter.status = statusFilter;
+  }
+  if (priorityFilter && ['low', 'medium', 'high', 'urgent'].includes(priorityFilter)) {
+    filter.priority = priorityFilter;
+  }
+  if (sourceFilter && ['chat', 'post_call', 'other', 'staff_portal'].includes(sourceFilter)) {
+    filter.source = sourceFilter;
+  }
+  if (creatorReportsOnly) {
+    filter.$or = [
+      { reportedCreatorUserId: { $exists: true } },
+      { reportedCreatorFirebaseUid: { $exists: true, $ne: null } },
+    ];
+  }
+  if (staffPortalOnly) {
+    filter.role = { $in: ['agency', 'bd'] };
+  }
+  if (becomeCreatorOnly) {
+    filter.subject = { $regex: /^Become a Creator/i };
+  } else if (subjectExact?.trim()) {
+    filter.subject = subjectExact.trim();
+  } else if (subjectContains?.trim()) {
+    filter.subject = buildSafeMongoSubstringRegex(subjectContains.trim());
+  }
+  if (range.hasRange) {
+    filter.createdAt = { $gte: range.from, $lt: range.to };
+  }
+  return filter;
+}
+
+function csvEscapeCell(value: string): string {
+  if (/[",\r\n]/.test(value)) return `"${value.replace(/"/g, '""')}"`;
+  return value;
+}
+
 export const getSupportTickets = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
-    const roleFilter = req.query.role as string | undefined;
-    const statusFilter = req.query.status as string | undefined;
-    const priorityFilter = req.query.priority as string | undefined;
-    const sourceFilter = req.query.source as string | undefined;
-    const creatorReportsOnly = String(req.query.creatorReports || '').toLowerCase() === 'true';
-    const staffPortalOnly = String(req.query.staffPortal || '').toLowerCase() === 'true';
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
     const skip = (page - 1) * limit;
+    const filter = buildSupportTicketsMongoFilter(req);
     const range = parseAdminDateRange(req);
-
-    const filter: any = {};
-    if (roleFilter && ['user', 'creator', 'agency', 'bd'].includes(roleFilter)) filter.role = roleFilter;
-    if (statusFilter && ['open', 'in_progress', 'resolved', 'closed'].includes(statusFilter)) filter.status = statusFilter;
-    if (priorityFilter && ['low', 'medium', 'high', 'urgent'].includes(priorityFilter)) filter.priority = priorityFilter;
-    if (sourceFilter && ['chat', 'post_call', 'other', 'staff_portal'].includes(sourceFilter)) filter.source = sourceFilter;
-    if (creatorReportsOnly) {
-      filter.$or = [
-        { reportedCreatorUserId: { $exists: true } },
-        { reportedCreatorFirebaseUid: { $exists: true, $ne: null } },
-      ];
-    }
-    if (staffPortalOnly) {
-      filter.role = { $in: ['agency', 'bd'] };
-    }
-    if (range.hasRange) {
-      filter.createdAt = { $gte: range.from, $lt: range.to };
-    }
 
     const [tickets, total] = await Promise.all([
       SupportTicket.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
@@ -2772,6 +2920,66 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
     });
   } catch (error) {
     console.error('❌ [ADMIN] Get support tickets error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const exportSupportTicketsCsv = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const filter = buildSupportTicketsMongoFilter(req);
+    const total = await SupportTicket.countDocuments(filter);
+    const maxRows = 10_000;
+    if (total > maxRows) {
+      res.status(400).json({
+        success: false,
+        error: `Export limited to ${maxRows} rows; narrow your date filter (${total} matches).`,
+      });
+      return;
+    }
+
+    const batchSize = 500;
+    const lines: string[] = [
+      'name,email,contactPhone,profilePhone,userId,createdAt,status,subject,message',
+    ];
+
+    for (let skip = 0; skip < total; skip += batchSize) {
+      const tickets = await SupportTicket.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(batchSize)
+        .lean();
+      const userIds = [...new Set(tickets.map((t) => t.userId.toString()))];
+      const users = await User.find({ _id: { $in: userIds } })
+        .select('username email phone')
+        .lean();
+      const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+
+      for (const t of tickets) {
+        const u = userMap.get(t.userId.toString());
+        const name = u?.username || u?.email || u?.phone || 'Unknown';
+        const row = [
+          csvEscapeCell(name),
+          csvEscapeCell(u?.email ?? ''),
+          csvEscapeCell(t.contactPhone ?? ''),
+          csvEscapeCell(u?.phone ?? ''),
+          csvEscapeCell(t.userId.toString()),
+          csvEscapeCell(t.createdAt?.toISOString?.() ?? ''),
+          csvEscapeCell(t.status ?? ''),
+          csvEscapeCell(t.subject ?? ''),
+          csvEscapeCell(t.message ?? ''),
+        ].join(',');
+        lines.push(row);
+      }
+    }
+
+    const filename = `support-export-${new Date().toISOString().slice(0, 10)}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(lines.join('\n'));
+  } catch (error) {
+    console.error('❌ [ADMIN] Export support CSV error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

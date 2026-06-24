@@ -11,7 +11,7 @@ import { CallHistory } from '../billing/call-history.model';
 import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { logError, logInfo } from '../../utils/logger';
 import { getBatchAvailability } from '../availability/availability.service';
-import { countOnlineCreatorsForBd } from '../availability/presence-dashboard.service';
+import { countOnlineCreatorsForAgency } from '../availability/presence-dashboard.service';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import { buildCreatorMediaPayload, buildUserMediaPayload } from '../creator/creator-staff-portal.payload';
@@ -404,7 +404,7 @@ export const getAgencyDashboardSummary = async (req: Request, res: Response): Pr
       Creator.find({ assignedAgencyId: agency._id }).select('userId').lean(),
     ]);
 
-    const onlineCreators = await countOnlineCreatorsForBd(agency._id.toString());
+    const onlineCreators = await countOnlineCreatorsForAgency(agency._id.toString());
 
     const totalCreators = creatorRows.length;
 

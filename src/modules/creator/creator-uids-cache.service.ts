@@ -9,7 +9,7 @@
  * - Fallback: Mongo cursor stream on cache miss
  */
 import mongoose from 'mongoose';
-import { Creator } from './creator.model';
+import { Creator, CREATOR_LISTABLE_FILTER } from './creator.model';
 import { User } from '../user/user.model';
 import {
   CREATOR_UIDS_CACHE_KEY,
@@ -48,7 +48,7 @@ export async function streamCreatorFirebaseUidsFromMongo(): Promise<string[]> {
   const missingUidUserIds: mongoose.Types.ObjectId[] = [];
   const pendingRows: Array<{ firebaseUid?: string | null; userId?: mongoose.Types.ObjectId }> = [];
 
-  const cursor = Creator.find({})
+  const cursor = Creator.find(CREATOR_LISTABLE_FILTER)
     .select(allowFallbackJoin ? 'firebaseUid userId' : 'firebaseUid')
     .lean()
     .cursor();

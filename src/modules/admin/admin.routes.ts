@@ -44,6 +44,8 @@ import {
   getSystemHealth,
   adjustUserCoins,
   resetCreatorPresence,
+  deactivateCreator,
+  reactivateCreator,
   refundCall,
   getRefundPreview,
   getAdminActionLog,
@@ -52,6 +54,7 @@ import {
   rejectWithdrawal,
   markWithdrawalPaid,
   getSupportTickets,
+  exportSupportTicketsCsv,
   updateTicketStatus,
   assignTicket,
   getRealtimeMetrics,
@@ -125,6 +128,8 @@ import {
   getRevenueAnalyticsSummary,
   getUsersSummary,
   getUsersLoginSeries,
+  getUsersSignupSeries,
+  getCoinsPaidUsers,
   getVipPaidUsers,
   getWalletTransactions,
 } from './admin-analytics.controller';
@@ -146,6 +151,8 @@ router.get('/leaderboards/hosts/cached', getCachedLeaderboardHosts);
 router.get('/leaderboards/users', getLeaderboardUsers);
 router.get('/analytics/users/summary', getUsersSummary);
 router.get('/analytics/users/login-series', getUsersLoginSeries);
+router.get('/analytics/users/signup-series', getUsersSignupSeries);
+router.get('/analytics/coins/paid-users', getCoinsPaidUsers);
 router.get('/analytics/moments/paid-users', getMomentsPaidUsers);
 router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
@@ -202,6 +209,7 @@ router.post('/withdrawals/:id/reject', rejectWithdrawal);
 router.post('/withdrawals/:id/mark-paid', markWithdrawalPaid);
 
 // ── Support Ticket Management ────────────────────────────────────────────
+router.get('/support/export.csv', exportSupportTicketsCsv);
 router.get('/support', getSupportTickets);
 router.patch('/support/:id/status', updateTicketStatus);
 router.patch('/support/:id/assign', assignTicket);
@@ -209,6 +217,8 @@ router.patch('/support/:id/assign', assignTicket);
 // ── Admin Actions ───────────────────────────────────────────────────────
 router.post('/users/:id/adjust-coins', adjustUserCoins);
 router.post('/creators/:id/reset-presence', resetCreatorPresence);
+router.post('/creators/:id/deactivate', deactivateCreator);
+router.post('/creators/:id/reactivate', reactivateCreator);
 router.patch('/creators/:id/user', patchCreatorLinkedUser);
 router.post('/creators/:id/transfer-agency', postAdminTransferCreatorToAgency);
 router.post('/creators/:id/avatar/commit', adminCreatorAvatarCommit);

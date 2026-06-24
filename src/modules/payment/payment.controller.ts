@@ -212,6 +212,7 @@ const createPendingCoinTransaction = async (
     coins,
     source: 'payment_gateway',
     description: `Purchase ${coins} coins for ₹${priceInr}`,
+    priceInr,
     paymentGatewayTransactionId: orderId,
     paymentGatewayOrderId: orderId,
     paymentGatewayProvider: 'razorpay',

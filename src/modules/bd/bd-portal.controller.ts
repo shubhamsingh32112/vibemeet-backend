@@ -18,7 +18,7 @@ import { utcDateKey } from '../analytics/analytics-aggregation.service';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import {
-  countOnlineCreatorsForAgency,
+  countOnlineCreatorsForBd,
   countOnlineByAgencyIds,
 } from '../availability/presence-dashboard.service';
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
@@ -164,7 +164,7 @@ export const getBdDashboard = async (req: Request, res: Response): Promise<void>
         : Creator.countDocuments({ assignedAgencyId: { $in: bdIds } }),
       bdIds.length === 0
         ? Promise.resolve(0)
-        : countOnlineCreatorsForAgency(bdOid.toString()),
+        : countOnlineCreatorsForBd(bdOid.toString()),
     ]);
 
     let revenueToday = 0;
