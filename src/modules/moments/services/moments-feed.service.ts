@@ -135,7 +135,7 @@ export async function buildFollowingFeedOrdering(input: {
       ...publicMomentQuery(),
     });
     feedDocs = orderMomentsByIds(found, cachedIds).filter(
-      (m) => !excludeIds.some((id) => id.equals(m._id)),
+      (m) => !excludeIds.some((id) => id.toString() === m._id.toString()),
     ) as InstanceType<typeof CreatorMoment>[];
   } else if (creatorIds.length) {
     feedDocs = await CreatorMoment.find(

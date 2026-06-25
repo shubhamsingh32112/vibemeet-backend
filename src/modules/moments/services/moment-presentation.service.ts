@@ -27,6 +27,10 @@ import type { FeedSection } from './moments-feed.service';
 const PLACEHOLDER_THUMB =
   'https://imagedelivery.net/static/placeholder/moments/thumb';
 
+function toIsoString(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
 export interface ViewerContext {
   userId: Types.ObjectId | null;
   isCreatorOwner?: boolean;
@@ -137,7 +141,7 @@ export async function toMomentPresentationDTO(
     creatorAvatarUrl: meta.avatarUrl,
     media: await buildMomentMedia(moment, locked),
     caption: moment.caption ?? undefined,
-    createdAt: moment.createdAt.toISOString(),
+    createdAt: toIsoString(moment.createdAt),
     locked,
     isPreview: access.reason === 'PREVIEW',
     accessReason: access.reason,

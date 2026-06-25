@@ -693,6 +693,114 @@ export async function getFollowingListHandler(req: Request, res: Response): Prom
   }
 }
 
+export async function getFollowingCreatorProfilesHandler(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+
+    const follows = await CreatorFollow.find({ followerUserId: user._id })
+      .sort({ createdAt: -1 })
+      .select('creatorId');
+    const followedIds = follows.map((f) => f.creatorId.toString());
+    const total = followedIds.length;
+
+    if (total === 0) {
+      res.json({
+        success: true,
+        data: {
+          creators: [],
+          pagination: { page, limit, total: 0, totalPages: 0 },
+        },
+      });
+      return;
+    }
+
+    const start = (page - 1) * limit;
+    const pagedIds = followedIds.slice(start, start + limit);
+    const validObjectIds = pagedIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    const creators = validObjectIds.length
+      ? await Creator.find({ _id: { $in: validObjectIds } }).lean()
+      : [];
+    const creatorById = new Map(
+      creators.map((creator) => [creator._id.toString(), creator] as const),
+    );
+    const orderedCreators = pagedIds
+      .map((id) => creatorById.get(id))
+      .filter((creator): creator is NonNullable<typeof creator> => Boolean(creator));
+
+    const userIds = orderedCreators
+      .map((creator) => creator.userId)
+      .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
+    const linkedUsers = userIds.length
+      ? await User.find({ _id: { $in: userIds } }).select('_id firebaseUid').lean()
+      : [];
+    const firebaseUidByUserId = new Map(
+      linkedUsers.map((u) => [u._id.toString(), u.firebaseUid || null] as const),
+    );
+
+    const firebaseUids = orderedCreators
+      .map((creator) =>
+        creator.userId ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null) : null,
+      )
+      .filter((uid): uid is string => Boolean(uid));
+
+    const { getBatchAvailability } = await import('../../availability/availability.service');
+    const availabilityMap =
+      firebaseUids.length > 0 ? await getBatchAvailability(firebaseUids) : {};
+
+    res.json({
+      success: true,
+      data: {
+        creators: orderedCreators.map((creator) => {
+          const firebaseUid = creator.userId
+            ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
+            : null;
+          return {
+            id: creator._id.toString(),
+            userId: creator.userId ? creator.userId.toString() : '',
+            firebaseUid,
+            name: creator.name,
+            about: creator.about,
+            galleryImages: creator.galleryImages || [],
+            categories: creator.categories,
+            price: creator.price,
+            age: creator.age,
+            location: creator.location,
+            isOnline: creator.isOnline,
+            availability: firebaseUid ? (availabilityMap[firebaseUid] ?? 'offline') : 'offline',
+            isFavorite: false,
+            createdAt: creator.createdAt,
+            updatedAt: creator.updatedAt,
+          };
+        }),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    logError('Following creator profiles failed', error);
+    res.status(500).json({ success: false, error: 'Failed to load followed creators' });
+  }
+}
+
 export async function refreshPlaybackHandler(req: Request, res: Response): Promise<void> {
   try {
     assertMomentsEnabled();

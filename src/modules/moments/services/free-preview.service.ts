@@ -16,8 +16,14 @@ import {
   bustAllPopularFeedCaches,
 } from './feed-fanout.service';
 
-const PREVIEW_CACHE_KEY = 'moments:free_preview:active:v1';
+const PREVIEW_CACHE_KEY = 'moments:free_preview:active:v2';
 const PREVIEW_CACHE_TTL_SEC = 300;
+
+/** Redis stores ids + creator meta only — full moments are reloaded to keep ObjectIds/Dates valid. */
+interface PreviewCacheEntry {
+  momentId: string;
+  creator: PreviewCreatorMeta;
+}
 
 export interface PreviewCreatorMeta {
   id: string;
@@ -106,12 +112,47 @@ async function loadPreviewMomentsFromDb(
   return result;
 }
 
+export async function hydratePreviewMomentsFromCache(
+  entries: PreviewCacheEntry[],
+): Promise<PreviewMoment[]> {
+  if (!entries.length) return [];
+
+  const ids = entries.map((e) => e.momentId);
+  const moments = await CreatorMoment.find({
+    _id: { $in: ids },
+    ...publicMomentFilter(),
+  }).lean();
+  const byId = new Map(moments.map((m) => [m._id.toString(), m]));
+
+  const result: PreviewMoment[] = [];
+  for (const entry of entries) {
+    const moment = byId.get(entry.momentId);
+    if (!moment) continue;
+    result.push({
+      previewRow: { momentId: entry.momentId } as unknown as IFreePreviewMoment,
+      moment: moment as unknown as ICreatorMoment,
+      creator: entry.creator,
+    });
+  }
+  return result;
+}
+
+function toPreviewCacheEntries(items: PreviewMoment[]): PreviewCacheEntry[] {
+  return items.map((item) => ({
+    momentId: item.moment._id.toString(),
+    creator: item.creator,
+  }));
+}
+
 export async function getActivePreviewMoments(): Promise<PreviewMoment[]> {
   if (isRedisConfigured()) {
     const cached = await getRedis().get(PREVIEW_CACHE_KEY);
     if (cached) {
       try {
-        return JSON.parse(cached) as PreviewMoment[];
+        const entries = JSON.parse(cached) as PreviewCacheEntry[];
+        if (Array.isArray(entries)) {
+          return hydratePreviewMomentsFromCache(entries);
+        }
       } catch {
         // bust corrupt cache
       }
@@ -124,7 +165,7 @@ export async function getActivePreviewMoments(): Promise<PreviewMoment[]> {
     await getRedis().setex(
       PREVIEW_CACHE_KEY,
       PREVIEW_CACHE_TTL_SEC,
-      JSON.stringify(items),
+      JSON.stringify(toPreviewCacheEntries(items)),
     );
   }
 
