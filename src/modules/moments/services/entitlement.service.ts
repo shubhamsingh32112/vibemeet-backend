@@ -1,50 +1,60 @@
 import type { Types } from 'mongoose';
 import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
-import { MomentPurchase } from '../models/moment-purchase.model';
-import { CreatorMoment } from '../models/creator-moment.model';
 
+export type MomentAccessReason = 'OWNER' | 'PREMIUM' | 'PREVIEW' | 'ADMIN' | 'DENIED';
+
+export interface MomentAccessResult {
+  allowed: boolean;
+  reason: MomentAccessReason;
+}
+
+export interface MomentAccessContext {
+  isCreatorOwner?: boolean;
+  isPreviewMoment?: boolean;
+  isStaffAdmin?: boolean;
+}
+
+export async function resolveMomentAccess(
+  userId: Types.ObjectId | string | null | undefined,
+  _momentId: Types.ObjectId | string,
+  context: MomentAccessContext = {},
+): Promise<MomentAccessResult> {
+  if (context.isCreatorOwner) {
+    return { allowed: true, reason: 'OWNER' };
+  }
+  if (context.isStaffAdmin) {
+    return { allowed: true, reason: 'ADMIN' };
+  }
+  if (!userId) {
+    return { allowed: false, reason: 'DENIED' };
+  }
+  const uid = typeof userId === 'string' ? userId : userId.toString();
+  if (await isMomentsPremiumActive(uid)) {
+    return { allowed: true, reason: 'PREMIUM' };
+  }
+  if (context.isPreviewMoment) {
+    return { allowed: true, reason: 'PREVIEW' };
+  }
+  return { allowed: false, reason: 'DENIED' };
+}
+
+/** @deprecated Use resolveMomentAccess */
 export async function hasMomentAccess(
   userId: Types.ObjectId | string | null | undefined,
   momentId: Types.ObjectId | string,
+  context?: MomentAccessContext,
 ): Promise<boolean> {
-  if (!userId) return false;
-  const uid = typeof userId === 'string' ? userId : userId.toString();
-  const mid = typeof momentId === 'string' ? momentId : momentId.toString();
-
-  const purchase = await MomentPurchase.findOne({
-    userId: uid,
-    mediaId: mid,
-  }).lean();
-  if (purchase) return true;
-
-  const moment = await CreatorMoment.findById(mid).lean();
-  if (!moment) return false;
-  if (moment.isDeleted) return false;
-  if (moment.accessType === 'free') return true;
-  if (moment.accessType === 'paid' && (await isMomentsPremiumActive(uid))) {
-    return true;
-  }
-  return false;
+  const result = await resolveMomentAccess(userId, momentId, context);
+  return result.allowed;
 }
 
 export async function hasMomentAccessIncludingDeleted(
   userId: Types.ObjectId | string | null | undefined,
-  momentId: Types.ObjectId | string,
+  _momentId: Types.ObjectId | string,
 ): Promise<boolean> {
   if (!userId) return false;
-  const purchase = await MomentPurchase.findOne({
-    userId,
-    mediaId: momentId,
-  }).lean();
-  if (purchase) return true;
-
-  const moment = await CreatorMoment.findById(momentId).lean();
-  if (!moment) return false;
-  if (moment.isDeleted) {
-    return false;
-  }
-  return moment.accessType === 'free';
+  return false;
 }
 
 export async function canViewDeletedMoment(
@@ -52,11 +62,11 @@ export async function canViewDeletedMoment(
   momentId: Types.ObjectId | string,
 ): Promise<boolean> {
   if (!userId) return false;
+  const { CreatorMoment } = await import('../models/creator-moment.model');
   const moment = await CreatorMoment.findById(momentId).lean();
   if (!moment?.isDeleted) return true;
   if (moment.deletedAccessPolicy === 'fully_remove') return false;
-  const purchase = await MomentPurchase.findOne({ userId, mediaId: momentId }).lean();
-  return Boolean(purchase);
+  return false;
 }
 
 const PURCHASE_LOCK_PREFIX = 'lock:moment_purchase:';

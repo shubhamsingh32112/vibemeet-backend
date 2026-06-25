@@ -59,6 +59,21 @@ export async function emitMomentViewed(userId: string, momentId: string): Promis
   await enqueueAnalyticsEvent({ type: 'moment_viewed', userId, targetId: momentId });
 }
 
+/** Paywall impression — distinct from consumption (moment_viewed). */
+export async function emitMomentsPaywallShown(
+  userId: string,
+  metadata?: Record<string, unknown>,
+): Promise<void> {
+  const source = typeof metadata?.source === 'string' ? metadata.source : 'unknown';
+  const dedupKey = `paywall:moments:${userId}:${source}`;
+  if (!(await dedupeImpression(dedupKey))) return;
+  await enqueueAnalyticsEvent({
+    type: 'moments_paywall_shown',
+    userId,
+    metadata: { accessReason: 'DENIED', ...metadata },
+  });
+}
+
 export async function emitMomentCompleted(
   userId: string,
   momentId: string,

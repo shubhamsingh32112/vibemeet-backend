@@ -12,15 +12,13 @@ import { CloudflareImagesError } from '../../images/cloudflare.client';
 import { consumeStreamUploadSession } from '../../stream/stream-upload-session.service';
 import {
   defaultModerationStatus,
-  resolvePriceCoins,
+  presentationFromFeedOrderingItem,
   toCreatorSelfMomentDTO,
   toMomentFeedDTO,
   toMomentPresentationDTO,
 } from '../services/moment-presentation.service';
-import { toFeedDTO } from '../dto/moment.dto';
-import { purchaseMoment, PurchaseInProgressError } from '../services/purchase.service';
 import { checkMomentsRateLimit } from '../services/moments-rate-limit.service';
-import { emitMomentViewed, emitMomentCompleted } from '../services/analytics-emitter.service';
+import { emitMomentViewed, emitMomentCompleted, emitMomentsPaywallShown } from '../services/analytics-emitter.service';
 import {
   cacheFeedResponse,
   followingWarmCacheKey,
@@ -28,14 +26,13 @@ import {
   getFollowingFeedFromCache,
   pushToFollowingFeedCache,
   enqueueFanoutTask,
-  orderMomentsByIds,
   removeCreatorFromFollowingFeedCache,
   removeMomentFromFollowerFeeds,
   bustPopularFeedCacheForUser,
   bustFollowingWarmCacheForUser,
 } from '../services/feed-fanout.service';
 import { logError } from '../../../utils/logger';
-import { emitMomentUploaded, emitMomentPurchased, emitMomentPurchaseCountToCreator, emitCreatorFollowed } from '../moments.gateway';
+import { emitMomentUploaded, emitCreatorFollowed } from '../moments.gateway';
 import {
   getPlaybackTokenExpiresAtMs,
   isStreamSigningConfigured,
@@ -48,6 +45,14 @@ import {
   loadFollowedCreatorIds,
 } from '../services/follow-context.service';
 import { creditMomentUploadReward } from '../services/moment-upload-reward.service';
+import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
+import {
+  buildPopularFeedOrdering,
+  buildFollowingFeedOrdering,
+} from '../services/moments-feed.service';
+import { applyAudienceToFeedOrdering } from '../services/feed-audience.service';
+import { resolveMomentAccess } from '../services/entitlement.service';
+import { isPreviewMoment } from '../services/free-preview.service';
 
 async function resolveUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
@@ -58,9 +63,26 @@ async function resolveCreator(userId: mongoose.Types.ObjectId) {
   return Creator.findOne({ userId });
 }
 
+async function isUserOwnerOfCreator(
+  userId: mongoose.Types.ObjectId | null | undefined,
+  creatorId: mongoose.Types.ObjectId,
+): Promise<boolean> {
+  if (!userId) return false;
+  const creator = await resolveCreator(userId);
+  return creator != null && creator._id.equals(creatorId);
+}
+
+async function isUserOwnerOfMoment(
+  userId: mongoose.Types.ObjectId | null | undefined,
+  moment: InstanceType<typeof CreatorMoment>,
+): Promise<boolean> {
+  return isUserOwnerOfCreator(userId, moment.creatorId);
+}
+
 async function recordUniqueMomentView(
   userId: mongoose.Types.ObjectId,
   moment: InstanceType<typeof CreatorMoment>,
+  accessReason?: string,
 ): Promise<number> {
   const creator = await resolveCreator(userId);
   if (creator && moment.creatorId.equals(creator._id)) {
@@ -75,6 +97,7 @@ async function recordUniqueMomentView(
     await MomentView.create({
       momentId: moment._id,
       viewerUserId: userId,
+      accessReason,
     });
     await CreatorMoment.updateOne({ _id: moment._id }, { $inc: { viewsCount: 1 } });
     moment.viewsCount += 1;
@@ -114,14 +137,12 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
 
     const {
       type,
-      accessType = 'free',
       caption,
       imageSessionId,
       streamSessionId,
       thumbnailSessionId,
     } = req.body as {
       type: 'photo' | 'video';
-      accessType?: 'free' | 'paid';
       caption?: string;
       imageSessionId?: string;
       streamSessionId?: string;
@@ -133,13 +154,9 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
       return;
     }
 
-    const priceCoins = resolvePriceCoins(type, accessType === 'paid' ? 'paid' : 'free');
-
     const moment = await CreatorMoment.create({
       creatorId: creator._id,
       type,
-      accessType: accessType === 'paid' ? 'paid' : 'free',
-      priceCoins,
       feedScore: Date.now(),
       caption: caption?.trim() || null,
       processingStatus: 'uploading',
@@ -248,33 +265,33 @@ export async function getMomentsFeedHandler(req: Request, res: Response): Promis
     const viewer = { userId: user?._id ?? null, followedCreatorIds };
     const limit = Math.min(Number(req.query.limit) || 20, 50);
     const cursor = req.query.cursor as string | undefined;
+    const isPremium = user ? await isMomentsPremiumActive(user._id.toString()) : false;
 
-    const cacheKey = `moments:feed:${user?._id || 'anon'}:${cursor || '0'}:${limit}`;
+    const cacheKey = `moments:feed:${user?._id || 'anon'}:${isPremium ? 'p' : 'n'}:${cursor || '0'}:${limit}`;
     const cached = await getCachedFeedResponse(cacheKey);
     if (cached) {
       res.json(JSON.parse(cached));
       return;
     }
 
-    const query = publicMomentQuery();
-    if (cursor) {
-      const cursorDate = new Date(cursor);
-      Object.assign(query, { feedScore: { $lt: cursorDate.getTime() } });
-    }
-
-    const moments = await CreatorMoment.find(query)
-      .sort({ feedScore: -1, _id: -1 })
-      .limit(limit + 1);
-
-    const slice = moments.slice(0, limit);
+    const ordering = applyAudienceToFeedOrdering(
+      await buildPopularFeedOrdering({ limit, cursor }),
+      isPremium,
+    );
     const items = (
-      await Promise.all(slice.map((m) => toMomentFeedDTO(m, viewer)))
+      await Promise.all(
+        ordering.moments.map((item) => presentationFromFeedOrderingItem(item, viewer)),
+      )
     ).filter(Boolean);
 
-    const nextCursor =
-      moments.length > limit ? String(slice[slice.length - 1]?.feedScore) : undefined;
-
-    const payload = { success: true, data: { items, nextCursor } };
+    const payload = {
+      success: true,
+      data: {
+        items,
+        sections: ordering.sections,
+        nextCursor: ordering.nextCursor,
+      },
+    };
     await cacheFeedResponse(cacheKey, JSON.stringify(payload));
     res.json(payload);
   } catch (error) {
@@ -296,8 +313,9 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
     const offset = Number(req.query.offset) || 0;
     const followedCreatorIds = await loadFollowedCreatorIds(user._id);
     const viewer = { userId: user._id, followedCreatorIds };
+    const isPremium = await isMomentsPremiumActive(user._id.toString());
 
-    const warmKey = followingWarmCacheKey(user._id.toString(), offset, limit);
+    const warmKey = followingWarmCacheKey(user._id.toString(), isPremium, offset, limit);
     const warmCached = await getCachedFeedResponse(warmKey);
     if (warmCached) {
       res.json(JSON.parse(warmCached));
@@ -305,34 +323,62 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
     }
 
     const cachedIds = await getFollowingFeedFromCache(user._id.toString(), offset, limit);
-    let moments;
-    if (cachedIds) {
-      const found = await CreatorMoment.find({
-        _id: { $in: cachedIds },
-        ...publicMomentQuery(),
-      });
-      moments = orderMomentsByIds(found, cachedIds);
-    } else {
-      const follows = await CreatorFollow.find({ followerUserId: user._id }).select('creatorId');
-      const creatorIds = follows.map((f) => f.creatorId);
-      moments = await CreatorMoment.find({
-        creatorId: { $in: creatorIds },
-        ...publicMomentQuery(),
-      })
-        .sort({ createdAt: -1 })
-        .skip(offset)
-        .limit(limit);
-    }
+    const ordering = applyAudienceToFeedOrdering(
+      await buildFollowingFeedOrdering({
+        userId: user._id,
+        limit,
+        offset,
+        cachedIds,
+      }),
+      isPremium,
+    );
 
     const items = (
-      await Promise.all(moments.map((m) => toMomentFeedDTO(m, viewer)))
+      await Promise.all(
+        ordering.moments.map((item) => presentationFromFeedOrderingItem(item, viewer)),
+      )
     ).filter(Boolean);
-    const hasMore = moments.length >= limit;
-    res.json({ success: true, data: { items, hasMore, nextOffset: offset + items.length } });
+
+    const payload = {
+      success: true,
+      data: {
+        items,
+        sections: ordering.sections,
+        hasMore: ordering.hasMore,
+        nextOffset: ordering.nextOffset,
+      },
+    };
+    await cacheFeedResponse(warmKey, JSON.stringify(payload));
+    res.json(payload);
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;
     logError('Following feed failed', error);
     res.status(500).json({ success: false, error: 'Failed to load following feed' });
+  }
+}
+
+export async function recordMomentsPaywallShownHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const { source, momentId } = (req.body ?? {}) as {
+      source?: string;
+      momentId?: string;
+    };
+    await emitMomentsPaywallShown(user._id.toString(), {
+      source: source ?? 'unknown',
+      momentId,
+      accessReason: 'DENIED',
+    });
+    res.json({ success: true });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    logError('Record paywall shown failed', error);
+    res.status(500).json({ success: false, error: 'Failed to record paywall event' });
   }
 }
 
@@ -354,8 +400,18 @@ export async function recordMomentViewHandler(req: Request, res: Response): Prom
       res.status(404).json({ success: false, error: 'Not found' });
       return;
     }
-    const viewsCount = await recordUniqueMomentView(user._id, moment);
-    res.json({ success: true, data: { viewsCount } });
+    const preview = await isPreviewMoment(moment._id);
+    const isCreatorOwner = await isUserOwnerOfMoment(user._id, moment);
+    const access = await resolveMomentAccess(user._id, moment._id, {
+      isPreviewMoment: preview,
+      isCreatorOwner,
+    });
+    const viewsCount = await recordUniqueMomentView(
+      user._id,
+      moment,
+      access.reason,
+    );
+    res.json({ success: true, data: { viewsCount, accessReason: access.reason } });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;
     logError('Record moment view failed', error);
@@ -372,13 +428,20 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
       res.status(404).json({ success: false, error: 'Not found' });
       return;
     }
-    const dto = await toMomentPresentationDTO(moment, { userId: user?._id ?? null });
+    const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
+    const isCreatorOwner = await isUserOwnerOfCreator(user?._id, moment.creatorId);
+    const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
+    const dto = await toMomentPresentationDTO(
+      moment,
+      { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner },
+      { isPreviewMoment: preview },
+    );
     if (!dto) {
       res.status(404).json({ success: false, error: 'Not found' });
       return;
     }
-    if (user) {
-      await recordUniqueMomentView(user._id, moment);
+    if (user && !isCreatorOwner) {
+      await recordUniqueMomentView(user._id, moment, dto.accessReason);
     }
     res.json({ success: true, data: dto });
   } catch (error) {
@@ -396,55 +459,15 @@ export async function purchaseMomentHandler(req: Request, res: Response): Promis
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
-    const rate = await checkMomentsRateLimit('purchase', user._id.toString());
-    if (!rate.allowed) {
-      res.status(429).json({ success: false, error: 'Too many purchase attempts', retryAfterSec: rate.retryAfterSec });
-      return;
-    }
-    const dto = await purchaseMoment({
-      userId: user._id,
-      momentId: req.params.momentId,
-      transactionId: req.body?.transactionId,
+    res.status(403).json({
+      success: false,
+      error: 'Moments Premium subscription required',
+      code: 'MOMENTS_PREMIUM_REQUIRED',
     });
-    const moment = await CreatorMoment.findById(req.params.momentId);
-    if (user.firebaseUid) {
-      emitMomentPurchased(user.firebaseUid, {
-        momentId: req.params.momentId,
-        buyerUserId: user._id.toString(),
-        purchaseCount: moment?.purchaseCount ?? 0,
-        item: toFeedDTO(dto) as unknown as Record<string, unknown>,
-      });
-    }
-    if (moment) {
-      const creator = await Creator.findById(moment.creatorId);
-      if (creator) {
-        const creatorUser = await User.findById(creator.userId);
-        if (creatorUser?.firebaseUid) {
-          emitMomentPurchaseCountToCreator(creatorUser.firebaseUid, {
-            momentId: moment._id.toString(),
-            purchaseCount: moment.purchaseCount,
-          });
-        }
-      }
-    }
-    res.json({ success: true, data: dto });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;
-    if (error instanceof PurchaseInProgressError) {
-      res.status(409).json({ success: false, error: 'Purchase in progress' });
-      return;
-    }
-    const msg = error instanceof Error ? error.message : 'Purchase failed';
-    if (msg.includes('Insufficient')) {
-      res.status(400).json({ success: false, error: msg });
-      return;
-    }
-    if (msg.includes('Cannot purchase your own')) {
-      res.status(400).json({ success: false, error: msg });
-      return;
-    }
     logError('Purchase moment failed', error);
-    res.status(500).json({ success: false, error: msg });
+    res.status(500).json({ success: false, error: 'Purchase unavailable' });
   }
 }
 
@@ -491,9 +514,16 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
       .sort({ createdAt: -1 })
       .limit(60);
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
-    const viewer = { userId: user?._id ?? null, followedCreatorIds };
+    const isCreatorOwner = await isUserOwnerOfCreator(user?._id, creator._id);
+    const viewer = { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner };
     const items = (
-      await Promise.all(moments.map((m) => toMomentFeedDTO(m, viewer)))
+      await Promise.all(
+        moments.map(async (m) => {
+          const preview =
+            !isCreatorOwner && user ? await isPreviewMoment(m._id) : false;
+          return toMomentFeedDTO(m, viewer, { isPreviewMoment: preview });
+        }),
+      )
     ).filter(Boolean);
     res.json({ success: true, data: { items } });
   } catch (error) {
@@ -682,7 +712,16 @@ export async function refreshPlaybackHandler(req: Request, res: Response): Promi
       res.status(404).json({ success: false, error: 'Not found' });
       return;
     }
-    const dto = await toMomentPresentationDTO(moment, { userId: user?._id ?? null });
+    const followedCreatorIds = user
+      ? await loadFollowedCreatorIds(user._id)
+      : new Set<string>();
+    const isCreatorOwner = await isUserOwnerOfMoment(user?._id, moment);
+    const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
+    const dto = await toMomentPresentationDTO(
+      moment,
+      { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner },
+      { isPreviewMoment: preview },
+    );
     if (!dto?.media.playbackUrl) {
       recordPlaybackRefreshMetric('denied');
       res.status(403).json({

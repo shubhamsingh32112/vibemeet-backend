@@ -1,5 +1,5 @@
 import type { Types } from 'mongoose';
-import { buildMomentImageUrls, buildAvatarUrls } from '../../images/image-url';
+import { buildMomentImageUrls } from '../../images/image-url';
 import type { IImageAsset } from '../../images/image-asset.schema';
 import {
   buildSignedPlaybackUrl,
@@ -8,18 +8,21 @@ import {
 } from '../../stream/signed-token.service';
 import type { ICreatorMoment } from '../models/creator-moment.model';
 import type { ICreatorStory } from '../../stories/models/creator-story.model';
-import { Creator } from '../../creator/creator.model';
 import {
   type PresentationDTO,
   type CreatorSelfDTO,
   toFeedDTO,
   type FeedDTO,
 } from '../dto/moment.dto';
-import { hasMomentAccess, canViewDeletedMoment } from './entitlement.service';
-import { getMomentsConfig } from '../../../config/moments';
+import {
+  resolveMomentAccess,
+  canViewDeletedMoment,
+  type MomentAccessReason,
+} from './entitlement.service';
 import { isImageModerationPendingByDefault } from '../../../config/cloudflare';
 import type { ProcessingStatus } from '../../media-shared/types';
-import { resolveMomentPriceForUser } from '../../vip/vip-entitlement.service';
+import type { PreviewCreatorMeta } from './free-preview.service';
+import type { FeedSection } from './moments-feed.service';
 
 const PLACEHOLDER_THUMB =
   'https://imagedelivery.net/static/placeholder/moments/thumb';
@@ -28,20 +31,13 @@ export interface ViewerContext {
   userId: Types.ObjectId | null;
   isCreatorOwner?: boolean;
   followedCreatorIds?: Set<string>;
+  isStaffAdmin?: boolean;
 }
 
-async function resolveCreatorMeta(creatorId: Types.ObjectId) {
-  const creator = await Creator.findById(creatorId).lean();
-  if (!creator) {
-    return { name: 'Creator', avatarUrl: undefined as string | undefined };
-  }
-  const avatarUrl = creator.avatar?.imageId
-    ? buildAvatarUrls(creator.avatar.imageId).sm
-    : undefined;
-  return { name: creator.name, avatarUrl };
-}
-
-function thumbFromImageAsset(asset: IImageAsset | null | undefined, variant: 'blur' | 'feed' = 'feed'): string {
+function thumbFromImageAsset(
+  asset: IImageAsset | null | undefined,
+  variant: 'blur' | 'feed' = 'feed',
+): string {
   if (!asset?.imageId) return PLACEHOLDER_THUMB;
   const urls = buildMomentImageUrls(asset.imageId);
   return variant === 'blur' ? urls.blur : urls.feed;
@@ -50,12 +46,6 @@ function thumbFromImageAsset(asset: IImageAsset | null | undefined, variant: 'bl
 async function buildMomentMedia(
   moment: ICreatorMoment,
   locked: boolean,
-  pricing?: {
-    unlockPriceCoins?: number;
-    originalPriceCoins?: number;
-    vipFreeUnlockAvailable?: boolean;
-    discountApplied?: boolean;
-  },
 ): Promise<PresentationDTO['media']> {
   const processingStatus = moment.processingStatus;
   if (moment.type === 'photo') {
@@ -72,10 +62,6 @@ async function buildMomentMedia(
       playbackUrl,
       blurPlaceholder: moment.imageAsset?.blurhash ?? undefined,
       locked,
-      unlockPriceCoins: locked ? (pricing?.unlockPriceCoins ?? moment.priceCoins) : undefined,
-      originalPriceCoins: locked ? pricing?.originalPriceCoins : undefined,
-      vipFreeUnlockAvailable: locked ? pricing?.vipFreeUnlockAvailable : undefined,
-      discountApplied: locked ? pricing?.discountApplied : undefined,
       processingStatus,
     };
   }
@@ -86,9 +72,10 @@ async function buildMomentMedia(
     thumbnailUrl = thumbFromImageAsset(moment.thumbnailAsset, 'feed');
   } else if (videoId) {
     const signedThumb = await buildSignedThumbnailUrl(videoId, locked ? 400 : 600);
-    thumbnailUrl = moment.thumbnailValidated === false && moment.thumbnailFallbackUrl
-      ? moment.thumbnailFallbackUrl
-      : signedThumb;
+    thumbnailUrl =
+      moment.thumbnailValidated === false && moment.thumbnailFallbackUrl
+        ? moment.thumbnailFallbackUrl
+        : signedThumb;
   }
 
   let playbackUrl: string | undefined;
@@ -103,12 +90,9 @@ async function buildMomentMedia(
     thumbnailUrl,
     playbackUrl,
     expiresAtMs,
-    blurPlaceholder: moment.thumbnailAsset?.blurhash ?? moment.imageAsset?.blurhash ?? undefined,
+    blurPlaceholder:
+      moment.thumbnailAsset?.blurhash ?? moment.imageAsset?.blurhash ?? undefined,
     locked,
-    unlockPriceCoins: locked ? (pricing?.unlockPriceCoins ?? moment.priceCoins) : undefined,
-    originalPriceCoins: locked ? pricing?.originalPriceCoins : undefined,
-    vipFreeUnlockAvailable: locked ? pricing?.vipFreeUnlockAvailable : undefined,
-    discountApplied: locked ? pricing?.discountApplied : undefined,
     processingStatus,
   };
 }
@@ -116,6 +100,11 @@ async function buildMomentMedia(
 export async function toMomentPresentationDTO(
   moment: ICreatorMoment,
   viewer: ViewerContext,
+  options?: {
+    section?: FeedSection;
+    creatorMeta?: PreviewCreatorMeta;
+    isPreviewMoment?: boolean;
+  },
 ): Promise<PresentationDTO | null> {
   if (moment.processingStatus !== 'ready' || moment.moderationStatus !== 'approved') {
     if (!viewer.isCreatorOwner) return null;
@@ -125,50 +114,33 @@ export async function toMomentPresentationDTO(
     return null;
   }
 
-  const entitled =
-    moment.accessType === 'free' ||
-    (viewer.userId ? await hasMomentAccess(viewer.userId, moment._id) : false) ||
-    (moment.isDeleted && viewer.userId
-      ? await canViewDeletedMoment(viewer.userId, moment._id)
-      : false);
+  const isPreviewMoment =
+    options?.isPreviewMoment ?? options?.section === 'preview';
 
-  const locked = moment.accessType === 'paid' && !entitled;
-  const meta = await resolveCreatorMeta(moment.creatorId);
+  const access = await resolveMomentAccess(viewer.userId, moment._id, {
+    isCreatorOwner: viewer.isCreatorOwner,
+    isPreviewMoment,
+    isStaffAdmin: viewer.isStaffAdmin,
+  });
 
-  let vipPricing:
-    | {
-        unlockPriceCoins: number;
-        originalPriceCoins: number;
-        vipFreeUnlockAvailable: boolean;
-        discountApplied: boolean;
-      }
-    | undefined;
-
-  if (locked && viewer.userId) {
-    const resolved = await resolveMomentPriceForUser(viewer.userId, moment.priceCoins);
-    vipPricing = {
-      unlockPriceCoins: resolved.priceCoins,
-      originalPriceCoins: resolved.originalPriceCoins,
-      vipFreeUnlockAvailable: resolved.vipFreeUnlockAvailable,
-      discountApplied: resolved.discountApplied,
-    };
-  }
+  const locked = !access.allowed;
+  const meta = options?.creatorMeta ?? {
+    id: moment.creatorId.toString(),
+    name: 'Creator',
+    verified: false,
+  };
 
   return {
     id: moment._id.toString(),
     creatorId: moment.creatorId.toString(),
     creatorName: meta.name,
     creatorAvatarUrl: meta.avatarUrl,
-    media: await buildMomentMedia(moment, locked, vipPricing),
+    media: await buildMomentMedia(moment, locked),
     caption: moment.caption ?? undefined,
     createdAt: moment.createdAt.toISOString(),
     locked,
-    unlockPriceCoins: locked
-      ? (vipPricing?.unlockPriceCoins ?? moment.priceCoins)
-      : undefined,
-    originalPriceCoins: locked ? vipPricing?.originalPriceCoins : undefined,
-    vipFreeUnlockAvailable: locked ? vipPricing?.vipFreeUnlockAvailable : undefined,
-    discountApplied: locked ? vipPricing?.discountApplied : undefined,
+    isPreview: access.reason === 'PREVIEW',
+    accessReason: access.reason,
     processingStatus: moment.processingStatus,
     isFollowing: viewer.followedCreatorIds?.has(moment.creatorId.toString()) ?? false,
   };
@@ -177,17 +149,40 @@ export async function toMomentPresentationDTO(
 export async function toMomentFeedDTO(
   moment: ICreatorMoment,
   viewer: ViewerContext,
+  options?: {
+    section?: FeedSection;
+    creatorMeta?: PreviewCreatorMeta;
+    isPreviewMoment?: boolean;
+  },
 ): Promise<FeedDTO | null> {
-  const presentation = await toMomentPresentationDTO(moment, viewer);
+  const presentation = await toMomentPresentationDTO(moment, viewer, options);
   if (!presentation) return null;
   return toFeedDTO(presentation);
+}
+
+export async function presentationFromFeedOrderingItem(
+  item: {
+    moment: ICreatorMoment;
+    section: FeedSection;
+    creatorMeta: PreviewCreatorMeta;
+  },
+  viewer: ViewerContext,
+): Promise<FeedDTO | null> {
+  return toMomentFeedDTO(item.moment, viewer, {
+    section: item.section,
+    creatorMeta: item.creatorMeta,
+    isPreviewMoment: item.section === 'preview',
+  });
 }
 
 export async function toCreatorSelfMomentDTO(
   moment: ICreatorMoment,
   viewer: ViewerContext,
 ): Promise<CreatorSelfDTO | null> {
-  const base = await toMomentPresentationDTO(moment, { ...viewer, isCreatorOwner: true });
+  const base = await toMomentPresentationDTO(moment, {
+    ...viewer,
+    isCreatorOwner: true,
+  });
   if (!base) return null;
   return {
     ...base,
@@ -196,18 +191,11 @@ export async function toCreatorSelfMomentDTO(
     moderationReason: moment.moderationReason ?? undefined,
     viewsCount: moment.viewsCount,
     purchaseCount: moment.purchaseCount,
-    accessType: moment.accessType,
   };
 }
 
 export function defaultModerationStatus(): 'pending' | 'approved' {
   return isImageModerationPendingByDefault() ? 'pending' : 'approved';
-}
-
-export function resolvePriceCoins(type: 'photo' | 'video', accessType: 'free' | 'paid'): number {
-  if (accessType === 'free') return 0;
-  const cfg = getMomentsConfig();
-  return type === 'photo' ? cfg.photoPriceCoins : cfg.videoPriceCoins;
 }
 
 export interface StoryPresentationDTO {
@@ -279,4 +267,4 @@ export async function toStoryPresentationDTO(
   };
 }
 
-// Re-export gallery urls helper used above — buildMomentImageUrls added in image-url.ts
+export type { MomentAccessReason };

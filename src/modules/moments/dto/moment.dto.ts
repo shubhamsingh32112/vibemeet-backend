@@ -1,4 +1,5 @@
 import type { ProcessingStatus } from '../../media-shared/types';
+import type { MomentAccessReason } from '../services/entitlement.service';
 
 export interface MediaPresentation {
   mediaType: 'image' | 'video';
@@ -8,10 +9,6 @@ export interface MediaPresentation {
   expiresAtMs?: number;
   blurPlaceholder?: string;
   locked: boolean;
-  unlockPriceCoins?: number;
-  originalPriceCoins?: number;
-  vipFreeUnlockAvailable?: boolean;
-  discountApplied?: boolean;
   processingStatus: ProcessingStatus;
 }
 
@@ -24,10 +21,8 @@ export interface PresentationDTO {
   caption?: string;
   createdAt: string;
   locked: boolean;
-  unlockPriceCoins?: number;
-  originalPriceCoins?: number;
-  vipFreeUnlockAvailable?: boolean;
-  discountApplied?: boolean;
+  isPreview: boolean;
+  accessReason: MomentAccessReason;
   isFollowing?: boolean;
   processingStatus?: ProcessingStatus;
   moderationStatus?: string;
@@ -43,7 +38,8 @@ export const FEED_DTO_KEYS = [
   'caption',
   'createdAt',
   'locked',
-  'unlockPriceCoins',
+  'isPreview',
+  'accessReason',
   'isFollowing',
 ] as const;
 
@@ -55,8 +51,23 @@ export type CreatorSelfDTO = PresentationDTO & {
   moderationReason?: string;
   viewsCount: number;
   purchaseCount: number;
-  accessType: 'free' | 'paid';
 };
+
+export interface MomentsFeedSections {
+  /**
+   * v1: count of items in the admin-curated preview section (indices [0, previewEndIndex)).
+   * v2 target: `preview: { start: 0, end: 3 }` plus featured/recommended/ads ranges.
+   */
+  previewEndIndex: number;
+}
+
+export interface MomentsFeedResponse {
+  items: FeedDTO[];
+  sections: MomentsFeedSections;
+  nextCursor?: string;
+  hasMore?: boolean;
+  nextOffset?: number;
+}
 
 export function toFeedDTO(presentation: PresentationDTO): FeedDTO {
   const out: Record<string, unknown> = {};

@@ -94,6 +94,15 @@ import {
   rejectMomentModerationHandler,
 } from './admin-moment-moderation.controller';
 import {
+  getMomentsAdminConfigHandler,
+  listFreePreviewsHandler,
+  reorderFreePreviewsHandler,
+  addFreePreviewHandler,
+  removeFreePreviewHandler,
+  patchFreePreviewHandler,
+  browseMomentsForAdminHandler,
+} from './admin-moments-free-preview.controller';
+import {
   getAdminVipPlan,
   getAdminVipStats,
   grantAdminVipMembership,
@@ -264,6 +273,14 @@ router.get('/moments/moderation/escalated', listEscalatedMomentsModerationHandle
 router.post('/moments/moderation/approve', approveMomentModerationHandler);
 router.post('/moments/moderation/reject', rejectMomentModerationHandler);
 router.post('/moments/moderation/escalate', escalateMomentModerationHandler);
+
+router.get('/moments/config', getMomentsAdminConfigHandler);
+router.get('/moments/free-previews', listFreePreviewsHandler);
+router.put('/moments/free-previews/reorder', reorderFreePreviewsHandler);
+router.post('/moments/free-previews', addFreePreviewHandler);
+router.delete('/moments/free-previews/:momentId', removeFreePreviewHandler);
+router.patch('/moments/free-previews/:momentId', patchFreePreviewHandler);
+router.get('/moments/browse', browseMomentsForAdminHandler);
 
 router.get('/vip/plan', getAdminVipPlan);
 router.get('/vip/plans', listAdminVipPlans);

@@ -80,7 +80,6 @@ export async function regrantMomentEntitlement(input: {
 
   const moment = await CreatorMoment.findById(momentObjectId);
   if (!moment || moment.isDeleted) throw new Error('Moment not found');
-  if (moment.accessType !== 'paid') throw new Error('Moment is not paid content');
 
   const buyer = await User.findById(userObjectId);
   if (!buyer) throw new Error('User not found');
@@ -95,7 +94,7 @@ export async function regrantMomentEntitlement(input: {
   }
 
   const txnId = `admin_regrant_${input.momentId}_${input.userId}_${randomUUID()}`;
-  const gross = moment.priceCoins;
+  const gross = existing?.amountCoins ?? 0;
   const creatorShare = Math.floor(gross * cfg.creatorRevenueShare);
   const platformShare = gross - creatorShare;
 
@@ -202,10 +201,7 @@ export async function regrantMomentEntitlement(input: {
           { session },
         );
         purchaseId = purchaseObjectId.toString();
-        if (!input.skipLedger) {
-          moment.purchaseCount += 1;
-          await moment.save({ session });
-        }
+        // purchaseCount is legacy — do not increment on regrant (subscription model).
       }
     });
 

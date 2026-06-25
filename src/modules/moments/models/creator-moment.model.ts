@@ -26,8 +26,6 @@ export interface ICreatorMoment extends Document {
   moderationReason?: string | null;
   moderatedAt?: Date | null;
   visibilityState: VisibilityState;
-  accessType: 'free' | 'paid';
-  priceCoins: number;
   feedScore: number;
   engagementScore: number;
   mediaVersion: number;
@@ -36,6 +34,10 @@ export interface ICreatorMoment extends Document {
   thumbnailFallbackUrl?: string | null;
   thumbnailValidated?: boolean;
   viewsCount: number;
+  /**
+   * @deprecated Historical coin-purchase data only. Do not increment in new code.
+   * UI should stop displaying this; analytics should use Premium metrics.
+   */
   purchaseCount: number;
   isDeleted: boolean;
   createdAt: Date;
@@ -69,8 +71,6 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
       enum: VISIBILITY_STATES,
       default: 'public',
     },
-    accessType: { type: String, enum: ['free', 'paid'], default: 'free' },
-    priceCoins: { type: Number, default: 0, min: 0 },
     feedScore: { type: Number, default: () => Date.now(), index: true },
     engagementScore: { type: Number, default: 0, index: true },
     mediaVersion: { type: Number, default: 1, min: 1 },
@@ -83,6 +83,7 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
     thumbnailFallbackUrl: { type: String, default: null },
     thumbnailValidated: { type: Boolean, default: false },
     viewsCount: { type: Number, default: 0, min: 0 },
+    /** @deprecated Historical data only — no new writes */
     purchaseCount: { type: Number, default: 0, min: 0 },
     isDeleted: { type: Boolean, default: false, index: true },
   },

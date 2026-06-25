@@ -6,17 +6,24 @@ import { CreatorMoment } from '../models/creator-moment.model';
 import { logWarning } from '../../../utils/logger';
 import { bumpStreamCounter, recordStreamMetric } from '../../stream/stream-metrics';
 import {
-  toMomentFeedDTO,
+  presentationFromFeedOrderingItem,
 } from './moment-presentation.service';
 import { loadFollowedCreatorIds } from './follow-context.service';
+import { buildFollowingFeedOrdering } from './moments-feed.service';
+import { applyAudienceToFeedOrdering } from './feed-audience.service';
 
 const FOLLOWING_PREFIX = 'feed:following:';
 const FANOUT_QUEUE_KEY = 'moments:fanout:queue';
 const FANOUT_DLQ_KEY = 'moments:fanout:dead_letter';
 const WARM_QUEUE_KEY = 'moments:feed:warm:queue';
 
-export function followingWarmCacheKey(userId: string, offset: number, limit: number): string {
-  return `moments:following:warm:${userId}:${offset}:${limit}`;
+export function followingWarmCacheKey(
+  userId: string,
+  isPremium: boolean,
+  offset: number,
+  limit: number,
+): string {
+  return `moments:following:warm:${userId}:${isPremium ? 'p' : 'n'}:${offset}:${limit}`;
 }
 
 /** Phase 2: populate on upload/follow. Phase 1: stub with cache helpers. */
@@ -79,6 +86,14 @@ export async function bustPopularFeedCacheForUser(userId: string): Promise<void>
 
 export async function bustFollowingWarmCacheForUser(userId: string): Promise<void> {
   await deleteKeysByPattern(`moments:following:warm:${userId}:*`);
+}
+
+export async function bustAllPopularFeedCaches(): Promise<void> {
+  await deleteKeysByPattern('moments:feed:*');
+}
+
+export async function bustAllFollowingWarmCaches(): Promise<void> {
+  await deleteKeysByPattern('moments:following:warm:*');
 }
 
 export async function removeMomentFromFollowerFeeds(
@@ -286,34 +301,44 @@ async function warmFollowingFeedForCreator(creatorId: string): Promise<void> {
     .select('followerUserId')
     .lean();
 
+  const limit = 20;
+  const offset = 0;
+
   for (const f of followers) {
     const userId = f.followerUserId;
+    const userIdStr = userId.toString();
     const followedCreatorIds = await loadFollowedCreatorIds(userId);
+    const cachedIds = await getFollowingFeedFromCache(userIdStr, offset, limit);
+    if (!cachedIds?.length) continue;
+
     const viewer = { userId, followedCreatorIds };
-    const limit = 20;
-    const offset = 0;
-    const cachedIds = await getFollowingFeedFromCache(userId.toString(), offset, limit);
-    let moments;
-    if (cachedIds) {
-      moments = await CreatorMoment.find({
-        _id: { $in: cachedIds },
-        isDeleted: false,
-        processingStatus: 'ready',
-        moderationStatus: 'approved',
-      });
-      moments = orderMomentsByIds(moments, cachedIds);
-    } else {
-      continue;
-    }
-    const items = (
-      await Promise.all(moments.map((m) => toMomentFeedDTO(m, viewer)))
-    ).filter(Boolean);
-    const payload = JSON.stringify({
-      success: true,
-      data: { items, hasMore: items.length >= limit, nextOffset: items.length },
+
+    const baseOrdering = await buildFollowingFeedOrdering({
+      userId,
+      limit,
+      offset,
+      cachedIds,
     });
-    const cacheKey = followingWarmCacheKey(userId.toString(), offset, limit);
-    await cacheFeedResponse(cacheKey, payload);
+
+    for (const isPremium of [false, true]) {
+      const ordering = applyAudienceToFeedOrdering(baseOrdering, isPremium);
+      const items = (
+        await Promise.all(
+          ordering.moments.map((item) => presentationFromFeedOrderingItem(item, viewer)),
+        )
+      ).filter(Boolean);
+      const payload = JSON.stringify({
+        success: true,
+        data: {
+          items,
+          sections: ordering.sections,
+          hasMore: ordering.hasMore,
+          nextOffset: ordering.nextOffset,
+        },
+      });
+      const cacheKey = followingWarmCacheKey(userIdStr, isPremium, offset, limit);
+      await cacheFeedResponse(cacheKey, payload);
+    }
     recordStreamMetric('feed.warm.ok', 1, { creatorId });
   }
 }

@@ -38,7 +38,7 @@ export async function listPendingMomentsModerationHandler(
       CreatorMoment.find({ moderationStatus: 'pending', isDeleted: false })
         .sort({ createdAt: -1 })
         .limit(limit)
-        .select('_id creatorId type accessType caption createdAt moderationStatus processingStatus')
+        .select('_id creatorId type caption createdAt moderationStatus processingStatus')
         .lean(),
       CreatorStory.find({ moderationStatus: 'pending', isDeleted: false })
         .sort({ createdAt: -1 })
@@ -95,7 +95,7 @@ export async function listEscalatedMomentsModerationHandler(
         .sort({ createdAt: -1 })
         .limit(limit)
         .select(
-          '_id creatorId type accessType caption createdAt moderationStatus moderationReason processingStatus',
+          '_id creatorId type caption createdAt moderationStatus moderationReason processingStatus',
         )
         .lean(),
       CreatorStory.find({

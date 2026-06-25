@@ -4,6 +4,7 @@ import { CoinTransaction } from '../user/coin-transaction.model';
 import { MomentsPremiumMembership } from './models/moments-premium-membership.model';
 import { getMomentsPremiumPlanById } from './models/moments-premium-plan-config.model';
 import { invalidateMomentsPremiumCache } from './moments-premium-entitlement.service';
+import { bustFollowingWarmCacheForUser } from '../moments/services/feed-fanout.service';
 
 export interface FinalizeMomentsPremiumPurchaseInput {
   userId: string;
@@ -136,6 +137,7 @@ export async function finalizeMomentsPremiumPurchaseAtomically(
   if (!result) throw new Error('MOMENTS_PREMIUM_PURCHASE_FINALIZATION_FAILED');
 
   await invalidateMomentsPremiumCache(input.userId);
+  await bustFollowingWarmCacheForUser(input.userId);
   return result;
 }
 

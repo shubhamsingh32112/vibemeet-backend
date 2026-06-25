@@ -17,6 +17,7 @@ import {
   getCreatorSummaryHandler,
   getMyMomentsHandler,
   recordMomentViewHandler,
+  recordMomentsPaywallShownHandler,
 } from '../controllers/moments.controller';
 
 const router = Router();
@@ -28,6 +29,7 @@ router.get('/creator/me/analytics', verifyFirebaseToken, getCreatorAnalyticsHand
 router.get('/creator/me', verifyFirebaseToken, getMyMomentsHandler);
 router.get('/creator/:creatorId', verifyFirebaseToken, getCreatorMomentsHandler);
 router.get('/following/list', verifyFirebaseToken, getFollowingListHandler);
+router.post('/analytics/paywall-shown', verifyFirebaseToken, recordMomentsPaywallShownHandler);
 router.get('/creators/:creatorId/summary', verifyFirebaseToken, getCreatorSummaryHandler);
 router.post('/creators/:creatorId/follow', verifyFirebaseToken, followCreatorHandler);
 router.delete('/creators/:creatorId/follow', verifyFirebaseToken, unfollowCreatorHandler);

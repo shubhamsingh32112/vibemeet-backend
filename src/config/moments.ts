@@ -45,6 +45,8 @@ export interface MomentsConfig {
   feedWarmerFollowerThreshold: number;
   feedWarmerTopFollowers: number;
   followingFeedCacheTtlSec: number;
+  /** Max admin-curated preview moments shown to non-premium users. */
+  freePreviewLimit: number;
 }
 
 let cached: MomentsConfig | null = null;
@@ -84,6 +86,7 @@ export function getMomentsConfig(): MomentsConfig {
     feedWarmerFollowerThreshold: readIntEnv('MOMENTS_FEED_WARMER_FOLLOWER_THRESHOLD', 1000),
     feedWarmerTopFollowers: readIntEnv('MOMENTS_FEED_WARMER_TOP_FOLLOWERS', 50),
     followingFeedCacheTtlSec: readIntEnv('MOMENTS_FOLLOWING_FEED_CACHE_TTL_SEC', 7 * 24 * 3600),
+    freePreviewLimit: readIntEnv('MOMENTS_FREE_PREVIEW_LIMIT', 12),
   };
   return cached;
 }

@@ -6,6 +6,7 @@ export type AnalyticsEventType =
   | 'moment_viewed'
   | 'moment_completed'
   | 'moment_purchased'
+  | 'moments_paywall_shown'
   | 'creator_followed'
   | 'creator_unfollowed';
 

@@ -2,8 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { followingWarmCacheKey, orderMomentsByIds } from '../feed-fanout.service';
 
-test('followingWarmCacheKey matches handler and warmer format', () => {
-  assert.equal(followingWarmCacheKey('user123', 0, 20), 'moments:following:warm:user123:0:20');
+test('followingWarmCacheKey includes premium tier', () => {
+  assert.equal(
+    followingWarmCacheKey('user123', false, 0, 20),
+    'moments:following:warm:user123:n:0:20',
+  );
+  assert.equal(
+    followingWarmCacheKey('user123', true, 0, 20),
+    'moments:following:warm:user123:p:0:20',
+  );
 });
 
 test('orderMomentsByIds preserves cache order', () => {
