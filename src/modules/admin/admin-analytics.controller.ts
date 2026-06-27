@@ -8,6 +8,7 @@ import {
   financePayoutsSummaryPayload,
   financeSettlementsPayload,
   momentsPaidUsersPayload,
+  momentsPremiumUsersPayload,
   revenueSummaryPayload,
   usersSummaryPayload,
   usersLoginSeriesPayload,
@@ -90,6 +91,18 @@ export const getMomentsPaidUsers = async (req: Request, res: Response): Promise<
     res.json({ success: true, data });
   } catch (error) {
     logError('getMomentsPaidUsers', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getMomentsPremiumUsers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { page, limit } = parsePageLimit(req);
+    const data = await momentsPremiumUsersPayload(page, limit);
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getMomentsPremiumUsers', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

@@ -30,8 +30,9 @@ import {
   removeMomentFromFollowerFeeds,
   bustPopularFeedCacheForUser,
   bustFollowingWarmCacheForUser,
+  popularFeedCacheKey,
 } from '../services/feed-fanout.service';
-import { logError } from '../../../utils/logger';
+import { logError, logWarning } from '../../../utils/logger';
 import { emitMomentUploaded, emitCreatorFollowed } from '../moments.gateway';
 import {
   getPlaybackTokenExpiresAtMs,
@@ -51,7 +52,7 @@ import {
   buildFollowingFeedOrdering,
 } from '../services/moments-feed.service';
 import { applyAudienceToFeedOrdering } from '../services/feed-audience.service';
-import { resolveMomentAccess } from '../services/entitlement.service';
+import { resolveMomentAccess, isCreatorOrAdminRole } from '../services/entitlement.service';
 import { isPreviewMoment } from '../services/free-preview.service';
 
 async function resolveUser(req: Request) {
@@ -61,6 +62,29 @@ async function resolveUser(req: Request) {
 
 async function resolveCreator(userId: mongoose.Types.ObjectId) {
   return Creator.findOne({ userId });
+}
+
+async function resolvePremiumFeedTier(
+  user: InstanceType<typeof User> | null,
+): Promise<boolean> {
+  if (!user) return false;
+  return (
+    isCreatorOrAdminRole(user.role) ||
+    (await isMomentsPremiumActive(user._id.toString()))
+  );
+}
+
+function buildMomentsViewer(
+  user: InstanceType<typeof User> | null | undefined,
+  followedCreatorIds: Set<string>,
+  isCreatorOwner?: boolean,
+) {
+  return {
+    userId: user?._id ?? null,
+    followedCreatorIds,
+    isCreatorOwner,
+    isCreatorRole: user ? isCreatorOrAdminRole(user.role) : false,
+  };
 }
 
 async function isUserOwnerOfCreator(
@@ -262,12 +286,17 @@ export async function getMomentsFeedHandler(req: Request, res: Response): Promis
     assertMomentsEnabled();
     const user = await resolveUser(req);
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
-    const viewer = { userId: user?._id ?? null, followedCreatorIds };
+    const viewer = buildMomentsViewer(user, followedCreatorIds);
     const limit = Math.min(Number(req.query.limit) || 20, 50);
     const cursor = req.query.cursor as string | undefined;
-    const isPremium = user ? await isMomentsPremiumActive(user._id.toString()) : false;
+    const isPremium = await resolvePremiumFeedTier(user);
 
-    const cacheKey = `moments:feed:${user?._id || 'anon'}:${isPremium ? 'p' : 'n'}:${cursor || '0'}:${limit}`;
+    const cacheKey = popularFeedCacheKey(
+      user?._id?.toString() || 'anon',
+      isPremium,
+      cursor || '0',
+      limit,
+    );
     const cached = await getCachedFeedResponse(cacheKey);
     if (cached) {
       res.json(JSON.parse(cached));
@@ -312,8 +341,8 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
     const limit = Math.min(Number(req.query.limit) || 20, 50);
     const offset = Number(req.query.offset) || 0;
     const followedCreatorIds = await loadFollowedCreatorIds(user._id);
-    const viewer = { userId: user._id, followedCreatorIds };
-    const isPremium = await isMomentsPremiumActive(user._id.toString());
+    const viewer = buildMomentsViewer(user, followedCreatorIds);
+    const isPremium = await resolvePremiumFeedTier(user);
 
     const warmKey = followingWarmCacheKey(user._id.toString(), isPremium, offset, limit);
     const warmCached = await getCachedFeedResponse(warmKey);
@@ -405,6 +434,7 @@ export async function recordMomentViewHandler(req: Request, res: Response): Prom
     const access = await resolveMomentAccess(user._id, moment._id, {
       isPreviewMoment: preview,
       isCreatorOwner,
+      isCreatorRole: isCreatorOrAdminRole(user.role),
     });
     const viewsCount = await recordUniqueMomentView(
       user._id,
@@ -433,7 +463,7 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
     const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
     const dto = await toMomentPresentationDTO(
       moment,
-      { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner },
+      buildMomentsViewer(user, followedCreatorIds, isCreatorOwner),
       { isPreviewMoment: preview },
     );
     if (!dto) {
@@ -515,7 +545,7 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
       .limit(60);
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
     const isCreatorOwner = await isUserOwnerOfCreator(user?._id, creator._id);
-    const viewer = { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner };
+    const viewer = buildMomentsViewer(user, followedCreatorIds, isCreatorOwner);
     const items = (
       await Promise.all(
         moments.map(async (m) => {
@@ -741,6 +771,14 @@ export async function getFollowingCreatorProfilesHandler(
       .map((id) => creatorById.get(id))
       .filter((creator): creator is NonNullable<typeof creator> => Boolean(creator));
 
+    const missingCreatorIds = pagedIds.filter((id) => !creatorById.has(id));
+    if (missingCreatorIds.length > 0) {
+      logWarning('Following list has orphaned creator follows', {
+        userId: user._id.toString(),
+        missingCreatorIds,
+      });
+    }
+
     const userIds = orderedCreators
       .map((creator) => creator.userId)
       .filter((id): id is mongoose.Types.ObjectId => Boolean(id));
@@ -827,7 +865,7 @@ export async function refreshPlaybackHandler(req: Request, res: Response): Promi
     const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
     const dto = await toMomentPresentationDTO(
       moment,
-      { userId: user?._id ?? null, followedCreatorIds, isCreatorOwner },
+      buildMomentsViewer(user, followedCreatorIds, isCreatorOwner),
       { isPreviewMoment: preview },
     );
     if (!dto?.media.playbackUrl) {

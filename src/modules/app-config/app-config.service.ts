@@ -1,5 +1,5 @@
 import { featureFlags } from '../../config/feature-flags';
-import { isMomentsEnabled } from '../../config/moments';
+import { getMomentsAccessMode, isMomentsEnabled } from '../../config/moments';
 import {
   getFreeCallDurationSeconds,
   getWelcomeIntroCallCreditsGrant,
@@ -11,6 +11,7 @@ export interface PublicAppConfig {
   features: {
     vipEnabled: boolean;
     momentsEnabled: boolean;
+    momentsAccessMode: 'free' | 'paid';
   };
   pricing: {
     freeCallEnabled: boolean;
@@ -25,6 +26,7 @@ export function getPublicAppConfig(): PublicAppConfig {
     features: {
       vipEnabled: featureFlags.vipEnabled,
       momentsEnabled: isMomentsEnabled(),
+      momentsAccessMode: getMomentsAccessMode(),
     },
     pricing: {
       freeCallEnabled: isFreeCallEnabled(),

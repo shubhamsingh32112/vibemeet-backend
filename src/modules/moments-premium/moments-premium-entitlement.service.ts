@@ -1,6 +1,7 @@
 import type { Types } from 'mongoose';
 import { getRedis } from '../../config/redis';
 import { isMomentsEnabled } from '../../config/moments';
+import { User } from '../user/user.model';
 import { MomentsPremiumMembership } from './models/moments-premium-membership.model';
 
 const CACHE_PREFIX = 'moments_premium:active:';
@@ -32,6 +33,38 @@ export async function invalidateMomentsPremiumCache(userId: string): Promise<voi
   await redis.del(`${CACHE_PREFIX}${userId}`).catch(() => {});
 }
 
+async function normalizeExpiredMembership(
+  userId: Types.ObjectId | string,
+  membership: {
+    _id: Types.ObjectId;
+    status: string;
+    expiresAt: Date;
+  },
+): Promise<void> {
+  const userIdStr = userId.toString();
+  await MomentsPremiumMembership.updateOne(
+    { _id: membership._id },
+    { $set: { status: 'expired' } },
+  );
+  await User.updateOne({ _id: userId }, { $set: { momentsPremiumExpiresAt: null } });
+  await invalidateMomentsPremiumCache(userIdStr);
+}
+
+async function loadMembershipWithExpiryNormalization(
+  userId: Types.ObjectId | string,
+): Promise<InstanceType<typeof MomentsPremiumMembership> | null> {
+  const membership = await MomentsPremiumMembership.findOne({ userId });
+  if (!membership) return null;
+
+  const now = Date.now();
+  if (membership.status === 'active' && membership.expiresAt.getTime() <= now) {
+    await normalizeExpiredMembership(userId, membership);
+    membership.status = 'expired';
+  }
+
+  return membership;
+}
+
 export async function isMomentsPremiumActive(
   userId: Types.ObjectId | string,
 ): Promise<boolean> {
@@ -42,7 +75,7 @@ export async function isMomentsPremiumActive(
   const cached = await redis.get(`${CACHE_PREFIX}${userIdStr}`);
   if (cached === '1') return true;
 
-  const membership = await MomentsPremiumMembership.findOne({ userId: userIdStr }).lean();
+  const membership = await loadMembershipWithExpiryNormalization(userId);
   if (!membership) {
     await cacheActive(userIdStr, false, null);
     return false;
@@ -68,7 +101,7 @@ export async function getMomentsPremiumStatus(
     };
   }
 
-  const membership = await MomentsPremiumMembership.findOne({ userId }).lean();
+  const membership = await loadMembershipWithExpiryNormalization(userId);
   if (!membership) {
     return {
       active: false,

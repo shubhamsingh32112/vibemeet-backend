@@ -1,3 +1,4 @@
+import { isMomentsFreeAccessMode } from '../../../config/moments';
 import type { FeedOrderingResult } from './moments-feed.service';
 
 /**
@@ -9,7 +10,7 @@ export function applyAudienceToFeedOrdering(
   ordering: FeedOrderingResult,
   isPremium: boolean,
 ): FeedOrderingResult {
-  if (!isPremium) return ordering;
+  if (!isPremium && !isMomentsFreeAccessMode()) return ordering;
   return {
     ...ordering,
     moments: ordering.moments.filter((m) => m.section !== 'preview'),

@@ -10,6 +10,7 @@ import { StaffWalletLedger } from '../billing/staff-wallet-ledger.model';
 import { Withdrawal } from '../creator/withdrawal.model';
 import { MomentPurchase } from '../moments/models/moment-purchase.model';
 import { VipMembership } from '../vip/models/vip-membership.model';
+import { MomentsPremiumMembership } from '../moments-premium/models/moments-premium-membership.model';
 import { isBdRole, isAgencyRole } from '../../utils/staff-roles';
 import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRedis } from '../../config/redis';
@@ -411,6 +412,112 @@ export async function momentsPaidUsersPayload(page: number, limit: number) {
       total: totalAgg[0]?.total ?? 0,
       totalPages: Math.ceil((totalAgg[0]?.total ?? 0) / lim),
     },
+  };
+}
+
+function effectiveMomentsPremiumStatus(
+  membership: { status: string; expiresAt: Date },
+  now: Date,
+): 'active' | 'expired' | 'cancelled' {
+  if (membership.status === 'cancelled') return 'cancelled';
+  if (membership.status === 'active' && membership.expiresAt.getTime() > now.getTime()) {
+    return 'active';
+  }
+  return 'expired';
+}
+
+function computeMomentsPremiumDaysRemaining(expiresAt: Date, now: Date): number {
+  return Math.max(0, Math.ceil((expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+export async function momentsPremiumUsersPayload(page: number, limit: number) {
+  const lim = Math.min(100, Math.max(1, limit));
+  const skip = (page - 1) * lim;
+  const now = new Date();
+  const todayStart = utcStartOfDay(now);
+  const d7 = new Date(now.getTime() - 7 * 86400000);
+  const d30 = new Date(now.getTime() - 30 * 86400000);
+
+  const [activeCount, newToday, new7d, new30d, total, members] = await Promise.all([
+    MomentsPremiumMembership.countDocuments({ status: 'active', expiresAt: { $gt: now } }),
+    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: todayStart } }),
+    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d7 } }),
+    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d30 } }),
+    MomentsPremiumMembership.countDocuments({}),
+    MomentsPremiumMembership.find({})
+      .sort({ startedAt: -1 })
+      .skip(skip)
+      .limit(lim)
+      .lean(),
+  ]);
+
+  const userIds = members.map((m) => m.userId);
+  const [users, premiumTxns, revenueTxns] = await Promise.all([
+    userIds.length > 0
+      ? User.find({ _id: { $in: userIds } }).select('username email phone').lean()
+      : [],
+    CoinTransaction.find({
+      userId: { $in: userIds },
+      source: 'moments_premium_membership',
+      status: 'completed',
+    })
+      .select('userId priceInr description createdAt')
+      .sort({ createdAt: -1 })
+      .lean(),
+    CoinTransaction.find({
+      source: 'moments_premium_membership',
+      status: 'completed',
+      createdAt: { $gte: d30 },
+    })
+      .select('priceInr description')
+      .lean(),
+  ]);
+
+  const userById = new Map(users.map((u) => [u._id.toString(), u]));
+  const txnByUser = new Map<string, { priceInr: number; paidAt: Date }>();
+  for (const tx of premiumTxns) {
+    const uid = tx.userId.toString();
+    if (!txnByUser.has(uid)) {
+      txnByUser.set(uid, {
+        priceInr: tx.priceInr ?? parseInrFromPurchaseDescription(tx.description),
+        paidAt: tx.createdAt,
+      });
+    }
+  }
+
+  const revenueInr30d = revenueTxns.reduce(
+    (sum, tx) => sum + (tx.priceInr ?? parseInrFromPurchaseDescription(tx.description)),
+    0,
+  );
+
+  return {
+    summary: {
+      activeMembers: activeCount,
+      newPurchasesToday: newToday,
+      newPurchases7d: new7d,
+      newPurchases30d: new30d,
+      revenueInr30d,
+    },
+    rows: members.map((m, i) => {
+      const u = userById.get(m.userId.toString());
+      const txn = txnByUser.get(m.userId.toString());
+      const status = effectiveMomentsPremiumStatus(m, now);
+      const daysRemaining =
+        status === 'active' ? computeMomentsPremiumDaysRemaining(m.expiresAt, now) : 0;
+      return {
+        rank: skip + i + 1,
+        userId: m.userId.toString(),
+        username: u?.username || u?.email || u?.phone || 'Unknown',
+        status,
+        planId: m.planId,
+        daysRemaining,
+        startedAt: m.startedAt,
+        expiresAt: m.expiresAt,
+        priceInr: txn?.priceInr ?? 0,
+        paidAt: txn?.paidAt ?? m.startedAt,
+      };
+    }),
+    pagination: { page, limit: lim, total, totalPages: Math.ceil(total / lim) },
   };
 }
 

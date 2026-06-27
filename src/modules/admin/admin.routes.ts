@@ -134,6 +134,7 @@ import {
   getFinancePayoutsSummary,
   getFinanceSettlements,
   getMomentsPaidUsers,
+  getMomentsPremiumUsers,
   getRevenueAnalyticsSummary,
   getUsersSummary,
   getUsersLoginSeries,
@@ -163,6 +164,7 @@ router.get('/analytics/users/login-series', getUsersLoginSeries);
 router.get('/analytics/users/signup-series', getUsersSignupSeries);
 router.get('/analytics/coins/paid-users', getCoinsPaidUsers);
 router.get('/analytics/moments/paid-users', getMomentsPaidUsers);
+router.get('/analytics/moments/premium-users', getMomentsPremiumUsers);
 router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
 router.get('/wallet/transactions', getWalletTransactions);

@@ -10,13 +10,13 @@ npm run build
 # Pick a unique tag, e.g. upload-fix-20260620
 export BUILD_ID=DioUploadFix
 
-docker build -t app-backend:adminchanges  .
+docker build -t app-backend:momenstpaymentfix  .
 
-docker tag app-backend:adminchanges  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:adminchanges 
+docker tag app-backend:momenstpaymentfix  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:momenstpaymentfix 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:adminchanges 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:momenstpaymentfix 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.
@@ -102,3 +102,19 @@ BILLING_RECOVERY_EMPTY_CACHE_TTL_SECONDS=3
 2. Creator calls user: same billing behavior.
 3. Toggle **OFF**: fan cannot start call; creator auto-rejects incoming ring; webhook logs `call_rejected_creator_offline`.
 4. Toggle OFF through call end: creator stays offline in feed.
+
+## Moments access mode (`MOMENTS_ACCESS_MODE`)
+
+Set on the ECS task / backend `.env`:
+
+| Value | Behavior |
+|-------|----------|
+| `paid` (default) | Non-premium users see admin previews + locked feed; Moments Premium checkout enabled |
+| `free` | All authenticated users see unlocked moments; premium UI hidden |
+
+```env
+USE_MOMENTS=true
+MOMENTS_ACCESS_MODE=paid   # or free
+```
+
+After changing this value, redeploy the backend. Feed cache keys include `accessMode`, so stale locked/unlocked payloads should not persist across mode switches.

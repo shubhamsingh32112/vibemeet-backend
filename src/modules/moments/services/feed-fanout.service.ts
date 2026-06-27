@@ -1,8 +1,9 @@
 import mongoose from 'mongoose';
 import { getRedis, isRedisConfigured } from '../../../config/redis';
-import { getMomentsConfig } from '../../../config/moments';
+import { getMomentsConfig, getMomentsAccessMode } from '../../../config/moments';
 import { CreatorFollow } from '../models/creator-follow.model';
 import { CreatorMoment } from '../models/creator-moment.model';
+import { User } from '../../user/user.model';
 import { logWarning } from '../../../utils/logger';
 import { bumpStreamCounter, recordStreamMetric } from '../../stream/stream-metrics';
 import {
@@ -11,11 +12,23 @@ import {
 import { loadFollowedCreatorIds } from './follow-context.service';
 import { buildFollowingFeedOrdering } from './moments-feed.service';
 import { applyAudienceToFeedOrdering } from './feed-audience.service';
+import { isCreatorOrAdminRole } from './entitlement.service';
 
 const FOLLOWING_PREFIX = 'feed:following:';
 const FANOUT_QUEUE_KEY = 'moments:fanout:queue';
 const FANOUT_DLQ_KEY = 'moments:fanout:dead_letter';
 const WARM_QUEUE_KEY = 'moments:feed:warm:queue';
+
+export function popularFeedCacheKey(
+  userId: string,
+  isPremium: boolean,
+  cursor: string,
+  limit: number,
+): string {
+  const accessMode = getMomentsAccessMode();
+  const tier = accessMode === 'free' ? 'all' : isPremium ? 'p' : 'n';
+  return `moments:feed:${userId}:${accessMode}:${tier}:${cursor}:${limit}`;
+}
 
 export function followingWarmCacheKey(
   userId: string,
@@ -23,7 +36,9 @@ export function followingWarmCacheKey(
   offset: number,
   limit: number,
 ): string {
-  return `moments:following:warm:${userId}:${isPremium ? 'p' : 'n'}:${offset}:${limit}`;
+  const accessMode = getMomentsAccessMode();
+  const tier = accessMode === 'free' ? 'all' : isPremium ? 'p' : 'n';
+  return `moments:following:warm:${userId}:${accessMode}:${tier}:${offset}:${limit}`;
 }
 
 /** Phase 2: populate on upload/follow. Phase 1: stub with cache helpers. */
@@ -311,7 +326,12 @@ async function warmFollowingFeedForCreator(creatorId: string): Promise<void> {
     const cachedIds = await getFollowingFeedFromCache(userIdStr, offset, limit);
     if (!cachedIds?.length) continue;
 
-    const viewer = { userId, followedCreatorIds };
+    const userDoc = await User.findById(userId).select('role').lean();
+    const viewer = {
+      userId,
+      followedCreatorIds,
+      isCreatorRole: isCreatorOrAdminRole(userDoc?.role),
+    };
 
     const baseOrdering = await buildFollowingFeedOrdering({
       userId,

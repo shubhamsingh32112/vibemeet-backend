@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { getRazorpayInstance } from '../../config/razorpay';
 import { featureFlags } from '../../config/feature-flags';
-import { isMomentsEnabled } from '../../config/moments';
+import { isMomentsEnabled, isMomentsPaidAccessMode } from '../../config/moments';
 import { logError, logInfo } from '../../utils/logger';
 import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -135,14 +135,15 @@ export const getMomentsPremiumPlan = async (_req: Request, res: Response): Promi
   try {
     const plans = await getOrCreateMomentsPremiumPlans();
     const momentsEnabled = isMomentsEnabled();
+    const momentsPremiumEnabled = momentsEnabled && isMomentsPaidAccessMode();
     const planShapes = plans.map((plan) =>
-      buildMomentsPremiumPlanApiShape(plan, momentsEnabled),
+      buildMomentsPremiumPlanApiShape(plan, momentsPremiumEnabled),
     );
 
     res.json({
       success: true,
       data: {
-        momentsPremiumEnabled: momentsEnabled,
+        momentsPremiumEnabled,
         plans: planShapes,
       },
     });
@@ -183,8 +184,12 @@ export const initiateMomentsPremiumCheckout = async (
       res.status(401).json({ success: false, error: 'Unauthorized' });
       return;
     }
-    if (!isMomentsEnabled()) {
-      res.status(503).json({ success: false, error: 'Moments Premium is not available yet' });
+    if (!isMomentsEnabled() || !isMomentsPaidAccessMode()) {
+      res.status(503).json({
+        success: false,
+        error: 'Moments Premium is not available',
+        code: 'FEATURE_NOT_AVAILABLE',
+      });
       return;
     }
 
@@ -250,8 +255,12 @@ export const createMomentsPremiumWebOrder = async (
   res: Response,
 ): Promise<void> => {
   try {
-    if (!isMomentsEnabled()) {
-      res.status(503).json({ success: false, error: 'Moments Premium is not available yet' });
+    if (!isMomentsEnabled() || !isMomentsPaidAccessMode()) {
+      res.status(503).json({
+        success: false,
+        error: 'Moments Premium is not available',
+        code: 'FEATURE_NOT_AVAILABLE',
+      });
       return;
     }
 
@@ -341,8 +350,12 @@ export const verifyMomentsPremiumWebPayment = async (
   res: Response,
 ): Promise<void> => {
   try {
-    if (!isMomentsEnabled()) {
-      res.status(503).json({ success: false, error: 'Moments Premium is not available yet' });
+    if (!isMomentsEnabled() || !isMomentsPaidAccessMode()) {
+      res.status(503).json({
+        success: false,
+        error: 'Moments Premium is not available',
+        code: 'FEATURE_NOT_AVAILABLE',
+      });
       return;
     }
 
@@ -498,8 +511,12 @@ export const handleMomentsPremiumRazorpayWebhook = async (
   res: Response,
 ): Promise<void> => {
   try {
-    if (!isMomentsEnabled()) {
-      res.status(503).json({ success: false, error: 'Moments Premium is not available yet' });
+    if (!isMomentsEnabled() || !isMomentsPaidAccessMode()) {
+      res.status(503).json({
+        success: false,
+        error: 'Moments Premium is not available',
+        code: 'FEATURE_NOT_AVAILABLE',
+      });
       return;
     }
 

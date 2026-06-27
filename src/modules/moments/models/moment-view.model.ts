@@ -16,7 +16,7 @@ const momentViewSchema = new Schema<IMomentView>(
     viewedAt: { type: Date, default: () => new Date() },
     accessReason: {
       type: String,
-      enum: ['OWNER', 'PREMIUM', 'PREVIEW', 'ADMIN', 'DENIED'],
+      enum: ['OWNER', 'CREATOR', 'PREMIUM', 'PREVIEW', 'ADMIN', 'DENIED'],
       default: undefined,
     },
   },

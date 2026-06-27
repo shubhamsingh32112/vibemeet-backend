@@ -14,6 +14,7 @@ import {
   toFeedDTO,
   type FeedDTO,
 } from '../dto/moment.dto';
+import { isMomentsFreeAccessMode } from '../../../config/moments';
 import {
   resolveMomentAccess,
   canViewDeletedMoment,
@@ -36,6 +37,7 @@ export interface ViewerContext {
   isCreatorOwner?: boolean;
   followedCreatorIds?: Set<string>;
   isStaffAdmin?: boolean;
+  isCreatorRole?: boolean;
 }
 
 function thumbFromImageAsset(
@@ -121,13 +123,23 @@ export async function toMomentPresentationDTO(
   const isPreviewMoment =
     options?.isPreviewMoment ?? options?.section === 'preview';
 
-  const access = await resolveMomentAccess(viewer.userId, moment._id, {
-    isCreatorOwner: viewer.isCreatorOwner,
-    isPreviewMoment,
-    isStaffAdmin: viewer.isStaffAdmin,
-  });
+  let locked: boolean;
+  let accessReason: MomentAccessReason;
 
-  const locked = !access.allowed;
+  if (isMomentsFreeAccessMode()) {
+    const allowed = viewer.userId != null || viewer.isCreatorOwner === true;
+    locked = !allowed;
+    accessReason = allowed ? 'PREMIUM' : 'DENIED';
+  } else {
+    const access = await resolveMomentAccess(viewer.userId, moment._id, {
+      isCreatorOwner: viewer.isCreatorOwner,
+      isPreviewMoment,
+      isStaffAdmin: viewer.isStaffAdmin,
+      isCreatorRole: viewer.isCreatorRole,
+    });
+    locked = !access.allowed;
+    accessReason = access.reason;
+  }
   const meta = options?.creatorMeta ?? {
     id: moment.creatorId.toString(),
     name: 'Creator',
@@ -143,8 +155,8 @@ export async function toMomentPresentationDTO(
     caption: moment.caption ?? undefined,
     createdAt: toIsoString(moment.createdAt),
     locked,
-    isPreview: access.reason === 'PREVIEW',
-    accessReason: access.reason,
+    isPreview: accessReason === 'PREVIEW',
+    accessReason,
     processingStatus: moment.processingStatus,
     isFollowing: viewer.followedCreatorIds?.has(moment.creatorId.toString()) ?? false,
   };

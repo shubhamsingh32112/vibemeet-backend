@@ -2,7 +2,13 @@ import type { Types } from 'mongoose';
 import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 
-export type MomentAccessReason = 'OWNER' | 'PREMIUM' | 'PREVIEW' | 'ADMIN' | 'DENIED';
+export type MomentAccessReason =
+  | 'OWNER'
+  | 'CREATOR'
+  | 'PREMIUM'
+  | 'PREVIEW'
+  | 'ADMIN'
+  | 'DENIED';
 
 export interface MomentAccessResult {
   allowed: boolean;
@@ -13,6 +19,11 @@ export interface MomentAccessContext {
   isCreatorOwner?: boolean;
   isPreviewMoment?: boolean;
   isStaffAdmin?: boolean;
+  isCreatorRole?: boolean;
+}
+
+export function isCreatorOrAdminRole(role: string | undefined | null): boolean {
+  return role === 'creator' || role === 'admin';
 }
 
 export async function resolveMomentAccess(
@@ -25,6 +36,9 @@ export async function resolveMomentAccess(
   }
   if (context.isStaffAdmin) {
     return { allowed: true, reason: 'ADMIN' };
+  }
+  if (context.isCreatorRole) {
+    return { allowed: true, reason: 'CREATOR' };
   }
   if (!userId) {
     return { allowed: false, reason: 'DENIED' };

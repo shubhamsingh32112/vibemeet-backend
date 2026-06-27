@@ -16,11 +16,12 @@ function readIntEnv(key: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export type MomentsAccessMode = 'free' | 'paid';
+
 export interface MomentsConfig {
   enabled: boolean;
+  accessMode: MomentsAccessMode;
   creatorRevenueShare: number;
-  photoPriceCoins: number;
-  videoPriceCoins: number;
   photoUploadRewardCoins: number;
   videoUploadRewardCoins: number;
   entitlementVersion: number;
@@ -55,13 +56,25 @@ export function isMomentsEnabled(): boolean {
   return process.env.USE_MOMENTS === 'true';
 }
 
+export function getMomentsAccessMode(): MomentsAccessMode {
+  const raw = (process.env.MOMENTS_ACCESS_MODE || 'paid').trim().toLowerCase();
+  return raw === 'free' ? 'free' : 'paid';
+}
+
+export function isMomentsFreeAccessMode(): boolean {
+  return getMomentsAccessMode() === 'free';
+}
+
+export function isMomentsPaidAccessMode(): boolean {
+  return getMomentsAccessMode() === 'paid';
+}
+
 export function getMomentsConfig(): MomentsConfig {
   if (cached) return cached;
   cached = {
     enabled: isMomentsEnabled(),
+    accessMode: getMomentsAccessMode(),
     creatorRevenueShare: readNumberEnv('MOMENTS_CREATOR_REVENUE_SHARE', 0.5),
-    photoPriceCoins: readIntEnv('MOMENTS_PHOTO_PRICE_COINS', 10),
-    videoPriceCoins: readIntEnv('MOMENTS_VIDEO_PRICE_COINS', 30),
     photoUploadRewardCoins: readIntEnv('MOMENTS_PHOTO_UPLOAD_REWARD_COINS', 10),
     videoUploadRewardCoins: readIntEnv('MOMENTS_VIDEO_UPLOAD_REWARD_COINS', 30),
     entitlementVersion: readIntEnv('MOMENTS_ENTITLEMENT_VERSION', 1),

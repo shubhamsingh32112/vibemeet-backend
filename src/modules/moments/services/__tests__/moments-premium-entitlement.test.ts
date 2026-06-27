@@ -31,6 +31,20 @@ describe('isPreviewRowVisible', () => {
 });
 
 describe('resolveMomentAccess', () => {
+  test('CREATOR when creator role without subscription', async () => {
+    const result = await resolveMomentAccess('user1', 'moment1', {
+      isCreatorRole: true,
+    });
+    assert.deepEqual(result, { allowed: true, reason: 'CREATOR' });
+  });
+
+  test('ADMIN when staff admin', async () => {
+    const result = await resolveMomentAccess('user1', 'moment1', {
+      isStaffAdmin: true,
+    });
+    assert.deepEqual(result, { allowed: true, reason: 'ADMIN' });
+  });
+
   test('OWNER when creator owner', async () => {
     const result = await resolveMomentAccess('user1', 'moment1', {
       isCreatorOwner: true,
