@@ -16,6 +16,10 @@ import {
   updatePreviewSchedule,
   PreviewListVersionConflictError,
 } from '../moments/services/free-preview.service';
+import {
+  isMomentVisibilityTier,
+  type MomentVisibilityTier,
+} from '../moments/types/moment-visibility-tier';
 
 async function resolveAdminUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
@@ -73,6 +77,7 @@ export async function listFreePreviewsHandler(req: Request, res: Response): Prom
           viewsCount: p.moment.viewsCount,
           processingStatus: p.moment.processingStatus,
           moderationStatus: p.moment.moderationStatus,
+          visibilityTier: p.moment.visibilityTier ?? 'PUBLIC',
           createdAt: p.moment.createdAt,
           thumbnailUrl: momentThumbUrl(p.moment),
           creator: {
@@ -211,6 +216,7 @@ export async function browseMomentsForAdminHandler(
     const q = (req.query.q as string | undefined)?.trim();
     const type = req.query.type as 'photo' | 'video' | undefined;
     const hasPreview = req.query.hasPreview as 'yes' | 'no' | undefined;
+    const visibilityTier = req.query.visibilityTier as string | undefined;
 
     const query: Record<string, unknown> = {
       isDeleted: false,
@@ -218,6 +224,9 @@ export async function browseMomentsForAdminHandler(
       moderationStatus: 'approved',
     };
     if (type === 'photo' || type === 'video') query.type = type;
+    if (visibilityTier && isMomentVisibilityTier(visibilityTier)) {
+      query.visibilityTier = visibilityTier;
+    }
     if (cursor) {
       const cursorScore = Number(cursor);
       if (Number.isFinite(cursorScore)) {
@@ -256,6 +265,7 @@ export async function browseMomentsForAdminHandler(
         viewsCount: m.viewsCount,
         processingStatus: m.processingStatus,
         moderationStatus: m.moderationStatus,
+        visibilityTier: (m.visibilityTier ?? 'PUBLIC') as MomentVisibilityTier,
         createdAt: m.createdAt,
         thumbnailUrl: momentThumbUrl(m),
         inFreePreview: previewIdSet.has(m._id.toString()),
@@ -281,5 +291,46 @@ export async function browseMomentsForAdminHandler(
   } catch (error) {
     logError('Browse moments for admin failed', error);
     res.status(500).json({ success: false, error: 'Failed to browse moments' });
+  }
+}
+
+export async function patchMomentVisibilityTierHandler(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { momentId } = req.params;
+    const { visibilityTier } = req.body as { visibilityTier?: string };
+    if (!momentId || !mongoose.Types.ObjectId.isValid(momentId)) {
+      res.status(400).json({ success: false, error: 'Valid momentId required' });
+      return;
+    }
+    if (!visibilityTier || !isMomentVisibilityTier(visibilityTier)) {
+      res.status(400).json({
+        success: false,
+        error: `visibilityTier must be one of: PUBLIC, VIP`,
+      });
+      return;
+    }
+    const updated = await CreatorMoment.findOneAndUpdate(
+      { _id: momentId, isDeleted: false },
+      { $set: { visibilityTier } },
+      { new: true },
+    ).select('_id visibilityTier');
+    if (!updated) {
+      res.status(404).json({ success: false, error: 'Moment not found' });
+      return;
+    }
+    res.json({
+      success: true,
+      data: {
+        momentId: updated._id.toString(),
+        visibilityTier: updated.visibilityTier,
+      },
+    });
+  } catch (error) {
+    logError('Patch moment visibility tier failed', error);
+    res.status(500).json({ success: false, error: 'Failed to update visibility tier' });
   }
 }

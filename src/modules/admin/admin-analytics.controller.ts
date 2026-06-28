@@ -111,7 +111,10 @@ export const getVipPaidUsers = async (req: Request, res: Response): Promise<void
   try {
     if (!(await assertAdmin(req, res))) return;
     const { page, limit } = parsePageLimit(req);
-    const data = await vipPaidUsersPayload(page, limit);
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'all';
+    const statusFilter =
+      rawStatus === 'active' || rawStatus === 'expired' ? rawStatus : 'all';
+    const data = await vipPaidUsersPayload(page, limit, statusFilter);
     res.json({ success: true, data });
   } catch (error) {
     logError('getVipPaidUsers', error as Error);

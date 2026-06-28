@@ -99,5 +99,11 @@ export const featureFlags = {
   vipSchedulingEnabled: process.env.VIP_SCHEDULING_ENABLED === 'true',
   /** Enables VIP priority call queue when creator is busy (opt-in). */
   vipPriorityQueueEnabled: process.env.VIP_PRIORITY_QUEUE_ENABLED === 'true',
+  /** VIP recharge bonus coins (opt-in perk; membership still active when off). */
+  vipRechargeBonusEnabled: process.env.VIP_RECHARGE_BONUS_ENABLED === 'true',
+  /** VIP profile frame in client app-config (opt-in perk). */
+  vipProfileFrameEnabled: process.env.VIP_PROFILE_FRAME_ENABLED === 'true',
+  /** VIP priority support bump on tickets (opt-in perk). */
+  vipSupportEnabled: process.env.VIP_SUPPORT_ENABLED === 'true',
 };
 

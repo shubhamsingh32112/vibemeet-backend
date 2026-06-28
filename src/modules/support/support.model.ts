@@ -1,4 +1,8 @@
 import mongoose, { Schema, Document } from 'mongoose';
+import {
+  MEMBERSHIP_TIERS,
+  type MembershipTier,
+} from '../membership/membership-tier';
 
 export interface ISupportTicketAttachment {
   name: string;
@@ -37,6 +41,7 @@ export interface ISupportTicket extends Document {
   reportedCreatorName?: string;
   status: 'open' | 'in_progress' | 'resolved' | 'closed';
   priority: 'low' | 'medium' | 'high' | 'urgent';
+  submitterMembershipTier: MembershipTier;
   assignedAdminId?: mongoose.Types.ObjectId;
   adminNotes?: string;
   createdAt: Date;
@@ -154,6 +159,12 @@ const supportTicketSchema = new Schema<ISupportTicket>(
       type: String,
       enum: ['low', 'medium', 'high', 'urgent'],
       default: 'medium',
+      index: true,
+    },
+    submitterMembershipTier: {
+      type: String,
+      enum: MEMBERSHIP_TIERS,
+      default: 'NONE',
       index: true,
     },
     assignedAdminId: {

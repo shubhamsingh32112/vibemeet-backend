@@ -136,6 +136,7 @@ export async function toMomentPresentationDTO(
       isPreviewMoment,
       isStaffAdmin: viewer.isStaffAdmin,
       isCreatorRole: viewer.isCreatorRole,
+      visibilityTier: moment.visibilityTier ?? 'PUBLIC',
     });
     locked = !access.allowed;
     accessReason = access.reason;

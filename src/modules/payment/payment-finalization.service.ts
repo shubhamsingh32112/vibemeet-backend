@@ -17,16 +17,44 @@ export interface FinalizePaymentResult {
   coinsAdded: number;
 }
 
+const buildPendingTransactionId = (orderId: string) => `pay_${orderId}`;
+const buildPendingBonusTransactionId = (orderId: string) => `pay_bonus_${orderId}`;
+
+const getOrderTransactionSelectors = (orderId: string) => [
+  { transactionId: buildPendingTransactionId(orderId) },
+  { transactionId: `razorpay_${orderId}` },
+  { paymentGatewayOrderId: orderId },
+];
+
+async function completePendingTransaction(
+  tx: ICoinTransaction,
+  orderId: string,
+  paymentId: string,
+  session: mongoose.ClientSession,
+): Promise<ICoinTransaction | null> {
+  return CoinTransaction.findOneAndUpdate(
+    {
+      _id: tx._id,
+      status: { $ne: 'completed' },
+    },
+    {
+      $set: {
+        status: 'completed',
+        paymentGatewayTransactionId: paymentId,
+        paymentGatewayOrderId: orderId,
+        paymentGatewayProvider: 'razorpay',
+      },
+    },
+    { new: true, session },
+  );
+}
+
 export async function finalizePaymentAtomically(
   input: FinalizePaymentInput
 ): Promise<FinalizePaymentResult> {
   const { orderId, paymentId, expectedUserId } = input;
   const startedAt = Date.now();
-  const selectors = [
-    { transactionId: `pay_${orderId}` },
-    { transactionId: `razorpay_${orderId}` }, // backward compatibility with older rows
-    { paymentGatewayOrderId: orderId },
-  ];
+  const selectors = getOrderTransactionSelectors(orderId);
   const session = await mongoose.startSession();
 
   try {
@@ -48,20 +76,11 @@ export async function finalizePaymentAtomically(
         throw new Error('USER_NOT_FOUND');
       }
 
-      const updatedTx = await CoinTransaction.findOneAndUpdate(
-        {
-          _id: currentTx._id,
-          status: { $ne: 'completed' },
-        },
-        {
-          $set: {
-            status: 'completed',
-            paymentGatewayTransactionId: paymentId,
-            paymentGatewayOrderId: orderId,
-            paymentGatewayProvider: 'razorpay',
-          },
-        },
-        { new: true, session }
+      const updatedTx = await completePendingTransaction(
+        currentTx,
+        orderId,
+        paymentId,
+        session,
       );
 
       if (!updatedTx) {
@@ -69,6 +88,40 @@ export async function finalizePaymentAtomically(
         if (!alreadyCompleted) {
           throw new Error('TRANSACTION_NOT_FOUND');
         }
+
+        let bonusCoinsAdded = 0;
+        let updatedUserCoins = user.coins || 0;
+
+        const bonusTx = await CoinTransaction.findOne({
+          transactionId: buildPendingBonusTransactionId(orderId),
+        }).session(session);
+
+        if (bonusTx && bonusTx.status !== 'completed') {
+          const completedBonus = await completePendingTransaction(
+            bonusTx,
+            orderId,
+            paymentId,
+            session,
+          );
+          if (completedBonus) {
+            bonusCoinsAdded = completedBonus.coins;
+            const userUpdate = await User.findByIdAndUpdate(
+              user._id,
+              { $inc: { coins: bonusCoinsAdded } },
+              { new: true, session },
+            );
+            if (!userUpdate) {
+              throw new Error('USER_NOT_FOUND');
+            }
+            updatedUserCoins = userUpdate.coins || 0;
+            logInfo('Payment bonus finalized on idempotent retry', {
+              orderId,
+              paymentId,
+              bonusCoins: bonusCoinsAdded,
+            });
+          }
+        }
+
         recordPaymentMetric('finalize.already_completed', 1);
         recordPaymentMetric('finalize.duration_ms', Date.now() - startedAt, {
           status: 'already_completed',
@@ -77,20 +130,39 @@ export async function finalizePaymentAtomically(
           orderId,
           paymentId,
           transactionId: alreadyCompleted._id.toString(),
+          bonusCoinsAdded,
         });
         result = {
           status: 'already_completed',
           transaction: alreadyCompleted,
-          updatedUserCoins: user.coins || 0,
-          coinsAdded: 0,
+          updatedUserCoins,
+          coinsAdded: bonusCoinsAdded,
         };
         return;
+      }
+
+      let totalCoinsAdded = updatedTx.coins;
+
+      const bonusTx = await CoinTransaction.findOne({
+        transactionId: buildPendingBonusTransactionId(orderId),
+      }).session(session);
+
+      if (bonusTx && bonusTx.status !== 'completed') {
+        const completedBonus = await completePendingTransaction(
+          bonusTx,
+          orderId,
+          paymentId,
+          session,
+        );
+        if (completedBonus) {
+          totalCoinsAdded += completedBonus.coins;
+        }
       }
 
       const userUpdate = await User.findByIdAndUpdate(
         user._id,
         {
-          $inc: { coins: updatedTx.coins },
+          $inc: { coins: totalCoinsAdded },
         },
         {
           new: true,
@@ -106,10 +178,10 @@ export async function finalizePaymentAtomically(
         status: 'completed',
         transaction: updatedTx,
         updatedUserCoins: userUpdate.coins || 0,
-        coinsAdded: updatedTx.coins,
+        coinsAdded: totalCoinsAdded,
       };
       recordPaymentMetric('finalize.completed', 1);
-      recordPaymentMetric('finalize.coins_added', updatedTx.coins);
+      recordPaymentMetric('finalize.coins_added', totalCoinsAdded);
       recordPaymentMetric('finalize.duration_ms', Date.now() - startedAt, {
         status: 'completed',
       });
@@ -117,7 +189,9 @@ export async function finalizePaymentAtomically(
         orderId,
         paymentId,
         userId: user._id.toString(),
-        coinsAdded: updatedTx.coins,
+        baseCoins: updatedTx.coins,
+        bonusCoins: bonusTx?.coins ?? 0,
+        coinsAdded: totalCoinsAdded,
       });
     });
 
@@ -130,4 +204,30 @@ export async function finalizePaymentAtomically(
   } finally {
     await session.endSession();
   }
+}
+
+export async function createPendingBonusCoinTransaction(
+  userId: string,
+  orderId: string,
+  bonusCoins: number,
+  bonusReason: string,
+): Promise<void> {
+  if (bonusCoins <= 0) return;
+  const transactionId = buildPendingBonusTransactionId(orderId);
+  const existing = await CoinTransaction.findOne({ transactionId });
+  if (existing) return;
+
+  const transaction = new CoinTransaction({
+    transactionId,
+    userId,
+    type: 'credit',
+    coins: bonusCoins,
+    source: 'recharge_bonus',
+    bonusReason,
+    description: `Recharge bonus (${bonusReason}): ${bonusCoins} coins`,
+    paymentGatewayOrderId: orderId,
+    paymentGatewayProvider: 'razorpay',
+    status: 'pending',
+  });
+  await transaction.save();
 }

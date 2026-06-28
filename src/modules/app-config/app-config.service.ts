@@ -10,6 +10,7 @@ import { MIN_COINS_TO_CALL } from '../../config/pricing.config';
 export interface PublicAppConfig {
   features: {
     vipEnabled: boolean;
+    vipProfileFrameEnabled: boolean;
     momentsEnabled: boolean;
     momentsAccessMode: 'free' | 'paid';
   };
@@ -25,6 +26,7 @@ export function getPublicAppConfig(): PublicAppConfig {
   return {
     features: {
       vipEnabled: featureFlags.vipEnabled,
+      vipProfileFrameEnabled: featureFlags.vipProfileFrameEnabled,
       momentsEnabled: isMomentsEnabled(),
       momentsAccessMode: getMomentsAccessMode(),
     },

@@ -84,6 +84,8 @@ export async function isVipActive(
       { _id: membership._id },
       { $set: { status: 'expired' } },
     );
+    const { User } = await import('../user/user.model');
+    await User.updateOne({ _id: userIdStr }, { $set: { vipExpiresAt: null } });
   }
 
   await cacheVipActive(
@@ -220,6 +222,8 @@ export async function getVipStatus(
         { _id: membership._id },
         { $set: { status: 'expired' } },
       );
+      const { User } = await import('../user/user.model');
+      await User.updateOne({ _id: userId }, { $set: { vipExpiresAt: null } });
     }
   }
 

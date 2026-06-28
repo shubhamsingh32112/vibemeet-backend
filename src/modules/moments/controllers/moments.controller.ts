@@ -435,6 +435,7 @@ export async function recordMomentViewHandler(req: Request, res: Response): Prom
       isPreviewMoment: preview,
       isCreatorOwner,
       isCreatorRole: isCreatorOrAdminRole(user.role),
+      visibilityTier: moment.visibilityTier ?? 'PUBLIC',
     });
     const viewsCount = await recordUniqueMomentView(
       user._id,

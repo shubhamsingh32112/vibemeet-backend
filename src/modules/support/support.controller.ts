@@ -14,6 +14,9 @@ import {
   commitSupportAttachmentsFromSessions,
   SupportAttachmentCommitError,
 } from './support-attachment-commit.service';
+import { featureFlags } from '../../config/feature-flags';
+import { resolveMembershipTier } from '../membership/resolve-membership-tier';
+import type { MembershipTier } from '../membership/membership-tier';
 import {
   assertCloudflareEnabled,
   CloudflareImagesDisabledError,
@@ -479,7 +482,14 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
     }
 
     const validPriorities = ['low', 'medium', 'high', 'urgent'];
-    const ticketPriority = priority && validPriorities.includes(priority) ? priority : 'medium';
+    let ticketPriority = priority && validPriorities.includes(priority) ? priority : 'medium';
+    let submitterMembershipTier: MembershipTier = 'NONE';
+    if (!staffPortal && featureFlags.vipSupportEnabled) {
+      submitterMembershipTier = await resolveMembershipTier(currentUser._id.toString());
+      if (submitterMembershipTier === 'VIP') {
+        ticketPriority = 'high';
+      }
+    }
     const validSources = ['chat', 'post_call', 'other', 'staff_portal'];
     const ticketSource =
       source && validSources.includes(source)
@@ -507,6 +517,7 @@ export const createTicket = async (req: Request, res: Response): Promise<void> =
         contactPhone: normalizedContactPhone,
         attachments: ticketAttachments,
         priority: ticketPriority,
+        submitterMembershipTier,
         source: ticketSource,
         relatedCallId: callId,
         reportedCreatorUserId: resolvedCreator.creatorUserId,

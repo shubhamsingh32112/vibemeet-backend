@@ -521,7 +521,11 @@ export async function momentsPremiumUsersPayload(page: number, limit: number) {
   };
 }
 
-export async function vipPaidUsersPayload(page: number, limit: number) {
+export async function vipPaidUsersPayload(
+  page: number,
+  limit: number,
+  statusFilter: 'active' | 'expired' | 'all' = 'all',
+) {
   const lim = Math.min(100, Math.max(1, limit));
   const skip = (page - 1) * lim;
   const now = new Date();
@@ -529,13 +533,24 @@ export async function vipPaidUsersPayload(page: number, limit: number) {
   const d7 = new Date(now.getTime() - 7 * 86400000);
   const d30 = new Date(now.getTime() - 30 * 86400000);
 
+  const membershipQuery: Record<string, unknown> = {};
+  if (statusFilter === 'active') {
+    membershipQuery.status = 'active';
+    membershipQuery.expiresAt = { $gt: now };
+  } else if (statusFilter === 'expired') {
+    membershipQuery.$or = [
+      { status: { $in: ['expired', 'cancelled'] } },
+      { status: 'active', expiresAt: { $lte: now } },
+    ];
+  }
+
   const [activeCount, newToday, new7d, new30d, total, members] = await Promise.all([
     VipMembership.countDocuments({ status: 'active', expiresAt: { $gt: now } }),
     VipMembership.countDocuments({ startedAt: { $gte: todayStart } }),
     VipMembership.countDocuments({ startedAt: { $gte: d7 } }),
     VipMembership.countDocuments({ startedAt: { $gte: d30 } }),
-    VipMembership.countDocuments({}),
-    VipMembership.find({})
+    VipMembership.countDocuments(membershipQuery),
+    VipMembership.find(membershipQuery)
       .sort({ startedAt: -1 })
       .skip(skip)
       .limit(lim)
@@ -588,12 +603,17 @@ export async function vipPaidUsersPayload(page: number, limit: number) {
     rows: members.map((m, i) => {
       const u = userById.get(m.userId.toString());
       const txn = txnByUser.get(m.userId.toString());
+      const isActive = m.status === 'active' && m.expiresAt.getTime() > now.getTime();
+      const daysRemaining = isActive
+        ? Math.max(0, Math.ceil((m.expiresAt.getTime() - now.getTime()) / 86400000))
+        : 0;
       return {
         rank: skip + i + 1,
         userId: m.userId.toString(),
         username: u?.username || u?.email || 'Unknown',
-        status: m.status,
+        status: isActive ? 'active' : 'expired',
         planId: m.planId,
+        daysRemaining,
         startedAt: m.startedAt,
         expiresAt: m.expiresAt,
         coinsPaid: txn?.coins ?? 0,

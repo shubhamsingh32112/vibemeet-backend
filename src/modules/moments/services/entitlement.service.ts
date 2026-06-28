@@ -1,13 +1,17 @@
 import type { Types } from 'mongoose';
 import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
+import { isVipActive } from '../../vip/vip-entitlement.service';
+import type { MomentVisibilityTier } from '../types/moment-visibility-tier';
 
 export type MomentAccessReason =
   | 'OWNER'
   | 'CREATOR'
+  | 'VIP'
   | 'PREMIUM'
   | 'PREVIEW'
   | 'ADMIN'
+  | 'VIP_ONLY'
   | 'DENIED';
 
 export interface MomentAccessResult {
@@ -20,12 +24,34 @@ export interface MomentAccessContext {
   isPreviewMoment?: boolean;
   isStaffAdmin?: boolean;
   isCreatorRole?: boolean;
+  visibilityTier?: MomentVisibilityTier;
+  /** @internal unit tests only — bypasses isVipActive lookup */
+  __testVipActive?: boolean;
+  /** @internal unit tests only — bypasses isMomentsPremiumActive lookup */
+  __testPremiumActive?: boolean;
 }
 
 export function isCreatorOrAdminRole(role: string | undefined | null): boolean {
   return role === 'creator' || role === 'admin';
 }
 
+/**
+ * Moment access precedence (resolveMomentAccess):
+ *
+ * Owner
+ *   ↓
+ * Admin
+ *   ↓
+ * Creator
+ *   ↓
+ * VIP-tier content (visibilityTier === VIP)
+ *   ↓ isVipActive? → ALLOW (reason: VIP) : DENY (reason: VIP_ONLY)
+ * PUBLIC-tier content (visibilityTier === PUBLIC)
+ *   ↓ isVipActive? → ALLOW (reason: VIP)
+ *   ↓ isMomentsPremiumActive? → ALLOW (reason: PREMIUM)
+ *   ↓ isPreviewMoment? → ALLOW (reason: PREVIEW)
+ *   ↓ DENY (reason: DENIED)
+ */
 export async function resolveMomentAccess(
   userId: Types.ObjectId | string | null | undefined,
   _momentId: Types.ObjectId | string,
@@ -43,8 +69,29 @@ export async function resolveMomentAccess(
   if (!userId) {
     return { allowed: false, reason: 'DENIED' };
   }
+
   const uid = typeof userId === 'string' ? userId : userId.toString();
-  if (await isMomentsPremiumActive(uid)) {
+  const visibilityTier = context.visibilityTier ?? 'PUBLIC';
+  const vipActive =
+    context.__testVipActive !== undefined
+      ? context.__testVipActive
+      : await isVipActive(uid);
+  const premiumActive =
+    context.__testPremiumActive !== undefined
+      ? context.__testPremiumActive
+      : await isMomentsPremiumActive(uid);
+
+  if (visibilityTier === 'VIP') {
+    if (vipActive) {
+      return { allowed: true, reason: 'VIP' };
+    }
+    return { allowed: false, reason: 'VIP_ONLY' };
+  }
+
+  if (vipActive) {
+    return { allowed: true, reason: 'VIP' };
+  }
+  if (premiumActive) {
     return { allowed: true, reason: 'PREMIUM' };
   }
   if (context.isPreviewMoment) {

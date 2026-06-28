@@ -19,7 +19,8 @@ import { processReferralRewardOnPurchase } from '../user/referral.service';
 import { finalizePaymentAtomically } from './payment-finalization.service';
 import { PaymentWebhookEvent } from './payment-webhook-event.model';
 import { recordPaymentMetric } from '../../utils/monitoring';
-import { applyRechargeDiscountForUser } from '../vip/vip-entitlement.service';
+import { resolveRechargeBenefits } from './recharge-pricing.service';
+import { createPendingBonusCoinTransaction } from './payment-finalization.service';
 
 const CHECKOUT_SESSION_TTL_SECONDS = 15 * 60;
 const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
@@ -40,6 +41,8 @@ interface CheckoutSessionPayload {
   coins: number;
   priceInr: number;
   pricingTier: PricingTier;
+  bonusCoins?: number;
+  bonusReason?: string;
   iat?: number;
   exp?: number;
 }
@@ -285,15 +288,20 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const priced = await applyRechargeDiscountForUser(user._id, pack.priceInr);
+    const benefits = await resolveRechargeBenefits(user._id.toString(), {
+      priceInr: pack.priceInr,
+      coins: pack.coins,
+    });
 
     const checkoutToken = signCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
       packageId: pack.packageId,
-      coins: pack.coins,
-      priceInr: priced.priceInr,
+      coins: benefits.baseCoins,
+      priceInr: benefits.discountedPriceInr,
       pricingTier,
+      bonusCoins: benefits.bonusCoins,
+      bonusReason: benefits.bonusReason ?? undefined,
     });
 
     const checkoutBase = WEB_CHECKOUT_BASE_URL.replace(/\/$/, '');
@@ -309,11 +317,14 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
         checkoutUrl,
         sessionId: checkoutToken,
         packageId: pack.packageId,
-        coins: pack.coins,
-        priceInr: priced.priceInr,
-        originalPriceInr: priced.originalPriceInr,
-        vipDiscountApplied: priced.vipDiscountApplied,
-        amount: priced.priceInr * 100,
+        coins: benefits.baseCoins,
+        priceInr: benefits.discountedPriceInr,
+        originalPriceInr: benefits.vipDiscountApplied ? benefits.originalPriceInr : undefined,
+        vipDiscountApplied: benefits.vipDiscountApplied,
+        vipBonusCoins: benefits.bonusCoins,
+        totalCoinsReceived: benefits.totalCoins,
+        vipBonusApplied: benefits.vipBonusApplied,
+        amount: benefits.discountedPriceInr * 100,
         expiresInSeconds: CHECKOUT_SESSION_TTL_SECONDS,
       },
     });
@@ -395,6 +406,17 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
       chargedPriceInr,
     );
 
+    const sessionBonusCoins =
+      typeof session.bonusCoins === 'number' ? session.bonusCoins : 0;
+    if (sessionBonusCoins > 0) {
+      await createPendingBonusCoinTransaction(
+        user._id.toString(),
+        order.id,
+        sessionBonusCoins,
+        session.bonusReason ?? 'VIP',
+      );
+    }
+
     if (!process.env.RAZORPAY_KEY_ID) {
       recordPaymentMetric('web.create_order_failed', 1, { reason: 'missing_razorpay_key_id' });
       res.status(500).json({ success: false, error: 'Payment checkout is currently unavailable' });
@@ -403,6 +425,7 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
 
     recordPaymentMetric('web.create_order_success', 1);
     recordPaymentMetric('web.create_order_duration_ms', Date.now() - startedAt, { status: 'success' });
+    const totalCoinsReceived = activePack.coins + sessionBonusCoins;
     res.json({
       success: true,
       data: {
@@ -410,6 +433,9 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
         amount: amountInPaise,
         currency: 'INR',
         coins: activePack.coins,
+        vipBonusCoins: sessionBonusCoins,
+        totalCoinsReceived,
+        vipBonusApplied: sessionBonusCoins > 0,
         keyId: process.env.RAZORPAY_KEY_ID,
       },
     });
@@ -1023,13 +1049,19 @@ export const getWalletPackages = async (req: Request, res: Response): Promise<vo
         })
         .map(async (p) => {
           const basePrice = getEffectivePackPrice(p, pricingTier);
-          const priced = await applyRechargeDiscountForUser(user._id, basePrice);
+          const benefits = await resolveRechargeBenefits(user._id.toString(), {
+            priceInr: basePrice,
+            coins: p.coins,
+          });
           return {
             packageId: normalizePackageId(p.coins),
-            coins: p.coins,
-            priceInr: priced.priceInr,
-            originalPriceInr: priced.vipDiscountApplied ? priced.originalPriceInr : undefined,
-            vipDiscountApplied: priced.vipDiscountApplied,
+            coins: benefits.baseCoins,
+            priceInr: benefits.discountedPriceInr,
+            originalPriceInr: benefits.vipDiscountApplied ? benefits.originalPriceInr : undefined,
+            vipDiscountApplied: benefits.vipDiscountApplied,
+            vipBonusCoins: benefits.bonusCoins,
+            totalCoinsReceived: benefits.totalCoins,
+            vipBonusApplied: benefits.vipBonusApplied,
             oldPriceInr: p.oldPriceInr,
             badge: p.badge,
             sortOrder: p.sortOrder,

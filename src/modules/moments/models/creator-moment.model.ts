@@ -12,6 +12,10 @@ import {
   type VisibilityState,
   type DeletedAccessPolicy,
 } from '../../media-shared/types';
+import {
+  MOMENT_VISIBILITY_TIERS,
+  type MomentVisibilityTier,
+} from '../types/moment-visibility-tier';
 
 export interface ICreatorMoment extends Document {
   _id: mongoose.Types.ObjectId;
@@ -26,6 +30,8 @@ export interface ICreatorMoment extends Document {
   moderationReason?: string | null;
   moderatedAt?: Date | null;
   visibilityState: VisibilityState;
+  /** Content visibility tier for entitlement (PUBLIC = default feed; VIP = VIP-only). */
+  visibilityTier: MomentVisibilityTier;
   feedScore: number;
   engagementScore: number;
   mediaVersion: number;
@@ -70,6 +76,12 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
       type: String,
       enum: VISIBILITY_STATES,
       default: 'public',
+    },
+    visibilityTier: {
+      type: String,
+      enum: MOMENT_VISIBILITY_TIERS,
+      default: 'PUBLIC',
+      index: true,
     },
     feedScore: { type: Number, default: () => Date.now(), index: true },
     engagementScore: { type: Number, default: 0, index: true },

@@ -2726,6 +2726,7 @@ function buildSupportTicketsMongoFilter(req: Request): Record<string, unknown> {
   const statusFilter = req.query.status as string | undefined;
   const priorityFilter = req.query.priority as string | undefined;
   const sourceFilter = req.query.source as string | undefined;
+  const membershipFilter = req.query.membership as string | undefined;
   const creatorReportsOnly = String(req.query.creatorReports || '').toLowerCase() === 'true';
   const staffPortalOnly = String(req.query.staffPortal || '').toLowerCase() === 'true';
   const becomeCreatorOnly = String(req.query.becomeCreatorOnly || '').toLowerCase() === 'true';
@@ -2743,6 +2744,19 @@ function buildSupportTicketsMongoFilter(req: Request): Record<string, unknown> {
   }
   if (sourceFilter && ['chat', 'post_call', 'other', 'staff_portal'].includes(sourceFilter)) {
     filter.source = sourceFilter;
+  }
+  if (membershipFilter === 'VIP') {
+    filter.submitterMembershipTier = 'VIP';
+  } else if (membershipFilter === 'NONE') {
+    filter.$and = [
+      ...((filter.$and as unknown[] | undefined) ?? []),
+      {
+        $or: [
+          { submitterMembershipTier: 'NONE' },
+          { submitterMembershipTier: { $exists: false } },
+        ],
+      },
+    ];
   }
   if (creatorReportsOnly) {
     filter.$or = [
@@ -2886,6 +2900,7 @@ export const getSupportTickets = async (req: Request, res: Response): Promise<vo
             attachments: mapSupportAttachmentsForApi(t.attachments || []),
             status: t.status,
             priority: t.priority,
+            submitterMembershipTier: t.submitterMembershipTier ?? 'NONE',
             assignedAdminId: t.assignedAdminId?.toString() || null,
             adminNotes: t.adminNotes || null,
             source: t.source || 'other',

@@ -19,8 +19,10 @@ export interface ICoinTransaction extends Document {
   userId: mongoose.Types.ObjectId; // User involved in transaction
   type: 'credit' | 'debit'; // credit = coins added, debit = coins deducted
   coins: number; // Amount of coins (always positive, type indicates direction)
-  source: 'manual' | 'payment_gateway' | 'admin' | 'video_call' | 'chat_message' | 'creator_task' | 'withdrawal' | 'welcome_bonus' | 'referral_reward' | 'moment_purchase' | 'moment_earnings' | 'moment_upload_reward' | 'vip_moment_free' | 'vip_membership' | 'moments_premium_membership'; // Source of the transaction
+  source: 'manual' | 'payment_gateway' | 'recharge_bonus' | 'admin' | 'video_call' | 'chat_message' | 'creator_task' | 'withdrawal' | 'welcome_bonus' | 'referral_reward' | 'moment_purchase' | 'moment_earnings' | 'moment_upload_reward' | 'vip_moment_free' | 'vip_membership' | 'moments_premium_membership'; // Source of the transaction
   description?: string; // Human-readable description
+  /** Reason metadata for recharge_bonus (e.g. VIP, Referral, Festival). */
+  bonusReason?: string;
   callId?: string; // If transaction is from a video call
   paymentGatewayTransactionId?: string; // External payment gateway transaction ID (if applicable)
   paymentGatewayOrderId?: string; // External payment gateway order ID (if applicable)
@@ -58,12 +60,17 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
     },
     source: {
       type: String,
-      enum: ['manual', 'payment_gateway', 'admin', 'video_call', 'chat_message', 'creator_task', 'withdrawal', 'welcome_bonus', 'referral_reward', 'moment_purchase', 'moment_earnings', 'moment_upload_reward', 'vip_moment_free', 'vip_membership', 'moments_premium_membership'],
+      enum: ['manual', 'payment_gateway', 'recharge_bonus', 'admin', 'video_call', 'chat_message', 'creator_task', 'withdrawal', 'welcome_bonus', 'referral_reward', 'moment_purchase', 'moment_earnings', 'moment_upload_reward', 'vip_moment_free', 'vip_membership', 'moments_premium_membership'],
       default: 'manual',
     },
     description: {
       type: String,
       sparse: true,
+    },
+    bonusReason: {
+      type: String,
+      sparse: true,
+      index: true,
     },
     callId: {
       type: String,
