@@ -141,6 +141,23 @@ async function main(): Promise<void> {
     const callerFirebaseUid = row.callerFirebaseUid;
     const creatorFirebaseUid = row.creatorFirebaseUid;
 
+    const { resolveAuthoritativeSettlementTotals } = await import(
+      '../modules/billing/billing-settlement-totals.service'
+    );
+    const authoritativeTotals = await resolveAuthoritativeSettlementTotals(callId);
+    if (authoritativeTotals.totalDeductedMicros > 0) {
+      await DurableCallSession.updateOne(
+        { _id: callId },
+        {
+          $max: {
+            totalUserDebitedMicros: authoritativeTotals.totalDeductedMicros,
+            totalCreatorCreditedMicros: authoritativeTotals.totalEarnedMicros,
+            billingSequence: authoritativeTotals.billingSequence,
+          },
+        }
+      ).catch(() => {});
+    }
+
     const redis = getRedis();
     const sessionRaw = await redis.get(callSessionKey(callId));
     if (sessionRaw) {

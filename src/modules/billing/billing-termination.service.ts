@@ -77,6 +77,14 @@ export async function forceTerminateCall(
     return;
   }
 
+  const { tryClaimSettlementRequested } = await import('./billing-settlement-trigger.guards');
+  const claimed = await tryClaimSettlementRequested(callId);
+  if (!claimed) {
+    recordBillingMetric('force_terminate_settlement_deduped', 1, { callId, reason });
+    logInfo('forceTerminateCall settlement already requested — skipping finalize', { callId, reason });
+    return;
+  }
+
   const { finalizeCallEnd } = await import('../video/call-finalization.service');
   void finalizeCallEnd(io, callId, 'force_end').catch((finalizeError) => {
     logError('forceTerminateCall finalization trigger failed', finalizeError, { callId, reason });

@@ -15,5 +15,5 @@ test('reconcile-stuck-settling-calls defaults to dry-run and supports execute ac
   assert.ok(src.includes('enqueueImmediateSettlementRetry'));
   assert.ok(src.includes("actionArg === 'recover-failed'"));
   assert.ok(src.includes('resetDurableCallSessionForSettlementRetry'));
-  assert.ok(src.includes('billingRecoveryDeadLetterKey'));
+  assert.ok(src.includes('resolveAuthoritativeSettlementTotals'));
 });

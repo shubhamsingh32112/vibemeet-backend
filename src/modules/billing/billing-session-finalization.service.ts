@@ -262,11 +262,39 @@ export async function moveCallToRecoveryDeadLetter(
   const redis = getRedis();
   const recoveryOwnerInstanceId = getBillingInstanceId();
   const now = Date.now();
+
+  const { resolveAuthoritativeSettlementTotals } = await import('./billing-settlement-totals.service');
+  const authoritativeTotals = await resolveAuthoritativeSettlementTotals(callId);
+  const deadLetterMetadata = {
+    ...metadata,
+    authoritativeTotals,
+  };
+
+  if (isDurableCallSessionEnabled() && authoritativeTotals.totalDeductedMicros > 0) {
+    const { DurableCallSession } = await import('./call-session.model');
+    await DurableCallSession.updateOne(
+      { _id: callId },
+      {
+        $max: {
+          totalUserDebitedMicros: authoritativeTotals.totalDeductedMicros,
+          totalCreatorCreditedMicros: authoritativeTotals.totalEarnedMicros,
+          billingSequence: authoritativeTotals.billingSequence,
+        },
+      }
+    ).catch(() => {});
+  }
+
   const deadLetterKey = billingRecoveryDeadLetterKey(callId);
   await redis.setex(
     deadLetterKey,
     Math.max(300, BILLING_MAX_SETTLING_MS / 1000),
-    JSON.stringify({ reason, source, at: now, recoveryOwnerInstanceId, metadata })
+    JSON.stringify({
+      reason,
+      source,
+      at: now,
+      recoveryOwnerInstanceId,
+      metadata: deadLetterMetadata,
+    })
   );
 
   try {
@@ -973,26 +1001,32 @@ async function checkpointLifecycleState(
       if (!sessionRaw) {
         const checkpoint = (await getBillingCheckpoint(callId)) as Record<string, unknown> | null;
         if (checkpoint) {
-          const reconstructedSession = {
-            callId,
-            schemaVersion: 1,
-            userMongoId: String(checkpoint.userMongoId || ''),
-            creatorMongoId: String(checkpoint.creatorMongoId || ''),
-            userFirebaseUid: String(checkpoint.userFirebaseUid || ''),
-            creatorFirebaseUid: String(checkpoint.creatorFirebaseUid || ''),
-            startTime: Number(checkpoint.startTimeMs) || Date.now(),
-            lastProcessedAt: Number(checkpoint.lastProcessedAtMs) || Date.now(),
-            pricePerSecondMicros: Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0),
-            creatorEarningsPerSecondMicros: Math.max(
-              0,
-              Number(checkpoint.creatorEarningsPerSecondMicros) || 0
-            ),
-            totalDeductedMicros: Math.max(0, Number(checkpoint.totalDeductedMicros) || 0),
-            totalEarnedMicros: Math.max(0, Number(checkpoint.totalEarnedMicros) || 0),
-            billingSequence: Math.max(0, Number(checkpoint.billingSequence) || 0),
-            lifecycleState: String(checkpoint.lifecycleState || 'RECOVERING'),
-            version: Math.max(1, Number(checkpoint.version) || 1),
-          };
+          const { resolveAuthoritativeSettlementTotals, applyAuthoritativeTotalsToSession } =
+            await import('./billing-settlement-totals.service');
+          const authTotals = await resolveAuthoritativeSettlementTotals(callId);
+          const reconstructedSession = applyAuthoritativeTotalsToSession(
+            {
+              callId,
+              schemaVersion: 1,
+              userMongoId: String(checkpoint.userMongoId || ''),
+              creatorMongoId: String(checkpoint.creatorMongoId || ''),
+              userFirebaseUid: String(checkpoint.userFirebaseUid || ''),
+              creatorFirebaseUid: String(checkpoint.creatorFirebaseUid || ''),
+              startTime: Number(checkpoint.startTimeMs) || Date.now(),
+              lastProcessedAt: Number(checkpoint.lastProcessedAtMs) || Date.now(),
+              pricePerSecondMicros: Math.max(0, Number(checkpoint.pricePerSecondMicros) || 0),
+              creatorEarningsPerSecondMicros: Math.max(
+                0,
+                Number(checkpoint.creatorEarningsPerSecondMicros) || 0
+              ),
+              totalDeductedMicros: Math.max(0, Number(checkpoint.totalDeductedMicros) || 0),
+              totalEarnedMicros: Math.max(0, Number(checkpoint.totalEarnedMicros) || 0),
+              billingSequence: Math.max(0, Number(checkpoint.billingSequence) || 0),
+              lifecycleState: String(checkpoint.lifecycleState || 'RECOVERING'),
+              version: Math.max(1, Number(checkpoint.version) || 1),
+            },
+            authTotals
+          );
           if (
             reconstructedSession.userMongoId &&
             reconstructedSession.creatorMongoId &&
@@ -1242,6 +1276,16 @@ export async function finalizeCallSession(
     'NX'
   );
   if (inflightOk !== 'OK') {
+    recordBillingMetric('billing_finalize_concurrent_sources', 1, { callId, source });
+    const settlingCall = await Call.findOne({ callId }).select('settlement.status settlement.updatedAt').lean();
+    if (settlingCall?.settlement?.status === 'settling') {
+      const updatedAt = settlingCall.settlement.updatedAt
+        ? new Date(settlingCall.settlement.updatedAt).getTime()
+        : 0;
+      if (updatedAt > 0 && Date.now() - updatedAt > BILLING_MAX_SETTLING_MS) {
+        await enqueueImmediateSettlementRetry(retryParamsFromFinalize(params)).catch(() => {});
+      }
+    }
     logInfo('billing_finalize_duplicate_suppressed', {
       callId,
       source,
@@ -1482,6 +1526,31 @@ export async function finalizeCallSession(
       return { status: 'duplicate', callId };
     }
 
+    const authoritativeTotals = await (
+      await import('./billing-settlement-totals.service')
+    ).resolveAuthoritativeSettlementTotals(callId);
+    const { shouldBlockZeroSettlement } = await import('./billing-reconciliation.guards');
+    const zeroBlock = shouldBlockZeroSettlement(authoritativeTotals);
+    if (zeroBlock.blocked) {
+      recordBillingMetric('billing_finalize_zero_blocked', 1, {
+        callId,
+        source,
+        reason: zeroBlock.reason ?? 'unknown',
+      });
+      logWarning('billing_finalize_zero_blocked', {
+        callId,
+        source,
+        reason,
+        finalizeAttemptId,
+        blockReason: zeroBlock.reason,
+        authoritativeTotals,
+        recoveryOwnerInstanceId,
+      });
+      await enqueueSettlementRetry(retryParamsFromFinalize(params));
+      await redis.eval(RELEASE_IF_MATCH_LUA, 1, finalizeInflightKey(callId), inflightToken).catch(() => {});
+      return { status: 'pending_retry', callId };
+    }
+
     await removeCallFromBilling(callId);
 
     const persistResult = await settleCall(io, callId, {
@@ -1489,6 +1558,7 @@ export async function finalizeCallSession(
       lockToken,
       settleLockRedisKey,
       suppressSettledEmit: true,
+      source,
     });
 
     if (!persistResult) {
@@ -1560,6 +1630,7 @@ export async function finalizeCallSession(
       finalizeAttemptId,
       recoveryOwnerInstanceId,
       reconciliationWorkerId,
+      txnId: persistResult.lastTxnId,
       ...partyContext,
       durationSeconds: persistResult.durationSeconds,
       coinsDeducted: persistResult.totalDeducted,
@@ -1595,6 +1666,10 @@ export async function finalizeCallSession(
       reason,
       finalizeAttemptId,
       recoveryOwnerInstanceId,
+      txnId:
+        error && typeof error === 'object' && 'lastTxnId' in error
+          ? String((error as { lastTxnId?: string }).lastTxnId)
+          : undefined,
       ...snapshotMeta,
       ...partyContext,
     });

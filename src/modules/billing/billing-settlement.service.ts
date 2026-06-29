@@ -48,10 +48,36 @@ import { resolveStaffCommissionBps } from '../payment/commission-resolve.service
 import { computeStaffCutsFromHostEarnings } from './staff-revenue-share';
 import { enqueueSettlementDomainEvents } from '../events/domain-event.service';
 import { cancelBillingCycleJob } from './billing.queue';
+
+function throwSettlementTxnError(err: unknown, lastTxnId?: string): never {
+  const wrapped = err instanceof Error ? err : new Error(String(err));
+  if (lastTxnId) {
+    (wrapped as { lastTxnId?: string }).lastTxnId = lastTxnId;
+  }
+  throw wrapped;
+}
 import { emitBillingSettledFromSnapshot } from './billing-emitter.service';
 import { flushBillingPersist } from './billing-persist.service';
 import { sumLedgerForCall } from './billing-ledger.model';
 import { isIncrementalBillingPersistEnabled } from './billing-phase-flags';
+import {
+  classifyFailureStage,
+  getMongoErrorCode,
+  getMongoErrorLabels,
+  getMongoErrorName,
+  inferConflictingCollection,
+  isTransientMongoTransactionError,
+  isUnknownCommitResult,
+  settlementTxnBackoffMs,
+  sleepMs,
+  type SettlementWriteStage,
+} from '../../utils/mongo-transaction';
+import {
+  resolveAuthoritativeSettlementTotals,
+  applyAuthoritativeTotalsToSession,
+} from './billing-settlement-totals.service';
+
+const SETTLEMENT_TXN_MAX_ATTEMPTS = 3;
 
 interface CallSession {
   schemaVersion?: number;
@@ -79,6 +105,7 @@ interface CallSession {
   totalEarnedMicros?: number;
   elapsedSeconds: number;
   effectiveDurationLimitSeconds?: number;
+  billingSequence?: number;
 }
 
 function buildSettlementSessionFromCheckpoint(checkpoint: Record<string, unknown>, callId: string): CallSession | null {
@@ -201,6 +228,8 @@ export interface SettleCallFromFinalizerOptions {
   lockToken: string;
   settleLockRedisKey: string;
   suppressSettledEmit?: boolean;
+  /** Settlement source for instrumentation (billing_tick, force_end, etc.) */
+  source?: string;
 }
 
 export interface SettlePersistResult {
@@ -212,6 +241,7 @@ export interface SettlePersistResult {
   userMongoId: string;
   billingSequence: number;
   finalUserCoins: number;
+  lastTxnId?: string;
 }
 
 /**
@@ -445,7 +475,7 @@ export async function settleCall(
   }
 
   const billedSeconds = Math.max(0, Math.floor(Number(session.elapsedSeconds) || 0));
-  const durationSeconds = billedSeconds;
+  let durationSeconds = billedSeconds;
 
   const introDeductedMicros = Math.max(0, Number(session.totalIntroDeductedMicros) || 0);
   let walletDeductedMicros = session.totalWalletDeductedMicros;
@@ -468,11 +498,38 @@ export async function settleCall(
     });
   }
 
-  if ((session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION && session.pricePerSecond) {
+  const authoritativeTotals = await resolveAuthoritativeSettlementTotals(callId);
+  const mergedSession = applyAuthoritativeTotalsToSession(session, authoritativeTotals);
+  session.totalDeductedMicros = mergedSession.totalDeductedMicros;
+  session.totalEarnedMicros = mergedSession.totalEarnedMicros;
+  (session as { billingSequence?: number }).billingSequence = mergedSession.billingSequence;
+  if (mergedSession.elapsedSeconds != null) {
+    session.elapsedSeconds = mergedSession.elapsedSeconds;
+  }
+
+  durationSeconds = Math.max(0, Math.floor(Number(session.elapsedSeconds) || 0));
+  walletDeductedMicros =
+    session.totalWalletDeductedMicros ??
+    Math.max(0, (session.totalDeductedMicros ?? 0) - introDeductedMicros);
+  totalEarnedCreator = microsToCreatorCreditWholeCoins(session.totalEarnedMicros ?? 0);
+  totalDeducted = microsToUserDebitWholeCoins(session.totalDeductedMicros ?? 0);
+
+  if (
+    authoritativeTotals.source === 'none' &&
+    (session.schemaVersion ?? 0) < BILLING_SESSION_SCHEMA_VERSION &&
+    session.pricePerSecond
+  ) {
     const legacyDeductMicros = Math.round(billedSeconds * session.pricePerSecond * COIN_MICROS);
     totalDeducted = microsToUserDebitWholeCoins(legacyDeductMicros);
     const legacyEarnMicros = Math.round((earnRaw * COIN_MICROS) / 10000);
     totalEarnedCreator = microsToCreatorCreditWholeCoins(legacyEarnMicros);
+  }
+
+  if (authoritativeTotals.source !== 'none' && authoritativeTotals.totalDeductedMicros > 0) {
+    recordBillingMetric('settlement_authoritative_totals_applied', 1, {
+      callId,
+      source: authoritativeTotals.source,
+    });
   }
 
   const wallClockSeconds = Math.max(0, Math.floor((Date.now() - session.startTime) / 1000));
@@ -486,6 +543,8 @@ export async function settleCall(
     balanceMicros,
     totalDeducted,
     totalEarnedCreator,
+    walletDeductedMicros,
+    authoritativeSource: authoritativeTotals.source,
     redisValues: {
       coinsRaw: finalCoinsRaw,
       earningsRaw: finalEarningsRaw,
@@ -493,104 +552,133 @@ export async function settleCall(
     },
   });
 
-  const dbSession = await mongoose.startSession();
-  dbSession.startTransaction();
-
-  let mongoTransactionCommitted = false;
+  const settlementSource = opts?.source ?? (fromFinalizer ? 'finalizer' : 'direct_settle');
+  let lastTxnId: string | undefined;
+  let txnPersistSucceeded = false;
+  let updatedUserCoins = 0;
+  let creatorUser: (mongoose.Document<unknown, object, IUser> & IUser) | null = null;
+  let userForEmit: IUser | null = null;
   let settlementBdId: string | undefined;
   let settlementAgencyId: string | undefined;
-  const settlementIntegritySnapshot: {
-    userCoinsBefore?: number;
-    userCoinsAfter?: number;
-    userDebitDelta?: number;
-    expectedUserCoinsAfter?: number;
-    creatorCoinsBefore?: number;
-    creatorCoinsAfter?: number;
-    creatorCreditDelta?: number;
-    expectedCreatorCoinsAfter?: number;
-  } = {};
+  let creatorOwnerUserId: mongoose.Types.ObjectId | string | undefined;
+  let creatorName = 'Creator';
 
-  try {
-    const user = await User.findById(session.userMongoId).session(dbSession);
-    if (!user) {
-      throw new Error(`User not found: ${session.userMongoId}`);
-    }
+  for (let attempt = 0; attempt < SETTLEMENT_TXN_MAX_ATTEMPTS; attempt++) {
+    const txnId = `${callId}:${attempt}:${crypto.randomUUID()}`;
+    lastTxnId = txnId;
+    const dbSession = await mongoose.startSession();
+    dbSession.startTransaction();
 
-    const targetWalletDebitWhole = Math.max(0, microsToUserDebitWholeCoins(walletDeductedMicros));
-    const existingUserDebitTxn = await CoinTransaction.findOne({
+    let mongoTransactionCommitted = false;
+    let writeStage: SettlementWriteStage = 'read_user';
+    const settlementIntegritySnapshot: {
+      userCoinsBefore?: number;
+      userCoinsAfter?: number;
+      userDebitDelta?: number;
+      expectedUserCoinsAfter?: number;
+      creatorCoinsBefore?: number;
+      creatorCoinsAfter?: number;
+      creatorCreditDelta?: number;
+      expectedCreatorCoinsAfter?: number;
+    } = {};
+
+    logInfo('settlement_transaction_attempt', {
+      txnId,
       callId,
-      userId: session.userMongoId,
-      type: 'debit',
-    }).session(dbSession);
-    const alreadyDebited = Math.max(0, existingUserDebitTxn?.coins || 0);
-    const userDebitDelta = Math.max(0, targetWalletDebitWhole - alreadyDebited);
-    const userCoinsBefore = Number(user.coins) || 0;
-    settlementIntegritySnapshot.userCoinsBefore = userCoinsBefore;
-    settlementIntegritySnapshot.userDebitDelta = userDebitDelta;
-    settlementIntegritySnapshot.expectedUserCoinsAfter = Math.max(0, userCoinsBefore - userDebitDelta);
+      attempt,
+      source: settlementSource,
+    });
 
-    let updatedUserCoins = user.coins || 0;
-    if (userDebitDelta > 0) {
-      const updatedUser = await User.findByIdAndUpdate(
-        user._id,
-        [
-          {
-            $set: {
-              coins: {
-                $max: [0, { $subtract: ['$coins', userDebitDelta] }],
+    try {
+      logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
+      const user = await User.findById(session.userMongoId).session(dbSession);
+      if (!user) {
+        throw new Error(`User not found: ${session.userMongoId}`);
+      }
+      userForEmit = user;
+
+      const targetWalletDebitWhole = Math.max(0, microsToUserDebitWholeCoins(walletDeductedMicros));
+      const existingUserDebitTxn = await CoinTransaction.findOne({
+        callId,
+        userId: session.userMongoId,
+        type: 'debit',
+      }).session(dbSession);
+      const alreadyDebited = Math.max(0, existingUserDebitTxn?.coins || 0);
+      const userDebitDelta = Math.max(0, targetWalletDebitWhole - alreadyDebited);
+      const userCoinsBefore = Number(user.coins) || 0;
+      settlementIntegritySnapshot.userCoinsBefore = userCoinsBefore;
+      settlementIntegritySnapshot.userDebitDelta = userDebitDelta;
+      settlementIntegritySnapshot.expectedUserCoinsAfter = Math.max(0, userCoinsBefore - userDebitDelta);
+
+      writeStage = 'debit_user_wallet';
+      logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
+      let localUpdatedUserCoins = user.coins || 0;
+      if (userDebitDelta > 0) {
+        const updatedUser = await User.findByIdAndUpdate(
+          user._id,
+          [
+            {
+              $set: {
+                coins: {
+                  $max: [0, { $subtract: ['$coins', userDebitDelta] }],
+                },
               },
             },
-          },
-        ],
-        {
-          new: true,
-          session: dbSession,
+          ],
+          {
+            new: true,
+            session: dbSession,
+          }
+        );
+        if (!updatedUser) {
+          throw new Error(`User not found during debit update: ${session.userMongoId}`);
         }
-      );
-      if (!updatedUser) {
-        throw new Error(`User not found during debit update: ${session.userMongoId}`);
+        localUpdatedUserCoins = updatedUser.coins || 0;
       }
-      updatedUserCoins = updatedUser.coins || 0;
-    }
-    settlementIntegritySnapshot.userCoinsAfter = Number(updatedUserCoins) || 0;
+      updatedUserCoins = localUpdatedUserCoins;
+      settlementIntegritySnapshot.userCoinsAfter = Number(updatedUserCoins) || 0;
 
-    if (targetWalletDebitWhole > 0) {
-      await CoinTransaction.findOneAndUpdate(
-        { callId, userId: session.userMongoId, type: 'debit' },
-        {
-          transactionId: `call_debit_${callId}`,
-          userId: session.userMongoId,
-          type: 'debit',
-          coins: targetWalletDebitWhole,
-          source: 'video_call',
-          description: `Video call (${durationSeconds}s) @ ${session.pricePerMinute} coins/min`,
-          callId,
-          status: 'completed',
-        },
-        { upsert: true, new: true, session: dbSession }
-      );
-    }
-
-    if (session.introPromoActive === true && introDeductedMicros > 0) {
-      await User.findOneAndUpdate(
-        {
-          _id: user._id,
-          welcomeFreeCallConsumedAt: null,
-          introFreeCallCredits: { $gt: 0 },
-        },
-        {
-          $set: {
-            welcomeFreeCallConsumedAt: new Date(),
-            introFreeCallCredits: 0,
+      writeStage = 'upsert_user_debit_txn';
+      logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
+      if (targetWalletDebitWhole > 0) {
+        await CoinTransaction.findOneAndUpdate(
+          { callId, userId: session.userMongoId, type: 'debit' },
+          {
+            transactionId: `call_debit_${callId}`,
+            userId: session.userMongoId,
+            type: 'debit',
+            coins: targetWalletDebitWhole,
+            source: 'video_call',
+            description: `Video call (${durationSeconds}s) @ ${session.pricePerMinute} coins/min`,
+            callId,
+            status: 'completed',
           },
-        },
-        { session: dbSession }
-      );
-    }
+          { upsert: true, new: true, session: dbSession }
+        );
+      }
 
-    let creatorUser: (mongoose.Document<unknown, object, IUser> & IUser) | null = null;
-    let creatorCreditDeltaApplied = 0;
-    if (totalEarnedCreator > 0) {
+      if (session.introPromoActive === true && introDeductedMicros > 0) {
+        writeStage = 'consume_intro_promo';
+        logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
+        await User.findOneAndUpdate(
+          {
+            _id: user._id,
+            welcomeFreeCallConsumedAt: null,
+            introFreeCallCredits: { $gt: 0 },
+          },
+          {
+            $set: {
+              welcomeFreeCallConsumedAt: new Date(),
+              introFreeCallCredits: 0,
+            },
+          },
+          { session: dbSession }
+        );
+      }
+
+      creatorUser = null;
+      let creatorCreditDeltaApplied = 0;
+      if (totalEarnedCreator > 0) {
       // Settlement safety rule: do not hard-fail settlement if creator docs are missing.
       // We settle conservatively (user debit) and alert via logs/metrics for reconciliation.
       try {
@@ -624,6 +712,8 @@ export async function settleCall(
             let creatorCoinsBefore = creatorUser.coins || 0;
             settlementIntegritySnapshot.creatorCoinsBefore = Number(creatorCoinsBefore) || 0;
             if (creatorCreditDelta > 0) {
+              writeStage = 'credit_creator_wallet';
+              logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
               const updatedCreatorUser = await User.findByIdAndUpdate(
                 creatorUser._id,
                 { $inc: { coins: creatorCreditDelta } },
@@ -653,6 +743,7 @@ export async function settleCall(
             if (totalEarnedCreator > 0) {
               logInfo('Settling call - Creator coins updated', {
                 callId,
+                txnId,
                 creatorMongoId: session.creatorMongoId,
                 creatorUserId: creator.userId,
                 coinsBefore: creatorCoinsBefore,
@@ -660,6 +751,8 @@ export async function settleCall(
                 coinsEarned: totalEarnedCreator,
               });
 
+              writeStage = 'upsert_creator_credit_txn';
+              logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
               await CoinTransaction.findOneAndUpdate(
                 { callId, userId: creator.userId, type: 'credit' },
                 {
@@ -676,6 +769,8 @@ export async function settleCall(
               );
 
               // Staff revenue: BD/agency % of host-earned coins (gross). Snapshots stored on ledger rows.
+              writeStage = 'staff_revenue_split';
+              logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
               const agencyOid = creator.assignedAgencyId;
               if (agencyOid && totalEarnedCreator > 0) {
                 const agencyUser = await User.findById(agencyOid)
@@ -799,7 +894,7 @@ export async function settleCall(
       : null;
 
     const userName = userDoc?.username || userDoc?.phone || userDoc?.email || 'User';
-    const creatorName = creatorDoc?.name || 'Creator';
+    creatorName = creatorDoc?.name || 'Creator';
     // CallHistory stores avatars as string URLs; resolve the medium avatar
     // variant from the canonical IImageAsset (post Phase E removal of
     // `creator.photo` / legacy `user.avatar` string fields).
@@ -809,7 +904,8 @@ export async function settleCall(
     const creatorAvatar = creatorDoc?.avatar?.imageId
       ? buildAvatarUrls(creatorDoc.avatar.imageId).md
       : undefined;
-    const creatorOwnerUserId = creatorDoc?.userId;
+    const creatorOwnerUserIdLocal = creatorDoc?.userId;
+    creatorOwnerUserId = creatorOwnerUserIdLocal;
     const creatorFirebaseUid = creatorUserDoc?.firebaseUid || session.creatorFirebaseUid;
 
     const initiatedByRole = (session as any).initiatedByRole as string | undefined;
@@ -817,6 +913,8 @@ export async function settleCall(
     const userDirection = creatorInitiated ? 'incoming' : 'outgoing';
     const creatorDirection = creatorInitiated ? 'outgoing' : 'incoming';
 
+    writeStage = 'upsert_call_history';
+    logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
     const callLifecycle = await Call.findOne({ callId })
       .select('startedAt endedAt settlement.settledAt')
       .session(dbSession)
@@ -835,7 +933,7 @@ export async function settleCall(
       {
         callId,
         ownerUserId: session.userMongoId,
-        otherUserId: creatorOwnerUserId || session.creatorMongoId,
+        otherUserId: creatorOwnerUserIdLocal || session.creatorMongoId,
         otherCreatorId: creatorDoc?._id,
         otherName: creatorName,
         otherAvatar: creatorAvatar,
@@ -851,12 +949,12 @@ export async function settleCall(
       { upsert: true, new: true, session: dbSession }
     );
 
-    if (creatorOwnerUserId) {
+    if (creatorOwnerUserIdLocal) {
       await CallHistory.findOneAndUpdate(
-        { callId, ownerUserId: creatorOwnerUserId },
+        { callId, ownerUserId: creatorOwnerUserIdLocal },
         {
           callId,
-          ownerUserId: creatorOwnerUserId,
+          ownerUserId: creatorOwnerUserIdLocal,
           otherUserId: session.userMongoId,
           otherName: userName,
           otherAvatar: userAvatar,
@@ -897,57 +995,162 @@ export async function settleCall(
     }
 
     const txnStartedAt = Date.now();
+    writeStage = 'commit';
+    logInfo('settlement_transaction_stage', { txnId, callId, attempt, writeStage });
     await dbSession.commitTransaction();
     mongoTransactionCommitted = true;
-    recordBillingMetric('settlement_transaction_ms', Date.now() - txnStartedAt, { callId });
-    logInfo('Settlement transaction committed', { callId });
-
-    void enqueueSettlementDomainEvents({
+    recordBillingMetric('settlement_transaction_committed', 1, {
       callId,
-      totalEarnedCreator,
-      durationSeconds,
-    }).catch((err) =>
-      logError('enqueueSettlementDomainEvents failed', err instanceof Error ? err : new Error(String(err)), {
-        callId,
-      })
-    );
+      attempt: String(attempt),
+    });
+    recordBillingMetric('settlement_transaction_ms', Date.now() - txnStartedAt, { callId });
+    logInfo('Settlement transaction committed', { callId, txnId, attempt });
+    txnPersistSucceeded = true;
+    break;
+  } catch (err) {
+    const failureStage = classifyFailureStage(err, writeStage);
+    const mongoErrorLabels = getMongoErrorLabels(err);
+    const mongoErrorCode = getMongoErrorCode(err);
+    const conflictingCollection = inferConflictingCollection(writeStage, err);
 
-    if (!fromFinalizer) {
-      try {
-        await deleteBillingSessionRedisKeys(
-          redis,
+    if (failureStage === 'commit' && isUnknownCommitResult(err)) {
+      const { isCallBillingAlreadySettled } = await import('./billing-session-finalization.service');
+      if (await isCallBillingAlreadySettled(callId)) {
+        recordBillingMetric('settlement_transaction_commit_ambiguous_resolved', 1, {
           callId,
-          session.userFirebaseUid,
-          session.creatorFirebaseUid
-        );
-        await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
-      } catch (redisAfterCommitErr) {
-        logError(
-          'CRITICAL: Redis cleanup after successful Mongo settlement — balances are committed; clear keys via ops/reconciliation',
-          redisAfterCommitErr,
-          { callId, alert: true }
-        );
+          attempt: String(attempt),
+        });
+        logInfo('settlement_transaction_commit_ambiguous_resolved', {
+          txnId,
+          callId,
+          attempt,
+          source: settlementSource,
+        });
+        txnPersistSucceeded = true;
+        const historyRow = await CallHistory.findOne({ callId, ownerRole: 'user' })
+          .select('coinsDeducted durationSeconds')
+          .lean();
+        if (historyRow) {
+          totalDeducted = historyRow.coinsDeducted ?? totalDeducted;
+          if (historyRow.durationSeconds != null) {
+            durationSeconds = historyRow.durationSeconds;
+          }
+        }
+        const userRow = await User.findById(session.userMongoId).select('coins').lean();
+        if (userRow) {
+          updatedUserCoins = userRow.coins ?? 0;
+        }
+        break;
       }
     }
 
-    const persistResult: SettlePersistResult = {
-      totalDeducted,
-      totalEarnedCreator,
-      durationSeconds,
-      userFirebaseUid: session.userFirebaseUid,
-      creatorFirebaseUid: session.creatorFirebaseUid,
-      userMongoId: session.userMongoId,
-      billingSequence: Math.max(
-        0,
-        Number((session as { billingSequence?: number }).billingSequence) || 0
-      ),
-      finalUserCoins: updatedUserCoins,
-    };
+    try {
+      await dbSession.abortTransaction();
+    } catch (abortErr) {
+      logError('Failed to abort transaction', abortErr, { callId, txnId });
+    }
 
+    logError('settlement_transaction_failed', err, {
+      txnId,
+      callId,
+      attempt,
+      source: settlementSource,
+      failureStage,
+      writeStage,
+      mongoErrorCode,
+      mongoErrorLabels,
+      mongoErrorName: getMongoErrorName(err),
+      conflictingCollection,
+      conflictingKeys: { callId, userMongoId: session.userMongoId },
+    });
+    recordBillingMetric('settlement_transaction_failed', 1, {
+      callId,
+      attempt: String(attempt),
+      failureStage,
+      writeStage,
+      mongoErrorCode: String(mongoErrorCode ?? ''),
+    });
+
+    if (!isTransientMongoTransactionError(err) || attempt === SETTLEMENT_TXN_MAX_ATTEMPTS - 1) {
+      if (!mongoTransactionCommitted) {
+        try {
+          await redis.del(settledKey);
+        } catch {
+          /* allow settlement retry */
+        }
+      }
+      throwSettlementTxnError(err, lastTxnId);
+    }
+
+    recordBillingMetric('settlement_transaction_retry', 1, {
+      callId,
+      attempt: String(attempt),
+      failureStage,
+      writeStage,
+    });
+    await sleepMs(settlementTxnBackoffMs(attempt));
+  } finally {
+    await dbSession.endSession();
+  }
+  }
+
+  if (!txnPersistSucceeded) {
+    throwSettlementTxnError(
+      new Error(`Settlement transaction failed after ${SETTLEMENT_TXN_MAX_ATTEMPTS} attempts`),
+      lastTxnId
+    );
+  }
+
+  void enqueueSettlementDomainEvents({
+    callId,
+    totalEarnedCreator,
+    durationSeconds,
+  }).catch((err) =>
+    logError('enqueueSettlementDomainEvents failed', err instanceof Error ? err : new Error(String(err)), {
+      callId,
+    })
+  );
+
+  if (!fromFinalizer) {
+    try {
+      await deleteBillingSessionRedisKeys(
+        redis,
+        callId,
+        session.userFirebaseUid,
+        session.creatorFirebaseUid
+      );
+      await redis.setex(settledKey, SETTLED_CALL_TTL, '1');
+    } catch (redisAfterCommitErr) {
+      logError(
+        'CRITICAL: Redis cleanup after successful Mongo settlement — balances are committed; clear keys via ops/reconciliation',
+        redisAfterCommitErr,
+        { callId, alert: true }
+      );
+    }
+  }
+
+  const persistResult: SettlePersistResult = {
+    totalDeducted,
+    totalEarnedCreator,
+    durationSeconds,
+    userFirebaseUid: session.userFirebaseUid,
+    creatorFirebaseUid: session.creatorFirebaseUid,
+    userMongoId: session.userMongoId,
+    billingSequence: Math.max(
+      0,
+      Number((session as { billingSequence?: number }).billingSequence) || 0
+    ),
+    finalUserCoins: updatedUserCoins,
+    lastTxnId,
+  };
+
+  const userEmit = userForEmit;
+  if (userEmit) {
     io.to(`user:${session.userFirebaseUid}`).emit('coins_updated', {
-      userId: user._id.toString(),
+      userId: userEmit._id.toString(),
       coins: updatedUserCoins,
     });
+  }
 
     if (creatorUser) {
       io.to(`user:${session.creatorFirebaseUid}`).emit('coins_updated', {
@@ -1062,32 +1265,17 @@ export async function settleCall(
     recordBillingMetric('settlement_total_ms', Date.now() - settleStartedAt, { callId });
 
     if (fromFinalizer) {
+      if (lockHeartbeat) {
+        clearInterval(lockHeartbeat);
+      }
       return persistResult;
     }
-  } catch (err) {
-    try {
-      await dbSession.abortTransaction();
-      logError('Settlement transaction aborted', err, { callId });
-      recordBillingMetric('settlement_transaction_failed', 1, { callId });
-    } catch (abortErr) {
-      logError('Failed to abort transaction', abortErr, { callId });
-    }
-    if (!mongoTransactionCommitted) {
-      try {
-        await redis.del(settledKey);
-      } catch {
-        /* allow settlement retry if a mistaken settled flag was set pre-commit */
-      }
-    }
-    throw err;
-  } finally {
-    if (lockHeartbeat) {
-      clearInterval(lockHeartbeat);
-    }
-    await dbSession.endSession();
-    if (!fromFinalizer) {
-      await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
-    }
+
+  if (lockHeartbeat) {
+    clearInterval(lockHeartbeat);
+  }
+  if (!fromFinalizer) {
+    await redis.eval(RELEASE_IF_MATCH_LUA, 1, settleLockRedisKey, lockToken).catch(() => {});
   }
 }
 

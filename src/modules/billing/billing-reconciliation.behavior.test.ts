@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { shouldFinalizeSessionNoHistory, shouldRescheduleBillingCycleForSession } from './billing-reconciliation.guards';
+import { shouldFinalizeSessionNoHistory, shouldRescheduleBillingCycleForSession, shouldBlockZeroSettlement } from './billing-reconciliation.guards';
 
 test('behavioral: should not reschedule billing cycle for SETTLED session', () => {
   assert.equal(
@@ -68,3 +68,34 @@ test('behavioral: should finalize terminal and stale session without CallHistory
   assert.equal(decision.skipReason, undefined);
 });
 
+test('behavioral: shouldBlockZeroSettlement blocks zero deduct with positive sequence', () => {
+  const blocked = shouldBlockZeroSettlement({
+    totalDeductedMicros: 0,
+    totalEarnedMicros: 0,
+    billingSequence: 5,
+    source: 'durable',
+  });
+  assert.equal(blocked.blocked, true);
+  assert.equal(blocked.reason, 'zero_deduct_with_positive_sequence');
+});
+
+test('behavioral: shouldBlockZeroSettlement allows non-zero deduct', () => {
+  const blocked = shouldBlockZeroSettlement({
+    totalDeductedMicros: 27_000_000,
+    totalEarnedMicros: 6_000_000,
+    billingSequence: 5,
+    source: 'redis',
+  });
+  assert.equal(blocked.blocked, false);
+});
+
+test('behavioral: shouldBlockZeroSettlement blocks earn without deduct from authoritative source', () => {
+  const blocked = shouldBlockZeroSettlement({
+    totalDeductedMicros: 0,
+    totalEarnedMicros: 6_000_000,
+    billingSequence: 0,
+    source: 'redis',
+  });
+  assert.equal(blocked.blocked, true);
+  assert.equal(blocked.reason, 'zero_deduct_with_positive_earn');
+});

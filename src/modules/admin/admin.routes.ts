@@ -48,6 +48,9 @@ import {
   reactivateCreator,
   refundCall,
   getRefundPreview,
+  getSettlementRetryPreview,
+  retryCallSettlement,
+  retryCallSettlementBulk,
   getAdminActionLog,
   getWithdrawals,
   approveWithdrawal,
@@ -179,6 +182,9 @@ router.get('/platform-revenue', getPlatformRevenueConfigAdmin);
 router.put('/platform-revenue', updatePlatformRevenueConfigAdmin);
 router.get('/calls', getCallsAdmin);
 router.get('/calls/:callId/refund-preview', getRefundPreview);
+router.get('/calls/:callId/settlement-retry-preview', getSettlementRetryPreview);
+router.post('/calls/retry-settlement-bulk', retryCallSettlementBulk);
+router.post('/calls/:callId/retry-settlement', retryCallSettlement);
 router.get('/system/health', getSystemHealth);
 router.get('/app-updates/current', getCurrentGlobalAppUpdateForAdmin);
 router.get('/realtime-metrics', getRealtimeMetrics);

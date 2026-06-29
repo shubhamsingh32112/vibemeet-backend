@@ -4,6 +4,42 @@
  */
 
 import { isNonTerminalLifecycle } from './billing-active-call.service';
+import type { AuthoritativeSettlementTotals } from './billing-settlement-totals.service';
+
+export function isBlockZeroSettlementEnabled(): boolean {
+  return process.env.BILLING_BLOCK_ZERO_SETTLEMENT_ENABLED !== 'false';
+}
+
+export function shouldBlockZeroSettlement(totals: AuthoritativeSettlementTotals): {
+  blocked: boolean;
+  reason?: string;
+} {
+  if (!isBlockZeroSettlementEnabled()) {
+    return { blocked: false };
+  }
+  if (totals.totalDeductedMicros > 0) {
+    return { blocked: false };
+  }
+  if (totals.billingSequence > 0) {
+    return {
+      blocked: true,
+      reason: 'zero_deduct_with_positive_sequence',
+    };
+  }
+  if (totals.source === 'durable' || totals.source === 'ledger') {
+    return {
+      blocked: true,
+      reason: `zero_deduct_authoritative_${totals.source}`,
+    };
+  }
+  if (totals.totalEarnedMicros > 0 && totals.totalDeductedMicros === 0 && totals.source !== 'none') {
+    return {
+      blocked: true,
+      reason: 'zero_deduct_with_positive_earn',
+    };
+  }
+  return { blocked: false };
+}
 
 export function shouldRescheduleBillingCycleForSession(
   session: { lifecycleState?: string } | null,

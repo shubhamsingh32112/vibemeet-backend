@@ -247,7 +247,7 @@ async function ensureRuntimeOwnership(
     const ownerInstanceMismatch =
       parsedOwner != null && !billingInstanceIdsMatch(parsedOwner.instanceId, workerInstanceId);
 
-    if (stallMs > chainHealStallMs || ownerInstanceMismatch) {
+    if (stallMs > chainHealStallMs || (ownerInstanceMismatch && stallMs > 0)) {
       const nextEpoch = Math.max(runtimeEpoch, (parsedOwner?.epoch ?? runtimeEpoch) + 1);
       await redis.del(ownerLockKey).catch(() => 0);
       session.runtimeEpoch = nextEpoch;

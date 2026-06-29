@@ -524,6 +524,14 @@ export function startBillingBullWorker(): Worker | null {
           logError('BullMQ schedule deferred tick failed', e, { callId })
         );
       } else if (result === 'stop_needs_settlement') {
+        const { tryClaimSettlementRequested } = await import('./billing-settlement-trigger.guards');
+        if (!(await tryClaimSettlementRequested(callId))) {
+          recordBillingMetric('billing_finalize_duplicate_suppressed', 1, {
+            callId,
+            source: 'billing_tick_queue',
+          });
+          return result;
+        }
         const { finalizeCallSession } = await import('./billing-session-finalization.service');
         await finalizeCallSession(io, {
           callId,

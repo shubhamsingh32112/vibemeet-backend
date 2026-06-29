@@ -117,7 +117,7 @@ async function buildSessionFromCheckpoint(
   const elapsedSeconds =
     pricePerSecondMicros > 0 ? Math.floor(totalDeductedMicros / pricePerSecondMicros) : 0;
 
-  return {
+  const baseSession = {
     schemaVersion: BILLING_SESSION_SCHEMA_VERSION,
     callId,
     userFirebaseUid,
@@ -144,6 +144,12 @@ async function buildSessionFromCheckpoint(
     runtimeEpoch: Math.max(1, Number(checkpoint.version) || 1),
     leaderLock: `billing:runtime:owner:${callId}`,
   };
+
+  const { resolveAuthoritativeSettlementTotals, applyAuthoritativeTotalsToSession } = await import(
+    './billing-settlement-totals.service'
+  );
+  const authTotals = await resolveAuthoritativeSettlementTotals(callId);
+  return applyAuthoritativeTotalsToSession(baseSession, authTotals);
 }
 
 function mapDurableStateToLifecycle(state: DurableCallSessionState): BillingLifecycleState {

@@ -108,6 +108,12 @@ import {
   buildSafeMongoSubstringRegex,
 } from '../../utils/mongo-regex';
 import {
+  buildSettlementRetryPreview,
+  executeAdminSettlementRetry,
+  executeBulkAdminSettlementRetry,
+  batchBuildSettlementListMeta,
+} from './admin-call-settlement.service';
+import {
   DEFAULT_WALLET_COIN_PACKAGES,
   IWalletCoinPack,
   getOrCreateWalletPricingConfig,
@@ -1674,6 +1680,23 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
         : [];
     const callById = new Map(callLifecycleRows.map((r) => [r.callId, r]));
 
+    const settlementMetaByCallId = await batchBuildSettlementListMeta(
+      calls.map((c) => {
+        const lifecycle = callById.get(c.callId);
+        const billingStatus =
+          (lifecycle?.settlement as { status?: string } | undefined)?.status ?? 'settled';
+        return {
+          callId: c.callId,
+          userCall: {
+            durationSeconds: c.durationSeconds,
+            coinsDeducted: c.coinsDeducted,
+            settlementStatus: c.settlementStatus,
+          },
+          billingStatus,
+        };
+      })
+    );
+
     res.json({
       success: true,
       data: {
@@ -1691,6 +1714,10 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
             c.createdAt;
           const billingStatus =
             (lifecycle?.settlement as { status?: string } | undefined)?.status ?? 'settled';
+          const settlementMeta = settlementMetaByCallId.get(c.callId);
+          const settlementIssue = settlementMeta?.settlementIssue ?? null;
+          const canRetrySettlement = settlementMeta?.canRetrySettlement ?? false;
+          const authoritativeCoinsDeducted = settlementMeta?.authoritativeCoinsDeducted ?? null;
           return {
             callId: c.callId,
             ownerUserId: c.ownerUserId.toString(),
@@ -1715,6 +1742,9 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
             isVeryShort: c.durationSeconds > 0 && c.durationSeconds < 10,
             isSuspicious: c.durationSeconds === 0 && c.coinsDeducted > 0,
             isRefunded: refundedCallIds.has(c.callId),
+            canRetrySettlement,
+            settlementIssue,
+            authoritativeCoinsDeducted,
           };
         }),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
@@ -2134,6 +2164,81 @@ export const reactivateCreator = async (req: Request, res: Response): Promise<vo
     });
   } catch (error) {
     console.error('❌ [ADMIN] Reactivate creator error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * GET /admin/calls/:callId/settlement-retry-preview
+ */
+export const getSettlementRetryPreview = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { callId } = req.params;
+    const preview = await buildSettlementRetryPreview(callId);
+    res.json({ success: true, data: preview });
+  } catch (error) {
+    console.error('❌ [ADMIN] Settlement retry preview error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * POST /admin/calls/:callId/retry-settlement
+ */
+export const retryCallSettlement = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { callId } = req.params;
+    const force = req.body?.force === true;
+    const adminUser = await getAdminUser(req);
+    const io = getIO();
+    const result = await executeAdminSettlementRetry(io, callId, { force });
+    if (result.status === 'skipped') {
+      res.status(400).json({ success: false, error: result.message });
+      return;
+    }
+    await logAdminAction(
+      adminUser,
+      'RETRY_CALL_SETTLEMENT',
+      'call',
+      callId,
+      'Admin triggered call settlement retry',
+      { result }
+    );
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('❌ [ADMIN] Retry settlement error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/**
+ * POST /admin/calls/retry-settlement-bulk
+ */
+export const retryCallSettlementBulk = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const callIds = Array.isArray(req.body?.callIds) ? (req.body.callIds as string[]) : [];
+    if (callIds.length === 0) {
+      res.status(400).json({ success: false, error: 'callIds array required' });
+      return;
+    }
+    const force = req.body?.force === true;
+    const adminUser = await getAdminUser(req);
+    const io = getIO();
+    const results = await executeBulkAdminSettlementRetry(io, callIds, { force });
+    await logAdminAction(
+      adminUser,
+      'RETRY_CALL_SETTLEMENT_BULK',
+      'call',
+      'bulk',
+      'Admin bulk settlement retry',
+      { count: results.length, results }
+    );
+    res.json({ success: true, data: { results } });
+  } catch (error) {
+    console.error('❌ [ADMIN] Bulk retry settlement error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

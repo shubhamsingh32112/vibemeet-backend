@@ -327,6 +327,10 @@ export const SETTLEMENT_CLAIM_TTL_SECONDS = Math.min(
   Math.max(60, parseInt(process.env.BILLING_SETTLEMENT_CLAIM_TTL_SECONDS || '180', 10) || 180)
 );
 
+export const BILLING_SETTLEMENT_REQUESTED_PREFIX = 'billing:settlement:requested:';
+export const billingSettlementRequestedKey = (callId: string): string =>
+  `${BILLING_SETTLEMENT_REQUESTED_PREFIX}${callId}`;
+
 export const BILLING_SETTLEMENT_RETRY_KEY = 'billing:settlement-retry';
 export const BILLING_BALANCE_MISMATCH_REPAIR_QUEUE_KEY = 'billing:balance:mismatch:repair:zset';
 export const BILLING_BALANCE_MISMATCH_REPAIR_PAYLOAD_PREFIX =

@@ -430,6 +430,98 @@ paths:
           description: Client error
         '5XX':
           description: Server error
+  "/api/v1/admin/calls/:callId/settlement-retry-preview":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_calls_callId_settlement_retry_preview
+      summary: Preview call settlement retry eligibility and proposed totals
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Settlement retry preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/admin/calls/:callId/retry-settlement":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_calls_callId_retry_settlement
+      summary: Enqueue admin call settlement retry
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+      responses:
+        '200':
+          description: Retry enqueued or recovered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error (skipped / not eligible)
+        '5XX':
+          description: Server error
+  "/api/v1/admin/calls/retry-settlement-bulk":
+    post:
+      tags:
+        - Admin
+      operationId: post__api_v1_admin_calls_retry_settlement_bulk
+      summary: Bulk enqueue call settlement retries (max 20)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - callIds
+              properties:
+                callIds:
+                  type: array
+                  items:
+                    type: string
+                force:
+                  type: boolean
+      responses:
+        '200':
+          description: Per-call retry results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
   "/api/v1/admin/coins":
     get:
       tags:
