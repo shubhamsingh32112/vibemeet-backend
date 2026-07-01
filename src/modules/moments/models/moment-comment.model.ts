@@ -7,6 +7,7 @@ export interface IMomentComment extends Document {
   text: string;
   parentCommentId?: mongoose.Types.ObjectId | null;
   likesCount: number;
+  isVipHighlighted: boolean;
   isDeleted: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -19,6 +20,7 @@ const momentCommentSchema = new Schema<IMomentComment>(
     text: { type: String, required: true, maxlength: 500, trim: true },
     parentCommentId: { type: Schema.Types.ObjectId, ref: 'MomentComment', default: null },
     likesCount: { type: Number, default: 0, min: 0 },
+    isVipHighlighted: { type: Boolean, default: false, index: true },
     isDeleted: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },

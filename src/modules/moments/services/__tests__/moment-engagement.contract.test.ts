@@ -18,6 +18,26 @@ test('moments routes expose engagement endpoints', () => {
   assert.ok(src.includes('/:momentId/share'));
 });
 
+test('moment engagement service supports VIP highlighted comments', () => {
+  const src = readFileSync(join(__dirname, '../moment-engagement.service.ts'), 'utf8');
+  assert.ok(src.includes('isVipHighlighted'));
+  assert.ok(src.includes('pinnedHighlightedComments'));
+  assert.ok(src.includes('isVipActive'));
+  assert.ok(src.includes('$ne: true'));
+});
+
+test('legacy upload reward status defaults to approved in creator DTO', () => {
+  const src = readFileSync(join(__dirname, '../moment-presentation.service.ts'), 'utf8');
+  assert.ok(src.includes('resolveUploadRewardStatusForDto'));
+  assert.ok(src.includes('UploadRewardStatus.Approved'));
+});
+
+test('feed dto includes VIP highlight fields', () => {
+  const src = readFileSync(join(__dirname, '../../dto/moment.dto.ts'), 'utf8');
+  assert.ok(src.includes('isVipHighlighted'));
+  assert.ok(src.includes('pinnedHighlightedComments'));
+});
+
 test('feed dto includes engagement fields', () => {
   const src = readFileSync(join(__dirname, '../../dto/moment.dto.ts'), 'utf8');
   assert.ok(src.includes('likesCount'));

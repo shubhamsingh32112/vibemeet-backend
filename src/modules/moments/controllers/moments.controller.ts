@@ -45,7 +45,7 @@ import {
   isUserFollowingCreator,
   loadFollowedCreatorIds,
 } from '../services/follow-context.service';
-import { creditMomentUploadReward } from '../services/moment-upload-reward.service';
+import { UploadRewardStatus } from '../types/upload-reward-status';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 import {
   buildPopularFeedOrdering,
@@ -210,6 +210,7 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
       caption: caption?.trim() || null,
       processingStatus: 'uploading',
       moderationStatus: defaultModerationStatus(),
+      uploadRewardStatus: UploadRewardStatus.Pending,
     });
 
     if (type === 'photo' && imageSessionId) {
@@ -260,19 +261,6 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
     emitMomentUploaded(creator._id.toString(), moment._id.toString());
     void enqueueFanoutTask(moment._id.toString(), creator._id.toString(), moment.feedScore);
 
-    let uploadRewardCoins = 0;
-    try {
-      const uploadReward = await creditMomentUploadReward({
-        userId: user._id,
-        creatorId: creator._id,
-        momentId: moment._id.toString(),
-        momentType: type,
-      });
-      uploadRewardCoins = uploadReward?.coinsCredited ?? 0;
-    } catch (rewardError) {
-      logError('Moment upload reward failed (moment saved)', rewardError);
-    }
-
     const momentDto = await toCreatorSelfMomentDTO(moment, {
       userId: user._id,
       isCreatorOwner: true,
@@ -280,11 +268,12 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
     res.status(201).json({
       success: true,
       data: momentDto
-        ? { ...momentDto, uploadRewardCoins }
+        ? { ...momentDto, uploadRewardCoins: 0 }
         : {
             id: moment._id.toString(),
             creatorId: creator._id.toString(),
-            uploadRewardCoins,
+            uploadRewardStatus: UploadRewardStatus.Pending,
+            uploadRewardCoins: 0,
           },
     });
   } catch (error) {
@@ -1042,6 +1031,9 @@ function engagementErrorResponse(error: unknown, res: Response): boolean {
       case 'PARENT_NOT_FOUND':
         res.status(404).json({ success: false, error: 'Parent comment not found' });
         return true;
+      case 'VIP_REQUIRED':
+        res.status(403).json({ success: false, error: 'VIP membership required for highlighted comments' });
+        return true;
     }
   }
   return false;
@@ -1123,7 +1115,10 @@ export async function createMomentCommentHandler(req: Request, res: Response): P
     const text = typeof req.body?.text === 'string' ? req.body.text : '';
     const parentCommentId =
       typeof req.body?.parentCommentId === 'string' ? req.body.parentCommentId : undefined;
-    const data = await createMomentComment(user._id, momentId, text, parentCommentId);
+    const isVipHighlighted = req.body?.isVipHighlighted === true;
+    const data = await createMomentComment(user._id, momentId, text, parentCommentId, {
+      isVipHighlighted,
+    });
     res.status(201).json({ success: true, data });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;

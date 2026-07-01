@@ -14,6 +14,7 @@ import type {
 import { resolveMomentAccess, isCreatorOrAdminRole } from './entitlement.service';
 import { isPreviewMoment } from './free-preview.service';
 import { buildAvatarUrls } from '../../images/image-url';
+import { isVipActive } from '../../vip/vip-entitlement.service';
 
 const ENGAGEMENT_LIKE_WEIGHT = 1;
 const ENGAGEMENT_COMMENT_WEIGHT = 2;
@@ -185,6 +186,7 @@ function toCommentDTO(
     authorName: authorMeta.name,
     authorAvatarUrl: authorMeta.avatarUrl,
     isCreator: authorMeta.isCreator,
+    isVipHighlighted: comment.isVipHighlighted ?? false,
     text: comment.text,
     likesCount: comment.likesCount ?? 0,
     isLiked: likedIds.has(comment._id.toString()),
@@ -209,9 +211,30 @@ export async function listMomentComments(
   }
 
   const limit = Math.min(Math.max(options?.limit ?? 20, 1), 50);
+  const isFirstPage = !options?.cursor;
+
+  let pinnedHighlightedComments: MomentCommentDTO[] | undefined;
+  if (isFirstPage) {
+    const highlighted = await MomentComment.find({
+      momentId,
+      parentCommentId: null,
+      isVipHighlighted: true,
+      isDeleted: false,
+    }).sort({ createdAt: -1 });
+    if (highlighted.length > 0) {
+      pinnedHighlightedComments = await buildTopLevelCommentDTOs(
+        highlighted,
+        moment,
+        userId,
+      );
+    }
+  }
+
   const query: Record<string, unknown> = {
     momentId,
     parentCommentId: null,
+    // $ne: true includes legacy docs where isVipHighlighted is absent.
+    isVipHighlighted: { $ne: true },
     isDeleted: false,
   };
   if (options?.cursor) {
@@ -224,10 +247,29 @@ export async function listMomentComments(
 
   const hasMore = topLevel.length > limit;
   const page = hasMore ? topLevel.slice(0, limit) : topLevel;
-  const topIds = page.map((c) => c._id);
+  const items = await buildTopLevelCommentDTOs(page, moment, userId);
 
+  const nextCursor =
+    hasMore && page.length > 0 ? page[page.length - 1]!.createdAt.toISOString() : undefined;
+
+  return {
+    pinnedHighlightedComments,
+    items,
+    nextCursor,
+    hasMore,
+  };
+}
+
+async function buildTopLevelCommentDTOs(
+  page: InstanceType<typeof MomentComment>[],
+  moment: ICreatorMoment,
+  userId: Types.ObjectId,
+): Promise<MomentCommentDTO[]> {
+  if (page.length === 0) return [];
+
+  const topIds = page.map((c) => c._id);
   const replies = await MomentComment.find({
-    momentId,
+    momentId: moment._id,
     parentCommentId: { $in: topIds },
     isDeleted: false,
   })
@@ -254,7 +296,7 @@ export async function listMomentComments(
     }
   }
 
-  const items: MomentCommentDTO[] = page.map((comment) => {
+  return page.map((comment) => {
     const authorMeta = authorMap.get(comment.authorUserId.toString()) ?? {
       name: 'User',
       isCreator: false,
@@ -268,11 +310,6 @@ export async function listMomentComments(
     );
     return toCommentDTO(comment, authorMeta, likedIds, replyDtos);
   });
-
-  const nextCursor =
-    hasMore && page.length > 0 ? page[page.length - 1]!.createdAt.toISOString() : undefined;
-
-  return { items, nextCursor, hasMore };
 }
 
 export async function createMomentComment(
@@ -280,6 +317,7 @@ export async function createMomentComment(
   momentId: Types.ObjectId,
   text: string,
   parentCommentId?: string,
+  options?: { isVipHighlighted?: boolean },
 ): Promise<MomentCommentDTO> {
   const trimmed = text.trim();
   if (!trimmed || trimmed.length > 500) {
@@ -308,11 +346,21 @@ export async function createMomentComment(
     parentId = parent._id;
   }
 
+  let isVipHighlighted = false;
+  if (options?.isVipHighlighted && !parentId) {
+    const vipActive = await isVipActive(userId);
+    if (!vipActive) {
+      throw new Error('VIP_REQUIRED');
+    }
+    isVipHighlighted = true;
+  }
+
   const comment = await MomentComment.create({
     momentId,
     authorUserId: userId,
     text: trimmed,
     parentCommentId: parentId,
+    isVipHighlighted,
   });
 
   if (!parentId) {

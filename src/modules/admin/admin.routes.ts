@@ -91,10 +91,14 @@ import {
 } from './admin-moment-purchase.controller';
 import {
   approveMomentModerationHandler,
+  approveUploadRewardHandler,
   escalateMomentModerationHandler,
+  getUploadRewardsConfigHandler,
   listEscalatedMomentsModerationHandler,
   listPendingMomentsModerationHandler,
+  listPendingUploadRewardsHandler,
   rejectMomentModerationHandler,
+  rejectUploadRewardHandler,
 } from './admin-moment-moderation.controller';
 import {
   getMomentsAdminConfigHandler,
@@ -282,6 +286,11 @@ router.get('/moments/moderation/escalated', listEscalatedMomentsModerationHandle
 router.post('/moments/moderation/approve', approveMomentModerationHandler);
 router.post('/moments/moderation/reject', rejectMomentModerationHandler);
 router.post('/moments/moderation/escalate', escalateMomentModerationHandler);
+
+router.get('/moments/upload-rewards/config', getUploadRewardsConfigHandler);
+router.get('/moments/upload-rewards/pending', listPendingUploadRewardsHandler);
+router.post('/moments/upload-rewards/approve', approveUploadRewardHandler);
+router.post('/moments/upload-rewards/reject', rejectUploadRewardHandler);
 
 router.get('/moments/config', getMomentsAdminConfigHandler);
 router.get('/moments/free-previews', listFreePreviewsHandler);

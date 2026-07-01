@@ -15,6 +15,7 @@ import {
   type FeedDTO,
 } from '../dto/moment.dto';
 import { isMomentsFreeAccessMode } from '../../../config/moments';
+import { UploadRewardStatus } from '../types/upload-reward-status';
 import {
   resolveMomentAccess,
   canViewDeletedMoment,
@@ -196,6 +197,21 @@ export async function presentationFromFeedOrderingItem(
   });
 }
 
+/** Pre-field moments were credited on upload — treat missing status as approved. */
+export function resolveUploadRewardStatusForDto(
+  moment: Pick<ICreatorMoment, 'uploadRewardStatus'>,
+): UploadRewardStatus {
+  const raw = moment.uploadRewardStatus;
+  if (
+    raw === UploadRewardStatus.Pending ||
+    raw === UploadRewardStatus.Approved ||
+    raw === UploadRewardStatus.Rejected
+  ) {
+    return raw;
+  }
+  return UploadRewardStatus.Approved;
+}
+
 export async function toCreatorSelfMomentDTO(
   moment: ICreatorMoment,
   viewer: ViewerContext,
@@ -210,6 +226,7 @@ export async function toCreatorSelfMomentDTO(
     processingStatus: moment.processingStatus,
     moderationStatus: moment.moderationStatus,
     moderationReason: moment.moderationReason ?? undefined,
+    uploadRewardStatus: resolveUploadRewardStatusForDto(moment),
     viewsCount: moment.viewsCount,
     purchaseCount: moment.purchaseCount,
   };

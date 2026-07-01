@@ -16,6 +16,10 @@ import {
   MOMENT_VISIBILITY_TIERS,
   type MomentVisibilityTier,
 } from '../types/moment-visibility-tier';
+import {
+  UPLOAD_REWARD_STATUSES,
+  UploadRewardStatus,
+} from '../types/upload-reward-status';
 
 export interface ICreatorMoment extends Document {
   _id: mongoose.Types.ObjectId;
@@ -42,6 +46,11 @@ export interface ICreatorMoment extends Document {
   viewsCount: number;
   likesCount: number;
   commentsCount: number;
+  /** Coin upload reward review — independent of content moderationStatus. */
+  uploadRewardStatus: UploadRewardStatus;
+  uploadRewardApprovedAt?: Date | null;
+  uploadRewardReviewedBy?: mongoose.Types.ObjectId | null;
+  uploadRewardReviewedAt?: Date | null;
   /**
    * @deprecated Historical coin-purchase data only. Do not increment in new code.
    * UI should stop displaying this; analytics should use Premium metrics.
@@ -99,6 +108,15 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
     viewsCount: { type: Number, default: 0, min: 0 },
     likesCount: { type: Number, default: 0, min: 0 },
     commentsCount: { type: Number, default: 0, min: 0 },
+    uploadRewardStatus: {
+      type: String,
+      enum: UPLOAD_REWARD_STATUSES,
+      default: UploadRewardStatus.Pending,
+      index: true,
+    },
+    uploadRewardApprovedAt: { type: Date, default: null },
+    uploadRewardReviewedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    uploadRewardReviewedAt: { type: Date, default: null },
     /** @deprecated Historical data only — no new writes */
     purchaseCount: { type: Number, default: 0, min: 0 },
     isDeleted: { type: Boolean, default: false, index: true },

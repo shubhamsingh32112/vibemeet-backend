@@ -55,6 +55,7 @@ export type CreatorSelfDTO = PresentationDTO & {
   processingStatus: ProcessingStatus;
   moderationStatus: string;
   moderationReason?: string;
+  uploadRewardStatus: string;
   viewsCount: number;
   purchaseCount: number;
 };
@@ -65,6 +66,7 @@ export interface MomentCommentDTO {
   authorName: string;
   authorAvatarUrl?: string;
   isCreator: boolean;
+  isVipHighlighted: boolean;
   text: string;
   likesCount: number;
   isLiked: boolean;
@@ -74,6 +76,7 @@ export interface MomentCommentDTO {
 }
 
 export interface MomentCommentsPageDTO {
+  pinnedHighlightedComments?: MomentCommentDTO[];
   items: MomentCommentDTO[];
   nextCursor?: string;
   hasMore: boolean;
