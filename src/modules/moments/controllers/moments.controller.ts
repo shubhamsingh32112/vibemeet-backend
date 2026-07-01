@@ -54,6 +54,18 @@ import {
 import { applyAudienceToFeedOrdering } from '../services/feed-audience.service';
 import { resolveMomentAccess, isCreatorOrAdminRole } from '../services/entitlement.service';
 import { isPreviewMoment } from '../services/free-preview.service';
+import {
+  loadLikedMomentIds,
+  likeMoment,
+  unlikeMoment,
+  listMomentComments,
+  createMomentComment,
+  deleteMomentComment,
+  likeMomentComment,
+  unlikeMomentComment,
+  buildMomentShareInfo,
+} from '../services/moment-engagement.service';
+import type { ICreatorMoment } from '../models/creator-moment.model';
 
 async function resolveUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
@@ -78,13 +90,26 @@ function buildMomentsViewer(
   user: InstanceType<typeof User> | null | undefined,
   followedCreatorIds: Set<string>,
   isCreatorOwner?: boolean,
+  likedMomentIds?: Set<string>,
 ) {
   return {
     userId: user?._id ?? null,
     followedCreatorIds,
+    likedMomentIds,
     isCreatorOwner,
     isCreatorRole: user ? isCreatorOrAdminRole(user.role) : false,
   };
+}
+
+async function enrichViewerWithLikedMoments(
+  user: InstanceType<typeof User> | null | undefined,
+  followedCreatorIds: Set<string>,
+  moments: ICreatorMoment[],
+  isCreatorOwner?: boolean,
+) {
+  const momentIds = moments.map((m) => m._id);
+  const likedMomentIds = await loadLikedMomentIds(user?._id ?? null, momentIds);
+  return buildMomentsViewer(user, followedCreatorIds, isCreatorOwner, likedMomentIds);
 }
 
 async function isUserOwnerOfCreator(
@@ -286,7 +311,6 @@ export async function getMomentsFeedHandler(req: Request, res: Response): Promis
     assertMomentsEnabled();
     const user = await resolveUser(req);
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
-    const viewer = buildMomentsViewer(user, followedCreatorIds);
     const limit = Math.min(Number(req.query.limit) || 20, 50);
     const cursor = req.query.cursor as string | undefined;
     const isPremium = await resolvePremiumFeedTier(user);
@@ -306,6 +330,11 @@ export async function getMomentsFeedHandler(req: Request, res: Response): Promis
     const ordering = applyAudienceToFeedOrdering(
       await buildPopularFeedOrdering({ limit, cursor }),
       isPremium,
+    );
+    const viewer = await enrichViewerWithLikedMoments(
+      user,
+      followedCreatorIds,
+      ordering.moments.map((item) => item.moment),
     );
     const items = (
       await Promise.all(
@@ -341,7 +370,6 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
     const limit = Math.min(Number(req.query.limit) || 20, 50);
     const offset = Number(req.query.offset) || 0;
     const followedCreatorIds = await loadFollowedCreatorIds(user._id);
-    const viewer = buildMomentsViewer(user, followedCreatorIds);
     const isPremium = await resolvePremiumFeedTier(user);
 
     const warmKey = followingWarmCacheKey(user._id.toString(), isPremium, offset, limit);
@@ -360,6 +388,12 @@ export async function getFollowingMomentsFeedHandler(req: Request, res: Response
         cachedIds,
       }),
       isPremium,
+    );
+
+    const viewer = await enrichViewerWithLikedMoments(
+      user,
+      followedCreatorIds,
+      ordering.moments.map((item) => item.moment),
     );
 
     const items = (
@@ -462,9 +496,10 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
     const isCreatorOwner = await isUserOwnerOfCreator(user?._id, moment.creatorId);
     const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
+    const likedMomentIds = await loadLikedMomentIds(user?._id ?? null, [moment._id]);
     const dto = await toMomentPresentationDTO(
       moment,
-      buildMomentsViewer(user, followedCreatorIds, isCreatorOwner),
+      buildMomentsViewer(user, followedCreatorIds, isCreatorOwner, likedMomentIds),
       { isPreviewMoment: preview },
     );
     if (!dto) {
@@ -546,7 +581,12 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
       .limit(60);
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
     const isCreatorOwner = await isUserOwnerOfCreator(user?._id, creator._id);
-    const viewer = buildMomentsViewer(user, followedCreatorIds, isCreatorOwner);
+    const viewer = await enrichViewerWithLikedMoments(
+      user,
+      followedCreatorIds,
+      moments,
+      isCreatorOwner,
+    );
     const items = (
       await Promise.all(
         moments.map(async (m) => {
@@ -984,5 +1024,185 @@ export async function getMyMomentsHandler(req: Request, res: Response): Promise<
     if (respondMomentsDisabled(error, res)) return;
     logError('My moments failed', error);
     res.status(500).json({ success: false, error: 'Failed to load moments' });
+  }
+}
+
+function engagementErrorResponse(error: unknown, res: Response): boolean {
+  if (error instanceof Error) {
+    switch (error.message) {
+      case 'NOT_FOUND':
+        res.status(404).json({ success: false, error: 'Not found' });
+        return true;
+      case 'FORBIDDEN':
+        res.status(403).json({ success: false, error: 'Access denied' });
+        return true;
+      case 'INVALID_TEXT':
+        res.status(400).json({ success: false, error: 'Invalid comment text' });
+        return true;
+      case 'PARENT_NOT_FOUND':
+        res.status(404).json({ success: false, error: 'Parent comment not found' });
+        return true;
+    }
+  }
+  return false;
+}
+
+export async function likeMomentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const data = await likeMoment(user._id, momentId);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Like moment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to like moment' });
+  }
+}
+
+export async function unlikeMomentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const data = await unlikeMoment(user._id, momentId);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Unlike moment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to unlike moment' });
+  }
+}
+
+export async function listMomentCommentsHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const cursor = req.query.cursor as string | undefined;
+    const limit = Number(req.query.limit) || 20;
+    const data = await listMomentComments(user._id, momentId, { cursor, limit });
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('List moment comments failed', error);
+    res.status(500).json({ success: false, error: 'Failed to load comments' });
+  }
+}
+
+export async function createMomentCommentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const rate = await checkMomentsRateLimit('comment', user._id.toString());
+    if (!rate.allowed) {
+      res.status(429).json({ success: false, error: 'Rate limit exceeded' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    const parentCommentId =
+      typeof req.body?.parentCommentId === 'string' ? req.body.parentCommentId : undefined;
+    const data = await createMomentComment(user._id, momentId, text, parentCommentId);
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Create moment comment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to post comment' });
+  }
+}
+
+export async function deleteMomentCommentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const commentId = new mongoose.Types.ObjectId(req.params.commentId);
+    await deleteMomentComment(user._id, momentId, commentId);
+    res.json({ success: true, data: { deleted: true } });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Delete moment comment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to delete comment' });
+  }
+}
+
+export async function likeMomentCommentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const commentId = new mongoose.Types.ObjectId(req.params.commentId);
+    const data = await likeMomentComment(user._id, momentId, commentId);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Like moment comment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to like comment' });
+  }
+}
+
+export async function unlikeMomentCommentHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const user = await resolveUser(req);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const commentId = new mongoose.Types.ObjectId(req.params.commentId);
+    const data = await unlikeMomentComment(user._id, momentId, commentId);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Unlike moment comment failed', error);
+    res.status(500).json({ success: false, error: 'Failed to unlike comment' });
+  }
+}
+
+export async function getMomentShareInfoHandler(req: Request, res: Response): Promise<void> {
+  try {
+    assertMomentsEnabled();
+    const momentId = new mongoose.Types.ObjectId(req.params.momentId);
+    const data = await buildMomentShareInfo(momentId);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (respondMomentsDisabled(error, res)) return;
+    if (engagementErrorResponse(error, res)) return;
+    logError('Moment share info failed', error);
+    res.status(500).json({ success: false, error: 'Failed to build share link' });
   }
 }

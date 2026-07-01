@@ -39,6 +39,8 @@ export interface MomentsConfig {
   rateLimitUploadWindowSec: number;
   rateLimitStoryViewMax: number;
   rateLimitStoryViewWindowSec: number;
+  rateLimitCommentMax: number;
+  rateLimitCommentWindowSec: number;
   feedCacheTtlSec: number;
   impressionDedupTtlSec: number;
   fanoutOnUpload: boolean;
@@ -92,6 +94,8 @@ export function getMomentsConfig(): MomentsConfig {
     rateLimitUploadWindowSec: readIntEnv('MOMENTS_RATE_LIMIT_UPLOAD_WINDOW_SEC', 3600),
     rateLimitStoryViewMax: readIntEnv('MOMENTS_RATE_LIMIT_STORY_VIEW_MAX', 120),
     rateLimitStoryViewWindowSec: readIntEnv('MOMENTS_RATE_LIMIT_STORY_VIEW_WINDOW_SEC', 60),
+    rateLimitCommentMax: readIntEnv('MOMENTS_RATE_LIMIT_COMMENT_MAX', 30),
+    rateLimitCommentWindowSec: readIntEnv('MOMENTS_RATE_LIMIT_COMMENT_WINDOW_SEC', 3600),
     feedCacheTtlSec: readIntEnv('MOMENTS_FEED_CACHE_TTL_SEC', 30),
     impressionDedupTtlSec: readIntEnv('MOMENTS_IMPRESSION_DEDUP_TTL_SEC', 30 * 60),
     fanoutOnUpload: process.env.MOMENTS_FANOUT_ON_UPLOAD === 'true',

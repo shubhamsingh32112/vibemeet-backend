@@ -19,6 +19,14 @@ import {
   getMyMomentsHandler,
   recordMomentViewHandler,
   recordMomentsPaywallShownHandler,
+  likeMomentHandler,
+  unlikeMomentHandler,
+  listMomentCommentsHandler,
+  createMomentCommentHandler,
+  deleteMomentCommentHandler,
+  likeMomentCommentHandler,
+  unlikeMomentCommentHandler,
+  getMomentShareInfoHandler,
 } from '../controllers/moments.controller';
 
 const router = Router();
@@ -35,6 +43,14 @@ router.post('/analytics/paywall-shown', verifyFirebaseToken, recordMomentsPaywal
 router.get('/creators/:creatorId/summary', verifyFirebaseToken, getCreatorSummaryHandler);
 router.post('/creators/:creatorId/follow', verifyFirebaseToken, followCreatorHandler);
 router.delete('/creators/:creatorId/follow', verifyFirebaseToken, unfollowCreatorHandler);
+router.get('/:momentId/share', getMomentShareInfoHandler);
+router.post('/:momentId/like', verifyFirebaseToken, likeMomentHandler);
+router.delete('/:momentId/like', verifyFirebaseToken, unlikeMomentHandler);
+router.get('/:momentId/comments', verifyFirebaseToken, listMomentCommentsHandler);
+router.post('/:momentId/comments', verifyFirebaseToken, createMomentCommentHandler);
+router.delete('/:momentId/comments/:commentId', verifyFirebaseToken, deleteMomentCommentHandler);
+router.post('/:momentId/comments/:commentId/like', verifyFirebaseToken, likeMomentCommentHandler);
+router.delete('/:momentId/comments/:commentId/like', verifyFirebaseToken, unlikeMomentCommentHandler);
 router.get('/:momentId', verifyFirebaseToken, getMomentDetailHandler);
 router.post('/:momentId/view', verifyFirebaseToken, recordMomentViewHandler);
 router.post('/:momentId/purchase', verifyFirebaseToken, purchaseMomentHandler);

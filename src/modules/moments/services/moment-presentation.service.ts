@@ -36,6 +36,7 @@ export interface ViewerContext {
   userId: Types.ObjectId | null;
   isCreatorOwner?: boolean;
   followedCreatorIds?: Set<string>;
+  likedMomentIds?: Set<string>;
   isStaffAdmin?: boolean;
   isCreatorRole?: boolean;
 }
@@ -160,6 +161,9 @@ export async function toMomentPresentationDTO(
     accessReason,
     processingStatus: moment.processingStatus,
     isFollowing: viewer.followedCreatorIds?.has(moment.creatorId.toString()) ?? false,
+    likesCount: moment.likesCount ?? 0,
+    commentsCount: moment.commentsCount ?? 0,
+    isLiked: viewer.likedMomentIds?.has(moment._id.toString()) ?? false,
   };
 }
 

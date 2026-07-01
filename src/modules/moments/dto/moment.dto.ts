@@ -24,6 +24,9 @@ export interface PresentationDTO {
   isPreview: boolean;
   accessReason: MomentAccessReason;
   isFollowing?: boolean;
+  likesCount?: number;
+  commentsCount?: number;
+  isLiked?: boolean;
   processingStatus?: ProcessingStatus;
   moderationStatus?: string;
   moderationReason?: string;
@@ -41,6 +44,9 @@ export const FEED_DTO_KEYS = [
   'isPreview',
   'accessReason',
   'isFollowing',
+  'likesCount',
+  'commentsCount',
+  'isLiked',
 ] as const;
 
 export type FeedDTO = Pick<PresentationDTO, (typeof FEED_DTO_KEYS)[number]>;
@@ -52,6 +58,39 @@ export type CreatorSelfDTO = PresentationDTO & {
   viewsCount: number;
   purchaseCount: number;
 };
+
+export interface MomentCommentDTO {
+  id: string;
+  authorUserId: string;
+  authorName: string;
+  authorAvatarUrl?: string;
+  isCreator: boolean;
+  text: string;
+  likesCount: number;
+  isLiked: boolean;
+  parentCommentId?: string | null;
+  replies: MomentCommentDTO[];
+  createdAt: string;
+}
+
+export interface MomentCommentsPageDTO {
+  items: MomentCommentDTO[];
+  nextCursor?: string;
+  hasMore: boolean;
+}
+
+export interface MomentLikeResultDTO {
+  likesCount: number;
+  isLiked: boolean;
+}
+
+export interface MomentShareInfoDTO {
+  shareUrl: string;
+  deepLink: string;
+  playStoreUrl: string;
+  title: string;
+  thumbnailUrl: string;
+}
 
 export interface MomentsFeedSections {
   /**

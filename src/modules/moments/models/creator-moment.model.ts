@@ -40,6 +40,8 @@ export interface ICreatorMoment extends Document {
   thumbnailFallbackUrl?: string | null;
   thumbnailValidated?: boolean;
   viewsCount: number;
+  likesCount: number;
+  commentsCount: number;
   /**
    * @deprecated Historical coin-purchase data only. Do not increment in new code.
    * UI should stop displaying this; analytics should use Premium metrics.
@@ -95,6 +97,8 @@ const creatorMomentSchema = new Schema<ICreatorMoment>(
     thumbnailFallbackUrl: { type: String, default: null },
     thumbnailValidated: { type: Boolean, default: false },
     viewsCount: { type: Number, default: 0, min: 0 },
+    likesCount: { type: Number, default: 0, min: 0 },
+    commentsCount: { type: Number, default: 0, min: 0 },
     /** @deprecated Historical data only — no new writes */
     purchaseCount: { type: Number, default: 0, min: 0 },
     isDeleted: { type: Boolean, default: false, index: true },

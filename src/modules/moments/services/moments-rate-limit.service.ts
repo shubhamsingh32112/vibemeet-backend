@@ -1,13 +1,14 @@
 import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { getMomentsConfig } from '../../../config/moments';
 
-export type MomentsRateLimitKind = 'purchase' | 'follow' | 'upload' | 'storyView';
+export type MomentsRateLimitKind = 'purchase' | 'follow' | 'upload' | 'storyView' | 'comment';
 
 const PREFIX: Record<MomentsRateLimitKind, string> = {
   purchase: 'rate_limit:moment_purchase:',
   follow: 'rate_limit:follow:',
   upload: 'rate_limit:moment_upload:',
   storyView: 'rate_limit:story_view:',
+  comment: 'rate_limit:moment_comment:',
 };
 
 function limitsFor(kind: MomentsRateLimitKind): { max: number; windowSec: number } {
@@ -21,6 +22,8 @@ function limitsFor(kind: MomentsRateLimitKind): { max: number; windowSec: number
       return { max: cfg.rateLimitUploadMax, windowSec: cfg.rateLimitUploadWindowSec };
     case 'storyView':
       return { max: cfg.rateLimitStoryViewMax, windowSec: cfg.rateLimitStoryViewWindowSec };
+    case 'comment':
+      return { max: cfg.rateLimitCommentMax, windowSec: cfg.rateLimitCommentWindowSec };
   }
 }
 
