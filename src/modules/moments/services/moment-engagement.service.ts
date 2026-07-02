@@ -11,6 +11,7 @@ import type {
   MomentLikeResultDTO,
   MomentShareInfoDTO,
 } from '../dto/moment.dto';
+import { isMomentsFreeAccessMode } from '../../../config/moments';
 import { resolveMomentAccess, isCreatorOrAdminRole } from './entitlement.service';
 import { isPreviewMoment } from './free-preview.service';
 import { buildAvatarUrls } from '../../images/image-url';
@@ -59,6 +60,10 @@ export async function assertMomentEngagementAccess(
   const isCreatorOwner = await Creator.findOne({ userId, _id: moment.creatorId }).then(
     (c) => c != null,
   );
+  // Match feed presentation: in free access mode any signed-in viewer can engage.
+  if (isMomentsFreeAccessMode()) {
+    return { allowed: true, isCreatorOwner };
+  }
   const preview = !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
   const user = await User.findById(userId);
   const access = await resolveMomentAccess(userId, moment._id, {

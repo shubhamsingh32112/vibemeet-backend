@@ -24,6 +24,7 @@ test('moment engagement service supports VIP highlighted comments', () => {
   assert.ok(src.includes('pinnedHighlightedComments'));
   assert.ok(src.includes('isVipActive'));
   assert.ok(src.includes('$ne: true'));
+  assert.ok(src.includes('isMomentsFreeAccessMode'));
 });
 
 test('legacy upload reward status defaults to approved in creator DTO', () => {
