@@ -45,6 +45,7 @@ export interface SettlementRetryPreview {
   callHistory: {
     durationSeconds: number;
     coinsDeducted: number;
+    walletCoinsDeducted?: number | null;
     coinsEarned: number;
     settlementStatus?: string;
   } | null;
