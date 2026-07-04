@@ -26,7 +26,8 @@ export interface ICallHistory extends Document {
   callEndedAt?: Date;                // When the call session ended
   settledAt?: Date;                  // When billing settlement completed
   settlementStatus?: 'pending' | 'settled' | 'failed'; // Billing projection status
-  coinsDeducted: number;             // Coins deducted (user) or 0 (creator)
+  coinsDeducted: number;             // Total billable coins (intro promo + wallet)
+  walletCoinsDeducted?: number;      // Wallet coins only (0 for intro-only welcome calls)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
   ratingStars?: number;              // 1-5 star rating submitted by user for creator
   ratingComment?: string;            // Optional feedback message
@@ -112,6 +113,11 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: Number,
       default: 0,
       min: 0,
+    },
+    walletCoinsDeducted: {
+      type: Number,
+      min: 0,
+      sparse: true,
     },
     coinsEarned: {
       type: Number,

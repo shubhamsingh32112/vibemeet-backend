@@ -1579,6 +1579,7 @@ export async function finalizeCallSession(
         callId,
         payload: {
           coinsDeducted: persistResult.totalDeducted,
+          walletCoinsDeducted: persistResult.walletCoinsDeducted,
           coinsEarned: persistResult.totalEarnedCreator,
           durationSeconds: persistResult.durationSeconds,
           userMongoId: persistResult.userFirebaseUid,

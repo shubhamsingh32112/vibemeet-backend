@@ -16,6 +16,7 @@ import {
   coinRechargePaidUsersPayload,
   vipPaidUsersPayload,
   walletTransactionsPayload,
+  paymentPurchaseLogsPayload,
 } from './admin-analytics.service';
 import {
   leaderboardHosts,
@@ -158,6 +159,24 @@ export const getFinancePayments = async (req: Request, res: Response): Promise<v
     res.json({ success: true, data });
   } catch (error) {
     logError('getFinancePayments', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getPaymentPurchaseLogs = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const { page, limit } = parsePageLimit(req);
+    const range = parseAdminDateRange(req);
+    const data = await paymentPurchaseLogsPayload(
+      page,
+      limit,
+      range.hasRange ? range.from : undefined,
+      range.hasRange ? range.to : undefined,
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getPaymentPurchaseLogs', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

@@ -26,6 +26,7 @@ import {
   getDashboardOverview,
   getDashboardPayouts,
   getDashboardRazorpayBalance,
+  getDashboardRechargeTransactions,
   getDashboardRealtime,
   getDashboardRevenue,
   getDashboardTopAgencies,
@@ -139,6 +140,7 @@ import { getLeaderboardHosts, getLeaderboardUsers } from './admin-leaderboards.c
 import {
   getCachedLeaderboardHosts,
   getFinancePayments,
+  getPaymentPurchaseLogs,
   getFinancePayoutsSummary,
   getFinanceSettlements,
   getMomentsPaidUsers,
@@ -176,6 +178,7 @@ router.get('/analytics/moments/premium-users', getMomentsPremiumUsers);
 router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
 router.get('/wallet/transactions', getWalletTransactions);
+router.get('/finance/payment-logs', getPaymentPurchaseLogs);
 router.get('/finance/payments', getFinancePayments);
 router.get('/finance/payouts/summary', getFinancePayoutsSummary);
 router.get('/finance/settlements', getFinanceSettlements);
@@ -209,6 +212,7 @@ router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
 router.get('/dashboard/payouts', getDashboardPayouts);
 router.get('/dashboard/geo', getDashboardGeo);
 router.get('/dashboard/razorpay-balance', getDashboardRazorpayBalance);
+router.get('/dashboard/recharge-transactions', getDashboardRechargeTransactions);
 
 // ── Top-tier BDs (super-admin) ─────────────────────────────────────────────
 router.post('/bds', createBd);

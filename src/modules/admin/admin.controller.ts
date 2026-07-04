@@ -112,6 +112,7 @@ import {
   executeAdminSettlementRetry,
   executeBulkAdminSettlementRetry,
   batchBuildSettlementListMeta,
+  requiresUserWalletDebitTxn,
 } from './admin-call-settlement.service';
 import {
   DEFAULT_WALLET_COIN_PACKAGES,
@@ -123,7 +124,13 @@ import {
   getOrCreatePlatformRevenueConfig,
 } from '../payment/platform-revenue-config.model';
 import { parseAdminDateRange } from './admin-date-range';
-import { isAgencyRole, isSuperAdminRole } from '../../utils/staff-roles';
+import { addIstDays, istDateKey, istDayBounds } from '../../utils/ist-time';
+import {
+  AGENCY_ROLE_QUERY,
+  BD_ROLE_QUERY,
+  isAgencyRole,
+  isSuperAdminRole,
+} from '../../utils/staff-roles';
 import { CREATOR_SHARE_PERCENTAGE } from '../../config/pricing.config';
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -143,10 +150,9 @@ async function getAdminUser(req: Request): Promise<any | null> {
 }
 
 function daysAgo(days: number): Date {
-  const d = new Date();
-  d.setDate(d.getDate() - days);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  const todayKey = istDateKey(new Date());
+  const { start } = istDayBounds(addIstDays(todayKey, -days));
+  return start;
 }
 
 /** Write to AdminActionLog (fire-and-forget, never blocks the response) */
@@ -1690,6 +1696,7 @@ export const getCallsAdmin = async (req: Request, res: Response): Promise<void> 
           userCall: {
             durationSeconds: c.durationSeconds,
             coinsDeducted: c.coinsDeducted,
+            walletCoinsDeducted: c.walletCoinsDeducted,
             settlementStatus: c.settlementStatus,
           },
           billingStatus,
@@ -2525,8 +2532,15 @@ export const getWithdrawals = async (req: Request, res: Response): Promise<void>
     }
     const hasAssignedAgent = String(req.query.hasAssignedAgent || '').toLowerCase();
     const withdrawalType = String(req.query.type || 'all').toLowerCase();
+    const staffRoleFilter = String(req.query.staffRole || '').toLowerCase();
     if (withdrawalType === 'staff') {
-      filter.staffUserId = { $exists: true, $ne: null };
+      if (staffRoleFilter === 'bd' || staffRoleFilter === 'agency') {
+        const roleQuery = staffRoleFilter === 'bd' ? BD_ROLE_QUERY : AGENCY_ROLE_QUERY;
+        const staffUsersForRole = await User.find(roleQuery).select('_id').lean();
+        filter.staffUserId = { $in: staffUsersForRole.map((u) => u._id) };
+      } else {
+        filter.staffUserId = { $exists: true, $ne: null };
+      }
     } else if (withdrawalType === 'creator') {
       filter.$or = [
         { staffUserId: null },
@@ -3255,21 +3269,37 @@ export const getIntegrityChecks = async (req: Request, res: Response): Promise<v
       createdAt: { $gte: thirtyDaysAgo },
     });
 
-    // 2) Video call integrity: calls with coins > 0 that lack a CoinTransaction
+    // 2) Video call integrity: wallet-billed calls missing a user debit CoinTransaction
     const callsWithCoins = await CallHistory.find({
       coinsDeducted: { $gt: 0 },
       createdAt: { $gte: thirtyDaysAgo },
       ownerRole: 'user',
-    }).select('callId coinsDeducted').lean();
+    }).select('callId coinsDeducted walletCoinsDeducted').lean();
 
     const callIds = callsWithCoins.map((c: any) => c.callId);
     const callTxs = await CoinTransaction.find({
       source: 'video_call',
       callId: { $in: callIds },
       status: 'completed',
-    }).select('callId').lean();
-    const settledCallIds = new Set(callTxs.map((t: any) => t.callId));
-    const unsettledCalls = callIds.filter((id: string) => !settledCallIds.has(id));
+    }).select('callId type').lean();
+    const debitCallIds = new Set(
+      callTxs.filter((t: any) => t.type === 'debit').map((t: any) => t.callId),
+    );
+    const creditCallIds = new Set(
+      callTxs.filter((t: any) => t.type === 'credit').map((t: any) => t.callId),
+    );
+    const unsettledCalls = callsWithCoins
+      .filter((call: any) => {
+        if (debitCallIds.has(call.callId)) return false;
+        return requiresUserWalletDebitTxn(
+          {
+            coinsDeducted: call.coinsDeducted,
+            walletCoinsDeducted: call.walletCoinsDeducted,
+          },
+          creditCallIds.has(call.callId),
+        );
+      })
+      .map((call: any) => call.callId);
 
     // 3) Withdrawal integrity: approved/paid withdrawals that lack debit CoinTransaction
     const processedWithdrawals = await Withdrawal.find({

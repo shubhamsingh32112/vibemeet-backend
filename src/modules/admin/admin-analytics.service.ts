@@ -15,6 +15,15 @@ import { isBdRole, isAgencyRole } from '../../utils/staff-roles';
 import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRedis } from '../../config/redis';
 import { UserLoginEvent } from '../user/user-login-event.model';
+import {
+  addIstDays,
+  istDateKey,
+  istDayBounds,
+  istLookbackCalendarDays,
+  iterIstDateBucketDefs,
+  iterIstHourBuckets,
+  IST_TIMEZONE,
+} from '../../utils/ist-time';
 
 export type AnalyticsPeriod = 'today' | '7d' | '30d';
 export type UserLoginGranularity = 'daily' | 'weekly' | 'monthly';
@@ -26,29 +35,48 @@ function utcStartOfDay(d = new Date()): Date {
   return x;
 }
 
+function istRollingPeriodStarts(now = new Date()) {
+  const todayKey = istDateKey(now);
+  const { start: todayStart } = istDayBounds(todayKey);
+  const { start: d7Start } = istDayBounds(addIstDays(todayKey, -6));
+  const { start: d30Start } = istDayBounds(addIstDays(todayKey, -29));
+  return { todayKey, todayStart, d7Start, d30Start, now };
+}
+
+function paidUserSummaryMeta(todayKey: string) {
+  return {
+    timezone: IST_TIMEZONE,
+    todayIst: todayKey,
+    rangeSemantics: 'ist_calendar_day' as const,
+  };
+}
+
 export function periodToRange(period: AnalyticsPeriod): { from: Date; to: Date } {
-  const to = new Date();
-  const from = utcStartOfDay();
-  if (period === '7d') {
-    from.setUTCDate(from.getUTCDate() - 6);
-  } else if (period === '30d') {
-    from.setUTCDate(from.getUTCDate() - 29);
+  const now = new Date();
+  if (period === 'today') {
+    const todayKey = istDateKey(now);
+    const { start, end } = istDayBounds(todayKey);
+    return { from: start, to: end };
   }
-  return { from, to };
+  if (period === '7d') {
+    return istLookbackCalendarDays(7, now);
+  }
+  return istLookbackCalendarDays(30, now);
 }
 
 export async function usersSummaryPayload() {
   const now = new Date();
-  const todayStart = utcStartOfDay(now);
-  const d7 = new Date(now.getTime() - 7 * 86400000);
-  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const todayKey = istDateKey(now);
+  const { start: todayStart } = istDayBounds(todayKey);
+  const { start: d7Start } = istDayBounds(addIstDays(todayKey, -6));
+  const { start: d30Start } = istDayBounds(addIstDays(todayKey, -29));
   const userRole = { role: 'user' as const };
 
   const [totalUsers, signupsToday, signups7d, signups30d, onboardedUsers] = await Promise.all([
     User.countDocuments(userRole),
-    User.countDocuments({ ...userRole, createdAt: { $gte: todayStart } }),
-    User.countDocuments({ ...userRole, createdAt: { $gte: d7 } }),
-    User.countDocuments({ ...userRole, createdAt: { $gte: d30 } }),
+    User.countDocuments({ ...userRole, createdAt: { $gte: todayStart, $lte: now } }),
+    User.countDocuments({ ...userRole, createdAt: { $gte: d7Start, $lte: now } }),
+    User.countDocuments({ ...userRole, createdAt: { $gte: d30Start, $lte: now } }),
     User.countDocuments({ ...userRole, categories: { $exists: true, $ne: [] } }),
   ]);
 
@@ -58,6 +86,8 @@ export async function usersSummaryPayload() {
     signups7d,
     signups30d,
     onboardedUsers,
+    timezone: IST_TIMEZONE,
+    todayIst: todayKey,
     generatedAt: now.toISOString(),
   };
 }
@@ -70,31 +100,18 @@ function parseUserLoginGranularity(raw: unknown): UserLoginGranularity {
 
 function loginSeriesLookback(granularity: UserLoginGranularity): { from: Date; to: Date } {
   const to = new Date();
-  const from = utcStartOfDay(to);
   if (granularity === 'daily') {
-    from.setUTCDate(from.getUTCDate() - 29);
-    return { from, to };
+    return istLookbackCalendarDays(30, to);
   }
   if (granularity === 'weekly') {
-    from.setUTCDate(from.getUTCDate() - 7 * 11);
+    const from = new Date(to.getTime() - 7 * 11 * 86400000);
     return { from, to };
   }
+  const from = new Date(to.getTime());
   from.setUTCMonth(from.getUTCMonth() - 11);
   from.setUTCDate(1);
+  from.setUTCHours(0, 0, 0, 0);
   return { from, to };
-}
-
-function iterUtcDateStrings(from: Date, to: Date): string[] {
-  const dates: string[] = [];
-  const cur = new Date(from);
-  cur.setUTCHours(0, 0, 0, 0);
-  const end = new Date(to);
-  end.setUTCHours(0, 0, 0, 0);
-  while (cur <= end) {
-    dates.push(cur.toISOString().slice(0, 10));
-    cur.setUTCDate(cur.getUTCDate() + 1);
-  }
-  return dates;
 }
 
 function isoWeekLabel(year: number, week: number): string {
@@ -161,13 +178,13 @@ export async function usersLoginSeriesPayload(granularityInput: unknown) {
 
   const bucketGroupId =
     granularity === 'daily'
-      ? { $dateToString: { format: '%Y-%m-%d', date: '$loggedInAt', timezone: 'UTC' } }
+      ? { $dateToString: { format: '%Y-%m-%d', date: '$loggedInAt', timezone: IST_TIMEZONE } }
       : granularity === 'weekly'
         ? {
             year: { $isoWeekYear: '$loggedInAt' },
             week: { $isoWeek: '$loggedInAt' },
           }
-        : { $dateToString: { format: '%Y-%m', date: '$loggedInAt', timezone: 'UTC' } };
+        : { $dateToString: { format: '%Y-%m', date: '$loggedInAt', timezone: IST_TIMEZONE } };
 
   const agg = await UserLoginEvent.aggregate<{
     _id: string | { year: number; week: number };
@@ -204,7 +221,7 @@ export async function usersLoginSeriesPayload(granularityInput: unknown) {
 
   const bucketDefs =
     granularity === 'daily'
-      ? iterUtcDateStrings(from, to).map((date) => ({ key: date, label: date, startDate: date }))
+      ? iterIstDateBucketDefs(istDateKey(from), istDateKey(to))
       : granularity === 'weekly'
         ? iterWeeklyBuckets(from, to)
         : iterMonthlyBuckets(from, to);
@@ -221,11 +238,14 @@ export async function usersLoginSeriesPayload(granularityInput: unknown) {
 
   return {
     granularity,
+    timezone: IST_TIMEZONE,
     from: from.toISOString(),
     to: to.toISOString(),
     points,
     note:
-      'Unique end-users (role=user) who logged in per period. Data is recorded from deployment of login tracking onward.',
+      granularity === 'daily'
+        ? 'Unique end-users (role=user) who logged in per IST day. Data is recorded from deployment of login tracking onward.'
+        : 'Unique end-users (role=user) who logged in per period. Data is recorded from deployment of login tracking onward.',
     generatedAt: new Date().toISOString(),
   };
 }
@@ -233,23 +253,6 @@ export async function usersLoginSeriesPayload(granularityInput: unknown) {
 function parseUserSignupGranularity(raw: unknown): UserSignupGranularity {
   const g = String(raw ?? 'hourly');
   return g === 'daily' ? 'daily' : 'hourly';
-}
-
-function iterUtcHourBuckets(from: Date, to: Date): Array<{ key: string; label: string; startDate: string }> {
-  const buckets: Array<{ key: string; label: string; startDate: string }> = [];
-  const cur = new Date(from);
-  cur.setUTCMinutes(0, 0, 0);
-  const end = new Date(to);
-  while (cur <= end) {
-    const key = cur.toISOString().slice(0, 13).replace('T', ' ');
-    buckets.push({
-      key,
-      label: `${String(cur.getUTCHours()).padStart(2, '0')}:00`,
-      startDate: cur.toISOString(),
-    });
-    cur.setUTCHours(cur.getUTCHours() + 1);
-  }
-  return buckets;
 }
 
 export async function usersSignupSeriesPayload(
@@ -265,14 +268,13 @@ export async function usersSignupSeriesPayload(
   } else if (granularity === 'hourly') {
     from = new Date(to.getTime() - 48 * 60 * 60 * 1000);
   } else {
-    from = utcStartOfDay(to);
-    from.setUTCDate(from.getUTCDate() - 29);
+    ({ from } = istLookbackCalendarDays(30, to));
   }
 
   const bucketGroupId =
     granularity === 'hourly'
-      ? { $dateToString: { format: '%Y-%m-%d %H:00', date: '$createdAt', timezone: 'UTC' } }
-      : { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } };
+      ? { $dateToString: { format: '%Y-%m-%d %H:00', date: '$createdAt', timezone: IST_TIMEZONE } }
+      : { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } };
 
   const agg = await User.aggregate<{ _id: string; signups: number }>([
     { $match: { role: 'user', createdAt: { $gte: from, $lte: to } } },
@@ -286,8 +288,8 @@ export async function usersSignupSeriesPayload(
 
   const bucketDefs =
     granularity === 'hourly'
-      ? iterUtcHourBuckets(from, to)
-      : iterUtcDateStrings(from, to).map((date) => ({ key: date, label: date, startDate: date }));
+      ? iterIstHourBuckets(from, to)
+      : iterIstDateBucketDefs(istDateKey(from), istDateKey(to));
 
   const points = bucketDefs.map(({ key, label, startDate }) => ({
     label,
@@ -297,13 +299,14 @@ export async function usersSignupSeriesPayload(
 
   return {
     granularity,
+    timezone: IST_TIMEZONE,
     from: from.toISOString(),
     to: to.toISOString(),
     points,
     note:
       granularity === 'hourly'
-        ? 'New end-user signups (role=user) per UTC hour — proxy for app downloads/installs.'
-        : 'New end-user signups (role=user) per UTC day.',
+        ? 'New end-user signups (role=user) per IST hour (last 48h) — proxy for app downloads/installs.'
+        : 'New end-user signups (role=user) per IST day.',
     generatedAt: new Date().toISOString(),
   };
 }
@@ -313,10 +316,7 @@ const PAID_MOMENT_SOURCES = ['coin_purchase', 'vip_discounted'] as const;
 export async function momentsPaidUsersPayload(page: number, limit: number) {
   const lim = Math.min(100, Math.max(1, limit));
   const skip = (page - 1) * lim;
-  const now = new Date();
-  const todayStart = utcStartOfDay(now);
-  const d7 = new Date(now.getTime() - 7 * 86400000);
-  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const { todayKey, todayStart, d7Start, d30Start } = istRollingPeriodStarts();
 
   const matchPaid = {
     purchaseSource: { $in: PAID_MOMENT_SOURCES },
@@ -340,10 +340,10 @@ export async function momentsPaidUsersPayload(page: number, limit: number) {
             },
           },
           buyers7d: {
-            $sum: { $cond: [{ $gte: ['$purchasedAt', d7] }, 1, 0] },
+            $sum: { $cond: [{ $gte: ['$purchasedAt', d7Start] }, 1, 0] },
           },
           buyers30d: {
-            $sum: { $cond: [{ $gte: ['$purchasedAt', d30] }, 1, 0] },
+            $sum: { $cond: [{ $gte: ['$purchasedAt', d30Start] }, 1, 0] },
           },
           revenueCoins: { $sum: '$amountCoins' },
         },
@@ -394,6 +394,7 @@ export async function momentsPaidUsersPayload(page: number, limit: number) {
       uniqueBuyers30d: summary?.buyers30d ?? 0,
       totalRevenueCoins: summary?.revenueCoins ?? 0,
     },
+    ...paidUserSummaryMeta(todayKey),
     rows: rows.map((r, i) => {
       const u = userById.get(r._id.toString());
       return {
@@ -433,16 +434,13 @@ function computeMomentsPremiumDaysRemaining(expiresAt: Date, now: Date): number 
 export async function momentsPremiumUsersPayload(page: number, limit: number) {
   const lim = Math.min(100, Math.max(1, limit));
   const skip = (page - 1) * lim;
-  const now = new Date();
-  const todayStart = utcStartOfDay(now);
-  const d7 = new Date(now.getTime() - 7 * 86400000);
-  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const { todayKey, todayStart, d7Start, d30Start, now } = istRollingPeriodStarts();
 
   const [activeCount, newToday, new7d, new30d, total, members] = await Promise.all([
     MomentsPremiumMembership.countDocuments({ status: 'active', expiresAt: { $gt: now } }),
     MomentsPremiumMembership.countDocuments({ startedAt: { $gte: todayStart } }),
-    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d7 } }),
-    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d30 } }),
+    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d7Start } }),
+    MomentsPremiumMembership.countDocuments({ startedAt: { $gte: d30Start } }),
     MomentsPremiumMembership.countDocuments({}),
     MomentsPremiumMembership.find({})
       .sort({ startedAt: -1 })
@@ -467,7 +465,7 @@ export async function momentsPremiumUsersPayload(page: number, limit: number) {
     CoinTransaction.find({
       source: 'moments_premium_membership',
       status: 'completed',
-      createdAt: { $gte: d30 },
+      createdAt: { $gte: d30Start },
     })
       .select('priceInr description')
       .lean(),
@@ -498,6 +496,7 @@ export async function momentsPremiumUsersPayload(page: number, limit: number) {
       newPurchases30d: new30d,
       revenueInr30d,
     },
+    ...paidUserSummaryMeta(todayKey),
     rows: members.map((m, i) => {
       const u = userById.get(m.userId.toString());
       const txn = txnByUser.get(m.userId.toString());
@@ -528,10 +527,7 @@ export async function vipPaidUsersPayload(
 ) {
   const lim = Math.min(100, Math.max(1, limit));
   const skip = (page - 1) * lim;
-  const now = new Date();
-  const todayStart = utcStartOfDay(now);
-  const d7 = new Date(now.getTime() - 7 * 86400000);
-  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const { todayKey, todayStart, d7Start, d30Start, now } = istRollingPeriodStarts();
 
   const membershipQuery: Record<string, unknown> = {};
   if (statusFilter === 'active') {
@@ -547,8 +543,8 @@ export async function vipPaidUsersPayload(
   const [activeCount, newToday, new7d, new30d, total, members] = await Promise.all([
     VipMembership.countDocuments({ status: 'active', expiresAt: { $gt: now } }),
     VipMembership.countDocuments({ startedAt: { $gte: todayStart } }),
-    VipMembership.countDocuments({ startedAt: { $gte: d7 } }),
-    VipMembership.countDocuments({ startedAt: { $gte: d30 } }),
+    VipMembership.countDocuments({ startedAt: { $gte: d7Start } }),
+    VipMembership.countDocuments({ startedAt: { $gte: d30Start } }),
     VipMembership.countDocuments(membershipQuery),
     VipMembership.find(membershipQuery)
       .sort({ startedAt: -1 })
@@ -586,7 +582,7 @@ export async function vipPaidUsersPayload(
         source: 'vip_membership',
         type: 'debit',
         status: 'completed',
-        createdAt: { $gte: d30 },
+        createdAt: { $gte: d30Start },
       },
     },
     { $group: { _id: null, total: { $sum: '$coins' } } },
@@ -600,6 +596,7 @@ export async function vipPaidUsersPayload(
       newPurchases30d: new30d,
       revenueCoins30d: vipRevenueAgg[0]?.total ?? 0,
     },
+    ...paidUserSummaryMeta(todayKey),
     rows: members.map((m, i) => {
       const u = userById.get(m.userId.toString());
       const txn = txnByUser.get(m.userId.toString());
@@ -627,10 +624,7 @@ export async function vipPaidUsersPayload(
 export async function coinRechargePaidUsersPayload(page: number, limit: number) {
   const lim = Math.min(100, Math.max(1, limit));
   const skip = (page - 1) * lim;
-  const now = new Date();
-  const todayStart = utcStartOfDay(now);
-  const d7 = new Date(now.getTime() - 7 * 86400000);
-  const d30 = new Date(now.getTime() - 30 * 86400000);
+  const { todayKey, todayStart, d7Start, d30Start } = istRollingPeriodStarts();
   const rechargeMatch = {
     type: 'credit' as const,
     source: 'payment_gateway' as const,
@@ -681,14 +675,14 @@ export async function coinRechargePaidUsersPayload(page: number, limit: number) 
             $sum: { $cond: [{ $gte: ['$firstAt', todayStart] }, 1, 0] },
           },
           buyers7d: {
-            $sum: { $cond: [{ $gte: ['$firstAt', d7] }, 1, 0] },
+            $sum: { $cond: [{ $gte: ['$firstAt', d7Start] }, 1, 0] },
           },
           buyers30d: {
-            $sum: { $cond: [{ $gte: ['$firstAt', d30] }, 1, 0] },
+            $sum: { $cond: [{ $gte: ['$firstAt', d30Start] }, 1, 0] },
           },
           revenueInr30d: {
             $sum: {
-              $cond: [{ $gte: ['$lastAt', d30] }, '$totalInr', 0],
+              $cond: [{ $gte: ['$lastAt', d30Start] }, '$totalInr', 0],
             },
           },
         },
@@ -746,6 +740,7 @@ export async function coinRechargePaidUsersPayload(page: number, limit: number) 
       buyers30d: summaryRow?.buyers30d ?? 0,
       revenueInr30d: summaryRow?.revenueInr30d ?? 0,
     },
+    ...paidUserSummaryMeta(todayKey),
     rows: buyerRows.map((r, i) => {
       const u = userById.get(r._id.toString());
       let totalInr = r.totalInrFromField ?? 0;
@@ -772,6 +767,99 @@ export async function coinRechargePaidUsersPayload(page: number, limit: number) 
       total: uniqueBuyers,
       totalPages: Math.ceil(uniqueBuyers / lim),
     },
+  };
+}
+
+const PAYMENT_PURCHASE_SOURCES = [
+  'payment_gateway',
+  'vip_membership',
+  'moments_premium_membership',
+] as const;
+
+function paymentProductLabel(source: string): string {
+  switch (source) {
+    case 'payment_gateway':
+      return 'Coins';
+    case 'vip_membership':
+      return 'VIP';
+    case 'moments_premium_membership':
+      return 'Moments Premium';
+    default:
+      return source;
+  }
+}
+
+function paymentAmountInr(tx: { priceInr?: number | null; description?: string | null }): number {
+  if (typeof tx.priceInr === 'number' && tx.priceInr > 0) return tx.priceInr;
+  return parseInrFromPurchaseDescription(tx.description);
+}
+
+export async function paymentPurchaseLogsPayload(
+  page: number,
+  limit: number,
+  from?: Date,
+  to?: Date,
+) {
+  const lim = Math.min(100, Math.max(1, limit));
+  const skip = (page - 1) * lim;
+  const filter: Record<string, unknown> = {
+    type: 'credit',
+    status: 'completed',
+    source: { $in: [...PAYMENT_PURCHASE_SOURCES] },
+  };
+  if (from && to) filter.createdAt = { $gte: from, $lt: to };
+
+  const [rows, total, summaryAgg] = await Promise.all([
+    CoinTransaction.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(lim)
+      .populate('userId', 'username email role')
+      .lean(),
+    CoinTransaction.countDocuments(filter),
+    CoinTransaction.aggregate<{ totalInr: number }>([
+      { $match: filter },
+      {
+        $group: {
+          _id: null,
+          totalInr: {
+            $sum: {
+              $cond: [
+                { $gt: ['$priceInr', 0] },
+                '$priceInr',
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+  ]);
+
+  return {
+    summary: {
+      totalPurchases: total,
+      totalInrFromPriceField: summaryAgg[0]?.totalInr ?? 0,
+    },
+    purchases: rows.map((tx) => ({
+      id: tx._id.toString(),
+      transactionId: tx.transactionId,
+      userId: tx.userId?._id?.toString?.() ?? String(tx.userId),
+      username:
+        (tx.userId as { username?: string; email?: string })?.username ||
+        (tx.userId as { email?: string })?.email ||
+        'Unknown',
+      product: paymentProductLabel(tx.source),
+      source: tx.source,
+      planLabel: tx.description || '—',
+      amountInr: paymentAmountInr(tx),
+      coins: tx.coins > 0 ? tx.coins : null,
+      paymentId: tx.paymentGatewayTransactionId ?? null,
+      orderId: tx.paymentGatewayOrderId ?? null,
+      status: tx.status,
+      createdAt: tx.createdAt,
+    })),
+    pagination: { page, limit: lim, total, totalPages: Math.ceil(total / lim) },
   };
 }
 
@@ -821,7 +909,7 @@ export async function walletTransactionsPayload(
 
 export async function financePayoutsSummaryPayload(period: AnalyticsPeriod) {
   const { from, to } = periodToRange(period);
-  const dateMatch = { processedAt: { $gte: from, $lte: to }, status: 'paid' as const };
+  const dateMatch = { processedAt: { $gte: from, $lt: to }, status: 'paid' as const };
 
   const paid = await Withdrawal.find(dateMatch).select('amount staffUserId creatorUserId').lean();
   const staffIds = [

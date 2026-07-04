@@ -2,6 +2,7 @@ import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
 import { Creator, type ICreator, CREATOR_LISTABLE_FILTER } from './creator.model';
+import { MIN_CREATOR_WITHDRAWAL_COINS } from './creator-withdrawal.constants';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -3095,7 +3096,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
  * Creator requests to withdraw coins.
  * Rules:
  *   - Must be a creator
- *   - Minimum withdrawal: 100 coins
+ *   - Minimum withdrawal: 1000 coins
  *   - Amount must not exceed current balance
  *   - Coins are NOT deducted at this point (only when payout is marked paid)
  *   - Creates a Withdrawal record with status 'pending'
@@ -3157,8 +3158,11 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       }
     }
 
-    if (amount < 100) {
-      res.status(400).json({ success: false, error: 'Minimum withdrawal amount is 100 coins' });
+    if (amount < MIN_CREATOR_WITHDRAWAL_COINS) {
+      res.status(400).json({
+        success: false,
+        error: `Minimum withdrawal amount is ${MIN_CREATOR_WITHDRAWAL_COINS} coins`,
+      });
       return;
     }
 

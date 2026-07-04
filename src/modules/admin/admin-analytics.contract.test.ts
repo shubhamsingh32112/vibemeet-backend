@@ -4,11 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { periodToRange } from './admin-analytics.service';
 
-test('periodToRange today is single UTC day', () => {
+test('periodToRange today is single IST calendar day', () => {
   const { from, to } = periodToRange('today');
-  assert.ok(from <= to);
+  assert.ok(from < to);
   const hours = (to.getTime() - from.getTime()) / 3600000;
-  assert.ok(hours < 24.1);
+  assert.ok(Math.abs(hours - 24) < 0.1);
 });
 
 test('admin routes register analytics BFF endpoints', () => {

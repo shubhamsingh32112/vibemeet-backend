@@ -13,6 +13,7 @@ import {
   dashboardRazorpayBalance,
   dashboardRealtimePayload,
   dashboardRevenueSeries,
+  dashboardRechargeTransactionsForDay,
   dashboardTopAgencies,
   dashboardTopBds,
   dashboardTopHosts,
@@ -184,6 +185,26 @@ export const getDashboardRazorpayBalance = async (req: Request, res: Response): 
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardRazorpayBalance', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getDashboardRechargeTransactions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const date = typeof req.query.date === 'string' ? req.query.date.trim() : '';
+    if (!date) {
+      res.status(400).json({ success: false, error: 'date query param required (YYYY-MM-DD IST)' });
+      return;
+    }
+    const data = await dashboardRechargeTransactionsForDay(date);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'INVALID_IST_DATE') {
+      res.status(400).json({ success: false, error: 'Invalid date; use YYYY-MM-DD (IST calendar day)' });
+      return;
+    }
+    logError('getDashboardRechargeTransactions', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

@@ -234,6 +234,7 @@ export interface SettleCallFromFinalizerOptions {
 
 export interface SettlePersistResult {
   totalDeducted: number;
+  walletCoinsDeducted: number;
   totalEarnedCreator: number;
   durationSeconds: number;
   userFirebaseUid: string;
@@ -513,6 +514,7 @@ export async function settleCall(
     Math.max(0, (session.totalDeductedMicros ?? 0) - introDeductedMicros);
   totalEarnedCreator = microsToCreatorCreditWholeCoins(session.totalEarnedMicros ?? 0);
   totalDeducted = microsToUserDebitWholeCoins(session.totalDeductedMicros ?? 0);
+  const walletCoinsDeducted = microsToUserDebitWholeCoins(walletDeductedMicros);
 
   if (
     authoritativeTotals.source === 'none' &&
@@ -944,6 +946,7 @@ export async function settleCall(
         ...callTimestampFields,
         settlementStatus: 'settled',
         coinsDeducted: totalDeducted,
+        walletCoinsDeducted,
         coinsEarned: 0,
       },
       { upsert: true, new: true, session: dbSession }
@@ -1131,6 +1134,7 @@ export async function settleCall(
 
   const persistResult: SettlePersistResult = {
     totalDeducted,
+    walletCoinsDeducted,
     totalEarnedCreator,
     durationSeconds,
     userFirebaseUid: session.userFirebaseUid,

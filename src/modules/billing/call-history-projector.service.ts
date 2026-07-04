@@ -135,6 +135,11 @@ export async function projectCallHistoryFromBillingEvent(
     if (event.type === 'call.billing.settled') {
       const settledAt = new Date();
       const coinsDeducted = Math.max(0, Number(payload.coinsDeducted) || 0);
+      const walletCoinsDeductedRaw = payload.walletCoinsDeducted;
+      const walletCoinsDeducted =
+        walletCoinsDeductedRaw == null
+          ? undefined
+          : Math.max(0, Number(walletCoinsDeductedRaw) || 0);
       const coinsEarned = Math.max(0, Number(payload.coinsEarned) || 0);
       const settledBase = {
         settlementStatus: 'settled' as const,
@@ -148,6 +153,7 @@ export async function projectCallHistoryFromBillingEvent(
           $set: {
             ...settledBase,
             coinsDeducted,
+            ...(walletCoinsDeducted != null ? { walletCoinsDeducted } : {}),
             coinsEarned: 0,
           },
         }

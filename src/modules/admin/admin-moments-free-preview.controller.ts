@@ -211,7 +211,7 @@ export async function browseMomentsForAdminHandler(
 ): Promise<void> {
   try {
     if (!(await assertAdmin(req, res))) return;
-    const limit = Math.min(Number(req.query.limit) || 20, 50);
+    const limit = Math.min(Number(req.query.limit) || 30, 100);
     const cursor = req.query.cursor as string | undefined;
     const q = (req.query.q as string | undefined)?.trim();
     const type = req.query.type as 'photo' | 'video' | undefined;
@@ -227,17 +227,30 @@ export async function browseMomentsForAdminHandler(
     if (visibilityTier && isMomentVisibilityTier(visibilityTier)) {
       query.visibilityTier = visibilityTier;
     }
-    if (cursor) {
-      const cursorScore = Number(cursor);
-      if (Number.isFinite(cursorScore)) {
-        query.feedScore = { $lt: cursorScore };
-      }
-    }
     if (q) {
       query.caption = { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     }
 
-    const moments = await CreatorMoment.find(query)
+    if (hasPreview === 'yes' || hasPreview === 'no') {
+      const previewRows = await FreePreviewMoment.find().select('momentId').lean();
+      const previewIds = previewRows.map((row) => row.momentId);
+      query._id =
+        hasPreview === 'yes'
+          ? { $in: previewIds }
+          : { $nin: previewIds };
+    }
+
+    const total = await CreatorMoment.countDocuments(query);
+
+    const pageQuery = { ...query };
+    if (cursor) {
+      const cursorScore = Number(cursor);
+      if (Number.isFinite(cursorScore)) {
+        pageQuery.feedScore = { $lt: cursorScore };
+      }
+    }
+
+    const moments = await CreatorMoment.find(pageQuery)
       .sort({ feedScore: -1, _id: -1 })
       .limit(limit + 1);
 
@@ -253,7 +266,7 @@ export async function browseMomentsForAdminHandler(
     const creators = await Creator.find({ _id: { $in: creatorIds } }).lean();
     const creatorMap = new Map(creators.map((c) => [c._id.toString(), c]));
 
-    let items = slice.map((m) => {
+    const items = slice.map((m) => {
       const creator = creatorMap.get(m.creatorId.toString());
       const avatarUrl = creator?.avatar?.imageId
         ? buildAvatarUrls(creator.avatar.imageId).sm
@@ -278,16 +291,10 @@ export async function browseMomentsForAdminHandler(
       };
     });
 
-    if (hasPreview === 'yes') {
-      items = items.filter((i) => i.inFreePreview);
-    } else if (hasPreview === 'no') {
-      items = items.filter((i) => !i.inFreePreview);
-    }
-
     const nextCursor =
       moments.length > limit ? String(slice[slice.length - 1]?.feedScore) : undefined;
 
-    res.json({ success: true, data: { items, nextCursor } });
+    res.json({ success: true, data: { items, nextCursor, total } });
   } catch (error) {
     logError('Browse moments for admin failed', error);
     res.status(500).json({ success: false, error: 'Failed to browse moments' });

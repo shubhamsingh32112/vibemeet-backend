@@ -7,8 +7,9 @@ import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { StaffPayoutAccount } from './staff-payout-account.model';
 import { invalidateAdminCaches } from '../../config/redis';
 import { emitToAdmin } from '../admin/admin.gateway';
+import { MIN_STAFF_WITHDRAWAL_COINS } from '../creator/creator-withdrawal.constants';
 
-export const MIN_STAFF_WITHDRAWAL_COINS = 100;
+export { MIN_STAFF_WITHDRAWAL_COINS };
 const STAFF_WITHDRAWAL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export type PayoutAccountInput = {
