@@ -1028,6 +1028,9 @@ function engagementErrorResponse(error: unknown, res: Response): boolean {
       case 'INVALID_TEXT':
         res.status(400).json({ success: false, error: 'Invalid comment text' });
         return true;
+      case 'NUMBERS_NOT_ALLOWED':
+        res.status(400).json({ success: false, error: 'Numbers are not allowed in comments' });
+        return true;
       case 'PARENT_NOT_FOUND':
         res.status(404).json({ success: false, error: 'Parent comment not found' });
         return true;

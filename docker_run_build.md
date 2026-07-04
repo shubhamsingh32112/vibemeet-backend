@@ -10,13 +10,13 @@ npm run build
 # Pick a unique tag, e.g. upload-fix-20260620
 export BUILD_ID=likeCommentShare
 
-docker build -t app-backend:likeCommentShare  .
+docker build -t app-backend:fixLikeCommentShare  .
 
-docker tag app-backend:likeCommentShare  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:likeCommentShare 
+docker tag app-backend:fixLikeCommentShare  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:fixLikeCommentShare 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:likeCommentShare 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:fixLikeCommentShare 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.
@@ -95,6 +95,35 @@ BILLING_RECOVERY_EMPTY_CACHE_TTL_SECONDS=3
 | `Settlement complete` | 0 | > 0 after hang-up |
 | `call_rejected_creator_offline` | N/A | when toggle off + ring attempt |
 | `Post-call restore using Redis base` | N/A | snapshot missing + Redis offline |
+
+### Download CloudWatch logs (api-ws + billing-worker)
+
+Before running the script, verify AWS CLI credentials (ECR `docker login` does **not** authenticate CloudWatch):
+
+```bash
+aws sts get-caller-identity
+```
+
+If that returns your account details, download logs for any date range:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File backend/scripts/download-cloudwatch-logs.ps1 `
+    -StartDate "2026-06-27" `
+    -EndDate "2026-07-03" `
+    -NoVerifySsl
+```
+
+Output (repo root) — pretty-printed JSON files:
+
+```
+aws_logs/
+├── api-ws.json
+└── billing-worker.json
+```
+
+Each file is a JSON document with `logGroup`, `startDate`, `endDate`, `region`, `eventCount`, and an `events` array of CloudWatch log records.
+
+Covers `/ecs/api-ws` and `/ecs/billing-worker` from start of `StartDate` through end of `EndDate` (23:59:59.999 local time). Optional: `-Region "ap-south-1"` (default).
 
 ### Manual QA
 

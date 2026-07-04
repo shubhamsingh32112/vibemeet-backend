@@ -55,7 +55,7 @@ import {
 } from './creator-gallery.constants';
 import { logError, logInfo, logWarning } from '../../utils/logger';
 import { recordCallMetric, recordFeedMetric } from '../../utils/monitoring';
-import { ensureCreatorPromotionBonusReversalEntry } from './creator-starter.service';
+import { ensureCreatorPromotionWalletClearedEntry } from './creator-starter.service';
 import { ensureStreamUser } from '../../config/stream';
 import { getStreamUpsertPayload } from '../../utils/stream-user-payload';
 import { invalidateOtherMemberCacheForFirebaseUid } from '../chat/chat-cache-invalidation';
@@ -996,7 +996,7 @@ export const createCreator = async (req: Request, res: Response): Promise<void> 
         targetUser.role = 'creator';
       }
       await targetUser.save({ session });
-      await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+      await ensureCreatorPromotionWalletClearedEntry(targetUser, session);
 
       const created = await Creator.create(
         [{

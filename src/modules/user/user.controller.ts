@@ -36,7 +36,7 @@ import {
 import { validateCreatorPriceForApi } from '../../config/creator-price.config';
 import { parseCreatorLocationForCreate } from '../creator/creator-location.util';
 import {
-  ensureCreatorPromotionBonusReversalEntry,
+  ensureCreatorPromotionWalletClearedEntry,
   promoteUserToCreatorWithStarterProfile,
 } from '../creator/creator-starter.service';
 import { isAgencyRole, isNonConsumerCoinsRole, isSuperAdminRole } from '../../utils/staff-roles';
@@ -1621,7 +1621,7 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
         }
 
         await targetUser.save({ session });
-        await ensureCreatorPromotionBonusReversalEntry(targetUser, session);
+        await ensureCreatorPromotionWalletClearedEntry(targetUser, session);
 
         const creator = await Creator.create(
           [

@@ -1,4 +1,5 @@
 import type { ClientSession } from 'mongoose';
+import mongoose from 'mongoose';
 import type { IUser } from '../user/user.model';
 import { Creator, type ICreator } from './creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -8,25 +9,79 @@ export const STARTER_CREATOR_ABOUT =
   'Complete your creator profile in the app to start connecting with fans.';
 /** @deprecated Prefer `getSystemDefaultHostPriceForNewHosts()` for new host rows. */
 export const DEFAULT_CREATOR_STARTER_PRICE = 60;
-export const CREATOR_PROMOTION_BONUS_REVERSAL_COINS = 30;
 
-export function creatorPromotionBonusReversalTransactionId(userId: string): string {
-  return `creator_promotion_bonus_reversal_${userId}`;
+export function creatorPromotionWalletClearTransactionId(userId: string): string {
+  return `creator_promotion_wallet_clear_${userId}`;
 }
 
-export async function ensureCreatorPromotionBonusReversalEntry(
+async function getCompletedLedgerBalance(
+  userId: mongoose.Types.ObjectId,
+  session?: ClientSession
+): Promise<number> {
+  const pipeline = [
+    {
+      $match: {
+        userId: new mongoose.Types.ObjectId(userId.toString()),
+        status: 'completed',
+      },
+    },
+    {
+      $group: {
+        _id: '$type',
+        total: { $sum: '$coins' },
+      },
+    },
+  ];
+
+  const agg = session
+    ? await CoinTransaction.aggregate(pipeline).session(session)
+    : await CoinTransaction.aggregate(pipeline);
+
+  const credits = agg.find((a: { _id: string; total: number }) => a._id === 'credit')?.total || 0;
+  const debits = agg.find((a: { _id: string; total: number }) => a._id === 'debit')?.total || 0;
+  return credits - debits;
+}
+
+/**
+ * After promotion sets User.coins = 0, write one ledger entry so credits − debits nets to 0.
+ * Debits surplus balance; credits a deficit (e.g. legacy fixed −30 reversal).
+ * Idempotent via deterministic transactionId.
+ */
+export async function ensureCreatorPromotionWalletClearedEntry(
   user: IUser,
   session?: ClientSession
 ): Promise<void> {
+  const transactionId = creatorPromotionWalletClearTransactionId(user._id.toString());
+
+  const existingQuery = CoinTransaction.findOne({ transactionId }).select('_id');
+  const existing = session
+    ? await existingQuery.session(session).lean()
+    : await existingQuery.lean();
+  if (existing) {
+    return;
+  }
+
+  const ledgerBalance = await getCompletedLedgerBalance(user._id, session);
+  if (ledgerBalance === 0) {
+    return;
+  }
+
+  const type: 'credit' | 'debit' = ledgerBalance > 0 ? 'debit' : 'credit';
+  const coins = Math.abs(ledgerBalance);
+  const description =
+    type === 'debit'
+      ? 'Consumer wallet cleared on creator promotion'
+      : 'Ledger correction on creator promotion';
+
   await CoinTransaction.updateOne(
-    { transactionId: creatorPromotionBonusReversalTransactionId(user._id.toString()) },
+    { transactionId },
     {
       $setOnInsert: {
         userId: user._id,
-        type: 'debit',
-        coins: CREATOR_PROMOTION_BONUS_REVERSAL_COINS,
+        type,
+        coins,
         source: 'admin',
-        description: 'Welcome bonus reversal on creator promotion (-30 coins)',
+        description,
         status: 'completed',
       },
     },
@@ -64,7 +119,7 @@ export async function promoteUserToCreatorWithStarterProfile(
   user.coins = 0;
   user.role = 'creator';
   await user.save({ session });
-  await ensureCreatorPromotionBonusReversalEntry(user, session);
+  await ensureCreatorPromotionWalletClearedEntry(user, session);
 
   if (previousCoins > 0) {
     // eslint-disable-next-line no-console

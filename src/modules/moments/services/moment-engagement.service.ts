@@ -16,6 +16,7 @@ import { resolveMomentAccess, isCreatorOrAdminRole } from './entitlement.service
 import { isPreviewMoment } from './free-preview.service';
 import { buildAvatarUrls } from '../../images/image-url';
 import { isVipActive } from '../../vip/vip-entitlement.service';
+import { momentCommentContainsNumbers } from '../utils/moment-comment-text-filter';
 
 const ENGAGEMENT_LIKE_WEIGHT = 1;
 const ENGAGEMENT_COMMENT_WEIGHT = 2;
@@ -327,6 +328,9 @@ export async function createMomentComment(
   const trimmed = text.trim();
   if (!trimmed || trimmed.length > 500) {
     throw new Error('INVALID_TEXT');
+  }
+  if (momentCommentContainsNumbers(trimmed)) {
+    throw new Error('NUMBERS_NOT_ALLOWED');
   }
 
   const moment = await CreatorMoment.findById(momentId);

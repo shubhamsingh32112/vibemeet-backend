@@ -215,7 +215,8 @@ async function processBalanceMismatchRepairs(startedAt: number): Promise<void> {
       ]);
       const credits = agg.find((a: any) => a._id === 'credit')?.total || 0;
       const debits = agg.find((a: any) => a._id === 'debit')?.total || 0;
-      const expectedBalance = credits - debits;
+      // Coins cannot go below 0 (User.coins min: 0); clamp ledger-derived balance.
+      const expectedBalance = Math.max(0, credits - debits);
       const actualBalance = Number(user.coins) || 0;
       const discrepancy = actualBalance - expectedBalance;
       if (Math.abs(discrepancy) <= 1) {

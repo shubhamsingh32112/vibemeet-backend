@@ -43,7 +43,8 @@ export async function getCanonicalCoinsAndRepairIfNeeded(
 
     const credits = agg.find((a: any) => a._id === 'credit')?.total || 0;
     const debits = agg.find((a: any) => a._id === 'debit')?.total || 0;
-    const expectedCoins = credits - debits;
+    // Coins cannot go below 0 (User.coins min: 0); clamp ledger-derived balance.
+    const expectedCoins = Math.max(0, credits - debits);
     const discrepancy = (Number(actualCoins) || 0) - expectedCoins;
 
     if (Math.abs(discrepancy) <= tolerance) {
