@@ -97,3 +97,47 @@ test('creator disconnect grace uses redis grace key and skip metric', () => {
   assert.ok(src.includes('presence.grace_callback_skipped'));
   assert.ok(src.includes('cancelDisconnectGrace'));
 });
+
+test('creator heartbeat deferred when no local socket on REST-only node', () => {
+  const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  assert.ok(src.includes('maybeStartCreatorHeartbeat'));
+  assert.ok(src.includes('localConnectedCheckOnThisNode'));
+  assert.ok(src.includes('presence.heartbeat_deferred_no_local_socket'));
+  assert.ok(src.includes('handleCreatorExplicitOnline'));
+  const explicitBlock = src.slice(
+    src.indexOf('async function handleCreatorExplicitOnline'),
+    src.indexOf('async function handleCreatorExplicitOffline')
+  );
+  assert.ok(explicitBlock.includes('maybeStartCreatorHeartbeat'));
+  assert.ok(!explicitBlock.includes('await startCreatorHeartbeat(io, firebaseUid);'));
+});
+
+test('creator DISCONNECTED guarded before false offline on cluster socket or active call', () => {
+  const src = readFileSync(join(__dirname, 'availability.gateway.ts'), 'utf8');
+  assert.ok(src.includes('applyCreatorDisconnectedTransition'));
+  assert.ok(src.includes('evaluateCreatorDisconnectedGuard'));
+  assert.ok(src.includes('presence.heartbeat_abort_cluster_still_connected'));
+  assert.ok(src.includes('presence.heartbeat_abort_active_call'));
+  assert.ok(src.includes('getCreatorMongoIntentOnline'));
+  const heartbeatBlock = src.slice(
+    src.indexOf('async function startCreatorHeartbeat'),
+    src.indexOf('function startUserHeartbeat')
+  );
+  assert.ok(heartbeatBlock.includes('applyCreatorDisconnectedTransition'));
+});
+
+test('setCreatorOnlineStatus surfaces Redis runtime failures', () => {
+  const src = readFileSync(join(__dirname, '..', 'creator', 'creator.controller.ts'), 'utf8');
+  const block = src.slice(
+    src.indexOf('export const setCreatorOnlineStatus'),
+    src.indexOf('export const updateMyCreatorProfile')
+  );
+  assert.ok(block.includes('res.status(503)'));
+  assert.ok(block.includes('Availability runtime update failed'));
+});
+
+test('availability service base TTL aligned with presence TTL', () => {
+  const src = readFileSync(join(__dirname, 'availability.service.ts'), 'utf8');
+  assert.ok(src.includes('CREATOR_PRESENCE_TTL_SECONDS'));
+  assert.ok(!src.includes('CREATOR_BASE_TTL_SECONDS = 120'));
+});

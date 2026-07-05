@@ -18,8 +18,8 @@
  *   creator:availability:{creatorId} → "online" | "offline"
  * 
  * 🔥 SCALABILITY OPTIMIZATION (1000 users/day, 200 creators):
- * - TTL: 120 seconds (auto-expire safety)
- * - Heartbeat: 60 seconds (refreshes TTL while connected)
+ * - TTL: CREATOR_PRESENCE_TTL_SECONDS (default 180s; aligned with presence.service)
+ * - Heartbeat: CREATOR_HEARTBEAT_INTERVAL_MS (default 45s; gateway-owned)
  * - Batch operations: Uses MGET for efficient batch queries
  * - Socket.IO broadcasting: Instant updates to all connected clients
  * - Prevents ghost online users
@@ -40,7 +40,10 @@ import { getBatchCreatorPresence, readCreatorPresenceState } from './presence.se
 export type CreatorAvailability = 'online' | 'on_call' | 'offline';
 type CreatorBaseAvailability = 'online' | 'offline';
 
-const CREATOR_BASE_TTL_SECONDS = 120;
+const CREATOR_BASE_TTL_SECONDS = Math.min(
+  600,
+  Math.max(90, parseInt(process.env.CREATOR_PRESENCE_TTL_SECONDS || '180', 10) || 180)
+);
 
 function parsePresenceState(raw: string | null): CreatorAvailability | null {
   if (raw === 'online') return 'online';

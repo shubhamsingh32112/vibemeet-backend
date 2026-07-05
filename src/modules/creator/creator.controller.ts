@@ -1531,8 +1531,21 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
         `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'offline'}`
       );
     } catch (availabilityError) {
-      // Don't fail the request if Redis/Socket broadcast fails
       console.error('⚠️  [REDIS+SOCKET] Failed to update availability:', availabilityError);
+      res.status(503).json({
+        success: false,
+        error:
+          'Availability runtime update failed; Mongo intent saved. Retry toggle or reconnect the app.',
+        data: {
+          creator: {
+            id: creator._id.toString(),
+            userId: creator.userId.toString(),
+            name: creator.name,
+            isOnline: creator.isOnline,
+          },
+        },
+      });
+      return;
     }
     
     res.json({

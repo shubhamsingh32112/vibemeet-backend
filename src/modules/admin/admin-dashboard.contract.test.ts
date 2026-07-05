@@ -86,3 +86,11 @@ test('createdAtRangeMatch uses half-open $lt semantics', () => {
   assert.ok(src.includes('return istRangeMatch(range.from, range.to)'));
   assert.ok(!src.includes('$lte: range.to'));
 });
+
+test('dashboard aggregations nest createdAt in $match (not spread)', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  assert.ok(!src.includes('{ $match: { ...createdAt'), 'must not spread createdAt into $match');
+  assert.ok(!src.includes('{ $match: { ...volumeCreatedAt'), 'must not spread volumeCreatedAt into $match');
+  assert.ok(src.includes('{ $match: { createdAt, ownerRole: \'user\' } }'));
+  assert.ok(src.includes('{ $match: { createdAt: volumeCreatedAt, ownerRole: \'user\' } }'));
+});

@@ -337,7 +337,7 @@ export async function dashboardWalletFlowSeries(days: number, range?: DashboardD
     _id: { date: string; type: string };
     total: number;
   }>([
-    { $match: { ...createdAt, status: 'completed' } },
+    { $match: { createdAt, status: 'completed' } },
     {
       $group: {
         _id: {
@@ -484,7 +484,7 @@ export async function dashboardRevenueSeries(days: number, range?: DashboardDate
   }
 
   const agg = await CallHistory.aggregate<{ _id: string; revenue: number; commission: number }>([
-    { $match: { ...createdAt, ownerRole: 'user' } },
+    { $match: { createdAt, ownerRole: 'user' } },
     {
       $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } },
@@ -853,7 +853,7 @@ export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
 
   const [todayAgg, monthAgg] = await Promise.all([
     CallHistory.aggregate([
-      { $match: { ...createdAt, ownerRole: 'user' } },
+      { $match: { createdAt, ownerRole: 'user' } },
       {
         $group: {
           _id: null,
@@ -865,7 +865,7 @@ export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
       },
     ]),
     CallHistory.aggregate([
-      { $match: { ...volumeCreatedAt, ownerRole: 'user' } },
+      { $match: { createdAt: volumeCreatedAt, ownerRole: 'user' } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } },
