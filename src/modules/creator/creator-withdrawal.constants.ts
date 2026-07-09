@@ -5,3 +5,6 @@ export const MIN_WITHDRAWAL_COINS = 1000;
 export const MIN_CREATOR_WITHDRAWAL_COINS = MIN_WITHDRAWAL_COINS;
 
 export const MIN_STAFF_WITHDRAWAL_COINS = MIN_WITHDRAWAL_COINS;
+
+/** Statuses that block a new withdrawal request until resolved. */
+export const ACTIVE_WITHDRAWAL_STATUSES = ['pending', 'approved'] as const;

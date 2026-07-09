@@ -2,7 +2,7 @@ import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
 import { Creator, type ICreator, CREATOR_LISTABLE_FILTER } from './creator.model';
-import { MIN_CREATOR_WITHDRAWAL_COINS } from './creator-withdrawal.constants';
+import { ACTIVE_WITHDRAWAL_STATUSES, MIN_CREATOR_WITHDRAWAL_COINS } from './creator-withdrawal.constants';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -3187,36 +3187,21 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Optimized: Single query to check both pending withdrawal and cooldown
-    // This reduces database round trips from 2 to 1, improving performance under load
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const existingWithdrawal = await Withdrawal.findOne({
+    const activeWithdrawal = await Withdrawal.findOne({
       creatorUserId: currentUser._id,
-      $or: [
-        { status: 'pending' }, // Check for pending withdrawal
-        { requestedAt: { $gte: oneDayAgo } }, // Check for recent withdrawal (cooldown)
-      ],
+      status: { $in: ACTIVE_WITHDRAWAL_STATUSES },
     })
-      .sort({ requestedAt: -1 }) // Get most recent first
+      .sort({ requestedAt: -1 })
       .limit(1)
-      .lean(); // Use lean() for better performance (returns plain JS object)
+      .lean();
 
-    if (existingWithdrawal) {
-      if (existingWithdrawal.status === 'pending') {
-        res.status(409).json({
-          success: false,
-          error: 'You already have a pending withdrawal request. Please wait for it to be processed.',
-        });
-        return;
-      }
-      // Check if it's within cooldown period
-      if (existingWithdrawal.requestedAt >= oneDayAgo) {
-        res.status(429).json({
-          success: false,
-          error: 'You can only request one withdrawal per 24 hours. Please try again later.',
-        });
-        return;
-      }
+    if (activeWithdrawal) {
+      const error =
+        activeWithdrawal.status === 'pending'
+          ? 'You already have a pending withdrawal request. Please wait for it to be processed.'
+          : 'You already have an approved withdrawal awaiting payout. Please wait until it is marked paid.';
+      res.status(409).json({ success: false, error });
+      return;
     }
 
     const creatorProfile = await Creator.findOne({ userId: currentUser._id })

@@ -117,7 +117,7 @@ withdrawalSchema.index({ assignedAgencyId: 1, createdAt: -1 });
 withdrawalSchema.index({ creatorUserId: 1, status: 1 });
 withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });
-// Index for cooldown check: find recent withdrawals by creator
+// Index for active-withdrawal lookup by creator
 withdrawalSchema.index({ creatorUserId: 1, requestedAt: -1 });
 withdrawalSchema.index({ staffUserId: 1, createdAt: -1 }, { sparse: true });
 
