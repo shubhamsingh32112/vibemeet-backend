@@ -112,6 +112,10 @@ import {
   patchMomentVisibilityTierHandler,
 } from './admin-moments-free-preview.controller';
 import {
+  deleteMomentAsAdminHandler,
+  listAllMomentsForAdminHandler,
+} from './admin-moments-management.controller';
+import {
   getAdminVipPlan,
   getAdminVipStats,
   grantAdminVipMembership,
@@ -303,6 +307,8 @@ router.post('/moments/free-previews', addFreePreviewHandler);
 router.delete('/moments/free-previews/:momentId', removeFreePreviewHandler);
 router.patch('/moments/free-previews/:momentId', patchFreePreviewHandler);
 router.get('/moments/browse', browseMomentsForAdminHandler);
+router.get('/moments/all', listAllMomentsForAdminHandler);
+router.delete('/moments/:momentId', deleteMomentAsAdminHandler);
 router.patch('/moments/:momentId/visibility-tier', patchMomentVisibilityTierHandler);
 
 router.get('/vip/plan', getAdminVipPlan);

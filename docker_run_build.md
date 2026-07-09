@@ -8,15 +8,15 @@ cd backend
 npm run build
 
 # Pick a unique tag, e.g. upload-fix-20260620
-export BUILD_ID=likeCommentShare
+export BUILD_ID=PresenceFix
 
-docker build -t app-backend:deployadminfixes  .
+docker build -t app-backend:commentsname  .
 
-docker tag app-backend:deployadminfixes  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:deployadminfixes 
+docker tag app-backend:commentsname  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:commentsname 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:deployadminfixes 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:commentsname 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.

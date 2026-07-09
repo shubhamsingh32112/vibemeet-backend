@@ -65,6 +65,115 @@ export function resolveMomentUploadRewardCoins(type: 'photo' | 'video'): number 
   return Math.floor(coins);
 }
 
+export function uploadRewardCreditTransactionId(momentId: string): string {
+  return `moment_upload_reward_${momentId}`;
+}
+
+export function uploadRewardClawbackTransactionId(momentId: string): string {
+  return `moment_upload_reward_clawback_${momentId}`;
+}
+
+export async function lookupMomentUploadRewardCoins(momentId: string): Promise<number> {
+  const existing = await CoinTransaction.findOne({
+    transactionId: uploadRewardCreditTransactionId(momentId),
+  }).lean();
+  return existing?.coins ?? 0;
+}
+
+export async function debitMomentUploadRewardClawback(input: {
+  userId: mongoose.Types.ObjectId;
+  creatorId: mongoose.Types.ObjectId;
+  momentId: string;
+  actorLabel?: string;
+  session?: mongoose.ClientSession;
+}): Promise<{ coinsClawedBack: number; newBalance: number }> {
+  const creditTxnId = uploadRewardCreditTransactionId(input.momentId);
+  const clawbackTxnId = uploadRewardClawbackTransactionId(input.momentId);
+
+  const creditTx = await CoinTransaction.findOne({ transactionId: creditTxnId }).lean();
+  if (!creditTx || creditTx.coins <= 0) {
+    const user = await User.findById(input.userId).select('coins').lean();
+    return { coinsClawedBack: 0, newBalance: user?.coins ?? 0 };
+  }
+
+  const existingClawback = await CoinTransaction.findOne({ transactionId: clawbackTxnId }).lean();
+  if (existingClawback) {
+    const user = await User.findById(input.userId).select('coins').lean();
+    return {
+      coinsClawedBack: existingClawback.coins,
+      newBalance: user?.coins ?? 0,
+    };
+  }
+
+  const clawAmount = creditTx.coins;
+  const user = await User.findById(input.userId);
+  const creator = await Creator.findById(input.creatorId);
+  if (!user || !creator) {
+    throw new Error('User or creator not found for moment upload reward clawback');
+  }
+
+  const description = input.actorLabel
+    ? `Admin deleted moment — upload reward clawback (${input.actorLabel})`
+    : 'Admin deleted moment — upload reward clawback';
+
+  try {
+    await CoinTransaction.create(
+      [
+        {
+          transactionId: clawbackTxnId,
+          userId: user._id,
+          type: 'debit',
+          coins: clawAmount,
+          source: 'admin',
+          description,
+          status: 'completed',
+        },
+      ],
+      { session: input.session },
+    );
+  } catch (err) {
+    if (!isDuplicateKeyError(err)) {
+      throw err;
+    }
+    const duplicate = await CoinTransaction.findOne({ transactionId: clawbackTxnId }).lean();
+    const latestUser = await User.findById(input.userId).select('coins').lean();
+    return {
+      coinsClawedBack: duplicate?.coins ?? 0,
+      newBalance: latestUser?.coins ?? 0,
+    };
+  }
+
+  user.coins = Math.max(0, (user.coins || 0) - clawAmount);
+  creator.earningsCoins = Math.max(0, (creator.earningsCoins || 0) - clawAmount);
+  await user.save({ session: input.session });
+  await creator.save({ session: input.session });
+
+  logInfo('Moment upload reward clawed back', {
+    userId: user._id.toString(),
+    momentId: input.momentId,
+    clawAmount,
+  });
+
+  verifyUserBalance(user._id).catch(() => {});
+
+  try {
+    if (user.firebaseUid) {
+      const io = getIO();
+      io?.to(`user:${user.firebaseUid}`).emit('coins_updated', {
+        userId: user._id.toString(),
+        coins: user.coins,
+      });
+    }
+  } catch (err) {
+    logError('Failed to emit coins_updated for moment upload reward clawback', err);
+  }
+
+  return {
+    coinsClawedBack: clawAmount,
+    newBalance: user.coins,
+  };
+}
+
 export async function creditMomentUploadReward(input: {
   userId: mongoose.Types.ObjectId;
   creatorId: mongoose.Types.ObjectId;
