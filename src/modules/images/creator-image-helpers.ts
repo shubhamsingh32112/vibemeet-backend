@@ -42,8 +42,27 @@ export function serializeCreatorImages(creator: ICreator): SerializedCreatorImag
   };
 }
 
+function isSerializedGalleryImageView(value: unknown): value is ImageAssetView {
+  if (!value || typeof value !== 'object') return false;
+  const view = value as ImageAssetView;
+  return typeof view.imageId === 'string' && view.imageId.length > 0 && Boolean(view.galleryUrls);
+}
+
+/** Gallery rows from Mongo (`asset`) or Redis cache (`image` already serialized). */
+type GallerySerializeInput = ICreatorGalleryImage | SerializedGalleryItem;
+
+function resolveGalleryItemImage(
+  item: GallerySerializeInput,
+  options: SerializeOptions,
+): ImageAssetView | null {
+  if ('image' in item && isSerializedGalleryImageView(item.image)) {
+    return item.image;
+  }
+  return serializeImageAsset((item as ICreatorGalleryImage).asset ?? null, options);
+}
+
 export function serializeCreatorGallery(
-  items: ICreatorGalleryImage[],
+  items: GallerySerializeInput[],
   options: SerializeOptions = {},
 ): SerializedGalleryItem[] {
   return [...items]
@@ -52,7 +71,7 @@ export function serializeCreatorGallery(
       id: item.id,
       position: idx,
       createdAt: item.createdAt,
-      image: serializeImageAsset(item.asset ?? null, options),
+      image: resolveGalleryItemImage(item, options),
     }));
 }
 

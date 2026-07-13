@@ -233,6 +233,28 @@ test('serializeCreatorImages returns avatar:null when avatar is rejected', () =>
   assert.equal(out.avatar, null);
 });
 
+// ── serializeCreatorGallery cache round-trip ────────────────────────────
+test('serializeCreatorGallery preserves pre-serialized image from Redis cache', () => {
+  const mongoGallery = serializeCreatorGallery([
+    {
+      id: 'g-cache',
+      asset: ASSET_GALLERY_APPROVED,
+      position: 0,
+      createdAt: FIXED_DATE,
+    } as ICreatorGalleryImage,
+  ]);
+  const cachedPayload = mongoGallery;
+  const roundTrip = serializeCreatorGallery(cachedPayload);
+
+  assert.equal(roundTrip.length, 1);
+  assert.ok(roundTrip[0].image, 'cached gallery image must survive re-serialize');
+  assert.equal(roundTrip[0].image?.imageId, 'img-gallery-002');
+  assert.ok(
+    roundTrip[0].image?.galleryUrls.thumb?.includes('img-gallery-002'),
+    'gallery URLs must be preserved on cache hit',
+  );
+});
+
 // ── serializeCreatorGallery sort stability ──────────────────────────────
 test('serializeCreatorGallery uses createdAt as tiebreaker when positions match', () => {
   const earlier = new Date('2025-01-01T00:00:00.000Z');
