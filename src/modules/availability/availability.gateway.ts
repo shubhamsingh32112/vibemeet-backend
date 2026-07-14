@@ -782,19 +782,14 @@ export function setupAvailabilityGateway(io: Server): void {
     });
 
     // ── availability:get ────────────────────────────────────────────────
+    // Fan-safe: any authenticated socket may batch-resolve creator presence
+    // for feed UIDs they already have. user:availability:get stays creator/admin-only.
     socket.on(
       'availability:get',
       async (data: { creatorIds: string[] } | string[]) => {
         try {
           const uid = socket.data.firebaseUid as string | undefined;
           if (!uid) return;
-
-          const auth = await assertCreatorOrAdminForPresenceLookup(uid);
-          if (!auth.ok) {
-            socket.emit('availability:batch', {});
-            socket.emit('availability:batch:v2', {});
-            return;
-          }
 
           const rateLimit = await checkPresenceLookupRateLimit(socket.id);
           if (!rateLimit.allowed) {
