@@ -701,6 +701,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             gender: user.gender,
             age: user.age,
             username: user.username,
+            bio: user.bio ?? '',
             avatar: user.avatar,
             categories: user.categories,
             usernameChangeCount: user.usernameChangeCount,
@@ -1731,6 +1732,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       gender,
       age,
       username,
+      bio,
       avatarUploadSessionId,
       avatarPresetImageId,
       categories,
@@ -1800,6 +1802,29 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
         user.usernameChangeCount = (user.usernameChangeCount || 0) + 1;
         updated = true;
         console.log(`✅ [USER] Username updated - Change count: ${user.usernameChangeCount}`);
+      }
+    }
+
+    // Update bio (members)
+    if (bio !== undefined) {
+      if (typeof bio !== 'string') {
+        res.status(400).json({
+          success: false,
+          error: 'Bio must be a string',
+        });
+        return;
+      }
+      const trimmedBio = bio.trim();
+      if (trimmedBio.length > 500) {
+        res.status(400).json({
+          success: false,
+          error: 'Bio must be at most 500 characters',
+        });
+        return;
+      }
+      if (user.bio !== trimmedBio) {
+        user.bio = trimmedBio;
+        updated = true;
       }
     }
 
@@ -1915,6 +1940,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
           gender: user.gender,
           age: user.age,
           username: user.username,
+          bio: user.bio ?? '',
           // Cloudflare-Images shape (preferred by Flutter)
           avatarAsset: userImages.avatar,
           // Legacy shape — either a Firebase URL string or the raw IImageAsset doc

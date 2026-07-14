@@ -19,6 +19,8 @@ export interface IUser extends Document {
   gender?: 'male' | 'female' | 'other';
   age?: number;
   username?: string;
+  /** Optional short bio for member profiles (Edit Profile). */
+  bio?: string;
   /** Cloudflare-Images avatar (canonical). */
   avatar?: IImageAsset | null;
   /** Restored on moderation rejection. */
@@ -179,6 +181,12 @@ const userSchema = new Schema<IUser>(
       trim: true,
       minlength: 4,
       maxlength: 10,
+    },
+    bio: {
+      type: String,
+      trim: true,
+      maxlength: 500,
+      default: '',
     },
     avatar: {
       type: imageAssetSchema,
