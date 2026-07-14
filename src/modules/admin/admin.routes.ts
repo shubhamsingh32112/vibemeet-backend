@@ -26,6 +26,7 @@ import {
   getDashboardOverview,
   getDashboardPayouts,
   getDashboardRazorpayBalance,
+  getDashboardRechargeTransactions,
   getDashboardRealtime,
   getDashboardRevenue,
   getDashboardTopAgencies,
@@ -111,6 +112,10 @@ import {
   patchMomentVisibilityTierHandler,
 } from './admin-moments-free-preview.controller';
 import {
+  deleteMomentAsAdminHandler,
+  listAllMomentsForAdminHandler,
+} from './admin-moments-management.controller';
+import {
   getAdminVipPlan,
   getAdminVipStats,
   grantAdminVipMembership,
@@ -139,6 +144,7 @@ import { getLeaderboardHosts, getLeaderboardUsers } from './admin-leaderboards.c
 import {
   getCachedLeaderboardHosts,
   getFinancePayments,
+  getPaymentPurchaseLogs,
   getFinancePayoutsSummary,
   getFinanceSettlements,
   getMomentsPaidUsers,
@@ -176,6 +182,7 @@ router.get('/analytics/moments/premium-users', getMomentsPremiumUsers);
 router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
 router.get('/wallet/transactions', getWalletTransactions);
+router.get('/finance/payment-logs', getPaymentPurchaseLogs);
 router.get('/finance/payments', getFinancePayments);
 router.get('/finance/payouts/summary', getFinancePayoutsSummary);
 router.get('/finance/settlements', getFinanceSettlements);
@@ -209,6 +216,7 @@ router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
 router.get('/dashboard/payouts', getDashboardPayouts);
 router.get('/dashboard/geo', getDashboardGeo);
 router.get('/dashboard/razorpay-balance', getDashboardRazorpayBalance);
+router.get('/dashboard/recharge-transactions', getDashboardRechargeTransactions);
 
 // ── Top-tier BDs (super-admin) ─────────────────────────────────────────────
 router.post('/bds', createBd);
@@ -299,6 +307,8 @@ router.post('/moments/free-previews', addFreePreviewHandler);
 router.delete('/moments/free-previews/:momentId', removeFreePreviewHandler);
 router.patch('/moments/free-previews/:momentId', patchFreePreviewHandler);
 router.get('/moments/browse', browseMomentsForAdminHandler);
+router.get('/moments/all', listAllMomentsForAdminHandler);
+router.delete('/moments/:momentId', deleteMomentAsAdminHandler);
 router.patch('/moments/:momentId/visibility-tier', patchMomentVisibilityTierHandler);
 
 router.get('/vip/plan', getAdminVipPlan);

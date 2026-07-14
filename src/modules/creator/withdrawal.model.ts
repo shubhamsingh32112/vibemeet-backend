@@ -1,16 +1,16 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
 /**
- * Withdrawal — Tracks creator withdrawal requests.
+ * Withdrawal — Tracks creator and staff (BD/agency) withdrawal requests.
  *
  * Flow:
- *   1. Creator requests withdrawal → status: 'pending'
- *   2. Admin approves → status: 'approved', coins deducted, CoinTransaction created
- *   3. Admin marks paid → status: 'paid', processedAt set
+ *   1. Request → status: 'pending' (no coin deduction)
+ *   2. Admin approves → status: 'approved' (balance checked; still no deduction)
+ *   3. Admin marks paid → status: 'paid', coins debited, CoinTransaction created
  *   OR
- *   2. Admin rejects → status: 'rejected'
+ *   2. Admin rejects → status: 'rejected' (no deduction)
  *
- * Coins are NOT deducted at request time — only on admin approval.
+ * Coins are debited only on mark-paid, not on request or approve.
  */
 export interface IWithdrawal extends Document {
   _id: mongoose.Types.ObjectId;
@@ -22,7 +22,7 @@ export interface IWithdrawal extends Document {
   processedAt?: Date;
   adminUserId?: mongoose.Types.ObjectId;
   notes?: string;
-  transactionId?: string; // Links to CoinTransaction on approval
+  transactionId?: string; // Links to CoinTransaction on mark-paid
   // Withdrawal details
   name?: string;
   number?: string;
@@ -117,7 +117,7 @@ withdrawalSchema.index({ assignedAgencyId: 1, createdAt: -1 });
 withdrawalSchema.index({ creatorUserId: 1, status: 1 });
 withdrawalSchema.index({ status: 1, createdAt: -1 });
 withdrawalSchema.index({ createdAt: -1 });
-// Index for cooldown check: find recent withdrawals by creator
+// Index for active-withdrawal lookup by creator
 withdrawalSchema.index({ creatorUserId: 1, requestedAt: -1 });
 withdrawalSchema.index({ staffUserId: 1, createdAt: -1 }, { sparse: true });
 

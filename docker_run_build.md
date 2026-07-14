@@ -8,15 +8,15 @@ cd backend
 npm run build
 
 # Pick a unique tag, e.g. upload-fix-20260620
-export BUILD_ID=likeCommentShare
+export BUILD_ID=adminMoments
 
-docker build -t app-backend:fixLikeCommentShare  .
+docker build -t app-backend:adminMoments  .
 
-docker tag app-backend:fixLikeCommentShare  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:fixLikeCommentShare 
+docker tag app-backend:adminMoments  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:adminMoments 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:fixLikeCommentShare 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:adminMoments 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.
@@ -147,3 +147,51 @@ MOMENTS_ACCESS_MODE=paid   # or free
 ```
 
 After changing this value, redeploy the backend. Feed cache keys include `accessMode`, so stale locked/unlocked payloads should not persist across mode switches.
+
+## Creator presence toggle fix (multi-node api-ws)
+
+Deploy backend code **and** enable the Redis socket registry on **all** `api-ws` ECS tasks. Without the registry flag, heartbeats on tasks that do not hold the creator WebSocket falsely force `DISCONNECTED` (~45s–3min after toggle ON).
+
+```bash
+cd backend
+npm run build
+
+export BUILD_ID=presence-toggle-fix-$(date +%Y%m%d)
+
+docker build -t app-backend:$BUILD_ID .
+docker tag app-backend:$BUILD_ID 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:$BUILD_ID
+
+aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
+
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:$BUILD_ID
+```
+
+Update the **api-ws** ECS task definition image tag to `$BUILD_ID`, then set these env vars on **every** api-ws task before forcing a new deployment:
+
+```env
+PRESENCE_REDIS_SOCKET_REGISTRY_ENABLED=true
+PRESENCE_REGISTRY_SHADOW=true
+```
+
+Optional during first 24h cutover: keep `PRESENCE_REGISTRY_SHADOW=true` and watch CloudWatch for `presence.registry.shadow_mismatch` and log rate of `creator_heartbeat_no_sockets` (expect >95% drop vs Jul 4–5 baseline).
+
+**Rollback:** `PRESENCE_REDIS_SOCKET_REGISTRY_ENABLED=false` on all api-ws tasks.
+
+**Flutter:** rebuild APK/IPA for toggle/status reconciliation (`creator_status_provider.dart`, `creator_availability_toggle_provider.dart`).
+
+### Post-deploy presence checklist
+
+| Signal | Broken | Target |
+|--------|--------|--------|
+| `creator_heartbeat_no_sockets` | sustained high | near 0 |
+| `presence.heartbeat_deferred_no_local_socket` | N/A | OK on REST-only nodes |
+| `presence.heartbeat_abort_cluster_still_connected` | N/A | rare; no false offline |
+| Creator toggle ON 10+ min | fans see offline | fans see online |
+
+### Manual QA
+
+1. Creator toggles ON, stays on home 10+ min — fans see online; no `creator_heartbeat_no_sockets` in logs.
+2. Toggle OFF — immediate offline for fans.
+3. Toggle ON after false offline — recovers within ~2s; status shows Online (not stuck Syncing/Offline).
+4. Background/resume with toggle ON — restores without manual re-toggle.
+5. During live call — stays on_call; no offline flip.

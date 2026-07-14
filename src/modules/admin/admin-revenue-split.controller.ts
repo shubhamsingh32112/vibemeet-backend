@@ -10,20 +10,14 @@ import {
   getSplitIndependentHostPct,
   getSplitWithStaffPct,
 } from './admin-revenue-split.constants';
-
-function utcStartOfDaysAgo(days: number): Date {
-  const d = new Date();
-  d.setUTCHours(0, 0, 0, 0);
-  d.setUTCDate(d.getUTCDate() - (days - 1));
-  return d;
-}
+import { istLookbackCalendarDays, IST_TIMEZONE } from '../../utils/ist-time';
 
 export const getRevenueSplitSummary = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!(await assertAdmin(req, res))) return;
 
     const days = Math.min(365, Math.max(1, parseInt(String(req.query.days ?? '30'), 10) || 30));
-    const from = utcStartOfDaysAgo(days);
+    const { from } = istLookbackCalendarDays(days);
 
     const userCallMatch = { ownerRole: 'user' as const, createdAt: { $gte: from } };
 
@@ -111,6 +105,8 @@ export const getRevenueSplitSummary = async (req: Request, res: Response): Promi
       data: {
         rangeDays: days,
         from: from.toISOString(),
+        timezone: IST_TIMEZONE,
+        rangeSemantics: 'half_open_ist',
         inrPerCoin: 0.8,
         inrPerCoinNote: '₹0.80 per coin (80 paise) — display conversion only',
         actual: {

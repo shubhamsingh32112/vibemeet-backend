@@ -7,9 +7,9 @@ import { StaffWalletLedger } from './staff-wallet-ledger.model';
 import { StaffPayoutAccount } from './staff-payout-account.model';
 import { invalidateAdminCaches } from '../../config/redis';
 import { emitToAdmin } from '../admin/admin.gateway';
+import { ACTIVE_WITHDRAWAL_STATUSES, MIN_STAFF_WITHDRAWAL_COINS } from '../creator/creator-withdrawal.constants';
 
-export const MIN_STAFF_WITHDRAWAL_COINS = 100;
-const STAFF_WITHDRAWAL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export { MIN_STAFF_WITHDRAWAL_COINS };
 
 export type PayoutAccountInput = {
   accountHolderName: string;
@@ -120,7 +120,7 @@ export async function getStaffWalletSummary(staffUserId: mongoose.Types.ObjectId
   const user = await User.findById(staffUserId).select('staffCoinsBalance').lean();
   const balance = user?.staffCoinsBalance ?? 0;
 
-  const [creditAgg, withdrawnAgg, pendingCount] = await Promise.all([
+  const [creditAgg, withdrawnAgg, activeWithdrawalCount] = await Promise.all([
     StaffWalletLedger.aggregate<{ t: number }>([
       { $match: { staffUserId, direction: 'credit' } },
       { $group: { _id: null, t: { $sum: '$amountCoins' } } },
@@ -134,7 +134,7 @@ export async function getStaffWalletSummary(staffUserId: mongoose.Types.ObjectId
       },
       { $group: { _id: null, t: { $sum: '$amount' } } },
     ]),
-    Withdrawal.countDocuments({ staffUserId, status: 'pending' }),
+    Withdrawal.countDocuments({ staffUserId, status: { $in: ACTIVE_WITHDRAWAL_STATUSES } }),
   ]);
 
   const payoutDoc = await StaffPayoutAccount.findOne({ staffUserId }).lean();
@@ -143,7 +143,9 @@ export async function getStaffWalletSummary(staffUserId: mongoose.Types.ObjectId
     balance,
     totalEarningsCoins: creditAgg[0]?.t ?? 0,
     totalWithdrawnCoins: withdrawnAgg[0]?.t ?? 0,
-    pendingWithdrawalCount: pendingCount,
+    pendingWithdrawalCount: activeWithdrawalCount,
+    activeWithdrawalCount,
+    canRequestWithdrawal: activeWithdrawalCount === 0,
     payoutAccount: payoutDoc ? serializePayoutAccount(payoutDoc) : null,
     payoutAccountBound: Boolean(payoutDoc && serializePayoutAccount(payoutDoc).isComplete),
   };
@@ -302,19 +304,20 @@ export async function createStaffWithdrawalRequest(
     throw new Error('Insufficient wallet balance');
   }
 
-  const oneDayAgo = new Date(Date.now() - STAFF_WITHDRAWAL_COOLDOWN_MS);
-  const recent = await Withdrawal.findOne({
+  const activeWithdrawal = await Withdrawal.findOne({
     staffUserId,
-    $or: [{ status: 'pending' }, { requestedAt: { $gte: oneDayAgo } }],
+    status: { $in: ACTIVE_WITHDRAWAL_STATUSES },
   })
-    .select('status requestedAt')
+    .sort({ requestedAt: -1 })
+    .select('status')
     .lean();
 
-  if (recent?.status === 'pending') {
-    throw new Error('You already have a pending withdrawal request');
-  }
-  if (recent && recent.requestedAt && recent.requestedAt >= oneDayAgo) {
-    throw new Error('You can only request one withdrawal per 24 hours');
+  if (activeWithdrawal) {
+    throw new Error(
+      activeWithdrawal.status === 'pending'
+        ? 'You already have a pending withdrawal request. Please wait for it to be processed.'
+        : 'You already have an approved withdrawal awaiting payout. Please wait until it is marked paid.',
+    );
   }
 
   const payoutDoc = await StaffPayoutAccount.findOne({ staffUserId }).lean();

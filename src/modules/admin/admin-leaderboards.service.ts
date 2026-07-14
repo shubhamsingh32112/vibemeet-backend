@@ -11,6 +11,7 @@ import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import { CreatorFollow } from '../moments/models/creator-follow.model';
 import { clampDashboardLimit } from './admin-dashboard.service';
+import { istLookbackCalendarDays } from '../../utils/ist-time';
 
 export type LeaderboardPeriod = '7d' | '30d' | '90d' | 'all';
 
@@ -33,10 +34,7 @@ export type UserLeaderboardSort =
 function periodToFrom(period: LeaderboardPeriod): Date | null {
   if (period === 'all') return null;
   const days = period === '7d' ? 7 : period === '30d' ? 30 : 90;
-  const d = new Date();
-  d.setUTCHours(0, 0, 0, 0);
-  d.setUTCDate(d.getUTCDate() - (days - 1));
-  return d;
+  return istLookbackCalendarDays(days).from;
 }
 
 function createdAtMatch(from: Date | null): Record<string, unknown> {

@@ -45,6 +45,7 @@ export interface SettlementRetryPreview {
   callHistory: {
     durationSeconds: number;
     coinsDeducted: number;
+    walletCoinsDeducted?: number | null;
     coinsEarned: number;
     settlementStatus?: string;
   } | null;
@@ -54,17 +55,40 @@ export interface SettlementRetryPreview {
   proposedCoinsDeducted: number;
   deadLetterPresent: boolean;
   hasVideoCallDebitTxn: boolean;
+  hasCreatorCreditTxn: boolean;
+}
+
+export type UserCallLedgerContext = {
+  durationSeconds: number;
+  coinsDeducted: number;
+  walletCoinsDeducted?: number | null;
+  settlementStatus?: string;
+};
+
+/**
+ * User wallet debits are persisted as a video_call CoinTransaction only when
+ * wallet coins were charged. Intro / welcome promo seconds update CallHistory
+ * coinsDeducted but intentionally omit the user debit txn.
+ */
+export function requiresUserWalletDebitTxn(
+  userCall: Pick<UserCallLedgerContext, 'coinsDeducted' | 'walletCoinsDeducted'>,
+  hasCreatorCreditTxn: boolean,
+): boolean {
+  if (userCall.coinsDeducted <= 0) return false;
+  if (userCall.walletCoinsDeducted != null) {
+    return userCall.walletCoinsDeducted > 0;
+  }
+  // Legacy rows: intro-only settlements still create a creator credit txn.
+  if (hasCreatorCreditTxn) return false;
+  return true;
 }
 
 export function computeSettlementIssue(
-  userCall: {
-    durationSeconds: number;
-    coinsDeducted: number;
-    settlementStatus?: string;
-  } | null,
+  userCall: UserCallLedgerContext | null,
   totals: AuthoritativeSettlementTotals,
   billingStatus: string,
-  hasVideoCallDebitTxn: boolean
+  hasVideoCallDebitTxn: boolean,
+  hasCreatorCreditTxn: boolean,
 ): SettlementIssue {
   if (billingStatus === 'failed_recovery_settlement') {
     return 'failed_recovery';
@@ -79,7 +103,11 @@ export function computeSettlementIssue(
   ) {
     return 'zero_duration_with_billing';
   }
-  if (userCall && userCall.coinsDeducted > 0 && !hasVideoCallDebitTxn) {
+  if (
+    userCall &&
+    requiresUserWalletDebitTxn(userCall, hasCreatorCreditTxn) &&
+    !hasVideoCallDebitTxn
+  ) {
     return 'unsettled_ledger';
   }
   return null;
@@ -96,11 +124,7 @@ export interface SettlementListMeta {
 export async function batchBuildSettlementListMeta(
   items: Array<{
     callId: string;
-    userCall: {
-      durationSeconds: number;
-      coinsDeducted: number;
-      settlementStatus?: string;
-    };
+    userCall: UserCallLedgerContext;
     billingStatus: string;
   }>
 ): Promise<Map<string, SettlementListMeta>> {
@@ -110,27 +134,34 @@ export async function batchBuildSettlementListMeta(
   }
 
   const callIds = items.map((item) => item.callId);
-  const [totalsList, debitTxns] = await Promise.all([
+  const [totalsList, ledgerTxns] = await Promise.all([
     Promise.all(callIds.map((callId) => resolveAuthoritativeSettlementTotals(callId))),
     CoinTransaction.find({
       callId: { $in: callIds },
-      type: 'debit',
       source: 'video_call',
+      status: 'completed',
     })
-      .select('callId')
+      .select('callId type')
       .lean(),
   ]);
 
-  const debitTxnCallIds = new Set(debitTxns.map((txn) => txn.callId));
+  const debitTxnCallIds = new Set(
+    ledgerTxns.filter((txn) => txn.type === 'debit').map((txn) => txn.callId),
+  );
+  const creditTxnCallIds = new Set(
+    ledgerTxns.filter((txn) => txn.type === 'credit').map((txn) => txn.callId),
+  );
 
   items.forEach((item, index) => {
     const totals = totalsList[index];
     const hasVideoCallDebitTxn = debitTxnCallIds.has(item.callId);
+    const hasCreatorCreditTxn = creditTxnCallIds.has(item.callId);
     const settlementIssue = computeSettlementIssue(
       item.userCall,
       totals,
       item.billingStatus,
-      hasVideoCallDebitTxn
+      hasVideoCallDebitTxn,
+      hasCreatorCreditTxn,
     );
     result.set(item.callId, {
       totals,
@@ -145,23 +176,40 @@ export async function batchBuildSettlementListMeta(
 }
 
 export async function buildSettlementRetryPreview(callId: string): Promise<SettlementRetryPreview> {
-  const [userCall, callDoc, totals, deadLetterRaw, debitTxn] = await Promise.all([
+  const [userCall, callDoc, totals, deadLetterRaw, debitTxn, creditTxn] = await Promise.all([
     CallHistory.findOne({ callId, ownerRole: 'user' })
-      .select('durationSeconds coinsDeducted coinsEarned settlementStatus')
+      .select('durationSeconds coinsDeducted walletCoinsDeducted coinsEarned settlementStatus')
       .lean(),
     Call.findOne({ callId }).select('settlement.status').lean(),
     resolveAuthoritativeSettlementTotals(callId),
     getRedis().get(billingRecoveryDeadLetterKey(callId)),
-    CoinTransaction.findOne({ callId, type: 'debit', source: 'video_call' }).select('_id').lean(),
+    CoinTransaction.findOne({
+      callId,
+      type: 'debit',
+      source: 'video_call',
+      status: 'completed',
+    })
+      .select('_id')
+      .lean(),
+    CoinTransaction.findOne({
+      callId,
+      type: 'credit',
+      source: 'video_call',
+      status: 'completed',
+    })
+      .select('_id')
+      .lean(),
   ]);
 
   const billingStatus = callDoc?.settlement?.status ?? 'unknown';
   const hasVideoCallDebitTxn = Boolean(debitTxn);
+  const hasCreatorCreditTxn = Boolean(creditTxn);
   const settlementIssue = computeSettlementIssue(
     userCall,
     totals,
     billingStatus,
-    hasVideoCallDebitTxn
+    hasVideoCallDebitTxn,
+    hasCreatorCreditTxn,
   );
 
   const pricePerSecondMicros =
@@ -185,7 +233,7 @@ export async function buildSettlementRetryPreview(callId: string): Promise<Settl
       userCall &&
       userCall.durationSeconds > 0 &&
       userCall.coinsDeducted > 0 &&
-      hasVideoCallDebitTxn
+      (!requiresUserWalletDebitTxn(userCall, hasCreatorCreditTxn) || hasVideoCallDebitTxn)
     ) {
       eligible = false;
       skipReason = 'already_settled_correctly';
@@ -206,6 +254,7 @@ export async function buildSettlementRetryPreview(callId: string): Promise<Settl
       ? {
           durationSeconds: userCall.durationSeconds,
           coinsDeducted: userCall.coinsDeducted,
+          walletCoinsDeducted: userCall.walletCoinsDeducted,
           coinsEarned: userCall.coinsEarned,
           settlementStatus: userCall.settlementStatus,
         }
@@ -216,6 +265,7 @@ export async function buildSettlementRetryPreview(callId: string): Promise<Settl
     proposedCoinsDeducted,
     deadLetterPresent: Boolean(deadLetterRaw),
     hasVideoCallDebitTxn,
+    hasCreatorCreditTxn,
   };
 }
 
@@ -280,7 +330,8 @@ export async function executeAdminSettlementRetry(
       preview.callHistory &&
       preview.callHistory.durationSeconds > 0 &&
       preview.callHistory.coinsDeducted > 0 &&
-      preview.hasVideoCallDebitTxn;
+      (!requiresUserWalletDebitTxn(preview.callHistory, preview.hasCreatorCreditTxn) ||
+        preview.hasVideoCallDebitTxn);
     if (correctlySettled && !opts?.force) {
       return { status: 'skipped', message: 'already_settled_correctly' };
     }

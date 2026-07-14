@@ -140,10 +140,17 @@ function isLoopbackClient(req: Request): boolean {
   );
 }
 
+function isStaffDashboardRequest(req: Request): boolean {
+  const pathOnly = req.originalUrl.split('?')[0];
+  return pathOnly.includes('/admin/dashboard/');
+}
+
 function shouldSkipGeneralRateLimit(req: Request): boolean {
   if (rateLimitDisabledInDev) return true;
   // Emulator + adb reverse share the host loopback IP; 100/15min is too low for dev.
   if (isDev && isLoopbackClient(req)) return true;
+  // Staff dashboard BFF: many parallel widget fetches; route auth still required.
+  if (req.staffRateLimit?.userId && isStaffDashboardRequest(req)) return true;
   return false;
 }
 

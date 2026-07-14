@@ -17,6 +17,19 @@ import { countCreatorPresenceBreakdownPlatform } from '../availability/presence-
 import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 import { logError } from '../../utils/logger';
+import {
+  formatIstDateTime,
+  istDateKey,
+  istDateKeysLastNDays,
+  istDayBounds,
+  istLookbackCalendarDays,
+  istRangeMatch,
+  istStartOfToday,
+  istYesterdayKey,
+  iterIstDateBucketDefs,
+  IST_TIMEZONE,
+  isValidIstDateKey,
+} from '../../utils/ist-time';
 
 const TOP_BD_ROLE = { role: 'bd' as const };
 const MIDDLE_AGENCY_ROLE = { role: 'agency' as const };
@@ -32,9 +45,10 @@ export type DashboardDateFilter = {
 type DashboardMetricDefinition = {
   label: string;
   backendField: string;
-  scope: 'selected_range' | 'realtime';
+  scope: 'selected_range' | 'realtime' | 'ist_today';
   unit: string;
   definition: string;
+  timezoneScope?: 'ist' | 'header_range' | 'realtime';
 };
 
 type RazorpayBalanceBucket = {
@@ -49,12 +63,6 @@ type RazorpayBalanceBucket = {
   net: number;
   raw: Record<string, unknown>;
 };
-
-function utcStartOfDay(d = new Date()): Date {
-  const x = new Date(d);
-  x.setUTCHours(0, 0, 0, 0);
-  return x;
-}
 
 export function clampDashboardLimit(raw: unknown, def: number): number {
   const n = Math.max(1, parseInt(String(raw ?? def), 10) || def);
@@ -73,7 +81,12 @@ function dashboardCreatorAvatarSmUrl(avatar: IImageAsset | null | undefined): st
 
 function createdAtRangeMatch(range?: DashboardDateFilter): Record<string, Date> {
   if (!range) return {};
-  return { $gte: range.from, $lte: range.to };
+  return istRangeMatch(range.from, range.to);
+}
+
+function dateFieldRangeMatch(range: DashboardDateFilter | undefined, field: string): Record<string, unknown> {
+  if (!range) return {};
+  return { [field]: istRangeMatch(range.from, range.to) };
 }
 
 function selectedRangePayload(range?: DashboardDateFilter): { from: string; to: string } | undefined {
@@ -91,64 +104,69 @@ function buildOverviewMetricContract(): Record<string, DashboardMetricDefinition
       backendField: 'revenueCoinsToday',
       scope: 'selected_range',
       unit: 'coins',
-      definition: 'Completed wallet credits minus completed wallet debits in the selected time window.',
+      timezoneScope: 'header_range',
+      definition:
+        'Completed wallet credits minus completed wallet debits in the header IST range (CoinTransaction.createdAt).',
     },
     revenueDailyBalance: {
-      label: 'Revenue daily balance',
+      label: 'Recharge collection (today IST)',
       backendField: 'revenueDailyBalance',
-      scope: 'selected_range',
-      unit: 'coins',
-      definition: 'Net completed wallet coin flow for today (UTC) only — credits minus debits.',
+      scope: 'ist_today',
+      unit: 'INR',
+      timezoneScope: 'ist',
+      definition:
+        'Sum of completed payment_gateway wallet recharges for the current IST calendar day (CoinTransaction.updatedAt). Ignores header date filter.',
     },
     liveCallsProxy: {
       label: 'Live calls (5m proxy)',
       backendField: 'liveCallsProxy',
       scope: 'realtime',
       unit: 'calls',
-      definition: 'Count of user-side call history rows created in the trailing 5 minutes.',
+      timezoneScope: 'realtime',
+      definition: 'Count of user-side call history rows created in the trailing 5 minutes (wall clock).',
     },
     totalCallMinutesToday: {
       label: 'Call minutes',
       backendField: 'totalCallMinutesToday',
       scope: 'selected_range',
       unit: 'minutes',
-      definition: 'Sum of user-side call durations in the selected time window, converted to minutes.',
+      timezoneScope: 'header_range',
+      definition:
+        'Sum of user-side call durations in the header IST range (CallHistory.createdAt), converted to minutes.',
     },
     totalCallsToday: {
       label: 'Calls',
       backendField: 'totalCallsToday',
       scope: 'selected_range',
       unit: 'calls',
-      definition: 'Total user-side calls created in the selected time window.',
+      timezoneScope: 'header_range',
+      definition: 'Total user-side calls created in the header IST range (CallHistory.createdAt).',
     },
     coinsSpentOnCallsToday: {
       label: 'Coins spent on calls',
       backendField: 'coinsSpentOnCallsToday',
       scope: 'selected_range',
       unit: 'coins',
-      definition: 'Sum of user-side coins deducted from call history in the selected time window.',
+      timezoneScope: 'header_range',
+      definition: 'Sum of user-side coins deducted in the header IST range (CallHistory.coinsDeducted).',
     },
     pendingPayouts: {
       label: 'Pending payouts',
       backendField: 'pendingPayouts',
       scope: 'selected_range',
       unit: 'requests',
-      definition: 'Pending withdrawal requests with requestedAt in the selected time window.',
+      timezoneScope: 'header_range',
+      definition: 'Pending withdrawal requests with requestedAt in the header IST range.',
+    },
+    hostsOnline: {
+      label: 'Hosts online',
+      backendField: 'hostsOnline',
+      scope: 'realtime',
+      unit: 'hosts',
+      timezoneScope: 'realtime',
+      definition: 'Live Redis presence: creators available for calls right now.',
     },
   };
-}
-
-function iterUtcDateStrings(from: Date, to: Date): string[] {
-  const dates: string[] = [];
-  const cur = new Date(from);
-  cur.setUTCHours(0, 0, 0, 0);
-  const end = new Date(to);
-  end.setUTCHours(0, 0, 0, 0);
-  while (cur <= end) {
-    dates.push(cur.toISOString().slice(0, 10));
-    cur.setUTCDate(cur.getUTCDate() + 1);
-  }
-  return dates;
 }
 
 function walletFlowPointsFromMap(
@@ -163,8 +181,8 @@ function walletFlowPointsFromMap(
   });
 
   if (range) {
-    return iterUtcDateStrings(range.from, range.to).map((date) =>
-      toPoint(date, byDate.get(date) ?? { credit: 0, debit: 0 })
+    return iterIstDateBucketDefs(istDateKey(range.from), istDateKey(new Date(range.to.getTime() - 1))).map(
+      ({ key }) => toPoint(key, byDate.get(key) ?? { credit: 0, debit: 0 })
     );
   }
 
@@ -173,7 +191,7 @@ function walletFlowPointsFromMap(
     .map(([date, entry]) => toPoint(date, entry));
 }
 
-function rechargeInrFromRow(row: {
+export function rechargeInrFromRow(row: {
   priceInr?: number | null;
   description?: string | null;
   coins?: number;
@@ -188,27 +206,36 @@ const RECHARGE_MATCH = {
   type: 'credit' as const,
   source: 'payment_gateway' as const,
   status: 'completed' as const,
-};
+} as const;
 
-export async function dashboardRechargeDailySeries(days: number, range?: DashboardDateFilter) {
-  const d = Math.min(90, Math.max(1, days));
-  const from = range ? new Date(range.from) : new Date();
-  if (!range) {
-    from.setUTCHours(0, 0, 0, 0);
-    from.setUTCDate(from.getUTCDate() - (d - 1));
-  }
-  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
+function rechargeUserLabel(
+  user: { username?: string; email?: string; phone?: string } | null | undefined,
+  userId: string
+): string {
+  const username = user?.username?.trim();
+  if (username) return username;
+  const email = user?.email?.trim();
+  if (email) return email;
+  const phone = user?.phone?.trim();
+  if (phone) return phone;
+  return userId;
+}
+
+export async function dashboardRechargeDailySeries(days: number) {
+  const historyDays = Math.min(90, Math.max(1, days));
+  const dateKeys = istDateKeysLastNDays(historyDays);
+  const windowStart = istDayBounds(dateKeys[0]).start;
 
   const rows = await CoinTransaction.find({
     ...RECHARGE_MATCH,
-    createdAt,
+    updatedAt: { $gte: windowStart },
   })
-    .select('createdAt coins priceInr description')
+    .select('updatedAt coins priceInr description')
     .lean();
 
   const byDate = new Map<string, { rechargeInr: number; rechargeCoins: number; transactionCount: number }>();
   for (const row of rows) {
-    const date = row.createdAt.toISOString().slice(0, 10);
+    const date = istDateKey(row.updatedAt);
     const entry = byDate.get(date) ?? { rechargeInr: 0, rechargeCoins: 0, transactionCount: 0 };
     entry.rechargeInr += rechargeInrFromRow(row);
     entry.rechargeCoins += row.coins ?? 0;
@@ -216,39 +243,95 @@ export async function dashboardRechargeDailySeries(days: number, range?: Dashboa
     byDate.set(date, entry);
   }
 
-  const points = (range
-    ? iterUtcDateStrings(range.from, range.to)
-    : [...byDate.keys()].sort()
-  ).map((date) => {
+  const points = dateKeys.map((date) => {
     const entry = byDate.get(date) ?? { rechargeInr: 0, rechargeCoins: 0, transactionCount: 0 };
     return { date, ...entry };
   });
 
   return {
     points,
-    note: 'Successful wallet recharges (payment_gateway credits) per UTC day in INR.',
-    selectedRange: selectedRangePayload(range),
+    timezone: IST_TIMEZONE,
+    historyDays,
+    note: 'Successful wallet recharges (payment_gateway credits) per IST day in INR. Timestamps use payment completion (updatedAt).',
   };
 }
 
-async function sumRechargeInrForUtcDay(dayStart: Date, dayEnd: Date): Promise<number> {
+async function sumRechargeInrForIstDay(istDate: string): Promise<number> {
+  const { start, end } = istDayBounds(istDate);
   const rows = await CoinTransaction.find({
     ...RECHARGE_MATCH,
-    createdAt: { $gte: dayStart, $lt: dayEnd },
+    updatedAt: { $gte: start, $lt: end },
   })
     .select('priceInr description')
     .lean();
   return rows.reduce((sum, row) => sum + rechargeInrFromRow(row), 0);
 }
 
+export async function dashboardRechargeTransactionsForDay(istDate: string) {
+  if (!isValidIstDateKey(istDate)) {
+    throw new Error('INVALID_IST_DATE');
+  }
+
+  const { start, end } = istDayBounds(istDate);
+  const rows = await CoinTransaction.find({
+    ...RECHARGE_MATCH,
+    updatedAt: { $gte: start, $lt: end },
+  })
+    .sort({ updatedAt: -1 })
+    .populate({ path: 'userId', select: 'username email phone' })
+    .select(
+      'transactionId userId coins priceInr description paymentGatewayOrderId paymentGatewayTransactionId updatedAt'
+    )
+    .lean();
+
+  const transactions = rows.map((row) => {
+    const user = row.userId as
+      | { _id?: mongoose.Types.ObjectId; username?: string; email?: string; phone?: string }
+      | mongoose.Types.ObjectId
+      | null
+      | undefined;
+    const userId =
+      user && typeof user === 'object' && '_id' in user && user._id
+        ? user._id.toString()
+        : user?.toString?.() ?? '';
+    const userObj = user && typeof user === 'object' && 'username' in user ? user : null;
+
+    return {
+      id: row._id.toString(),
+      completedAt: row.updatedAt.toISOString(),
+      completedAtIst: formatIstDateTime(row.updatedAt),
+      userId,
+      userLabel: rechargeUserLabel(userObj, userId),
+      inr: rechargeInrFromRow(row),
+      coins: row.coins ?? 0,
+      description: row.description ?? null,
+      orderId: row.paymentGatewayOrderId ?? null,
+      paymentId: row.paymentGatewayTransactionId ?? null,
+      transactionId: row.transactionId,
+    };
+  });
+
+  const totalInr = transactions.reduce((sum, row) => sum + row.inr, 0);
+
+  return {
+    date: istDate,
+    timezone: IST_TIMEZONE,
+    totalInr,
+    totalCoins: transactions.reduce((sum, row) => sum + row.coins, 0),
+    transactionCount: transactions.length,
+    transactions,
+  };
+}
+
 export async function dashboardWalletFlowSeries(days: number, range?: DashboardDateFilter) {
   const d = Math.min(90, Math.max(1, days));
-  const from = range ? new Date(range.from) : new Date();
-  if (!range) {
-    from.setUTCHours(0, 0, 0, 0);
-    from.setUTCDate(from.getUTCDate() - (d - 1));
+  let createdAt: Record<string, Date>;
+  if (range) {
+    createdAt = createdAtRangeMatch(range);
+  } else {
+    const { from } = istLookbackCalendarDays(d);
+    createdAt = { $gte: from };
   }
-  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
 
   const agg = await CoinTransaction.aggregate<{
     _id: { date: string; type: string };
@@ -258,7 +341,7 @@ export async function dashboardWalletFlowSeries(days: number, range?: DashboardD
     {
       $group: {
         _id: {
-          date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+          date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } },
           type: '$type',
         },
         total: { $sum: '$coins' },
@@ -278,21 +361,22 @@ export async function dashboardWalletFlowSeries(days: number, range?: DashboardD
 
   return {
     points: walletFlowPointsFromMap(byDate, range),
+    timezone: IST_TIMEZONE,
     note: range
-      ? 'Net wallet coin flow per UTC day (credits minus debits) for each day in the selected range.'
-      : 'Net wallet coin flow per UTC day (credits minus debits).',
+      ? 'Net wallet coin flow per IST day (credits minus debits) for each day in the selected range.'
+      : 'Net wallet coin flow per IST day (credits minus debits).',
     selectedRange: selectedRangePayload(range),
   };
 }
 
 export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
-  const today = utcStartOfDay();
+  const istTodayStart = istStartOfToday();
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-  const selectedCreatedAt = range ? createdAtRangeMatch(range) : { $gte: today };
+  const selectedCreatedAt = range ? createdAtRangeMatch(range) : { $gte: istTodayStart };
 
   const pendingPayoutsMatch = {
     status: 'pending' as const,
-    ...(range ? { requestedAt: createdAtRangeMatch(range) } : {}),
+    ...(range ? dateFieldRangeMatch(range, 'requestedAt') : {}),
   };
 
   const [
@@ -331,31 +415,28 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
       ownerRole: 'user',
       durationSeconds: 0,
     }),
-    dashboardRechargeDailySeries(90, range),
+    dashboardRechargeDailySeries(90),
   ]);
 
-  const yesterday = new Date(today);
-  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-  const tomorrow = new Date(today);
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+  const todayIst = istDateKey(new Date());
+  const yesterdayIst = istYesterdayKey();
 
   const [rechargeCollectionTodayInr, rechargeCollectionYesterdayInr] = await Promise.all([
-    sumRechargeInrForUtcDay(today, tomorrow),
-    sumRechargeInrForUtcDay(yesterday, today),
+    sumRechargeInrForIstDay(todayIst),
+    sumRechargeInrForIstDay(yesterdayIst),
   ]);
 
   const callT = callTodayAgg[0] || { totalCalls: 0, totalDurationSec: 0, totalCoinsSpent: 0 };
   const credits = coinFlowToday.find((r: { _id: string }) => r._id === 'credit');
   const debits = coinFlowToday.find((r: { _id: string }) => r._id === 'debit');
   const revenueCoinsToday = (credits?.total ?? 0) - (debits?.total ?? 0);
-  const rangeLabel = range ? 'selected range' : 'today (UTC)';
-  const todayUtc = today.toISOString().slice(0, 10);
+  const rangeLabel = range ? 'selected IST range' : 'today (IST)';
 
   return {
     revenueCoinsToday,
     revenueCoinsTodayNote: `Net completed wallet coin flow for ${rangeLabel} (credits minus debits).`,
     revenueDailyBalance: rechargeCollectionTodayInr,
-    revenueDailyBalanceNote: `Successful recharges today (${todayUtc} UTC). Yesterday: ₹${rechargeCollectionYesterdayInr.toLocaleString('en-IN')}. Tap for daily INR history.`,
+    revenueDailyBalanceNote: `Successful recharges today (${todayIst} IST). Yesterday: ₹${rechargeCollectionYesterdayInr.toLocaleString('en-IN')}. Tap for daily INR history.`,
     rechargeCollectionTodayInr,
     rechargeCollectionYesterdayInr,
     rechargeDailySeries,
@@ -372,7 +453,7 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,
     pendingPayoutsNote: range
-      ? `Pending withdrawals requested in the selected range.`
+      ? `Pending withdrawals requested in the selected IST range.`
       : `All pending withdrawal requests (no date filter).`,
     walletFlowSeries: rechargeDailySeries,
     totalCallMinutesToday: Math.round((callT.totalDurationSec / 60) * 100) / 100,
@@ -380,6 +461,8 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     coinsSpentOnCallsToday: callT.totalCoinsSpent,
     growthPlaceholder: { revenuePct: null, callsPct: null, hostsPct: null },
     selectedRange: selectedRangePayload(range),
+    timezone: IST_TIMEZONE,
+    rangeSemantics: 'half_open_ist',
     metricContract: buildOverviewMetricContract(),
     generatedAt: new Date().toISOString(),
   };
@@ -387,18 +470,24 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
 
 export async function dashboardRevenueSeries(days: number, range?: DashboardDateFilter) {
   const d = Math.min(90, Math.max(1, days));
-  const from = range ? new Date(range.from) : new Date();
-  if (!range) {
-    from.setUTCHours(0, 0, 0, 0);
-    from.setUTCDate(from.getUTCDate() - (d - 1));
+  let createdAt: Record<string, Date>;
+  let dateKeys: string[];
+  if (range) {
+    createdAt = createdAtRangeMatch(range);
+    dateKeys = iterIstDateBucketDefs(istDateKey(range.from), istDateKey(new Date(range.to.getTime() - 1))).map(
+      (b) => b.key
+    );
+  } else {
+    const { from } = istLookbackCalendarDays(d);
+    createdAt = { $gte: from };
+    dateKeys = istDateKeysLastNDays(d);
   }
-  const createdAt = range ? createdAtRangeMatch(range) : { $gte: from };
 
   const agg = await CallHistory.aggregate<{ _id: string; revenue: number; commission: number }>([
     { $match: { createdAt, ownerRole: 'user' } },
     {
       $group: {
-        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } },
         revenue: { $sum: '$coinsDeducted' },
         commission: { $sum: 0 },
       },
@@ -406,15 +495,18 @@ export async function dashboardRevenueSeries(days: number, range?: DashboardDate
     { $sort: { _id: 1 } },
   ]);
 
+  const byDate = new Map(agg.map((r) => [r._id, r]));
+
   return {
-    points: agg.map((r) => ({
-      date: r._id,
-      revenueCoins: r.revenue,
-      commissionCoins: r.commission,
+    points: dateKeys.map((date) => ({
+      date,
+      revenueCoins: byDate.get(date)?.revenue ?? 0,
+      commissionCoins: byDate.get(date)?.commission ?? 0,
     })),
+    timezone: IST_TIMEZONE,
     note: range
-      ? 'Revenue series uses user-side call history coins deducted per UTC day inside the selected range.'
-      : 'Revenue series uses user-side call history coins deducted per UTC day.',
+      ? 'Call revenue (coins deducted) per IST day inside the selected range.'
+      : 'Call revenue (coins deducted) per IST day.',
     selectedRange: selectedRangePayload(range),
   };
 }
@@ -755,11 +847,9 @@ export function dashboardHeatmapDemo() {
 }
 
 export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
-  const today = utcStartOfDay();
-  const thirty = new Date(today);
-  thirty.setUTCDate(thirty.getUTCDate() - 30);
-  const createdAt = range ? createdAtRangeMatch(range) : { $gte: today };
-  const volumeCreatedAt = range ? createdAtRangeMatch(range) : { $gte: thirty };
+  const { from: defaultFrom } = istLookbackCalendarDays(30);
+  const createdAt = range ? createdAtRangeMatch(range) : { $gte: istStartOfToday() };
+  const volumeCreatedAt = range ? createdAtRangeMatch(range) : { $gte: defaultFrom };
 
   const [todayAgg, monthAgg] = await Promise.all([
     CallHistory.aggregate([
@@ -778,7 +868,7 @@ export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
       { $match: { createdAt: volumeCreatedAt, ownerRole: 'user' } },
       {
         $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: IST_TIMEZONE } },
           c: { $sum: 1 },
         },
       },
@@ -787,6 +877,11 @@ export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
   ]);
 
   const t = todayAgg[0] || { total: 0, answered: 0, missed: 0, avgDur: 0 };
+  const volumeByDate = new Map(monthAgg.map((r) => [r._id, r.c]));
+  const volumeKeys = range
+    ? iterIstDateBucketDefs(istDateKey(range.from), istDateKey(new Date(range.to.getTime() - 1))).map((b) => b.key)
+    : istDateKeysLastNDays(30);
+
   return {
     today: {
       totalCalls: t.total,
@@ -794,7 +889,8 @@ export async function dashboardCallAnalytics(range?: DashboardDateFilter) {
       missedCalls: t.missed,
       avgCallDurationSec: Math.round(t.avgDur || 0),
     },
-    dailyVolume: monthAgg.map((r) => ({ date: r._id, calls: r.c })),
+    dailyVolume: volumeKeys.map((date) => ({ date, calls: volumeByDate.get(date) ?? 0 })),
+    timezone: IST_TIMEZONE,
     selectedRange: selectedRangePayload(range),
   };
 }
@@ -803,7 +899,7 @@ export async function dashboardPayouts(limit: number, range?: DashboardDateFilte
   const lim = clampDashboardLimit(limit, 25);
   const rows = await Withdrawal.find({
     status: 'pending',
-    ...(range ? { requestedAt: createdAtRangeMatch(range) } : {}),
+    ...(range ? dateFieldRangeMatch(range, 'requestedAt') : {}),
   })
     .sort({ requestedAt: -1 })
     .limit(lim)

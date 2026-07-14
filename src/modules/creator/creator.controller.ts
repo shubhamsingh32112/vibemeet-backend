@@ -2,6 +2,7 @@ import type { Request } from 'express';
 import { Response } from 'express';
 import mongoose from 'mongoose';
 import { Creator, type ICreator, CREATOR_LISTABLE_FILTER } from './creator.model';
+import { ACTIVE_WITHDRAWAL_STATUSES, MIN_CREATOR_WITHDRAWAL_COINS } from './creator-withdrawal.constants';
 import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
@@ -1530,8 +1531,21 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
         `📡 [REDIS+SOCKET] Creator availability updated: ${currentUser.firebaseUid} -> ${isOnline ? 'online' : 'offline'}`
       );
     } catch (availabilityError) {
-      // Don't fail the request if Redis/Socket broadcast fails
       console.error('⚠️  [REDIS+SOCKET] Failed to update availability:', availabilityError);
+      res.status(503).json({
+        success: false,
+        error:
+          'Availability runtime update failed; Mongo intent saved. Retry toggle or reconnect the app.',
+        data: {
+          creator: {
+            id: creator._id.toString(),
+            userId: creator.userId.toString(),
+            name: creator.name,
+            isOnline: creator.isOnline,
+          },
+        },
+      });
+      return;
     }
     
     res.json({
@@ -3095,7 +3109,7 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
  * Creator requests to withdraw coins.
  * Rules:
  *   - Must be a creator
- *   - Minimum withdrawal: 100 coins
+ *   - Minimum withdrawal: 1000 coins
  *   - Amount must not exceed current balance
  *   - Coins are NOT deducted at this point (only when payout is marked paid)
  *   - Creates a Withdrawal record with status 'pending'
@@ -3157,8 +3171,11 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       }
     }
 
-    if (amount < 100) {
-      res.status(400).json({ success: false, error: 'Minimum withdrawal amount is 100 coins' });
+    if (amount < MIN_CREATOR_WITHDRAWAL_COINS) {
+      res.status(400).json({
+        success: false,
+        error: `Minimum withdrawal amount is ${MIN_CREATOR_WITHDRAWAL_COINS} coins`,
+      });
       return;
     }
 
@@ -3170,36 +3187,21 @@ export const requestWithdrawal = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Optimized: Single query to check both pending withdrawal and cooldown
-    // This reduces database round trips from 2 to 1, improving performance under load
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const existingWithdrawal = await Withdrawal.findOne({
+    const activeWithdrawal = await Withdrawal.findOne({
       creatorUserId: currentUser._id,
-      $or: [
-        { status: 'pending' }, // Check for pending withdrawal
-        { requestedAt: { $gte: oneDayAgo } }, // Check for recent withdrawal (cooldown)
-      ],
+      status: { $in: ACTIVE_WITHDRAWAL_STATUSES },
     })
-      .sort({ requestedAt: -1 }) // Get most recent first
+      .sort({ requestedAt: -1 })
       .limit(1)
-      .lean(); // Use lean() for better performance (returns plain JS object)
+      .lean();
 
-    if (existingWithdrawal) {
-      if (existingWithdrawal.status === 'pending') {
-        res.status(409).json({
-          success: false,
-          error: 'You already have a pending withdrawal request. Please wait for it to be processed.',
-        });
-        return;
-      }
-      // Check if it's within cooldown period
-      if (existingWithdrawal.requestedAt >= oneDayAgo) {
-        res.status(429).json({
-          success: false,
-          error: 'You can only request one withdrawal per 24 hours. Please try again later.',
-        });
-        return;
-      }
+    if (activeWithdrawal) {
+      const error =
+        activeWithdrawal.status === 'pending'
+          ? 'You already have a pending withdrawal request. Please wait for it to be processed.'
+          : 'You already have an approved withdrawal awaiting payout. Please wait until it is marked paid.';
+      res.status(409).json({ success: false, error });
+      return;
     }
 
     const creatorProfile = await Creator.findOne({ userId: currentUser._id })

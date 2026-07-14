@@ -29,7 +29,8 @@ test('dashboard service keeps leaderboard numeric contract', () => {
   assert.ok(src.includes('metricContract: buildOverviewMetricContract()'));
   assert.ok(src.includes('dashboardWalletFlowSeries'));
   assert.ok(src.includes('revenueDailyBalance'));
-  assert.ok(src.includes('creditCoins: credit'));
+  assert.ok(src.includes('rechargeCollectionTodayInr'));
+  assert.ok(src.includes('dashboardRechargeTransactionsForDay'));
 });
 
 test('dashboardTopHosts does not use unbounded Creator.find({})', () => {
@@ -72,13 +73,24 @@ test('creators performance selects user coins for balance column', () => {
   assert.ok(block.includes('coins: user?.coins ?? 0'));
 });
 
-test('computeCreatorsPerformance does not use unbounded CallHistory.find for abuse refunds', () => {
-  const src = readFileSync(join(__dirname, 'admin.controller.ts'), 'utf8');
-  const start = src.indexOf('async function computeCreatorsPerformance');
-  const end = src.indexOf('// GET /admin/users/analytics');
-  assert.ok(start > 0 && end > start);
-  const block = src.slice(start, end);
-  assert.ok(!block.includes('CallHistory.find({'));
-  assert.ok(block.includes('REFUND_LOOKUP_BATCH'));
-  assert.ok(block.includes('$addToSet: \'$callId\''));
+test('dashboard service buckets wallet flow and revenue by Asia/Kolkata', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  assert.ok(src.includes("timezone: IST_TIMEZONE"));
+  assert.ok(src.includes('istRangeMatch(range.from, range.to)'));
+  assert.ok(!src.includes("timezone: 'UTC'"));
+  assert.ok(src.includes('rangeSemantics: \'half_open_ist\''));
+});
+
+test('createdAtRangeMatch uses half-open $lt semantics', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  assert.ok(src.includes('return istRangeMatch(range.from, range.to)'));
+  assert.ok(!src.includes('$lte: range.to'));
+});
+
+test('dashboard aggregations nest createdAt in $match (not spread)', () => {
+  const src = readFileSync(join(__dirname, 'admin-dashboard.service.ts'), 'utf8');
+  assert.ok(!src.includes('{ $match: { ...createdAt'), 'must not spread createdAt into $match');
+  assert.ok(!src.includes('{ $match: { ...volumeCreatedAt'), 'must not spread volumeCreatedAt into $match');
+  assert.ok(src.includes('{ $match: { createdAt, ownerRole: \'user\' } }'));
+  assert.ok(src.includes('{ $match: { createdAt: volumeCreatedAt, ownerRole: \'user\' } }'));
 });

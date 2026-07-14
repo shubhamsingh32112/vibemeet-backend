@@ -17,6 +17,7 @@ import { isPreviewMoment } from './free-preview.service';
 import { buildAvatarUrls } from '../../images/image-url';
 import { isVipActive } from '../../vip/vip-entitlement.service';
 import { momentCommentContainsNumbers } from '../utils/moment-comment-text-filter';
+import { displayNameForUser } from '../../../utils/stream-user-payload';
 
 const ENGAGEMENT_LIKE_WEIGHT = 1;
 const ENGAGEMENT_COMMENT_WEIGHT = 2;
@@ -151,7 +152,7 @@ async function resolveCommentAuthors(
   const creator = await Creator.findById(momentCreatorId).select('userId name gallery');
   const creatorUserId = creator?.userId?.toString();
   const users = await User.find({ _id: { $in: authorIds } }).select(
-    'displayName avatar',
+    'displayName username email phone avatar',
   );
   const map = new Map<string, { name: string; avatarUrl?: string; isCreator: boolean }>();
   for (const user of users) {
@@ -159,8 +160,15 @@ async function resolveCommentAuthors(
     const avatarUrl = user.avatar?.imageId
       ? buildAvatarUrls(user.avatar.imageId).sm
       : undefined;
+    const trimmedDisplayName = user.displayName?.trim();
+    const name =
+      trimmedDisplayName && trimmedDisplayName.length > 0
+        ? trimmedDisplayName
+        : isCreator && creator?.name?.trim()
+          ? creator.name.trim()
+          : displayNameForUser(user);
     map.set(user._id.toString(), {
-      name: user.displayName || creator?.name || 'User',
+      name,
       avatarUrl,
       isCreator,
     });
