@@ -10,7 +10,7 @@ import { z } from 'zod';
 // ─────────────────────────────────────────────────────────────────────────────
 // Creator DTOs
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 export const creatorSummarySchema = z.object({
   id: z.string(),
   userId: z.string().nullable().optional(),

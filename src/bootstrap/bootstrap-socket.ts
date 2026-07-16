@@ -4,6 +4,7 @@ import Redis from 'ioredis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { attachRedisClientMonitoring, isRedisConfigured } from '../config/redis';
 import { setIO } from '../config/socket';
+import { buildSocketCorsOrigin } from '../config/cors';
 import { logInfo, logWarning } from '../utils/logger';
 
 function socketAdapterFamily(): number | undefined {
@@ -71,35 +72,7 @@ export function initializeSocketIo(httpServer: HttpServer, socketCorsOrigin: Ret
   return io;
 }
 
-export function buildSocketCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
-  const raw = (process.env.CORS_ORIGIN || '').trim();
-  if (!raw || raw === '*') {
-    if (process.env.NODE_ENV === 'production') {
-      logWarning('CORS_ORIGIN is * or unset in production — set explicit origins for web clients', {});
-    }
-    return '*';
-  }
-  const escapeRegexLiteral = (input: string): string =>
-    input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const corsOriginEntryToMatcher = (entry: string): string | RegExp => {
-    const trimmed = entry.trim();
-    if (!trimmed) return '*';
-    if (trimmed === '*') return '*';
-    if (trimmed.includes('*')) {
-      const safe = escapeRegexLiteral(trimmed).replace(/\\\*/g, '.*');
-      return new RegExp(`^${safe}$`);
-    }
-    return trimmed;
-  };
-  const parts = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(corsOriginEntryToMatcher);
-  if (parts.length === 0) return '*';
-  if (parts.length === 1) return parts[0];
-  return parts;
-}
+export { buildSocketCorsOrigin };
 
 export function initializeHeadlessSocketIo(httpServer: HttpServer): Server {
   const io = new SocketIOServer(httpServer, {

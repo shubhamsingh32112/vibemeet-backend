@@ -37,6 +37,7 @@ import { recordAPIMetric } from './utils/monitoring';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { buildExpressCorsOptions } from './config/cors';
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -58,71 +59,12 @@ app.use(helmet({
   // Allow cleartext traffic for local development
   contentSecurityPolicy: false,
   crossOriginOpenerPolicy: false, // Allow popups for OAuth
+  // Public JSON API is called cross-origin from www → api; same-origin CORP
+  // blocks the browser even when Access-Control-Allow-Origin is present.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
-function escapeRegexLiteral(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function corsOriginEntryToMatcher(entry: string): string | RegExp {
-  const trimmed = entry.trim();
-  if (!trimmed) return '*';
-  if (trimmed === '*') return '*';
-
-  // Allow simple wildcard patterns like:
-  // - https://*.example.com
-  // - *.example.com
-  // This compiles into a safe regex that matches full origins.
-  if (trimmed.includes('*')) {
-    const safe = escapeRegexLiteral(trimmed).replace(/\\\*/g, '.*');
-    return new RegExp(`^${safe}$`);
-  }
-  return trimmed;
-}
-
-function buildCorsOrigin(): boolean | string | RegExp | (string | RegExp)[] {
-  const raw = (process.env.CORS_ORIGIN || '').trim();
-  if (!raw || raw === '*') {
-    if (process.env.NODE_ENV === 'production') {
-      logWarning('CORS_ORIGIN is * or unset in production — set explicit origins for web clients', {});
-    }
-    return '*';
-  }
-
-  const parts = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(corsOriginEntryToMatcher);
-
-  if (parts.length === 0) return '*';
-  if (parts.length === 1) return parts[0];
-  return parts;
-}
-
-app.use(
-  cors({
-    origin: buildCorsOrigin(),
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'Accept',
-      'X-Requested-With',
-      'x-idempotency-key',
-      'X-Idempotency-Key',
-      'x-request-id',
-      'X-Request-Id',
-      'x-correlation-id',
-      'X-Correlation-Id',
-    ],
-    exposedHeaders: ['Content-Length', 'Content-Type'],
-    maxAge: 86400,
-    optionsSuccessStatus: 204,
-    preflightContinue: false,
-  })
-);
+app.use(cors(buildExpressCorsOptions()));
 
 // Rate limiting
 // FIX 3: More lenient limit for status endpoint (polling every 3s = 20/min)
@@ -151,6 +93,8 @@ function shouldSkipGeneralRateLimit(req: Request): boolean {
   if (isDev && isLoopbackClient(req)) return true;
   // Staff dashboard BFF: many parallel widget fetches; route auth still required.
   if (req.staffRateLimit?.userId && isStaffDashboardRequest(req)) return true;
+  // Browsers need fast OPTIONS preflight; never count them against API quotas.
+  if (req.method === 'OPTIONS') return true;
   return false;
 }
 

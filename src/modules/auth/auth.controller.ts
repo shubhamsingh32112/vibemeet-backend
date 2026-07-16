@@ -94,6 +94,12 @@ function referralApplyFailure(code: ApplyReferralCodeErrorCode) {
   };
 }
 
+function isDuplicateKeyError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const mongoError = error as { code?: number; message?: string };
+  return mongoError.code === 11000 || mongoError.message?.includes("duplicate key") === true;
+}
+
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
   let createdNow = false;
@@ -132,82 +138,95 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         const firstLoginProfile = buildDefaultFirstLoginProfile();
 
         const grantWelcomeIntro = !showWelcomeBackDialog && isFreeCallEnabled();
-        user = await User.create({
-          firebaseUid: req.auth.firebaseUid,
-          phone: req.auth.phone,
-          email: req.auth.email,
-          role: 'user', // Default to 'user' - creators are promoted later via admin or referral
-          gender: firstLoginProfile.gender,
-          age: firstLoginProfile.age,
-          username: firstLoginProfile.username,
-          avatar: firstLoginProfile.avatar,
-          categories: firstLoginProfile.categories,
-          coins: 0,
-          introFreeCallCredits: grantWelcomeIntro ? getFreeCallDurationSeconds() : 0,
-          welcomeFreeCallConsumedAt: grantWelcomeIntro ? null : new Date(),
-          freeTextUsed: 0, // Legacy field; chat free quota is per creator in ChatMessageQuota
-          onboardingStage: 'welcome',
-          onboardingWelcomeSeenAt: null,
-          onboardingBonusSeenAt: null,
-          onboardingPermissionSeenAt: null,
-          onboardingCompletedAt: null,
-          permissionsIntroAcceptedAt: null,
-          cameraMicPermissionStatus: 'unknown',
-          notificationPermissionStatus: 'unknown',
-          permissionsLastCheckedAt: null,
-          lastPermissionsDecisionRequestId: null,
-          lastOnboardingStageIdempotencyKey: null,
-          lastOnboardingTransitionRequestId: null,
-          onboardingFlowVersion: 2,
-          permissionOnboardingStatus: 'unknown',
-        });
-
-        // Referral: assign unique code and apply referral if provided
         try {
-          await assignReferralCodeToUser(user);
-        } catch (assignErr) {
-          logError('assignReferralCodeToUser failed on signup', assignErr as Error, {
-            firebaseUid,
-            userId: user._id.toString(),
+          user = await User.create({
+            firebaseUid: req.auth.firebaseUid,
+            phone: req.auth.phone,
+            email: req.auth.email,
+            role: 'user', // Default to 'user' - creators are promoted later via admin or referral
+            gender: firstLoginProfile.gender,
+            age: firstLoginProfile.age,
+            username: firstLoginProfile.username,
+            avatar: firstLoginProfile.avatar,
+            categories: firstLoginProfile.categories,
+            coins: 0,
+            introFreeCallCredits: grantWelcomeIntro ? getFreeCallDurationSeconds() : 0,
+            welcomeFreeCallConsumedAt: grantWelcomeIntro ? null : new Date(),
+            freeTextUsed: 0, // Legacy field; chat free quota is per creator in ChatMessageQuota
+            onboardingStage: 'welcome',
+            onboardingWelcomeSeenAt: null,
+            onboardingBonusSeenAt: null,
+            onboardingPermissionSeenAt: null,
+            onboardingCompletedAt: null,
+            permissionsIntroAcceptedAt: null,
+            cameraMicPermissionStatus: 'unknown',
+            notificationPermissionStatus: 'unknown',
+            permissionsLastCheckedAt: null,
+            lastPermissionsDecisionRequestId: null,
+            lastOnboardingStageIdempotencyKey: null,
+            lastOnboardingTransitionRequestId: null,
+            onboardingFlowVersion: 2,
+            permissionOnboardingStatus: 'unknown',
           });
-        }
-        const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
-        if (referralCodeRaw) {
-          if (!isValidReferralCodeFormat(referralCodeRaw)) {
-            referralApply = referralApplyFailure('INVALID_FORMAT');
+        } catch (createErr) {
+          if (isDuplicateKeyError(createErr)) {
+            logInfo('Concurrent first-login race resolved via duplicate key', { firebaseUid });
+            createdNow = false;
+            user = await User.findOne({ firebaseUid });
+            if (!user) throw createErr;
           } else {
-            try {
-              const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
-              referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
-            } catch (applyErr) {
-              logError('applyReferralCode failed on signup', applyErr as Error, {
-                firebaseUid,
-                userId: user._id.toString(),
-              });
-              referralApply = referralApplyFailure('NOT_FOUND');
-            }
+            throw createErr;
           }
         }
-        const reloaded = await User.findOne({ firebaseUid });
-        if (!reloaded) {
-          res.status(500).json({ success: false, error: 'User creation failed' });
-          return;
-        }
-        user = reloaded;
 
-        logInfo('New user created', {
-          userId: user._id.toString(),
-          firebaseUid,
-          initialCoins: 0,
-          introFreeCallCredits: user.introFreeCallCredits,
-          grantWelcomeIntro,
-          freeTextUsed: 0,
-          gender: firstLoginProfile.gender,
-          age: firstLoginProfile.age,
-          username: firstLoginProfile.username,
-          categories: firstLoginProfile.categories,
-          showWelcomeBackDialog,
-        });
+        if (createdNow) {
+          // Referral: assign unique code and apply referral if provided
+          try {
+            await assignReferralCodeToUser(user);
+          } catch (assignErr) {
+            logError('assignReferralCodeToUser failed on signup', assignErr as Error, {
+              firebaseUid,
+              userId: user._id.toString(),
+            });
+          }
+          const referralCodeRaw = typeof req.body?.referralCode === 'string' ? req.body.referralCode.trim() : null;
+          if (referralCodeRaw) {
+            if (!isValidReferralCodeFormat(referralCodeRaw)) {
+              referralApply = referralApplyFailure('INVALID_FORMAT');
+            } else {
+              try {
+                const ar = await applyReferralCode(user, referralCodeRaw, { mode: 'signup' });
+                referralApply = ar.ok ? { ok: true } : referralApplyFailure(ar.code);
+              } catch (applyErr) {
+                logError('applyReferralCode failed on signup', applyErr as Error, {
+                  firebaseUid,
+                  userId: user._id.toString(),
+                });
+                referralApply = referralApplyFailure('NOT_FOUND');
+              }
+            }
+          }
+          const reloaded = await User.findOne({ firebaseUid });
+          if (!reloaded) {
+            res.status(500).json({ success: false, error: 'User creation failed' });
+            return;
+          }
+          user = reloaded;
+
+          logInfo('New user created', {
+            userId: user._id.toString(),
+            firebaseUid,
+            initialCoins: 0,
+            introFreeCallCredits: user.introFreeCallCredits,
+            grantWelcomeIntro,
+            freeTextUsed: 0,
+            gender: firstLoginProfile.gender,
+            age: firstLoginProfile.age,
+            username: firstLoginProfile.username,
+            categories: firstLoginProfile.categories,
+            showWelcomeBackDialog,
+          });
+        }
     } else {
       // Keep older users smooth: backfill profile defaults if onboarding fields are missing.
       const existingDefaults = buildDefaultFirstLoginProfile();
