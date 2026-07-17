@@ -22,8 +22,20 @@ import {
   findPendingMomentsPremiumTransaction,
   buildMomentsPremiumPurchaseTxnId,
 } from './moments-premium-purchase-finalization.service';
+import {
+  attachCheckoutOrder,
+  buildNeutralReturnTargets,
+  buildReturnTarget,
+  createCheckoutContext,
+  InvalidReturnToError,
+  recoverSignedNavigationClaims,
+  recordCheckoutResult,
+} from '../checkout/checkout-return.service';
+import { observeCapturedPaymentBestEffort } from '../payment/razorpay-captured-payment-projection.service';
 
-const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
+const WEB_CHECKOUT_BASE_URL =
+  process.env.WEB_CHECKOUT_BASE_URL ||
+  (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:8080');
 const MOMENTS_PREMIUM_APP_RETURN_DEEP_LINK =
   process.env.MOMENTS_PREMIUM_APP_RETURN_DEEP_LINK || 'zztherapy://moments-plan';
 
@@ -33,6 +45,9 @@ interface MomentsPremiumCheckoutSessionPayload {
   planId: string;
   priceInr: number;
   durationDays: number;
+  checkoutId?: string;
+  checkoutOrigin?: 'app' | 'web';
+  returnTo?: string;
   iat?: number;
   exp?: number;
 }
@@ -95,21 +110,6 @@ const buildStatusDeepLink = (
   if (values.reason) params.reason = values.reason;
   if (values.expiresAt) params.expiresAt = values.expiresAt;
   return buildAppOpenUrl(params);
-};
-
-const resolveApiBaseUrlForCheckout = (req: Request): string => {
-  const explicit =
-    process.env.PUBLIC_API_BASE_URL ||
-    process.env.API_BASE_URL ||
-    process.env.BACKEND_PUBLIC_URL;
-  if (explicit && explicit.trim().length > 0) {
-    return explicit.trim().replace(/\/$/, '');
-  }
-  const host = req.get('host');
-  if (host && host.trim().length > 0) {
-    return `${req.protocol}://${host}/api/v1`;
-  }
-  return 'http://localhost:3000/api/v1';
 };
 
 const verifyProviderPaymentCaptured = async (
@@ -217,25 +217,31 @@ export const initiateMomentsPremiumCheckout = async (
       return;
     }
 
+    const navigation = await createCheckoutContext({
+      userId: user._id,
+      product: 'moments',
+      checkoutOrigin: req.body?.checkoutOrigin,
+      returnTo: req.body?.returnTo,
+    });
     const checkoutToken = signCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
       planId: plan.planId,
       priceInr: plan.priceInr,
       durationDays: plan.durationDays,
+      ...navigation,
     });
 
     const checkoutBase = WEB_CHECKOUT_BASE_URL.replace(/\/$/, '');
-    const checkoutParams = new URLSearchParams({
-      session: checkoutToken,
-      apiBase: resolveApiBaseUrlForCheckout(req),
-    });
+    if (!checkoutBase) throw new Error('WEB_CHECKOUT_BASE_URL is required');
+    const checkoutParams = new URLSearchParams({ session: checkoutToken });
     const checkoutUrl = `${checkoutBase}/moments-premium-checkout?${checkoutParams.toString()}`;
 
     res.json({
       success: true,
       data: {
         checkoutUrl,
+        checkoutId: navigation.checkoutId,
         sessionId: checkoutToken,
         planId: plan.planId,
         priceInr: plan.priceInr,
@@ -245,6 +251,10 @@ export const initiateMomentsPremiumCheckout = async (
       },
     });
   } catch (error) {
+    if (error instanceof InvalidReturnToError || (error instanceof Error && error.message === 'Invalid checkoutOrigin')) {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
     logError('moments_premium_initiate_checkout_failed', error);
     res.status(500).json({ success: false, error: 'Failed to initiate Moments Premium checkout' });
   }
@@ -272,7 +282,17 @@ export const createMomentsPremiumWebOrder = async (
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
-      res.status(401).json({ success: false, error: 'Invalid or expired checkout token' });
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
+      res.status(401).json({
+        success: false,
+        error: 'Invalid or expired checkout token',
+        returnTargets: navigation
+          ? buildNeutralReturnTargets(
+              navigation,
+              (status, reason) => buildStatusDeepLink(status, { reason }),
+            )
+          : undefined,
+      });
       return;
     }
 
@@ -320,6 +340,7 @@ export const createMomentsPremiumWebOrder = async (
       plan.priceInr,
       plan.planId,
     );
+    await attachCheckoutOrder(session.checkoutId, order.id);
 
     if (!process.env.RAZORPAY_KEY_ID) {
       res.status(500).json({ success: false, error: 'Payment checkout is currently unavailable' });
@@ -337,6 +358,12 @@ export const createMomentsPremiumWebOrder = async (
         priceInr: plan.priceInr,
         label: plan.label,
         keyId: process.env.RAZORPAY_KEY_ID,
+        checkoutId: session.checkoutId,
+        returnTargets: buildNeutralReturnTargets(
+          session,
+          (status, reason) => buildStatusDeepLink(status, { reason }),
+        ),
+        appOpenUrl: buildStatusDeepLink('failed', { reason: 'cancelled' }),
       },
     });
   } catch (error) {
@@ -373,10 +400,21 @@ export const verifyMomentsPremiumWebPayment = async (
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
       res.status(401).json({
         success: false,
         error: 'Invalid or expired checkout token',
-        data: { appOpenUrl: buildStatusDeepLink('failed', { reason: 'session_expired' }) },
+        data: {
+          returnTarget: navigation
+            ? buildReturnTarget(
+                navigation,
+                'failed',
+                (status, reason) => buildStatusDeepLink(status, { reason }),
+                'session_expired',
+              )
+            : undefined,
+          appOpenUrl: buildStatusDeepLink('failed', { reason: 'session_expired' }),
+        },
       });
       return;
     }
@@ -404,6 +442,7 @@ export const verifyMomentsPremiumWebPayment = async (
     }
 
     if (!signatureOk) {
+      await recordCheckoutResult(session.checkoutId, 'failed', { reason: 'signature_mismatch' });
       await CoinTransaction.findOneAndUpdate(
         { transactionId: buildMomentsPremiumPurchaseTxnId(razorpay_order_id) },
         { status: 'failed' },
@@ -421,14 +460,23 @@ export const verifyMomentsPremiumWebPayment = async (
       return;
     }
 
+    let providerPayment: unknown;
     try {
-      await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
+      const providerCheck = await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
+      providerPayment = providerCheck.payment;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'provider_error';
-      res.status(400).json({
+      const pending = message.startsWith('PAYMENT_NOT_CAPTURED') || message === 'provider_error';
+      res.status(pending ? 202 : 400).json({
         success: false,
-        error: 'Payment provider verification failed',
+        error: pending ? 'Payment confirmation pending' : 'Payment provider verification failed',
         data: {
+          returnTarget: buildReturnTarget(
+            session,
+            pending ? 'pending' : 'failed',
+            (status, reason) => buildStatusDeepLink(status, { reason }),
+            message,
+          ),
           appOpenUrl: buildStatusDeepLink('failed', {
             sessionId: checkoutToken,
             reason: message,
@@ -476,6 +524,7 @@ export const verifyMomentsPremiumWebPayment = async (
       planId: session.planId,
       durationDays: plan.durationDays,
     });
+    await observeCapturedPaymentBestEffort(providerPayment, 'moments_verification');
 
     logInfo('moments_premium_purchase_completed', {
       userId: user._id.toString(),
@@ -483,10 +532,19 @@ export const verifyMomentsPremiumWebPayment = async (
       expiresAt: result.expiresAt.toISOString(),
       alreadyProcessed: result.alreadyProcessed,
     });
+    await recordCheckoutResult(session.checkoutId, 'success', {
+      expiresAt: result.expiresAt.toISOString(),
+    });
 
     res.json({
       success: true,
       data: {
+        checkoutId: session.checkoutId,
+        returnTarget: buildReturnTarget(
+          session,
+          'success',
+          (status, reason) => buildStatusDeepLink(status, { reason }),
+        ),
         appOpenUrl: buildStatusDeepLink('success', {
           sessionId: checkoutToken,
           expiresAt: result.expiresAt.toISOString(),
@@ -594,6 +652,7 @@ export const handleMomentsPremiumRazorpayWebhook = async (
         planId,
         durationDays,
       });
+      await observeCapturedPaymentBestEffort(paymentEntity, 'moments_webhook');
 
       await MomentsPremiumPurchaseEvent.updateOne(
         { eventId },

@@ -10,13 +10,13 @@ npm run build
 # Pick a unique tag, e.g. upload-fix-20260620
 export BUILD_ID=adminMoments
 
-docker build -t app-backend:endtoendweb  .
+docker build -t app-backend:logincors  .
 
-docker tag app-backend:endtoendweb  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:endtoendweb 
+docker tag app-backend:logincors  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:logincors 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:endtoendweb 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:logincors 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.

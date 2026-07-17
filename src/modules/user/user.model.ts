@@ -100,6 +100,14 @@ export interface IUser extends Document {
   agencyPlace?: string;
   /** Fast Login: 'google' | 'fast'. Omitted for existing users (treated as Google). */
   authProvider?: 'google' | 'fast';
+  /** Analytics claim supplied during the winning account creation request. */
+  accountCreationClient?: 'web' | 'mobile' | 'unknown';
+  /** Immutable, forward-only website audience classification. */
+  websiteAudienceCategory?: 'created_on_website' | 'preexisting_then_website';
+  /** First time this account became observable to website attribution. */
+  websiteAudienceSince?: Date | null;
+  firstWebsiteLoginAt?: Date | null;
+  lastWebsiteLoginAt?: Date | null;
   /** Fast Login: device fingerprint for lookup (one account per device). */
   deviceFingerprint?: string;
   /** Fast Login: install ID (per app install). */
@@ -364,6 +372,29 @@ const userSchema = new Schema<IUser>(
       enum: ['google', 'fast'],
       sparse: true,
     },
+    accountCreationClient: {
+      type: String,
+      enum: ['web', 'mobile', 'unknown'],
+      default: 'unknown',
+    },
+    websiteAudienceCategory: {
+      type: String,
+      enum: ['created_on_website', 'preexisting_then_website'],
+      sparse: true,
+      immutable: true,
+    },
+    websiteAudienceSince: {
+      type: Date,
+      default: null,
+    },
+    firstWebsiteLoginAt: {
+      type: Date,
+      default: null,
+    },
+    lastWebsiteLoginAt: {
+      type: Date,
+      default: null,
+    },
     deviceFingerprint: {
       type: String,
       sparse: true,
@@ -433,5 +464,25 @@ userSchema.index({ installId: 1 }, { unique: true, sparse: true });
 userSchema.index({ installId: 1, authProvider: 1 }, { sparse: true });
 userSchema.index({ bdId: 1, role: 1 }, { sparse: true });
 userSchema.index({ hostOnboardingStatus: 1, referredBy: 1 }, { sparse: true });
+// Forward-only website attribution scans. Search remains bounded but is not
+// represented as indexed substring search.
+userSchema.index(
+  { role: 1, websiteAudienceSince: -1, _id: -1 },
+  {
+    partialFilterExpression: {
+      role: 'user',
+      websiteAudienceSince: { $type: 'date' },
+    },
+  },
+);
+userSchema.index(
+  { role: 1, lastWebsiteLoginAt: -1, _id: -1 },
+  {
+    partialFilterExpression: {
+      role: 'user',
+      lastWebsiteLoginAt: { $type: 'date' },
+    },
+  },
+);
 
 export const User = mongoose.model<IUser>('User', userSchema);

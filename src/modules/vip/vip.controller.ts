@@ -25,8 +25,20 @@ import {
   findPendingVipTransaction,
   buildVipPurchaseTxnId,
 } from './vip-purchase-finalization.service';
+import {
+  attachCheckoutOrder,
+  buildNeutralReturnTargets,
+  buildReturnTarget,
+  createCheckoutContext,
+  InvalidReturnToError,
+  recoverSignedNavigationClaims,
+  recordCheckoutResult,
+} from '../checkout/checkout-return.service';
+import { observeCapturedPaymentBestEffort } from '../payment/razorpay-captured-payment-projection.service';
 
-const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
+const WEB_CHECKOUT_BASE_URL =
+  process.env.WEB_CHECKOUT_BASE_URL ||
+  (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:8080');
 const VIP_APP_RETURN_DEEP_LINK = process.env.VIP_APP_RETURN_DEEP_LINK || 'zztherapy://vip';
 
 interface VipCheckoutSessionPayload {
@@ -35,6 +47,9 @@ interface VipCheckoutSessionPayload {
   planId: string;
   priceInr: number;
   durationDays: number;
+  checkoutId?: string;
+  checkoutOrigin?: 'app' | 'web';
+  returnTo?: string;
   iat?: number;
   exp?: number;
 }
@@ -97,21 +112,6 @@ const buildVipStatusDeepLink = (
   if (values.reason) params.reason = values.reason;
   if (values.expiresAt) params.expiresAt = values.expiresAt;
   return buildVipAppOpenUrl(params);
-};
-
-const resolveApiBaseUrlForCheckout = (req: Request): string => {
-  const explicit =
-    process.env.PUBLIC_API_BASE_URL ||
-    process.env.API_BASE_URL ||
-    process.env.BACKEND_PUBLIC_URL;
-  if (explicit && explicit.trim().length > 0) {
-    return explicit.trim().replace(/\/$/, '');
-  }
-  const host = req.get('host');
-  if (host && host.trim().length > 0) {
-    return `${req.protocol}://${host}/api/v1`;
-  }
-  return 'http://localhost:3000/api/v1';
 };
 
 const verifyProviderPaymentCaptured = async (
@@ -217,25 +217,31 @@ export const initiateVipCheckout = async (
       return;
     }
 
+    const navigation = await createCheckoutContext({
+      userId: user._id,
+      product: 'vip',
+      checkoutOrigin: req.body?.checkoutOrigin,
+      returnTo: req.body?.returnTo,
+    });
     const checkoutToken = signVipCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
       planId: plan.planId,
       priceInr: plan.priceInr,
       durationDays: plan.durationDays,
+      ...navigation,
     });
 
     const checkoutBase = WEB_CHECKOUT_BASE_URL.replace(/\/$/, '');
-    const checkoutParams = new URLSearchParams({
-      session: checkoutToken,
-      apiBase: resolveApiBaseUrlForCheckout(req),
-    });
+    if (!checkoutBase) throw new Error('WEB_CHECKOUT_BASE_URL is required');
+    const checkoutParams = new URLSearchParams({ session: checkoutToken });
     const checkoutUrl = `${checkoutBase}/vip-checkout?${checkoutParams.toString()}`;
 
     res.json({
       success: true,
       data: {
         checkoutUrl,
+        checkoutId: navigation.checkoutId,
         sessionId: checkoutToken,
         planId: plan.planId,
         priceInr: plan.priceInr,
@@ -245,6 +251,10 @@ export const initiateVipCheckout = async (
       },
     });
   } catch (error) {
+    if (error instanceof InvalidReturnToError || (error instanceof Error && error.message === 'Invalid checkoutOrigin')) {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
     logError('vip_initiate_checkout_failed', error);
     res.status(500).json({ success: false, error: 'Failed to initiate VIP checkout' });
   }
@@ -268,7 +278,17 @@ export const createVipWebOrder = async (
 
     const session = verifyVipCheckoutSession(checkoutToken);
     if (!session) {
-      res.status(401).json({ success: false, error: 'Invalid or expired checkout token' });
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
+      res.status(401).json({
+        success: false,
+        error: 'Invalid or expired checkout token',
+        returnTargets: navigation
+          ? buildNeutralReturnTargets(
+              navigation,
+              (status, reason) => buildVipStatusDeepLink(status, { reason }),
+            )
+          : undefined,
+      });
       return;
     }
 
@@ -313,6 +333,7 @@ export const createVipWebOrder = async (
       plan.priceInr,
       plan.planId,
     );
+    await attachCheckoutOrder(session.checkoutId, order.id);
 
     if (!process.env.RAZORPAY_KEY_ID) {
       res.status(500).json({ success: false, error: 'Payment checkout is currently unavailable' });
@@ -330,6 +351,12 @@ export const createVipWebOrder = async (
         priceInr: plan.priceInr,
         label: plan.label,
         keyId: process.env.RAZORPAY_KEY_ID,
+        checkoutId: session.checkoutId,
+        returnTargets: buildNeutralReturnTargets(
+          session,
+          (status, reason) => buildVipStatusDeepLink(status, { reason }),
+        ),
+        appOpenUrl: buildVipStatusDeepLink('failed', { reason: 'cancelled' }),
       },
     });
   } catch (error) {
@@ -362,10 +389,21 @@ export const verifyVipWebPayment = async (
 
     const session = verifyVipCheckoutSession(checkoutToken);
     if (!session) {
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
       res.status(401).json({
         success: false,
         error: 'Invalid or expired checkout token',
-        data: { appOpenUrl: buildVipStatusDeepLink('failed', { reason: 'session_expired' }) },
+        data: {
+          returnTarget: navigation
+            ? buildReturnTarget(
+                navigation,
+                'failed',
+                (status, reason) => buildVipStatusDeepLink(status, { reason }),
+                'session_expired',
+              )
+            : undefined,
+          appOpenUrl: buildVipStatusDeepLink('failed', { reason: 'session_expired' }),
+        },
       });
       return;
     }
@@ -393,6 +431,7 @@ export const verifyVipWebPayment = async (
     }
 
     if (!signatureOk) {
+      await recordCheckoutResult(session.checkoutId, 'failed', { reason: 'signature_mismatch' });
       await CoinTransaction.findOneAndUpdate(
         { transactionId: buildVipPurchaseTxnId(razorpay_order_id) },
         { status: 'failed' },
@@ -410,14 +449,23 @@ export const verifyVipWebPayment = async (
       return;
     }
 
+    let providerPayment: unknown;
     try {
-      await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
+      const providerCheck = await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
+      providerPayment = providerCheck.payment;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'provider_error';
-      res.status(400).json({
+      const pending = message.startsWith('PAYMENT_NOT_CAPTURED') || message === 'provider_error';
+      res.status(pending ? 202 : 400).json({
         success: false,
-        error: 'Payment provider verification failed',
+        error: pending ? 'Payment confirmation pending' : 'Payment provider verification failed',
         data: {
+          returnTarget: buildReturnTarget(
+            session,
+            pending ? 'pending' : 'failed',
+            (status, reason) => buildVipStatusDeepLink(status, { reason }),
+            message,
+          ),
           appOpenUrl: buildVipStatusDeepLink('failed', {
             sessionId: checkoutToken,
             reason: message,
@@ -465,6 +513,7 @@ export const verifyVipWebPayment = async (
       planId: session.planId,
       durationDays: plan.durationDays,
     });
+    await observeCapturedPaymentBestEffort(providerPayment, 'vip_verification');
 
     logInfo('vip_purchase_completed', {
       userId: user._id.toString(),
@@ -472,10 +521,19 @@ export const verifyVipWebPayment = async (
       expiresAt: result.expiresAt.toISOString(),
       alreadyProcessed: result.alreadyProcessed,
     });
+    await recordCheckoutResult(session.checkoutId, 'success', {
+      expiresAt: result.expiresAt.toISOString(),
+    });
 
     res.json({
       success: true,
       data: {
+        checkoutId: session.checkoutId,
+        returnTarget: buildReturnTarget(
+          session,
+          'success',
+          (status, reason) => buildVipStatusDeepLink(status, { reason }),
+        ),
         appOpenUrl: buildVipStatusDeepLink('success', {
           sessionId: checkoutToken,
           expiresAt: result.expiresAt.toISOString(),
@@ -579,6 +637,7 @@ export const handleVipRazorpayWebhook = async (
         planId,
         durationDays,
       });
+      await observeCapturedPaymentBestEffort(paymentEntity, 'vip_webhook');
 
       await VipPurchaseEvent.updateOne(
         { eventId },

@@ -18,6 +18,10 @@ import {
   dashboardTopBds,
   dashboardTopHosts,
 } from './admin-dashboard.service';
+import {
+  dashboardRazorpayCollectedAmount,
+  RazorpayCollectedError,
+} from './admin-razorpay-collected.service';
 
 function extractDashboardRange(req: Request) {
   const parsed = parseAdminDateRange(req);
@@ -186,6 +190,38 @@ export const getDashboardRazorpayBalance = async (req: Request, res: Response): 
   } catch (error) {
     logError('getDashboardRazorpayBalance', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getDashboardRazorpayCollectedAmount = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const parsed = parseAdminDateRange(req);
+    if (parsed.invalidReason) {
+      res.status(400).json({
+        success: false,
+        error: 'A valid from/to half-open date range is required when either bound is supplied.',
+        code: parsed.invalidReason,
+      });
+      return;
+    }
+    const range =
+      parsed.hasRange && parsed.from && parsed.to
+        ? { from: parsed.from, to: parsed.to }
+        : undefined;
+    const data = await dashboardRazorpayCollectedAmount(range);
+    res.json({ success: true, data });
+  } catch (error) {
+    if (error instanceof RazorpayCollectedError) {
+      res.status(error.status).json({ success: false, error: error.message, code: error.code });
+      return;
+    }
+    logError('getDashboardRazorpayCollectedAmount', error as Error);
+    res.status(503).json({
+      success: false,
+      error: 'Unable to calculate Razorpay Collected Amount.',
+      code: 'PROVIDER_UNAVAILABLE',
+    });
   }
 };
 

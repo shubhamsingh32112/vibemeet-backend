@@ -50,13 +50,21 @@ curl -i -X OPTIONS 'https://YOUR_API_DOMAIN/api/v1/payment/web/create-order' \
   -H 'Access-Control-Request-Headers: content-type'
 ```
 
-## 3) Canonical URL configuration (prevents wrong apiBase)
+## 3) Canonical URL configuration
 
 Set these in production:
-- `PUBLIC_API_BASE_URL=https://YOUR_API_DOMAIN/api/v1`
 - `WEB_CHECKOUT_BASE_URL=https://www.mannatenterprises.shop`
+- `WEB_APP_BASE_URL=https://www.flirtycam.in`
+- Hosted checkout: `VITE_API_BASE_URL=https://YOUR_API_DOMAIN/api/v1`
 
-If `PUBLIC_API_BASE_URL` is missing, the backend may embed an incorrect `apiBase` in checkout URLs, leading to CORS failures.
+Checkout URLs never accept or embed an `apiBase` query parameter. The hosted build is the
+only API-origin authority. Web initiators send `checkoutOrigin=web` and a bounded relative
+`returnTo`; the backend signs those claims and returns allowlisted `returnTarget` values.
+Legacy initiators that omit the fields continue to receive app deep links.
+
+Website returns use opaque `checkoutId` values at `/payment/return`. The authenticated
+`GET /api/v1/payment/web/status/:checkoutId` response is authoritative; query-string status
+and reason values are display hints only.
 
 ## 4) Metrics to monitor (backend `/metrics`)
 

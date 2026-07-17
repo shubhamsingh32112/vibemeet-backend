@@ -12,21 +12,30 @@ export type ParsedDateRange = {
 
 const MAX_RANGE_DAYS = 366;
 
-function parseIsoDate(input: unknown): { date?: Date; iso?: string } {
-  if (typeof input !== 'string' || !input.trim()) return {};
+const ISO_INSTANT_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function parseIsoDate(input: unknown): { date?: Date; iso?: string; supplied: boolean } {
+  if (typeof input !== 'string' || !input.trim()) return { supplied: false };
   const iso = input.trim();
+  if (!ISO_INSTANT_RE.test(iso)) return { iso, supplied: true };
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return {};
-  return { date: d, iso };
+  if (Number.isNaN(d.getTime())) return { iso, supplied: true };
+  return { date: d, iso, supplied: true };
 }
 
 export function parseAdminDateRange(req: Request): ParsedDateRange {
-  const { date: from, iso: fromIso } = parseIsoDate(req.query.from);
-  const { date: to, iso: toIso } = parseIsoDate(req.query.to);
+  const fromParsed = parseIsoDate(req.query.from);
+  const toParsed = parseIsoDate(req.query.to);
+  const { date: from, iso: fromIso } = fromParsed;
+  const { date: to, iso: toIso } = toParsed;
 
-  const hasRange = Boolean(from || to);
+  const hasRange = fromParsed.supplied || toParsed.supplied;
   if (!hasRange) return { hasRange: false };
 
+  if ((fromParsed.supplied && !from) || (toParsed.supplied && !to)) {
+    return { hasRange: false, fromIso, toIso, invalidReason: 'invalid_bounds' };
+  }
   if (!from) return { hasRange: false, fromIso, toIso, invalidReason: 'missing_from' };
   if (!to) return { hasRange: false, fromIso, toIso, invalidReason: 'missing_to' };
 

@@ -11,6 +11,10 @@ import {
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { webhookLimiter } from '../../middlewares/rate-limit.middleware';
 import { verifyRazorpayWebhookSignature } from '../../middlewares/webhook-signature.middleware';
+import {
+  getCheckoutStatus,
+  recordHostedCheckoutResult,
+} from '../checkout/checkout-return.service';
 
 const router = Router();
 
@@ -31,6 +35,10 @@ router.post('/web/create-order', createWebOrder);
 
 // POST /payment/web/verify — Website verifies payment and returns app deep-link
 router.post('/web/verify', verifyWebPayment);
+
+// GET /payment/web/status/:checkoutId — authoritative cross-product checkout reconciliation
+router.get('/web/status/:checkoutId', verifyFirebaseToken, getCheckoutStatus);
+router.post('/web/result', recordHostedCheckoutResult);
 
 // POST /payment/webhook — Razorpay webhook (signature protected + rate limited)
 router.post('/webhook', webhookLimiter, verifyRazorpayWebhookSignature, handleRazorpayWebhook);

@@ -26,6 +26,7 @@ import {
   getDashboardOverview,
   getDashboardPayouts,
   getDashboardRazorpayBalance,
+  getDashboardRazorpayCollectedAmount,
   getDashboardRechargeTransactions,
   getDashboardRealtime,
   getDashboardRevenue,
@@ -157,6 +158,10 @@ import {
   getVipPaidUsers,
   getWalletTransactions,
 } from './admin-analytics.controller';
+import {
+  getUsersLoginAnalytics,
+  getWebsiteUsers,
+} from './admin-user-attribution.controller';
 
 const router = Router();
 
@@ -168,6 +173,8 @@ router.get('/overview', getOverview);
 router.get('/creators/performance', getCreatorsPerformance);
 router.get('/creators/:id/detail', getAdminCreatorDetail);
 router.get('/users/analytics', getUsersAnalytics);
+router.get('/users/website', getWebsiteUsers);
+router.get('/users/login-analytics', getUsersLoginAnalytics);
 router.get('/blocked-hosts', getBlockedHosts);
 router.get('/revenue-split/summary', getRevenueSplitSummary);
 router.get('/leaderboards/hosts', getLeaderboardHosts);
@@ -216,6 +223,7 @@ router.get('/dashboard/call-analytics', getDashboardCallAnalytics);
 router.get('/dashboard/payouts', getDashboardPayouts);
 router.get('/dashboard/geo', getDashboardGeo);
 router.get('/dashboard/razorpay-balance', getDashboardRazorpayBalance);
+router.get('/dashboard/razorpay-collected-amount', getDashboardRazorpayCollectedAmount);
 router.get('/dashboard/recharge-transactions', getDashboardRechargeTransactions);
 
 // ── Top-tier BDs (super-admin) ─────────────────────────────────────────────

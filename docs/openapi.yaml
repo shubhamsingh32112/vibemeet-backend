@@ -1640,6 +1640,81 @@ paths:
           description: Client error
         '5XX':
           description: Server error
+  "/api/v1/admin/users/login-analytics":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_users_login_analytics
+      summary: Cohort-based consumer auth activity analytics
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: cohort
+          schema:
+            type: string
+            enum: [first_time, relogin, all]
+            default: first_time
+        - in: query
+          name: activityKind
+          schema:
+            type: string
+            enum: [interactive_login, session_restore, all]
+            default: all
+        - in: query
+          name: from
+          schema: { type: string, format: date-time }
+        - in: query
+          name: to
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Cohort rows plus forward-coverage metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Invalid filter or date range
+        '5XX':
+          description: Server error
+  "/api/v1/admin/users/website":
+    get:
+      tags:
+        - Admin
+      operationId: get__api_v1_admin_users_website
+      summary: Forward-attributed website consumer users
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: audience
+          schema:
+            type: string
+            enum: [created_on_website, preexisting_then_website, all]
+            default: created_on_website
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [website_since, last_website_login]
+        - in: query
+          name: from
+          schema: { type: string, format: date-time }
+        - in: query
+          name: to
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Website audience rows plus forward-only coverage metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Invalid filter or date range
+        '5XX':
+          description: Server error
   "/api/v1/admin/vip/members":
     get:
       tags:
@@ -2329,6 +2404,27 @@ paths:
       summary: Auth POST /api/v1/auth/login
       security:
         - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                referralCode:
+                  type: string
+                clientPlatform:
+                  type: string
+                  enum: [web, mobile]
+                  description: Client analytics claim; never used for authorization.
+                eventKind:
+                  type: string
+                  enum: [interactive_login, session_restore]
+                clientEventId:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                  description: Stable identifier reused for one auth action and its HTTP retries.
       responses:
         '200':
           description: Success
@@ -3745,6 +3841,49 @@ paths:
       responses:
         '200':
           description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/web/status/{checkoutId}":
+    get:
+      tags:
+        - Payment
+      operationId: get__api_v1_payment_web_status_checkoutId
+      summary: Reconcile an opaque checkout ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: checkoutId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{32}$'
+      responses:
+        '200':
+          description: Authoritative checkout status and validated return location
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+        '5XX':
+          description: Server error
+  "/api/v1/payment/web/result":
+    post:
+      tags:
+        - Payment
+      operationId: post__api_v1_payment_web_result
+      summary: Record a signed hosted cancellation or provider failure
+      responses:
+        '200':
+          description: Result recorded
           content:
             application/json:
               schema:

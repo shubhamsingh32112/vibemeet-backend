@@ -21,9 +21,21 @@ import { PaymentWebhookEvent } from './payment-webhook-event.model';
 import { recordPaymentMetric } from '../../utils/monitoring';
 import { resolveRechargeBenefits } from './recharge-pricing.service';
 import { createPendingBonusCoinTransaction } from './payment-finalization.service';
+import { observeCapturedPaymentBestEffort } from './razorpay-captured-payment-projection.service';
+import {
+  attachCheckoutOrder,
+  buildNeutralReturnTargets,
+  buildReturnTarget,
+  createCheckoutContext,
+  InvalidReturnToError,
+  recoverSignedNavigationClaims,
+  recordCheckoutResult,
+} from '../checkout/checkout-return.service';
 
 const CHECKOUT_SESSION_TTL_SECONDS = 15 * 60;
-const WEB_CHECKOUT_BASE_URL = process.env.WEB_CHECKOUT_BASE_URL || 'http://localhost:8080';
+const WEB_CHECKOUT_BASE_URL =
+  process.env.WEB_CHECKOUT_BASE_URL ||
+  (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:8080');
 const APP_RETURN_DEEP_LINK = process.env.APP_RETURN_DEEP_LINK || 'zztherapy://wallet';
 const PAYMENT_WEBHOOK_MAX_RETRIES = Math.max(
   1,
@@ -43,6 +55,9 @@ interface CheckoutSessionPayload {
   pricingTier: PricingTier;
   bonusCoins?: number;
   bonusReason?: string;
+  checkoutId?: string;
+  checkoutOrigin?: 'app' | 'web';
+  returnTo?: string;
   iat?: number;
   exp?: number;
 }
@@ -106,21 +121,6 @@ const buildPaymentStatusDeepLink = (
   if (values.message) params.message = values.message;
   if (values.reason) params.reason = values.reason;
   return buildAppOpenUrl(params);
-};
-
-const resolveApiBaseUrlForCheckout = (req: Request): string => {
-  const explicit =
-    process.env.PUBLIC_API_BASE_URL ||
-    process.env.API_BASE_URL ||
-    process.env.BACKEND_PUBLIC_URL;
-  if (explicit && explicit.trim().length > 0) {
-    return explicit.trim().replace(/\/$/, '');
-  }
-  const host = req.get('host');
-  if (host && host.trim().length > 0) {
-    return `${req.protocol}://${host}/api/v1`;
-  }
-  return 'http://localhost:3000/api/v1';
 };
 
 const signCheckoutSession = (payload: CheckoutSessionPayload): string =>
@@ -255,7 +255,12 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const { packageId, coins } = req.body as { packageId?: string; coins?: number };
+    const { packageId, coins, checkoutOrigin, returnTo } = req.body as {
+      packageId?: string;
+      coins?: number;
+      checkoutOrigin?: 'app' | 'web';
+      returnTo?: string;
+    };
     if ((!packageId || typeof packageId !== 'string') && (!coins || typeof coins !== 'number')) {
       res.status(400).json({ success: false, error: 'Missing packageId' });
       return;
@@ -293,6 +298,12 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       coins: pack.coins,
     });
 
+    const navigation = await createCheckoutContext({
+      userId: user._id,
+      product: 'wallet',
+      checkoutOrigin,
+      returnTo,
+    });
     const checkoutToken = signCheckoutSession({
       firebaseUid: user.firebaseUid,
       userId: user._id.toString(),
@@ -302,19 +313,19 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       pricingTier,
       bonusCoins: benefits.bonusCoins,
       bonusReason: benefits.bonusReason ?? undefined,
+      ...navigation,
     });
 
     const checkoutBase = WEB_CHECKOUT_BASE_URL.replace(/\/$/, '');
-    const checkoutParams = new URLSearchParams({
-      session: checkoutToken,
-      apiBase: resolveApiBaseUrlForCheckout(req),
-    });
+    if (!checkoutBase) throw new Error('WEB_CHECKOUT_BASE_URL is required');
+    const checkoutParams = new URLSearchParams({ session: checkoutToken });
     const checkoutUrl = `${checkoutBase}/wallet-checkout?${checkoutParams.toString()}`;
 
     res.json({
       success: true,
       data: {
         checkoutUrl,
+        checkoutId: navigation.checkoutId,
         sessionId: checkoutToken,
         packageId: pack.packageId,
         coins: benefits.baseCoins,
@@ -329,6 +340,10 @@ export const initiateWebCheckout = async (req: Request, res: Response): Promise<
       },
     });
   } catch (error) {
+    if (error instanceof InvalidReturnToError || (error instanceof Error && error.message === 'Invalid checkoutOrigin')) {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
     const message = error instanceof Error ? error.message : 'unknown';
     console.error(`❌ [PAYMENT] initiateWebCheckout error: ${message}`);
     res.status(500).json({ success: false, error: 'Failed to initiate checkout' });
@@ -352,8 +367,18 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
       recordPaymentMetric('web.create_order_failed', 1, { reason: 'invalid_or_expired_session' });
-      res.status(401).json({ success: false, error: 'Invalid or expired checkout token' });
+      res.status(401).json({
+        success: false,
+        error: 'Invalid or expired checkout token',
+        returnTargets: navigation
+          ? buildNeutralReturnTargets(
+              navigation,
+              (status, reason) => buildPaymentStatusDeepLink(status, { reason }),
+            )
+          : undefined,
+      });
       return;
     }
 
@@ -405,6 +430,7 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
       activePack.coins,
       chargedPriceInr,
     );
+    await attachCheckoutOrder(session.checkoutId, order.id);
 
     const sessionBonusCoins =
       typeof session.bonusCoins === 'number' ? session.bonusCoins : 0;
@@ -437,6 +463,12 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
         totalCoinsReceived,
         vipBonusApplied: sessionBonusCoins > 0,
         keyId: process.env.RAZORPAY_KEY_ID,
+        checkoutId: session.checkoutId,
+        returnTargets: buildNeutralReturnTargets(
+          session,
+          (status, reason) => buildPaymentStatusDeepLink(status, { reason }),
+        ),
+        appOpenUrl: buildPaymentStatusDeepLink('failed', { reason: 'cancelled' }),
       },
     });
   } catch (error) {
@@ -480,11 +512,20 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
 
     const session = verifyCheckoutSession(checkoutToken);
     if (!session) {
+      const navigation = recoverSignedNavigationClaims(checkoutToken);
       recordPaymentMetric('web.verify_failed', 1, { reason: 'invalid_or_expired_session' });
       res.status(401).json({
         success: false,
         error: 'Invalid or expired checkout token',
         data: {
+          returnTarget: navigation
+            ? buildReturnTarget(
+                navigation,
+                'failed',
+                (status, reason) => buildPaymentStatusDeepLink(status, { reason }),
+                'session_expired',
+              )
+            : undefined,
           appOpenUrl: buildPaymentStatusDeepLink('failed', { reason: 'session_expired' }),
         },
       });
@@ -514,6 +555,7 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
     }
 
     if (!signatureOk) {
+      await recordCheckoutResult(session.checkoutId, 'failed', { reason: 'signature_mismatch' });
       recordPaymentMetric('web.verify_failed', 1, { reason: 'signature_mismatch' });
       await CoinTransaction.findOneAndUpdate(
         { $or: getOrderTransactionSelectors(razorpay_order_id) },
@@ -532,9 +574,11 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       return;
     }
     let providerOrder: any | null = null;
+    let providerPayment: unknown = null;
     try {
       const providerCheck = await verifyProviderPaymentCaptured(razorpay_order_id, razorpay_payment_id);
       providerOrder = providerCheck.order;
+      providerPayment = providerCheck.payment;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'PAYMENT_PROVIDER_ERROR';
       recordPaymentMetric('web.verify_failed', 1, { reason: 'provider_verification_failed' });
@@ -543,10 +587,17 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
         : message === 'PAYMENT_ORDER_MISMATCH'
           ? 'order_payment_mismatch'
           : 'provider_verification_failed';
-      res.status(400).json({
+      const pending = reason === 'payment_not_captured' || reason === 'provider_verification_failed';
+      res.status(pending ? 202 : 400).json({
         success: false,
-        error: 'Payment provider verification failed',
+        error: pending ? 'Payment confirmation pending' : 'Payment provider verification failed',
         data: {
+          returnTarget: buildReturnTarget(
+            session,
+            pending ? 'pending' : 'failed',
+            (status, targetReason) => buildPaymentStatusDeepLink(status, { reason: targetReason }),
+            reason,
+          ),
           appOpenUrl: buildPaymentStatusDeepLink('failed', { sessionId: checkoutToken, reason }),
         },
       });
@@ -645,6 +696,7 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       });
       return;
     }
+    await observeCapturedPaymentBestEffort(providerPayment, 'wallet_verification');
 
     verifyUserBalance(user._id).catch(() => {});
 
@@ -692,6 +744,9 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       userId: user._id.toString(),
       finalizeStatus: finalizeResult.status,
     });
+    await recordCheckoutResult(session.checkoutId, 'success', {
+      walletDelta: finalizeResult.coinsAdded,
+    });
 
     res.json({
       success: true,
@@ -705,6 +760,12 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
         coinsAdded: finalizeResult.coinsAdded,
         sessionId: checkoutToken,
         transactionRef: finalizeResult.transaction._id.toString(),
+        checkoutId: session.checkoutId,
+        returnTarget: buildReturnTarget(
+          session,
+          'success',
+          (status, reason) => buildPaymentStatusDeepLink(status, { reason }),
+        ),
         appOpenUrl: buildPaymentStatusDeepLink('success', {
           sessionId: checkoutToken,
           walletDelta: finalizeResult.coinsAdded,
@@ -862,8 +923,9 @@ async function processStoredRazorpayWebhookEvent(
 
   const processStartedAt = Date.now();
   try {
-    await verifyProviderPaymentCaptured(orderId, paymentId);
+    const providerCheck = await verifyProviderPaymentCaptured(orderId, paymentId);
     const finalizeResult = await finalizePaymentAtomically({ orderId, paymentId });
+    await observeCapturedPaymentBestEffort(providerCheck.payment, 'wallet_webhook');
     await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
       status: 'processed',
       processedAt: new Date(),

@@ -24,7 +24,11 @@ import { serializeCreatorGallery, serializeUserImages } from '../images/creator-
 import { serializeAvatar } from '../images/serialize-image-asset';
 import { normalizeStaffPortalPassword } from '../../utils/staff-password';
 import { getCanonicalCoinsAndRepairIfNeeded } from '../../utils/ledger-coins';
-import { recordConsumerUserLogin } from '../user/user-login.service';
+import {
+  normalizeAuthAnalyticsClaims,
+  observeExistingWebsiteUser,
+  recordConsumerUserLogin,
+} from '../user/user-login.service';
 
 const DEFAULT_NEW_USER_AGE = 26;
 const DEFAULT_NEW_USER_GENDER = 'male' as const;
@@ -102,6 +106,8 @@ function isDuplicateKeyError(error: unknown): boolean {
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const startedAt = Date.now();
+  const observedAt = new Date();
+  const authAnalytics = normalizeAuthAnalyticsClaims(req.body);
   let createdNow = false;
   let referralApply: { ok: true } | ReturnType<typeof referralApplyFailure> | undefined;
   try {
@@ -167,6 +173,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             lastOnboardingTransitionRequestId: null,
             onboardingFlowVersion: 2,
             permissionOnboardingStatus: 'unknown',
+            accountCreationClient: authAnalytics.clientPlatform,
+            ...(authAnalytics.clientPlatform === 'web'
+              ? {
+                  websiteAudienceCategory: 'created_on_website',
+                  websiteAudienceSince: observedAt,
+                  firstWebsiteLoginAt: observedAt,
+                  lastWebsiteLoginAt: observedAt,
+                }
+              : {}),
           });
         } catch (createErr) {
           if (isDuplicateKeyError(createErr)) {
@@ -361,10 +376,21 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       phone: user.phone || null,
       role: user.role,
       coins: coinsForResponse,
+      clientPlatform: authAnalytics.clientPlatform,
+      eventKind: authAnalytics.eventKind,
     });
 
     try {
-      await recordConsumerUserLogin(user);
+      const eventObservedAt = await recordConsumerUserLogin(user, {
+        ...authAnalytics,
+        accountCreated: createdNow,
+        observedAt,
+      });
+      if (authAnalytics.clientPlatform === 'web' && !createdNow) {
+        // Includes duplicate-key losers: reload happened above, then this CAS
+        // preserves a concurrent winner's created_on_website classification.
+        await observeExistingWebsiteUser(user._id, eventObservedAt ?? observedAt);
+      }
     } catch (loginTrackErr) {
       logError('recordConsumerUserLogin failed', loginTrackErr as Error, {
         userId: user._id.toString(),

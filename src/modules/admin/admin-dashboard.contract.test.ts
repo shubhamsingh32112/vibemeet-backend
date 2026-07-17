@@ -12,6 +12,10 @@ test('admin routes expose dashboard BFF endpoints', () => {
   assert.ok(src.includes("router.get('/dashboard/revenue'"), 'revenue route');
   assert.ok(src.includes("router.get('/dashboard/live-calls'"), 'live-calls route');
   assert.ok(src.includes("router.get('/dashboard/geo'"), 'geo route');
+  assert.ok(
+    src.includes("router.get('/dashboard/razorpay-collected-amount'"),
+    'Razorpay Collected Amount route'
+  );
 });
 
 test('admin-dashboard.controller exports handlers', () => {
@@ -20,6 +24,7 @@ test('admin-dashboard.controller exports handlers', () => {
   assert.ok(src.includes('assertAdmin'));
   assert.ok(src.includes('parseAdminDateRange'));
   assert.ok(src.includes('admin_dashboard_date_filter_applied'));
+  assert.ok(src.includes('getDashboardRazorpayCollectedAmount'));
 });
 
 test('dashboard service keeps leaderboard numeric contract', () => {
