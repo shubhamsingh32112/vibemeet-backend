@@ -110,6 +110,7 @@ test('recover-state accepts optional requested callId for fallback resolution', 
   const socketSrc = readFileSync(join(__dirname, 'billing-socket.gateway.ts'), 'utf8');
   assert.ok(socketSrc.includes('requestedCallId'));
   assert.ok(socketSrc.includes('resolveBillingRuntimeState(requestedCallId)'));
+  assert.ok(socketSrc.includes('!requestedCallId && (await isRecoveryEmptyCached(firebaseUid))'));
 });
 
 test('billing runtime ownership and heartbeat fields are present for watchdog guards', () => {

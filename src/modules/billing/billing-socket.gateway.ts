@@ -579,7 +579,10 @@ export function setupBillingGateway(io: Server): void {
         });
         const redis = getRedis();
 
-        if (await isRecoveryEmptyCached(firebaseUid)) {
+        // A call-specific recovery request is authoritative and must bypass the
+        // per-user negative cache. The cache may have been populated moments
+        // before billing seeded the requested call (common on incoming accept).
+        if (!requestedCallId && (await isRecoveryEmptyCached(firebaseUid))) {
           logInfo('billing_state_recovery_empty', {
             firebaseUid,
             recoveryRequestId,
