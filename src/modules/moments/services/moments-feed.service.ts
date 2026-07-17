@@ -33,6 +33,24 @@ function publicMomentQuery(extra: Record<string, unknown> = {}) {
   };
 }
 
+export interface PopularFeedCursor {
+  feedScore: number;
+  id: string;
+}
+
+export function encodePopularFeedCursor(cursor: PopularFeedCursor): string {
+  return `${cursor.feedScore}:${cursor.id}`;
+}
+
+export function decodePopularFeedCursor(cursor: string): PopularFeedCursor | null {
+  const separator = cursor.lastIndexOf(':');
+  if (separator < 1) return null;
+  const feedScore = Number(cursor.slice(0, separator));
+  const id = cursor.slice(separator + 1);
+  if (!Number.isFinite(feedScore) || !/^[a-f\d]{24}$/i.test(id)) return null;
+  return { feedScore, id };
+}
+
 /**
  * Editorial order: FreePreviewMoment.order (pinned preview section).
  * Chronological order: CreatorMoment.feedScore desc (main feed section).
@@ -63,9 +81,20 @@ export async function buildPopularFeedOrdering(input: {
 
   const query = publicMomentQuery();
   if (cursor) {
-    const cursorScore = Number(cursor);
-    if (Number.isFinite(cursorScore)) {
-      Object.assign(query, { feedScore: { $lt: cursorScore } });
+    const decoded = decodePopularFeedCursor(cursor);
+    if (decoded) {
+      Object.assign(query, {
+        $or: [
+          { feedScore: { $lt: decoded.feedScore } },
+          { feedScore: decoded.feedScore, _id: { $lt: decoded.id } },
+        ],
+      });
+    } else {
+      // Accept legacy score-only cursors during rolling deployments.
+      const cursorScore = Number(cursor);
+      if (Number.isFinite(cursorScore)) {
+        Object.assign(query, { feedScore: { $lt: cursorScore } });
+      }
     }
   }
   if (excludeIds.length) {
@@ -89,7 +118,12 @@ export async function buildPopularFeedOrdering(input: {
   const hasMore = feedDocs.length > limit;
   const lastFeed = feedSlice[feedSlice.length - 1];
   const nextCursor =
-    hasMore && lastFeed ? String(lastFeed.feedScore) : undefined;
+    hasMore && lastFeed
+      ? encodePopularFeedCursor({
+          feedScore: lastFeed.feedScore,
+          id: lastFeed._id.toString(),
+        })
+      : undefined;
 
   return {
     moments,
@@ -129,16 +163,28 @@ export async function buildFollowingFeedOrdering(input: {
   const creatorIds = follows.map((f) => f.creatorId);
 
   let feedDocs: InstanceType<typeof CreatorMoment>[];
+  let hasMore = false;
   if (cachedIds?.length) {
     const found = await CreatorMoment.find({
       _id: { $in: cachedIds },
       ...publicMomentQuery(),
     });
-    feedDocs = orderMomentsByIds(found, cachedIds).filter(
+    const ordered = orderMomentsByIds(found, cachedIds).filter(
       (m) => !excludeIds.some((id) => id.toString() === m._id.toString()),
     ) as InstanceType<typeof CreatorMoment>[];
-  } else if (creatorIds.length) {
-    feedDocs = await CreatorMoment.find(
+    if (cachedIds.length > limit && ordered.length > limit) {
+      hasMore = true;
+      feedDocs = ordered.slice(0, limit);
+    } else {
+      feedDocs = [];
+    }
+  } else {
+    feedDocs = [];
+  }
+
+  // A short or stale fanout page is not authoritative; MongoDB is the source of truth.
+  if (!feedDocs.length && creatorIds.length) {
+    const docs = await CreatorMoment.find(
       publicMomentQuery({
         creatorId: { $in: creatorIds },
         ...(excludeIds.length ? { _id: { $nin: excludeIds } } : {}),
@@ -146,9 +192,9 @@ export async function buildFollowingFeedOrdering(input: {
     )
       .sort({ createdAt: -1 })
       .skip(offset)
-      .limit(limit);
-  } else {
-    feedDocs = [];
+      .limit(limit + 1);
+    hasMore = docs.length > limit;
+    feedDocs = docs.slice(0, limit);
   }
 
   for (const moment of feedDocs) {
@@ -160,7 +206,6 @@ export async function buildFollowingFeedOrdering(input: {
     });
   }
 
-  const hasMore = feedDocs.length >= limit;
   return {
     moments,
     sections: { previewEndIndex },

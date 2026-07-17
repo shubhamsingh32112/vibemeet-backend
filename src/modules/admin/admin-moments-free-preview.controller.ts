@@ -14,6 +14,7 @@ import {
   removePreview,
   reorderPreviews,
   updatePreviewSchedule,
+  invalidatePreviewAndFeedCaches,
   PreviewListVersionConflictError,
 } from '../moments/services/free-preview.service';
 import {
@@ -329,6 +330,7 @@ export async function patchMomentVisibilityTierHandler(
       res.status(404).json({ success: false, error: 'Moment not found' });
       return;
     }
+    await invalidatePreviewAndFeedCaches();
     res.json({
       success: true,
       data: {

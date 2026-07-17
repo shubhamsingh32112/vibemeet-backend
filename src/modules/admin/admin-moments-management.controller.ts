@@ -13,7 +13,10 @@ import {
   uploadRewardCreditTransactionId,
 } from '../moments/services/moment-upload-reward.service';
 import { removePreview } from '../moments/services/free-preview.service';
-import { removeMomentFromFollowerFeeds } from '../moments/services/feed-fanout.service';
+import {
+  bustAllMomentFeedResponseCaches,
+  removeMomentFromFollowerFeeds,
+} from '../moments/services/feed-fanout.service';
 import { appendAuditEvent, extractAuditContext } from '../audit/audit-event.service';
 import { UploadRewardStatus, UPLOAD_REWARD_STATUSES } from '../moments/types/upload-reward-status';
 import {
@@ -252,6 +255,7 @@ export async function deleteMomentAsAdminHandler(req: Request, res: Response): P
     }
 
     void removeMomentFromFollowerFeeds(momentId, creator._id.toString());
+    await bustAllMomentFeedResponseCaches();
 
     const auditCtx = extractAuditContext(req);
     void appendAuditEvent({

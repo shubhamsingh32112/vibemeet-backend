@@ -3,12 +3,14 @@ import { getRedis, isRedisConfigured } from '../../../config/redis';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 import { isVipActive } from '../../vip/vip-entitlement.service';
 import type { MomentVisibilityTier } from '../types/moment-visibility-tier';
+import { isMomentsFreeAccessMode } from '../../../config/moments';
 
 export type MomentAccessReason =
   | 'OWNER'
   | 'CREATOR'
   | 'VIP'
   | 'PREMIUM'
+  | 'FREE'
   | 'PREVIEW'
   | 'ADMIN'
   | 'VIP_ONLY'
@@ -68,6 +70,9 @@ export async function resolveMomentAccess(
   }
   if (!userId) {
     return { allowed: false, reason: 'DENIED' };
+  }
+  if (isMomentsFreeAccessMode()) {
+    return { allowed: true, reason: 'FREE' };
   }
 
   const uid = typeof userId === 'string' ? userId : userId.toString();

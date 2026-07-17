@@ -131,7 +131,7 @@ export async function toMomentPresentationDTO(
   if (isMomentsFreeAccessMode()) {
     const allowed = viewer.userId != null || viewer.isCreatorOwner === true;
     locked = !allowed;
-    accessReason = allowed ? 'PREMIUM' : 'DENIED';
+    accessReason = allowed ? 'FREE' : 'DENIED';
   } else {
     const access = await resolveMomentAccess(viewer.userId, moment._id, {
       isCreatorOwner: viewer.isCreatorOwner,

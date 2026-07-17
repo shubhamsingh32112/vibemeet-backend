@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { __resetMomentsConfigForTests } from '../../../../config/moments';
-import { isPreviewRowVisible } from '../free-preview.service';
+import { calculatePreviewCacheTtlSec, isPreviewRowVisible } from '../free-preview.service';
 import { resolveMomentAccess } from '../entitlement.service';
 import { toFeedDTO } from '../../dto/moment.dto';
 import type { PresentationDTO } from '../../dto/moment.dto';
@@ -32,7 +32,40 @@ describe('isPreviewRowVisible', () => {
   });
 });
 
+test('preview cache expires at the nearest schedule boundary', () => {
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const ttl = calculatePreviewCacheTtlSec(
+    [
+      {
+        enabled: true,
+        startsAt: new Date('2026-01-01T00:00:45.000Z'),
+        endsAt: null,
+      },
+      {
+        enabled: true,
+        startsAt: null,
+        endsAt: new Date('2026-01-01T00:02:00.000Z'),
+      },
+    ] as never,
+    now,
+  );
+  assert.equal(ttl, 45);
+});
+
 describe('resolveMomentAccess', () => {
+  test('FREE on VIP tier when global free mode is enabled', async () => {
+    __resetMomentsConfigForTests();
+    process.env.MOMENTS_ACCESS_MODE = 'free';
+    const result = await resolveMomentAccess('user1', 'moment1', {
+      visibilityTier: 'VIP',
+      __testVipActive: false,
+      __testPremiumActive: false,
+    });
+    assert.deepEqual(result, { allowed: true, reason: 'FREE' });
+    delete process.env.MOMENTS_ACCESS_MODE;
+    __resetMomentsConfigForTests();
+  });
+
   test('CREATOR when creator role without subscription', async () => {
     const result = await resolveMomentAccess('user1', 'moment1', {
       isCreatorRole: true,

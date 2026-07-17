@@ -10,13 +10,13 @@ npm run build
 # Pick a unique tag, e.g. upload-fix-20260620
 export BUILD_ID=adminMoments
 
-docker build -t app-backend:logincors  .
+docker build -t app-backend:webcall  .
 
-docker tag app-backend:logincors  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:logincors 
+docker tag app-backend:webcall  624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:webcall 
 
 aws --no-verify-ssl ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 624905204878.dkr.ecr.ap-south-1.amazonaws.com
 
-docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:logincors 
+docker push 624905204878.dkr.ecr.ap-south-1.amazonaws.com/app-backend:webcall 
 ```
 
 Then update the ECS task definition image tag to `$BUILD_ID` and force a new deployment.
@@ -139,7 +139,7 @@ Set on the ECS task / backend `.env`:
 | Value | Behavior |
 |-------|----------|
 | `paid` (default) | Non-premium users see admin previews + locked feed; Moments Premium checkout enabled |
-| `free` | All authenticated users see unlocked moments; premium UI hidden |
+| `free` | All authenticated users see every ready, approved, non-deleted moment unlocked, including VIP-tier moments; premium UI hidden |
 
 ```env
 USE_MOMENTS=true
@@ -147,6 +147,9 @@ MOMENTS_ACCESS_MODE=paid   # or free
 ```
 
 After changing this value, redeploy the backend. Feed cache keys include `accessMode`, so stale locked/unlocked payloads should not persist across mode switches.
+
+`USE_MOMENTS=true` enables the routes and UI; it does not select access policy.
+Both flags are required for globally free Moments.
 
 ## Creator presence toggle fix (multi-node api-ws)
 

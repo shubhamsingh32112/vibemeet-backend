@@ -13,6 +13,7 @@ import {
   resolveMomentUploadRewardCoins,
 } from '../moments/services/moment-upload-reward.service';
 import { UploadRewardStatus } from '../moments/types/upload-reward-status';
+import { bustAllMomentFeedResponseCaches } from '../moments/services/feed-fanout.service';
 
 async function resolveAdminUser(req: Request) {
   if (!req.auth?.firebaseUid) return null;
@@ -46,6 +47,7 @@ async function setModerationStatus(
       { $set: { moderationStatus: status } },
       { new: true },
     );
+    if (updated) await bustAllMomentFeedResponseCaches();
     return Boolean(updated);
   }
   const updated = await CreatorStory.findOneAndUpdate(

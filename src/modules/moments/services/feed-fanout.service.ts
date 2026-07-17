@@ -64,7 +64,8 @@ export async function getFollowingFeedFromCache(
   if (!isRedisConfigured()) return null;
   const key = `${FOLLOWING_PREFIX}${userId}`;
   const redis = getRedis();
-  const ids = await redis.zrevrange(key, offset, offset + limit - 1);
+  // Fetch one look-ahead id so callers can prove the cached page is complete.
+  const ids = await redis.zrevrange(key, offset, offset + limit);
   if (!ids.length) return null;
   await redis.expire(key, getMomentsConfig().followingFeedCacheTtlSec);
   return ids;
@@ -109,6 +110,13 @@ export async function bustAllPopularFeedCaches(): Promise<void> {
 
 export async function bustAllFollowingWarmCaches(): Promise<void> {
   await deleteKeysByPattern('moments:following:warm:*');
+}
+
+export async function bustAllMomentFeedResponseCaches(): Promise<void> {
+  await Promise.all([
+    bustAllPopularFeedCaches(),
+    bustAllFollowingWarmCaches(),
+  ]);
 }
 
 export async function removeMomentFromFollowerFeeds(

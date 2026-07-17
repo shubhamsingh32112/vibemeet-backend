@@ -18,13 +18,14 @@ test('feed service orders only — no premium branch or locked field', () => {
   assert.ok(src.includes("section: 'preview'"));
 });
 
-test('audience layer strips preview for premium users', () => {
+test('audience layer preserves preview moments as chronological items', () => {
   const src = readFileSync(
     join(__dirname, 'services/feed-audience.service.ts'),
     'utf8',
   );
   assert.ok(src.includes('applyAudienceToFeedOrdering'));
-  assert.ok(src.includes("section !== 'preview'"));
+  assert.ok(src.includes("section === 'preview'"));
+  assert.ok(src.includes("section: 'feed'"));
 });
 
 test('presentation service calls entitlement for every feed item', () => {
@@ -36,10 +37,11 @@ test('presentation service calls entitlement for every feed item', () => {
   assert.ok(!src.includes('priceCoins'));
 });
 
-test('entitlement service uses premium + preview reasons only', () => {
+test('entitlement service includes free, premium, and preview reasons', () => {
   const src = readService('entitlement.service.ts');
   assert.ok(src.includes("'OWNER'"));
   assert.ok(src.includes("'PREMIUM'"));
+  assert.ok(src.includes("'FREE'"));
   assert.ok(src.includes("'PREVIEW'"));
   assert.ok(src.includes("'DENIED'"));
   assert.ok(!src.includes('MomentPurchase'));

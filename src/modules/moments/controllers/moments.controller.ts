@@ -30,6 +30,7 @@ import {
   removeMomentFromFollowerFeeds,
   bustPopularFeedCacheForUser,
   bustFollowingWarmCacheForUser,
+  bustAllMomentFeedResponseCaches,
   popularFeedCacheKey,
 } from '../services/feed-fanout.service';
 import { logError, logWarning } from '../../../utils/logger';
@@ -260,6 +261,7 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
 
     emitMomentUploaded(creator._id.toString(), moment._id.toString());
     void enqueueFanoutTask(moment._id.toString(), creator._id.toString(), moment.feedScore);
+    await bustAllMomentFeedResponseCaches();
 
     const momentDto = await toCreatorSelfMomentDTO(moment, {
       userId: user._id,
@@ -543,6 +545,7 @@ export async function deleteMomentHandler(req: Request, res: Response): Promise<
     moment.isDeleted = true;
     await moment.save();
     void removeMomentFromFollowerFeeds(moment._id.toString(), creator._id.toString());
+    await bustAllMomentFeedResponseCaches();
     res.json({ success: true });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;
@@ -566,8 +569,7 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
       processingStatus: 'ready',
       moderationStatus: 'approved',
     })
-      .sort({ createdAt: -1 })
-      .limit(60);
+      .sort({ createdAt: -1 });
     const followedCreatorIds = await loadFollowedCreatorIds(user?._id ?? null);
     const isCreatorOwner = await isUserOwnerOfCreator(user?._id, creator._id);
     const viewer = await enrichViewerWithLikedMoments(

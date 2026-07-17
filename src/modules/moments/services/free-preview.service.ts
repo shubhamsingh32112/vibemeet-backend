@@ -19,6 +19,19 @@ import {
 const PREVIEW_CACHE_KEY = 'moments:free_preview:active:v2';
 const PREVIEW_CACHE_TTL_SEC = 300;
 
+export function calculatePreviewCacheTtlSec(
+  rows: Array<Pick<IFreePreviewMoment, 'enabled' | 'startsAt' | 'endsAt'>>,
+  now: Date = new Date(),
+): number {
+  const nowMs = now.getTime();
+  const boundaries = rows
+    .filter((row) => row.enabled)
+    .flatMap((row) => [row.startsAt, row.endsAt])
+    .filter((value): value is Date => value instanceof Date && value.getTime() > nowMs)
+    .map((value) => Math.max(1, Math.ceil((value.getTime() - nowMs) / 1000)));
+  return Math.min(PREVIEW_CACHE_TTL_SEC, ...boundaries);
+}
+
 /** Redis stores ids + creator meta only — full moments are reloaded to keep ObjectIds/Dates valid. */
 interface PreviewCacheEntry {
   momentId: string;
@@ -162,9 +175,12 @@ export async function getActivePreviewMoments(): Promise<PreviewMoment[]> {
   const items = await loadPreviewMomentsFromDb(true);
 
   if (isRedisConfigured()) {
+    const scheduleRows = await FreePreviewMoment.find()
+      .select('enabled startsAt endsAt')
+      .lean();
     await getRedis().setex(
       PREVIEW_CACHE_KEY,
-      PREVIEW_CACHE_TTL_SEC,
+      calculatePreviewCacheTtlSec(scheduleRows),
       JSON.stringify(toPreviewCacheEntries(items)),
     );
   }
@@ -231,7 +247,12 @@ export async function addPreview(
   });
   if (!moment) throw new Error('Moment not found or not ready');
 
-  const count = await FreePreviewMoment.countDocuments();
+  const now = new Date();
+  const count = await FreePreviewMoment.countDocuments({
+    momentId: { $ne: moment._id },
+    enabled: true,
+    $or: [{ endsAt: null }, { endsAt: { $gte: now } }],
+  });
   const limit = getMomentsConfig().freePreviewLimit;
   if (count >= limit) {
     throw new Error(`Preview limit of ${limit} reached`);

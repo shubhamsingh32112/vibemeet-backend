@@ -36,19 +36,20 @@ describe('moments access mode config', () => {
 });
 
 describe('applyAudienceToFeedOrdering free mode', () => {
-  test('strips preview section in free mode for non-premium audience', () => {
+  test('keeps preview moments exactly once as feed items in free mode', () => {
     __resetMomentsConfigForTests();
     process.env.MOMENTS_ACCESS_MODE = 'free';
     const ordering = {
       moments: [
         { section: 'preview' as const, moment: {}, creatorMeta: {} },
-        { section: 'chronological' as const, moment: {}, creatorMeta: {} },
+        { section: 'feed' as const, moment: {}, creatorMeta: {} },
       ],
       sections: { previewEndIndex: 1 },
     };
     const result = applyAudienceToFeedOrdering(ordering as never, false);
     assert.equal(result.sections.previewEndIndex, 0);
-    assert.equal(result.moments.length, 1);
+    assert.equal(result.moments.length, 2);
+    assert.deepEqual(result.moments.map((item) => item.section), ['feed', 'feed']);
     __resetMomentsConfigForTests();
     delete process.env.MOMENTS_ACCESS_MODE;
   });
@@ -63,11 +64,11 @@ test('moment-presentation handles free mode before entitlement', () => {
   assert.ok(!src.includes('FREE_MODE'));
 });
 
-test('entitlement service has no access mode branch', () => {
+test('entitlement service resolves free mode before subscription tiers', () => {
   const src = readFileSync(
     join(__dirname, '../entitlement.service.ts'),
     'utf8',
   );
-  assert.ok(!src.includes('isMomentsFreeAccessMode'));
-  assert.ok(!src.includes('FREE_MODE'));
+  assert.ok(src.includes('isMomentsFreeAccessMode'));
+  assert.ok(src.includes("reason: 'FREE'"));
 });
