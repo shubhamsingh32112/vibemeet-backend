@@ -129,13 +129,16 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const firebaseUid = req.auth.firebaseUid;
     logDebug('Looking up user in database', { firebaseUid });
 
-    const deletedStatus = await checkDeletedStatus({
-      email: req.auth.email ?? null,
-      phone: req.auth.phone ?? null,
-    });
+    const [deletedStatus, existingUser] = await Promise.all([
+      checkDeletedStatus({
+        email: req.auth.email ?? null,
+        phone: req.auth.phone ?? null,
+      }),
+      User.findOne({ firebaseUid }),
+    ]);
     const showWelcomeBackDialog = deletedStatus.isDeleted;
 
-    let user = await User.findOne({ firebaseUid });
+    let user = existingUser;
 
       // ✅ Create user ONLY here (never in middleware)
       if (!user) {
@@ -362,11 +365,33 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       }
     }
 
-    // Never show a drifted balance in UI; canonicalize coins from ledger on read.
-    const canonical = await getCanonicalCoinsAndRepairIfNeeded(
-      user._id,
-      Number(user.coins) || 0
-    );
+    const recordLogin = async (): Promise<void> => {
+      try {
+        const eventObservedAt = await recordConsumerUserLogin(user, {
+          ...authAnalytics,
+          accountCreated: createdNow,
+          observedAt,
+        });
+        if (authAnalytics.clientPlatform === 'web' && !createdNow) {
+          // Includes duplicate-key losers: reload happened above, then this CAS
+          // preserves a concurrent winner's created_on_website classification.
+          await observeExistingWebsiteUser(user._id, eventObservedAt ?? observedAt);
+        }
+      } catch (loginTrackErr) {
+        logError('recordConsumerUserLogin failed', loginTrackErr as Error, {
+          userId: user._id.toString(),
+        });
+      }
+    };
+
+    // These operations are independent. Running them together removes several
+    // sequential database round-trips from the critical login path.
+    const [canonical, creator, appFlags] = await Promise.all([
+      getCanonicalCoinsAndRepairIfNeeded(user._id, Number(user.coins) || 0),
+      Creator.findOne({ userId: user._id }).lean(),
+      getCreatorApplicationFlagsForUser(user._id),
+      recordLogin(),
+    ]);
     const coinsForResponse = canonical.expectedCoins;
 
     logInfo('User login successful', {
@@ -379,26 +404,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       clientPlatform: authAnalytics.clientPlatform,
       eventKind: authAnalytics.eventKind,
     });
-
-    try {
-      const eventObservedAt = await recordConsumerUserLogin(user, {
-        ...authAnalytics,
-        accountCreated: createdNow,
-        observedAt,
-      });
-      if (authAnalytics.clientPlatform === 'web' && !createdNow) {
-        // Includes duplicate-key losers: reload happened above, then this CAS
-        // preserves a concurrent winner's created_on_website classification.
-        await observeExistingWebsiteUser(user._id, eventObservedAt ?? observedAt);
-      }
-    } catch (loginTrackErr) {
-      logError('recordConsumerUserLogin failed', loginTrackErr as Error, {
-        userId: user._id.toString(),
-      });
-    }
-
-    // Pure read - check if user has a creator profile (no auto-linking, no role mutation)
-    const creator = await Creator.findOne({ userId: user._id }).lean();
 
     const needsOnboarding = (user.categories ?? []).length === 0;
     const onboardingState = {
@@ -429,7 +434,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       stage: onboardingState.stage,
       showWelcomeBackDialog,
     });
-    const appFlags = await getCreatorApplicationFlagsForUser(user._id);
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
     const features = getPublicAppConfig().features;
 

@@ -1,4 +1,4 @@
-import { Creator, type ICreator } from './creator.model';
+import { Creator, CREATOR_LISTABLE_FILTER, type ICreator } from './creator.model';
 import { getBatchCreatorPresence } from '../availability/presence.service';
 import { serializeCreatorImages } from '../images/creator-image-helpers';
 import {
@@ -23,7 +23,6 @@ export type CreatorFeedCardSnapshot = {
   availability: 'online' | 'on_call' | 'offline';
   about: string;
   galleryImages: unknown[];
-  isFavorite: boolean;
 };
 
 const FEED_SELECT =
@@ -62,7 +61,6 @@ function buildSnapshotFromCreator(
     availability,
     about: '',
     galleryImages: [],
-    isFavorite: false,
   };
 }
 
@@ -71,7 +69,11 @@ export async function cacheCreatorFeedCardSnapshot(
 ): Promise<void> {
   if (!isRedisConfigured()) return;
   try {
-    await safeRedisSet(creatorCardCacheKey(snapshot.firebaseUid), JSON.stringify(snapshot), {
+    const { isFavorite: _isFavorite, ...sharedSnapshot } = snapshot as CreatorFeedCardSnapshot & {
+      isFavorite?: boolean;
+    };
+    void _isFavorite;
+    await safeRedisSet(creatorCardCacheKey(snapshot.firebaseUid), JSON.stringify(sharedSnapshot), {
       ex: CREATOR_CARD_TTL,
     });
   } catch (err) {
@@ -90,17 +92,24 @@ export async function getCreatorFeedCardSnapshot(
     try {
       const cached = await safeRedisGet<CreatorFeedCardSnapshot>(creatorCardCacheKey(uid));
       if (cached?.id && cached.firebaseUid === uid) {
+        // Strip viewer-specific data from snapshots written by older releases.
+        const { isFavorite: _isFavorite, ...sharedSnapshot } = cached as CreatorFeedCardSnapshot & {
+          isFavorite?: boolean;
+        };
+        void _isFavorite;
         if (options?.availability) {
-          return { ...cached, availability: options.availability };
+          return { ...sharedSnapshot, availability: options.availability };
         }
-        return cached;
+        return sharedSnapshot;
       }
     } catch {
       // fall through to Mongo
     }
   }
 
-  const creator = await Creator.findOne({ firebaseUid: uid }).select(FEED_SELECT).lean();
+  const creator = await Creator.findOne({ firebaseUid: uid, ...CREATOR_LISTABLE_FILTER })
+    .select(FEED_SELECT)
+    .lean();
   if (!creator) return null;
 
   const presenceMap = await getBatchCreatorPresence([uid]);

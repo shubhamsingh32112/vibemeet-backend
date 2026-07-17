@@ -102,6 +102,23 @@ export const verifyFirebaseToken = async (
       }
     }
 
+    // The global API identity middleware has already cryptographically
+    // verified Firebase bearer tokens before rate limiting. Reuse those
+    // claims instead of performing the same Firebase verification twice.
+    if (req.firebaseVerifiedAuth) {
+      req.auth = req.firebaseVerifiedAuth;
+      recordCallMetric('presence.http_auth_success', 1, {
+        context: authContext,
+        type: 'firebase_cached',
+      });
+      logInfo('Firebase token verification reused', {
+        firebaseUid: req.auth.firebaseUid,
+        path: req.path,
+      });
+      next();
+      return;
+    }
+
     const admin = getFirebaseAdmin();
 
     logDebug('Verifying token with Firebase Admin', { path: req.path });

@@ -111,6 +111,9 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
 
 // Compound index for efficient lookups
 coinTransactionSchema.index({ userId: 1, createdAt: -1 });
+// Login balance reconciliation filters by user and completed status, then
+// groups by type. Cover that hot path without scanning the user's full ledger.
+coinTransactionSchema.index({ userId: 1, status: 1, type: 1 });
 coinTransactionSchema.index({ source: 1, paymentGatewayOrderId: 1 });
 coinTransactionSchema.index({ source: 1, paymentGatewayTransactionId: 1 });
 

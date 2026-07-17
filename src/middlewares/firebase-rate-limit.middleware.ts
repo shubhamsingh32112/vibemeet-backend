@@ -49,6 +49,11 @@ export async function attachFirebaseRateLimitIdentity(
     const decoded = await admin.auth().verifyIdToken(token);
     if (decoded.uid) {
       req.firebaseRateLimitUid = decoded.uid;
+      req.firebaseVerifiedAuth = {
+        firebaseUid: decoded.uid,
+        email: decoded.email,
+        phone: decoded.phone_number,
+      };
     }
   } catch {
     // Invalid/expired token — fall through to IP bucket until route auth rejects.

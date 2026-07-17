@@ -92,6 +92,10 @@ import { isAgencyRole, isBdRole, isSuperAdminRole } from '../../utils/staff-role
 import { isMomentsEnabled } from '../../config/moments';
 import { CreatorMoment } from '../moments/models/creator-moment.model';
 import { MomentRevenue } from '../moments/models/moment-revenue.model';
+import {
+  toPublicCreatorDto,
+  type PublicCreatorAvailability,
+} from './creator-public.dto';
 
 /** Bump when feed Redis JSON shape changes so stale entries are ignored. */
 const CREATOR_FEED_CACHE_VERSION = 3;
@@ -116,6 +120,120 @@ export const getCreatorCatalogGone = async (_req: Request, res: Response): Promi
     code: 'ENDPOINT_REMOVED',
     error: 'This endpoint was removed. Use GET /creator/feed for the paginated catalog.',
   });
+};
+
+const PUBLIC_CREATOR_SELECT =
+  '_id firebaseUid name about avatar galleryImages categories price age location';
+
+/**
+ * Unauthenticated discovery catalog. The DTO is deliberately independent of
+ * authenticated feed/cache payloads so viewer and identity fields cannot leak.
+ */
+export const getPublicCreatorFeed = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+    const skip = (page - 1) * limit;
+
+    const [creators, total] = await Promise.all([
+      Creator.find(CREATOR_LISTABLE_FILTER)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select(PUBLIC_CREATOR_SELECT)
+        .lean(),
+      Creator.countDocuments(CREATOR_LISTABLE_FILTER),
+    ]);
+
+    const firebaseUids = normalizeFirebaseUids(
+      creators
+        .map((creator) => creator.firebaseUid)
+        .filter((uid): uid is string => typeof uid === 'string' && uid.trim().length > 0),
+    ).firebaseUids;
+    const presenceMap =
+      firebaseUids.length > 0 ? await getBatchCreatorPresence(firebaseUids) : {};
+
+    const creatorsOut = creators.map((creator) => {
+      const firebaseUid =
+        typeof creator.firebaseUid === 'string' ? creator.firebaseUid.trim() : '';
+      const availability: PublicCreatorAvailability = firebaseUid
+        ? (presenceMap[firebaseUid]?.state ?? 'offline')
+        : 'offline';
+      return toPublicCreatorDto(
+        {
+          id: creator._id.toString(),
+          name: creator.name,
+          about: creator.about,
+          categories: creator.categories,
+          price: creator.price,
+          age: creator.age,
+          location: creator.location,
+        },
+        serializeCreatorImages(creator as unknown as ICreator),
+        availability,
+      );
+    });
+
+    res.json({
+      success: true,
+      data: {
+        creators: creatorsOut,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    logError('Get public creator feed error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+/** Unauthenticated, listability-filtered creator detail. */
+export const getPublicCreatorById = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid creator id' });
+      return;
+    }
+
+    const creator = await Creator.findOne({ _id: id, ...CREATOR_LISTABLE_FILTER })
+      .select(PUBLIC_CREATOR_SELECT)
+      .lean();
+    if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+
+    const firebaseUid =
+      typeof creator.firebaseUid === 'string' ? creator.firebaseUid.trim() : '';
+    const presenceMap = firebaseUid ? await getBatchCreatorPresence([firebaseUid]) : {};
+    const availability: PublicCreatorAvailability = firebaseUid
+      ? (presenceMap[firebaseUid]?.state ?? 'offline')
+      : 'offline';
+    const creatorOut = toPublicCreatorDto(
+      {
+        id: creator._id.toString(),
+        name: creator.name,
+        about: creator.about,
+        categories: creator.categories,
+        price: creator.price,
+        age: creator.age,
+        location: creator.location,
+      },
+      serializeCreatorImages(creator as unknown as ICreator),
+      availability,
+    );
+
+    res.json({ success: true, data: { creator: creatorOut } });
+  } catch (error) {
+    logError('Get public creator by ID error', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 };
 
 type CreatorFeedBaseRow = {
@@ -364,7 +482,7 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
             .limit(limit)
             .select(feedSelect)
             .lean(),
-          Creator.countDocuments({}),
+          Creator.countDocuments(CREATOR_LISTABLE_FILTER),
         ]);
         total = count;
 
@@ -495,7 +613,6 @@ export const getCreatorFeed = async (req: Request, res: Response): Promise<void>
         availability: row.availability,
         about: '',
         galleryImages: [],
-        isFavorite: favoriteSet.has(row.id),
       };
       cacheCreatorFeedCardSnapshot(snapshot).catch(() => {});
     }
@@ -708,7 +825,6 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
       availability,
       about: '',
       galleryImages: [],
-      isFavorite: false,
     }).catch(() => {});
 
     logInfo('creator.by_uid.timing', { totalMs: Date.now() - t0 });

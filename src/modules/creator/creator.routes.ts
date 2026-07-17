@@ -6,6 +6,8 @@ import {
 } from '../../middlewares/rate-limit.middleware';
 import {
   getCreatorCatalogGone,
+  getPublicCreatorFeed,
+  getPublicCreatorById,
   getCreatorFeed,
   getCreatorFirebaseUids,
   getCreatorByFirebaseUid,
@@ -37,6 +39,8 @@ const router = Router();
 // Routes that require authentication to check user role
 router.get('/', verifyFirebaseToken, getCreatorCatalogGone);
 // IMPORTANT: Specific routes must come before parameterized routes
+router.get('/public/feed', getPublicCreatorFeed);
+router.get('/public/:id', getPublicCreatorById);
 router.get('/feed', verifyFirebaseToken, getCreatorFeed);
 router.get('/uids', verifyFirebaseToken, getCreatorFirebaseUids);
 router.get('/by-firebase-uid/:uid', verifyFirebaseToken, getCreatorByFirebaseUid);
