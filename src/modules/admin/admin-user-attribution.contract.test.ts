@@ -38,6 +38,7 @@ test('website and login analytics retain global cohort semantics', () => {
 
   assert.match(routes, /router\.get\('\/users\/website', getWebsiteUsers\)/);
   assert.match(routes, /router\.get\('\/users\/login-analytics', getUsersLoginAnalytics\)/);
+  assert.match(routes, /router\.get\('\/analytics\/website-visits', getWebsiteVisits\)/);
   assert.match(controller, /websiteAudienceSince = \{ \$gte: range\.from, \$lt: range\.to \}/);
   assert.match(controller, /createdAt: \{ \$lt: range\.from \}, 'authActivity\.0'/);
   assert.match(controller, /eventMatch\.accountCreated = false/);

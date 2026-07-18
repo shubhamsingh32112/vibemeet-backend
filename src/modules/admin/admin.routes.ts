@@ -162,6 +162,7 @@ import {
   getUsersLoginAnalytics,
   getWebsiteUsers,
 } from './admin-user-attribution.controller';
+import { getWebsiteVisits } from '../analytics/website-visits.controller';
 
 const router = Router();
 
@@ -175,6 +176,7 @@ router.get('/creators/:id/detail', getAdminCreatorDetail);
 router.get('/users/analytics', getUsersAnalytics);
 router.get('/users/website', getWebsiteUsers);
 router.get('/users/login-analytics', getUsersLoginAnalytics);
+router.get('/analytics/website-visits', getWebsiteVisits);
 router.get('/blocked-hosts', getBlockedHosts);
 router.get('/revenue-split/summary', getRevenueSplitSummary);
 router.get('/leaderboards/hosts', getLeaderboardHosts);

@@ -277,6 +277,22 @@ export const fastLoginLimiter = rateLimit({
   },
 });
 
+/** Unauthenticated homepage visit beacon — per IP. */
+export const websiteHomepageVisitLimiter = createLimiter(
+  {
+    windowMs: 60 * 1000,
+    max: 30,
+    message: 'Too many visit signals. Please wait a moment.',
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => `website_homepage_visit:${req.ip ?? 'unknown'}`,
+    skip: (_req: Request): boolean => {
+      return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+    },
+  },
+  'rl:website-homepage-visit:',
+);
+
 /**
  * Rate limiter for /auth/login (authenticated endpoint - Firebase token required)
  * - 30 requests per minute per user (prevents abuse, allows retries)

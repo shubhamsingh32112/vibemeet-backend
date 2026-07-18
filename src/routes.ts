@@ -21,11 +21,13 @@ import streamRoutes from './modules/stream/stream.routes';
 import vipRoutes from './modules/vip/vip.routes';
 import momentsPremiumRoutes from './modules/moments-premium/moments-premium.routes';
 import appConfigRoutes from './modules/app-config/app-config.routes';
+import analyticsRoutes from './modules/analytics/analytics.routes';
 
 const router = Router();
 
 router.use('/auth', authRoutes);
 router.use('/referral', referralRoutes);
+router.use('/analytics', analyticsRoutes);
 router.use('/user', userRoutes);
 router.use('/creator', creatorRoutes);
 router.use('/chat', chatRoutes);
