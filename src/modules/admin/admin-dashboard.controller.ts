@@ -17,6 +17,7 @@ import {
   dashboardTopAgencies,
   dashboardTopBds,
   dashboardTopHosts,
+  dashboardUsersOnline,
 } from './admin-dashboard.service';
 import {
   dashboardRazorpayCollectedAmount,
@@ -79,6 +80,17 @@ export const getDashboardLiveCalls = async (req: Request, res: Response): Promis
     res.json({ success: true, data });
   } catch (error) {
     logError('getDashboardLiveCalls', error as Error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getDashboardUsersOnline = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+    const data = await dashboardUsersOnline(parseInt(String(req.query.limit ?? '50'), 10));
+    res.json({ success: true, data });
+  } catch (error) {
+    logError('getDashboardUsersOnline', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };

@@ -4,6 +4,7 @@ import {
   withdrawalLimiter,
   tasksLimiter,
 } from '../../middlewares/rate-limit.middleware';
+import { blockIfHostDisabled } from './creator-disabled.guard';
 import {
   getCreatorCatalogGone,
   getPublicCreatorFeed,
@@ -35,6 +36,7 @@ import {
 } from './creator-leaderboard.controller';
 
 const router = Router();
+const hostTools = [verifyFirebaseToken, blockIfHostDisabled] as const;
 
 // Routes that require authentication to check user role
 router.get('/', verifyFirebaseToken, getCreatorCatalogGone);
@@ -44,26 +46,27 @@ router.get('/public/:id', getPublicCreatorById);
 router.get('/feed', verifyFirebaseToken, getCreatorFeed);
 router.get('/uids', verifyFirebaseToken, getCreatorFirebaseUids);
 router.get('/by-firebase-uid/:uid', verifyFirebaseToken, getCreatorByFirebaseUid);
-router.get('/dashboard', verifyFirebaseToken, getCreatorDashboard); // Consolidated creator dashboard (cached)
+router.get('/dashboard', ...hostTools, getCreatorDashboard); // Consolidated creator dashboard (cached)
 router.get('/leaderboard/summary', verifyFirebaseToken, getCreatorLeaderboardSummaryHandler);
 router.get('/leaderboard', verifyFirebaseToken, getCreatorLeaderboardHandler);
-router.get('/earnings', verifyFirebaseToken, getCreatorEarnings); // Get creator earnings summary
-router.get('/transactions', verifyFirebaseToken, getCreatorTransactions); // Get creator transaction history
-router.get('/tasks', verifyFirebaseToken, tasksLimiter, getCreatorTasks); // Get creator tasks progress (rate limited)
-router.post('/tasks/:taskKey/claim', verifyFirebaseToken, claimTaskReward); // Claim task reward
-router.post('/withdraw', verifyFirebaseToken, withdrawalLimiter, requestWithdrawal); // Request withdrawal (rate limited)
-router.get('/withdrawals', verifyFirebaseToken, getMyWithdrawals); // Get my withdrawal history
-router.get('/profile', verifyFirebaseToken, getMyCreatorProfile); // Get creator's own profile
-router.post('/profile/gallery/commit', verifyFirebaseToken, commitGalleryImage);
-router.delete('/profile/gallery/:imageId', verifyFirebaseToken, deleteGalleryImage);
-router.patch('/profile/gallery/reorder', verifyFirebaseToken, reorderGalleryImages);
+router.get('/earnings', ...hostTools, getCreatorEarnings); // Get creator earnings summary
+router.get('/transactions', ...hostTools, getCreatorTransactions); // Get creator transaction history
+router.get('/tasks', ...hostTools, tasksLimiter, getCreatorTasks); // Get creator tasks progress (rate limited)
+router.post('/tasks/:taskKey/claim', ...hostTools, claimTaskReward); // Claim task reward
+router.post('/withdraw', ...hostTools, withdrawalLimiter, requestWithdrawal); // Request withdrawal (rate limited)
+router.get('/withdrawals', ...hostTools, getMyWithdrawals); // Get my withdrawal history
+// Profile GET stays open so clients can detect isDisabled and show the lock screen
+router.get('/profile', verifyFirebaseToken, getMyCreatorProfile);
+router.post('/profile/gallery/commit', ...hostTools, commitGalleryImage);
+router.delete('/profile/gallery/:imageId', ...hostTools, deleteGalleryImage);
+router.patch('/profile/gallery/reorder', ...hostTools, reorderGalleryImages);
 router.get('/:id', verifyFirebaseToken, getCreatorById);
 
 // Protected routes (require authentication)
 router.post('/', verifyFirebaseToken, createCreator);
-router.put('/:id', verifyFirebaseToken, updateCreator);
-router.delete('/:id', verifyFirebaseToken, deleteCreator);
-router.patch('/status', verifyFirebaseToken, setCreatorOnlineStatus); // Set creator online/offline status
-router.patch('/profile', verifyFirebaseToken, updateMyCreatorProfile); // Update creator's own profile
+router.put('/:id', ...hostTools, updateCreator);
+router.delete('/:id', ...hostTools, deleteCreator);
+router.patch('/status', ...hostTools, setCreatorOnlineStatus); // Set creator online/offline status
+router.patch('/profile', ...hostTools, updateMyCreatorProfile); // Update creator's own profile
 
 export default router;

@@ -796,6 +796,20 @@ export async function promoteBootstrappingSession(
   if (!creator) {
     return { ok: false, reason: 'creator_not_found' };
   }
+  if (creator.isDisabled === true) {
+    if (terminateOnFailure) {
+      await releaseActiveCallSlotsIfOurs(redis, callId, userFirebaseUid, creatorFirebaseUid);
+      void forceTerminateCall(io, {
+        callId,
+        userFirebaseUid,
+        creatorFirebaseUid,
+        reason: 'unknown',
+        creatorReason: 'unknown',
+        userPayload: { message: 'This host is currently unavailable.' },
+      }).catch(() => {});
+    }
+    return { ok: false, reason: 'creator_disabled' };
+  }
 
   const creatorUser = await User.findById(creator.userId).select('firebaseUid role').lean();
   const creatorUserFirebaseUid = creatorUser?.firebaseUid || '';

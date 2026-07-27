@@ -33,6 +33,7 @@ import {
   getDashboardTopAgencies,
   getDashboardTopBds,
   getDashboardTopHosts,
+  getDashboardUsersOnline,
 } from './admin-dashboard.controller';
 import {
   getOverview,
@@ -215,6 +216,7 @@ router.get('/audit-events', getAuditEvents);
 router.get('/dashboard/overview', getDashboardOverview);
 router.get('/dashboard/revenue', getDashboardRevenue);
 router.get('/dashboard/live-calls', getDashboardLiveCalls);
+router.get('/dashboard/users-online', getDashboardUsersOnline);
 router.get('/dashboard/realtime', getDashboardRealtime);
 router.get('/dashboard/top-hosts', getDashboardTopHosts);
 router.get('/dashboard/top-bds', getDashboardTopBds);

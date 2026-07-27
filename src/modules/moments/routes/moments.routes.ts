@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { verifyFirebaseToken } from '../../../middlewares/auth.middleware';
+import { blockIfHostDisabled } from '../../creator/creator-disabled.guard';
 import {
   createMomentHandler,
   getMomentsFeedHandler,
@@ -31,11 +32,11 @@ import {
 
 const router = Router();
 
-router.post('/', verifyFirebaseToken, createMomentHandler);
+router.post('/', verifyFirebaseToken, blockIfHostDisabled, createMomentHandler);
 router.get('/feed', verifyFirebaseToken, getMomentsFeedHandler);
 router.get('/following', verifyFirebaseToken, getFollowingMomentsFeedHandler);
-router.get('/creator/me/analytics', verifyFirebaseToken, getCreatorAnalyticsHandler);
-router.get('/creator/me', verifyFirebaseToken, getMyMomentsHandler);
+router.get('/creator/me/analytics', verifyFirebaseToken, blockIfHostDisabled, getCreatorAnalyticsHandler);
+router.get('/creator/me', verifyFirebaseToken, blockIfHostDisabled, getMyMomentsHandler);
 router.get('/creator/:creatorId', verifyFirebaseToken, getCreatorMomentsHandler);
 router.get('/following/list', verifyFirebaseToken, getFollowingListHandler);
 router.get('/following/creators', verifyFirebaseToken, getFollowingCreatorProfilesHandler);

@@ -9,6 +9,11 @@ import { CreatorFollow } from '../models/creator-follow.model';
 import { MomentRevenue } from '../models/moment-revenue.model';
 import { commitImageAsset, CommitImageAssetError } from '../../images/commit-image-asset';
 import { CloudflareImagesError } from '../../images/cloudflare.client';
+import {
+  serializeCreatorGallery,
+  serializeCreatorImages,
+} from '../../images/creator-image-helpers';
+import type { ICreator } from '../../creator/creator.model';
 import { consumeStreamUploadSession } from '../../stream/stream-upload-session.service';
 import {
   defaultModerationStatus,
@@ -46,6 +51,7 @@ import {
   isUserFollowingCreator,
   loadFollowedCreatorIds,
 } from '../services/follow-context.service';
+import { resolveCreatorMetaForMoment } from '../services/creator-meta.service';
 import { UploadRewardStatus } from '../types/upload-reward-status';
 import { isMomentsPremiumActive } from '../../moments-premium/moments-premium-entitlement.service';
 import {
@@ -263,6 +269,7 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
     void enqueueFanoutTask(moment._id.toString(), creator._id.toString(), moment.feedScore);
     await bustAllMomentFeedResponseCaches();
 
+    const creatorMeta = await resolveCreatorMetaForMoment(creator._id);
     const momentDto = await toCreatorSelfMomentDTO(moment, {
       userId: user._id,
       isCreatorOwner: true,
@@ -270,7 +277,12 @@ export async function createMomentHandler(req: Request, res: Response): Promise<
     res.status(201).json({
       success: true,
       data: momentDto
-        ? { ...momentDto, uploadRewardCoins: 0 }
+        ? {
+            ...momentDto,
+            creatorName: creatorMeta.name,
+            creatorAvatarUrl: creatorMeta.avatarUrl ?? momentDto.creatorAvatarUrl,
+            uploadRewardCoins: 0,
+          }
         : {
             id: moment._id.toString(),
             creatorId: creator._id.toString(),
@@ -488,10 +500,11 @@ export async function getMomentDetailHandler(req: Request, res: Response): Promi
     const isCreatorOwner = await isUserOwnerOfCreator(user?._id, moment.creatorId);
     const preview = user && !isCreatorOwner ? await isPreviewMoment(moment._id) : false;
     const likedMomentIds = await loadLikedMomentIds(user?._id ?? null, [moment._id]);
+    const creatorMeta = await resolveCreatorMetaForMoment(moment.creatorId);
     const dto = await toMomentPresentationDTO(
       moment,
       buildMomentsViewer(user, followedCreatorIds, isCreatorOwner, likedMomentIds),
-      { isPreviewMoment: preview },
+      { isPreviewMoment: preview, creatorMeta },
     );
     if (!dto) {
       res.status(404).json({ success: false, error: 'Not found' });
@@ -559,7 +572,7 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
     assertMomentsEnabled();
     const user = await resolveUser(req);
     const creator = await Creator.findById(req.params.creatorId);
-    if (!creator) {
+    if (!creator || creator.isDisabled === true) {
       res.status(404).json({ success: false, error: 'Creator not found' });
       return;
     }
@@ -578,12 +591,13 @@ export async function getCreatorMomentsHandler(req: Request, res: Response): Pro
       moments,
       isCreatorOwner,
     );
+    const creatorMeta = await resolveCreatorMetaForMoment(creator._id);
     const items = (
       await Promise.all(
         moments.map(async (m) => {
           const preview =
             !isCreatorOwner && user ? await isPreviewMoment(m._id) : false;
-          return toMomentFeedDTO(m, viewer, { isPreviewMoment: preview });
+          return toMomentFeedDTO(m, viewer, { isPreviewMoment: preview, creatorMeta });
         }),
       )
     ).filter(Boolean);
@@ -661,7 +675,7 @@ export async function followCreatorHandler(req: Request, res: Response): Promise
       return;
     }
     const creator = await Creator.findById(creatorId);
-    if (!creator) {
+    if (!creator || creator.isDisabled === true) {
       res.status(404).json({ success: false, error: 'Creator not found' });
       return;
     }
@@ -794,7 +808,10 @@ export async function getFollowingCreatorProfilesHandler(
       .map((id) => new mongoose.Types.ObjectId(id));
 
     const creators = validObjectIds.length
-      ? await Creator.find({ _id: { $in: validObjectIds } }).lean()
+      ? await Creator.find({
+          _id: { $in: validObjectIds },
+          isDisabled: { $ne: true },
+        }).lean()
       : [];
     const creatorById = new Map(
       creators.map((creator) => [creator._id.toString(), creator] as const),
@@ -838,13 +855,15 @@ export async function getFollowingCreatorProfilesHandler(
           const firebaseUid = creator.userId
             ? (firebaseUidByUserId.get(creator.userId.toString()) ?? null)
             : null;
+          const images = serializeCreatorImages(creator as unknown as ICreator);
           return {
             id: creator._id.toString(),
             userId: creator.userId ? creator.userId.toString() : '',
             firebaseUid,
             name: creator.name,
             about: creator.about,
-            galleryImages: creator.galleryImages || [],
+            avatar: images.avatar,
+            galleryImages: serializeCreatorGallery(creator.galleryImages || []),
             categories: creator.categories,
             price: creator.price,
             age: creator.age,
@@ -956,7 +975,7 @@ export async function getCreatorSummaryHandler(req: Request, res: Response): Pro
       return;
     }
     const creator = await Creator.findById(creatorId);
-    if (!creator) {
+    if (!creator || creator.isDisabled === true) {
       res.status(404).json({ success: false, error: 'Creator not found' });
       return;
     }
@@ -1005,11 +1024,22 @@ export async function getMyMomentsHandler(req: Request, res: Response): Promise<
       creatorId: creator._id,
       isDeleted: false,
     }).sort({ createdAt: -1 });
+    const creatorMeta = await resolveCreatorMetaForMoment(creator._id);
     const items = (
       await Promise.all(
         moments.map((m) => toCreatorSelfMomentDTO(m, { userId: user._id, isCreatorOwner: true })),
       )
-    ).filter(Boolean);
+    )
+      .filter(Boolean)
+      .map((dto) =>
+        dto
+          ? {
+              ...dto,
+              creatorName: creatorMeta.name,
+              creatorAvatarUrl: creatorMeta.avatarUrl ?? dto.creatorAvatarUrl,
+            }
+          : dto,
+      );
     res.json({ success: true, data: { items } });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;

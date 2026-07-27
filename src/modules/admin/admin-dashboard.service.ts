@@ -14,6 +14,10 @@ import axios from 'axios';
 import { buildAvatarUrls } from '../images/image-url';
 import type { IImageAsset } from '../images/image-asset.schema';
 import { countCreatorPresenceBreakdownPlatform } from '../availability/presence-dashboard.service';
+import {
+  countUsersActiveWithinWindow,
+  getUsersActiveWithinWindow,
+} from '../availability/user-availability.service';
 import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 import { logError } from '../../utils/logger';
@@ -165,6 +169,14 @@ function buildOverviewMetricContract(): Record<string, DashboardMetricDefinition
       unit: 'hosts',
       timezoneScope: 'realtime',
       definition: 'Live Redis presence: creators available for calls right now.',
+    },
+    usersOnline: {
+      label: 'Users online (5m)',
+      backendField: 'usersOnline',
+      scope: 'realtime',
+      unit: 'users',
+      timezoneScope: 'realtime',
+      definition: 'Fans with socket activity in the last 5 minutes (Redis recent-activity TTL).',
     },
   };
 }
@@ -381,6 +393,7 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
 
   const [
     presenceBreakdown,
+    usersOnline,
     agencyCount,
     bdCount,
     pendingWithdrawals,
@@ -391,6 +404,7 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     rechargeDailySeries,
   ] = await Promise.all([
     countCreatorPresenceBreakdownPlatform(),
+    countUsersActiveWithinWindow(),
     User.countDocuments({ role: 'agency' }),
     User.countDocuments(TOP_BD_ROLE),
     Withdrawal.countDocuments(pendingPayoutsMatch),
@@ -449,6 +463,8 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     hostsTotal: presenceBreakdown.total,
     presenceNote:
       'Live Redis presence: online = available for calls, on_call = active video call, offline = unavailable.',
+    usersOnline,
+    usersOnlineNote: 'Fans with socket activity in the last 5 minutes.',
     totalAgencies: agencyCount,
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,
@@ -553,6 +569,51 @@ export async function dashboardLiveCalls(limit: number) {
       };
     }),
     note: 'Recent creator-side call rows (last 30m). Host name is the creator; caller is the user. Not a substitute for Stream session truth.',
+  };
+}
+
+export async function dashboardUsersOnline(limit = 50) {
+  const lim = Math.min(100, Math.max(1, limit));
+  const firebaseUids = await getUsersActiveWithinWindow();
+  const total = firebaseUids.length;
+  const windowed = firebaseUids.slice(0, lim);
+
+  if (windowed.length === 0) {
+    return {
+      total,
+      users: [] as Array<{
+        id: string;
+        firebaseUid: string;
+        username: string | null;
+        email: string | null;
+        displayName: string | null;
+        avatar: string | null;
+      }>,
+      note: 'Fans with socket activity in the last 5 minutes.',
+    };
+  }
+
+  const docs = await User.find({ firebaseUid: { $in: windowed } })
+    .select('_id firebaseUid username email displayName avatar')
+    .lean();
+  const byUid = new Map(docs.map((u) => [u.firebaseUid, u] as const));
+
+  const users = windowed
+    .map((uid) => byUid.get(uid))
+    .filter((u): u is NonNullable<typeof u> => Boolean(u))
+    .map((u) => ({
+      id: u._id.toString(),
+      firebaseUid: u.firebaseUid,
+      username: u.username ?? null,
+      email: u.email ?? null,
+      displayName: u.displayName ?? null,
+      avatar: u.avatar ?? null,
+    }));
+
+  return {
+    total,
+    users,
+    note: 'Fans with socket activity in the last 5 minutes.',
   };
 }
 

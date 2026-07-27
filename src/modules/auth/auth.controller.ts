@@ -480,6 +480,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
           hasAgencyAssignment,
+          isDisabled: !!creator.isDisabled,
+          disabledAt: creator.disabledAt ? new Date(creator.disabledAt).toISOString() : null,
           features,
           ...(referralApply !== undefined ? { referralApply } : {}),
           meta: {

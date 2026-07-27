@@ -750,10 +750,14 @@ export const getCreatorByFirebaseUid = async (req: Request, res: Response): Prom
 
     const creator = await Creator.findOne({ firebaseUid: uidRaw })
       .select(
-        '_id userId firebaseUid name photo avatar price age location categories createdAt updatedAt',
+        '_id userId firebaseUid name photo avatar price age location categories createdAt updatedAt isDisabled',
       )
       .lean();
     if (!creator) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
+    if (creator.isDisabled === true) {
       res.status(404).json({ success: false, error: 'Creator not found' });
       return;
     }
@@ -874,6 +878,18 @@ export const getCreatorById = async (req: Request, res: Response): Promise<void>
           success: false,
           error: 'Forbidden: Creators can only fetch their own profile by id.',
         });
+        return;
+      }
+      // Own disabled profile is still readable so the host app can show the lock screen.
+    } else {
+      // Consumers must not see deactivated hosts (including cached detail).
+      const disabledProbe = await Creator.findById(id).select('isDisabled').lean();
+      if (!disabledProbe) {
+        res.status(404).json({ success: false, error: 'Creator not found' });
+        return;
+      }
+      if (disabledProbe.isDisabled === true) {
+        res.status(404).json({ success: false, error: 'Creator not found' });
         return;
       }
     }
@@ -1617,6 +1633,16 @@ export const setCreatorOnlineStatus = async (req: Request, res: Response): Promi
       });
       return;
     }
+
+    if (creator.isDisabled === true) {
+      res.status(403).json({
+        success: false,
+        error:
+          'Your host account has been deactivated. Contact your BD or admin for help.',
+        errorCode: 'HOST_DISABLED',
+      });
+      return;
+    }
     
     // Validate isOnline parameter
     if (typeof isOnline !== 'boolean') {
@@ -2038,6 +2064,10 @@ export const getMyCreatorProfile = async (req: Request, res: Response): Promise<
           categories: creator.categories,
           price: creator.price,
           location: creator.location,
+          isDisabled: !!creator.isDisabled,
+          disabledAt: creator.disabledAt
+            ? new Date(creator.disabledAt).toISOString()
+            : null,
           createdAt: creator.createdAt,
           updatedAt: creator.updatedAt,
         },

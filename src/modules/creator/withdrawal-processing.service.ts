@@ -240,11 +240,11 @@ export async function processWithdrawalRejection(
     };
   }
 
-  if (withdrawal.status !== 'pending') {
+  if (withdrawal.status !== 'pending' && withdrawal.status !== 'approved') {
     return {
       ok: false,
       status: 400,
-      error: `Cannot reject withdrawal with status '${withdrawal.status}'. Only pending withdrawals can be rejected.`,
+      error: `Cannot reject withdrawal with status '${withdrawal.status}'. Only pending or approved withdrawals can be rejected.`,
     };
   }
 

@@ -237,7 +237,10 @@ export const getFavoriteCreatorProfiles = async (
       .map((id) => new mongoose.Types.ObjectId(id));
 
     const creators = validObjectIds.length
-      ? await Creator.find({ _id: { $in: validObjectIds } }).lean()
+      ? await Creator.find({
+          _id: { $in: validObjectIds },
+          isDisabled: { $ne: true },
+        }).lean()
       : [];
     const creatorById = new Map(creators.map((creator) => [creator._id.toString(), creator] as const));
     const orderedCreators = pagedIds
@@ -331,8 +334,11 @@ export const toggleFavoriteCreator = async (req: Request, res: Response): Promis
       return;
     }
 
-    // Ensure creator exists (can be offline; favorites are independent of online status)
-    const creatorExists = await Creator.exists({ _id: creatorId });
+    // Ensure creator exists and is not deactivated
+    const creatorExists = await Creator.exists({
+      _id: creatorId,
+      isDisabled: { $ne: true },
+    });
     if (!creatorExists) {
       res.status(404).json({ success: false, error: 'Creator not found' });
       return;
@@ -684,6 +690,8 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
             ? { creatorApplicationRejectionReason: appFlags.creatorApplicationRejectionReason }
             : {}),
           hasAgencyAssignment,
+          isDisabled: !!creator.isDisabled,
+          disabledAt: creator.disabledAt ? new Date(creator.disabledAt).toISOString() : null,
           vip,
           momentsPremium,
           features,

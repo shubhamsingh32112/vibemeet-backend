@@ -372,6 +372,17 @@ async function handleCreatorExplicitOnline(
   source: string,
   options?: { clearStuckCall?: boolean }
 ): Promise<void> {
+  const user = await User.findOne({ firebaseUid }).select('_id').lean();
+  if (user) {
+    const creatorDisabled = await Creator.findOne({ userId: user._id })
+      .select('isDisabled')
+      .lean();
+    if (creatorDisabled?.isDisabled === true) {
+      logWarning('Blocked creator:online — host deactivated', { firebaseUid, source });
+      await transitionCreatorPresence(io, firebaseUid, 'FORCE_OFFLINE', `${source}.host_disabled`);
+      return;
+    }
+  }
   clearCreatorDisconnectTimer(firebaseUid);
   const graceToken = creatorGraceTokens.get(firebaseUid);
   if (graceToken && useRegistryAsAuthoritative()) {
@@ -456,7 +467,11 @@ export async function restoreCreatorRuntimeFromIntent(
   if (!user) {
     return false;
   }
-  const creator = await Creator.findOne({ userId: user._id }).select('isOnline').lean();
+  const creator = await Creator.findOne({ userId: user._id }).select('isOnline isDisabled').lean();
+  if (creator?.isDisabled === true) {
+    logDebug('Creator deactivated — skipping runtime restore', { firebaseUid, source });
+    return false;
+  }
   if (creator?.isOnline !== true) {
     logDebug('Creator toggle mode: Mongo intent offline — no runtime restore', {
       firebaseUid,
@@ -765,13 +780,18 @@ export function setupAvailabilityGateway(io: Server): void {
         storeSocketVersion(socket, connectResult.socketVersion);
       }
 
+      // Always mark online on connect (not only isFirstSocket). Ghost registry
+      // entries can make reconnects look like "not first" and skip Redis writes,
+      // which hides website fans from the admin online-users tab.
+      lastUserHeartbeatAtMs.set(firebaseUid, Date.now());
+      await setUserAvailability(firebaseUid, 'online');
+      io.to('creators').emit('user:status', { firebaseUid, status: 'online' });
       if (connectResult.isFirstSocket) {
-        lastUserHeartbeatAtMs.set(firebaseUid, Date.now());
-        await setUserAvailability(firebaseUid, 'online');
-        io.to('creators').emit('user:status', { firebaseUid, status: 'online' });
         logInfo('User automatically set to online on connect', { firebaseUid });
-        startUserHeartbeat(io, firebaseUid);
+      } else {
+        logInfo('User online refreshed on additional/reconnect socket', { firebaseUid });
       }
+      startUserHeartbeat(io, firebaseUid);
     }
 
     logDebug('Socket client connected', {
@@ -925,6 +945,8 @@ export function setupAvailabilityGateway(io: Server): void {
       }
       await setUserAvailability(uid, 'online');
       lastUserHeartbeatAtMs.set(uid, Date.now());
+      // Keep TTL/recent-activity fresh while the tab stays open (website + Flutter).
+      startUserHeartbeat(io, uid);
       // 🔥 SCALABILITY: Broadcast only to creators
       io.to('creators').emit('user:status', { firebaseUid: uid, status: 'online' });
       logInfo('User set to online', { firebaseUid: uid });

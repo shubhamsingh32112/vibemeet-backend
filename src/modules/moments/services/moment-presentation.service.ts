@@ -24,6 +24,7 @@ import {
 import { isImageModerationPendingByDefault } from '../../../config/cloudflare';
 import type { ProcessingStatus } from '../../media-shared/types';
 import type { PreviewCreatorMeta } from './free-preview.service';
+import { resolveCreatorMetaForMoment } from './creator-meta.service';
 import type { FeedSection } from './moments-feed.service';
 
 const PLACEHOLDER_THUMB =
@@ -143,11 +144,14 @@ export async function toMomentPresentationDTO(
     locked = !access.allowed;
     accessReason = access.reason;
   }
-  const meta = options?.creatorMeta ?? {
-    id: moment.creatorId.toString(),
-    name: 'Creator',
-    verified: false,
-  };
+  let meta = options?.creatorMeta;
+  const genericName =
+    !meta?.name ||
+    !String(meta.name).trim() ||
+    String(meta.name).trim().toLowerCase() === 'creator';
+  if (!meta || genericName) {
+    meta = await resolveCreatorMetaForMoment(moment.creatorId);
+  }
 
   return {
     id: moment._id.toString(),

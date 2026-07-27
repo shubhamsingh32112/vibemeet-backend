@@ -16,6 +16,7 @@
  * 
  * Redis key design:
  *   user:availability:{firebaseUid} → "online" | "offline"
+ *   user:recent-activity:{firebaseUid} → "1" (admin 5m proximity window; not deleted on offline)
  * 
  * 🔥 SCALABILITY OPTIMIZATION (1000 users/day, 200 creators):
  * - TTL: 120 seconds (auto-expire safety)
@@ -33,10 +34,14 @@ export type UserAvailability = 'online' | 'offline';
 
 // Redis key prefix
 const KEY_PREFIX = 'user:availability:';
+const RECENT_ACTIVITY_PREFIX = 'user:recent-activity:';
 
 // TTL in seconds (2 minutes)
 // Users must re-announce presence within this window
 const AVAILABILITY_TTL = 120;
+
+/** Admin "users online (5m)" proximity window — independent of matching availability TTL. */
+const RECENT_ACTIVITY_TTL = 300;
 
 /**
  * Set a user's availability status
@@ -55,9 +60,29 @@ export async function setUserAvailability(
   try {
     const redis = getRedis();
     await redis.setex(`${KEY_PREFIX}${firebaseUid}`, AVAILABILITY_TTL, status);
+    if (status === 'online') {
+      await touchUserRecentActivity(firebaseUid);
+    }
     console.log(`📡 [USER AVAILABILITY] Set: ${firebaseUid} → ${status} (TTL: ${AVAILABILITY_TTL}s)`);
   } catch (err) {
     console.error(`❌ [USER AVAILABILITY] Failed to set status:`, err);
+  }
+}
+
+/**
+ * Touch admin recent-activity marker (5-minute proximity).
+ * Not removed on offline so recently disconnected fans still count until TTL expires.
+ */
+export async function touchUserRecentActivity(firebaseUid: string): Promise<void> {
+  if (!isRedisConfigured() || !firebaseUid) {
+    return;
+  }
+
+  try {
+    const redis = getRedis();
+    await redis.setex(`${RECENT_ACTIVITY_PREFIX}${firebaseUid}`, RECENT_ACTIVITY_TTL, '1');
+  } catch (err) {
+    console.error(`❌ [USER AVAILABILITY] Failed to touch recent activity:`, err);
   }
 }
 
@@ -105,6 +130,7 @@ export async function refreshUserAvailability(firebaseUid: string): Promise<void
     if (status === 'online') {
       // Re-set with fresh TTL
       await redis.setex(`${KEY_PREFIX}${firebaseUid}`, AVAILABILITY_TTL, 'online');
+      await touchUserRecentActivity(firebaseUid);
       console.log(`🔄 [USER AVAILABILITY] Refreshed TTL: ${firebaseUid}`);
     } else {
       // Status is offline or missing - don't refresh
@@ -217,4 +243,44 @@ export async function getAllOnlineUsers(): Promise<string[]> {
     console.error(`❌ [USER AVAILABILITY] Failed to get all online:`, err);
     return [];
   }
+}
+
+/**
+ * Fans with socket activity in the last ~5 minutes (admin Command Centre KPI).
+ * Uses SCAN; call sparingly.
+ */
+export async function getUsersActiveWithinWindow(): Promise<string[]> {
+  if (!isRedisConfigured()) {
+    return [];
+  }
+
+  try {
+    const redis = getRedis();
+    const uids: string[] = [];
+    let cursor = '0';
+
+    do {
+      const [nextCursor, keys] = await redis.scan(
+        cursor,
+        'MATCH',
+        `${RECENT_ACTIVITY_PREFIX}*`,
+        'COUNT',
+        100
+      );
+      cursor = nextCursor;
+      for (const key of keys) {
+        const firebaseUid = key.replace(RECENT_ACTIVITY_PREFIX, '');
+        if (firebaseUid) uids.push(firebaseUid);
+      }
+    } while (cursor !== '0');
+
+    return uids;
+  } catch (err) {
+    console.error(`❌ [USER AVAILABILITY] Failed to get recent-activity users:`, err);
+    return [];
+  }
+}
+
+export async function countUsersActiveWithinWindow(): Promise<number> {
+  return (await getUsersActiveWithinWindow()).length;
 }

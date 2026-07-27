@@ -8,7 +8,9 @@ import mongoose, { Schema, Document } from 'mongoose';
  *   2. Admin approves → status: 'approved' (balance checked; still no deduction)
  *   3. Admin marks paid → status: 'paid', coins debited, CoinTransaction created
  *   OR
- *   2. Admin rejects → status: 'rejected' (no deduction)
+ *   2. Admin rejects pending → status: 'rejected' (no deduction)
+ *   OR
+ *   2→3. Admin rejects approved → status: 'rejected' (no deduction; coins never reserved)
  *
  * Coins are debited only on mark-paid, not on request or approve.
  */

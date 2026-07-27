@@ -213,6 +213,11 @@ export async function getCreatorStoriesHandler(req: Request, res: Response): Pro
   try {
     assertMomentsEnabled();
     const user = await resolveUser(req);
+    const creator = await Creator.findById(req.params.creatorId).select('isDisabled').lean();
+    if (!creator || creator.isDisabled === true) {
+      res.status(404).json({ success: false, error: 'Creator not found' });
+      return;
+    }
     const now = new Date();
     const stories = await CreatorStory.find({
       creatorId: req.params.creatorId,
