@@ -274,10 +274,17 @@ export async function getUsersActiveWithinWindow(): Promise<string[]> {
       }
     } while (cursor !== '0');
 
-    return uids;
+    // Also include fans currently marked online. Covers the case where
+    // recent-activity TTL keys are missing but live availability is present.
+    const liveOnline = await getAllOnlineUsers();
+    return [...new Set([...uids, ...liveOnline])];
   } catch (err) {
     console.error(`❌ [USER AVAILABILITY] Failed to get recent-activity users:`, err);
-    return [];
+    try {
+      return await getAllOnlineUsers();
+    } catch {
+      return [];
+    }
   }
 }
 
