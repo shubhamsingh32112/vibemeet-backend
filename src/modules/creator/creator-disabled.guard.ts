@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { User } from '../user/user.model';
 import { Creator } from './creator.model';
-import { isSuperAdminRole } from '../admin/admin-roles';
+import { isSuperAdminRole } from '../../utils/staff-roles';
 
 export const HOST_DISABLED_ERROR_CODE = 'HOST_DISABLED';
 

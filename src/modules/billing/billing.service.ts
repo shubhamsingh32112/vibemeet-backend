@@ -724,6 +724,7 @@ export type PromoteBootstrapResult =
       reason:
         | 'user_not_found'
         | 'creator_not_found'
+        | 'creator_disabled'
         | 'invalid_participants'
         | 'insufficient_coins'
         | 'concurrent_promote'

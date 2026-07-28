@@ -21,6 +21,7 @@ const CALL_SESSION_TTL = 7200;
 type PromoteBootstrapFailureReason =
   | 'user_not_found'
   | 'creator_not_found'
+  | 'creator_disabled'
   | 'invalid_participants'
   | 'insufficient_coins'
   | 'concurrent_promote'
@@ -33,6 +34,7 @@ export type SessionPricingRepairResult = {
     | 'pricing_patched'
     | 'bootstrap_completed'
     | 'creator_not_found'
+    | 'creator_disabled'
     | 'user_not_found'
     | 'still_bootstrapping'
     | 'invalid_participants'
@@ -174,6 +176,7 @@ export async function repairSessionPricingIfNeeded(
       > = {
         user_not_found: 'user_not_found',
         creator_not_found: 'creator_not_found',
+        creator_disabled: 'creator_disabled',
         invalid_participants: 'invalid_participants',
         insufficient_coins: 'insufficient_coins',
         concurrent_promote: 'already_valid',
