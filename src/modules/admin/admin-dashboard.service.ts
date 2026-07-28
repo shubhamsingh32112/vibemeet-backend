@@ -464,7 +464,8 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     presenceNote:
       'Live Redis presence: online = available for calls, on_call = active video call, offline = unavailable.',
     usersOnline,
-    usersOnlineNote: 'Fans with socket activity in the last 5 minutes.',
+    usersOnlineNote:
+      'Fans currently connected or with socket activity in the last 5 minutes.',
     totalAgencies: agencyCount,
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,
@@ -589,7 +590,7 @@ export async function dashboardUsersOnline(limit = 50) {
         displayName: string | null;
         avatar: string | null;
       }>,
-      note: 'Fans with socket activity in the last 5 minutes.',
+      note: 'Fans currently connected or with socket activity in the last 5 minutes.',
     };
   }
 
@@ -613,7 +614,7 @@ export async function dashboardUsersOnline(limit = 50) {
   return {
     total,
     users,
-    note: 'Fans with socket activity in the last 5 minutes.',
+    note: 'Fans currently connected or with socket activity in the last 5 minutes.',
   };
 }
 
