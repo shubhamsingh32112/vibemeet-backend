@@ -147,6 +147,7 @@ import {
   getCachedLeaderboardHosts,
   getFinancePayments,
   getPaymentPurchaseLogs,
+  getPaymentErrorCheck,
   getFinancePayoutsSummary,
   getFinanceSettlements,
   getMomentsPaidUsers,
@@ -193,6 +194,7 @@ router.get('/analytics/vip/paid-users', getVipPaidUsers);
 router.get('/analytics/revenue/summary', getRevenueAnalyticsSummary);
 router.get('/wallet/transactions', getWalletTransactions);
 router.get('/finance/payment-logs', getPaymentPurchaseLogs);
+router.get('/finance/payment-error-check', getPaymentErrorCheck);
 router.get('/finance/payments', getFinancePayments);
 router.get('/finance/payouts/summary', getFinancePayoutsSummary);
 router.get('/finance/settlements', getFinanceSettlements);

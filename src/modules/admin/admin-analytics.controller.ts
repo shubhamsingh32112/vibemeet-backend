@@ -24,6 +24,7 @@ import {
   parseLeaderboardPeriod,
 } from './admin-leaderboards.service';
 import { clampDashboardLimit } from './admin-dashboard.service';
+import { runPaymentErrorCheck } from './admin-payment-error-check.service';
 
 function parsePeriod(raw: unknown): AnalyticsPeriod {
   const p = String(raw ?? '30d');
@@ -201,6 +202,54 @@ export const getFinanceSettlements = async (req: Request, res: Response): Promis
   } catch (error) {
     logError('getFinanceSettlements', error as Error);
     res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+export const getPaymentErrorCheck = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!(await assertAdmin(req, res))) return;
+
+    const range = parseAdminDateRange(req);
+    const now = new Date();
+    const from = range.hasRange && range.from ? range.from : new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const to = range.hasRange && range.to ? range.to : now;
+
+    if (range.invalidReason === 'range_too_wide') {
+      res.status(400).json({ success: false, error: 'Date range is too wide (max 7 days for this check)' });
+      return;
+    }
+    if (range.invalidReason === 'invalid_bounds' || range.invalidReason === 'missing_from' || range.invalidReason === 'missing_to') {
+      res.status(400).json({
+        success: false,
+        error: 'Provide a valid from/to ISO range, or omit both to use the past 24 hours',
+      });
+      return;
+    }
+
+    // Payment-error-check enforces its own 7-day cap (stricter than parseAdminDateRange).
+    if (to.getTime() - from.getTime() > 7 * 24 * 60 * 60 * 1000) {
+      res.status(400).json({ success: false, error: 'Date range is too wide (max 7 days for this check)' });
+      return;
+    }
+    if (!(to.getTime() > from.getTime())) {
+      res.status(400).json({ success: false, error: 'Invalid from/to bounds' });
+      return;
+    }
+
+    const data = await runPaymentErrorCheck({ from, to });
+    res.json({ success: true, data });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown';
+    if (message === 'RANGE_TOO_WIDE') {
+      res.status(400).json({ success: false, error: 'Date range is too wide (max 7 days for this check)' });
+      return;
+    }
+    if (message === 'INVALID_RANGE') {
+      res.status(400).json({ success: false, error: 'Invalid from/to bounds' });
+      return;
+    }
+    logError('getPaymentErrorCheck', error as Error);
+    res.status(500).json({ success: false, error: 'Failed to run payment error check' });
   }
 };
 
