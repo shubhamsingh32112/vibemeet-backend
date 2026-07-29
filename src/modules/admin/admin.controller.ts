@@ -2763,7 +2763,8 @@ export const approveWithdrawal = async (req: Request, res: Response): Promise<vo
 /**
  * POST /admin/withdrawals/:id/reject
  *
- * Rejects a pending withdrawal (no coins deducted).
+ * Rejects a pending or approved withdrawal (no coins deducted).
+ * Approved → rejected cancels approval before mark-paid; coins were never reserved.
  */
 export const rejectWithdrawal = async (req: Request, res: Response): Promise<void> => {
   try {

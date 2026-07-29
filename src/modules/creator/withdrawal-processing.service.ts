@@ -248,6 +248,7 @@ export async function processWithdrawalRejection(
     };
   }
 
+  const previousStatus = withdrawal.status;
   withdrawal.status = 'rejected';
   withdrawal.adminUserId = actingUser._id;
   withdrawal.notes = notes;
@@ -258,6 +259,7 @@ export async function processWithdrawalRejection(
     creatorUserId: withdrawal.creatorUserId?.toString() || (withdrawal as { creatorFirebaseUid?: string }).creatorFirebaseUid || 'unknown',
     amount: withdrawal.amount,
     actorRole: actingUser.role,
+    previousStatus,
   });
 
   await invalidateAdminCaches('overview', 'coins', 'creators_performance');
@@ -271,6 +273,7 @@ export async function processWithdrawalRejection(
     data: {
       withdrawalId: withdrawal._id.toString(),
       status: 'rejected',
+      previousStatus,
       amount: withdrawal.amount,
       notes,
     },
