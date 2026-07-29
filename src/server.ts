@@ -29,7 +29,7 @@ import { attachStaffRateLimitIdentity } from './middlewares/staff-rate-limit.mid
 import routes from './routes';
 import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
-import { getDailyPeriodBounds } from './modules/creator/creator-tasks.config';
+import { getWeeklyPeriodBounds } from './modules/creator/creator-tasks.config';
 import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { requestContextMiddleware } from './middlewares/request-context.middleware';
 import { requestQueueMiddleware } from './middlewares/request-queue.middleware';
@@ -314,15 +314,15 @@ const startServer = async () => {
   }
 };
 
-// ── Daily task progress cleanup (remove records older than 7 days) ────
+// ── Weekly task progress cleanup (remove records older than ~5 weeks) ──
 // Runs every 6 hours. Old CreatorTaskProgress records are irrelevant
 // because task queries filter by the current period's periodStart.
 // This is purely for database hygiene.
 async function cleanupOldTaskProgress(): Promise<void> {
   try {
-    const { periodStart } = getDailyPeriodBounds();
-    // Keep records from the last 7 days for auditing, delete older ones
-    const cutoff = new Date(periodStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const { periodStart } = getWeeklyPeriodBounds();
+    // Keep ~5 weeks for auditing, delete older ones
+    const cutoff = new Date(periodStart.getTime() - 35 * 24 * 60 * 60 * 1000);
     const result = await CreatorTaskProgress.deleteMany({
       periodStart: { $lt: cutoff },
     });
