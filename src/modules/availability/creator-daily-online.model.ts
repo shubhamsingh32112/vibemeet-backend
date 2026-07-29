@@ -1,6 +1,6 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-/** Seconds creator was in Redis "online" (available) during a task day (23:59 boundary). */
+/** Seconds creator was in Redis "online" (available) during a task day (midnight 00:00 IST). */
 export interface ICreatorDailyOnline extends Document {
   _id: mongoose.Types.ObjectId;
   creatorFirebaseUid: string;

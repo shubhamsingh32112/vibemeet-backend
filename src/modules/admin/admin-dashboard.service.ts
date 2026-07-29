@@ -18,6 +18,7 @@ import {
   countUsersActiveWithinWindow,
   getUsersActiveWithinWindow,
 } from '../availability/user-availability.service';
+import { isRedisConfigured } from '../../config/redis';
 import { parseInrFromPurchaseDescription } from './admin-leaderboards.service';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 import { logError } from '../../utils/logger';
@@ -464,8 +465,11 @@ export async function dashboardOverviewPayload(range?: DashboardDateFilter) {
     presenceNote:
       'Live Redis presence: online = available for calls, on_call = active video call, offline = unavailable.',
     usersOnline,
-    usersOnlineNote:
-      'Fans currently connected or with socket activity in the last 5 minutes.',
+    usersOnlineNote: !isRedisConfigured()
+      ? 'Redis not configured — online fan count unavailable.'
+      : usersOnline === 0
+        ? 'No fans with socket activity in the last 5 minutes (Redis presence keys empty).'
+        : 'Fans currently connected or with socket activity in the last 5 minutes.',
     totalAgencies: agencyCount,
     totalBds: bdCount,
     pendingPayouts: pendingWithdrawals,

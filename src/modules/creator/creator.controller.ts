@@ -7,7 +7,11 @@ import { User } from '../user/user.model';
 import { CreatorTaskProgress, ICreatorTaskProgress } from './creator-task.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from '../billing/call-history.model';
-import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds } from './creator-tasks.config';
+import {
+  FREE_COINS_EARNED_EXPR,
+  PAID_COINS_EARNED_EXPR,
+} from '../billing/creator-earnings-split';
+import { CREATOR_TASKS, getTaskByKey, isValidTaskKey, getDailyPeriodBounds, getWeeklyPeriodBounds } from './creator-tasks.config';
 import { getIO } from '../../config/socket';
 import { transitionCreatorPresence } from '../availability/presence.service';
 import { emitCreatorDataUpdated } from './creator-notify';
@@ -2416,14 +2420,24 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
         $group: {
           _id: null,
           totalEarnings: { $sum: '$coinsEarned' },
+          freeCallEarnings: { $sum: FREE_COINS_EARNED_EXPR },
+          paidCallEarnings: { $sum: PAID_COINS_EARNED_EXPR },
           totalSeconds: { $sum: '$durationSeconds' },
           totalCalls: { $sum: 1 },
         },
       },
     ]);
 
-    const summary = summaryAgg[0] || { totalEarnings: 0, totalSeconds: 0, totalCalls: 0 };
+    const summary = summaryAgg[0] || {
+      totalEarnings: 0,
+      freeCallEarnings: 0,
+      paidCallEarnings: 0,
+      totalSeconds: 0,
+      totalCalls: 0,
+    };
     const totalEarnings = summary.totalEarnings || 0;
+    const freeCallEarnings = summary.freeCallEarnings || 0;
+    const paidCallEarnings = summary.paidCallEarnings || 0;
     const totalSeconds = summary.totalSeconds || 0;
     const totalMinutes = totalSeconds / 60;
     const totalCalls = summary.totalCalls || 0;
@@ -2451,6 +2465,8 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
         durationFormatted: formatted,
         durationMinutes: Math.round(mins * 100) / 100,
         earnings: call.coinsEarned,
+        paidCoinsEarned: call.paidCoinsEarned ?? call.coinsEarned,
+        freeCoinsEarned: call.freeCoinsEarned ?? 0,
         endedAt: call.createdAt.toISOString(),
       };
     });
@@ -2461,6 +2477,8 @@ export const getCreatorEarnings = async (req: Request, res: Response): Promise<v
       success: true,
       data: {
         totalEarnings,
+        freeCallEarnings,
+        paidCallEarnings,
         totalMinutes: Math.round(totalMinutes * 100) / 100,
         totalCalls,
         avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
@@ -2600,9 +2618,9 @@ export const getCreatorTransactions = async (req: Request, res: Response): Promi
 
 /**
  * Get creator tasks progress
- * 
- * Calculates total minutes from ended calls and returns task progress.
- * Only ended calls with duration > 0 count towards minutes.
+ *
+ * Calculates paid-call coins earned within the current weekly period
+ * and returns weekly target progress.
  */
 export const getCreatorTasks = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -2651,10 +2669,10 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
       // Continue to database query on cache failure
     }
 
-    // ── Daily period bounds ─────────────────────────────────────────────
-    const { periodStart, periodEnd, resetsAt } = getDailyPeriodBounds();
+    // ── Weekly period bounds ─────────────────────────────────────────────
+    const { periodStart, periodEnd, resetsAt } = getWeeklyPeriodBounds();
 
-    // Compute total minutes from call history **within the current daily period**
+    // Paid coins earned within the current weekly period
     const callAgg = await CallHistory.aggregate([
       {
         $match: {
@@ -2667,11 +2685,11 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
       {
         $group: {
           _id: null,
-          totalSeconds: { $sum: '$durationSeconds' },
+          totalPaidCoins: { $sum: PAID_COINS_EARNED_EXPR },
         },
       },
     ]);
-    const totalMinutes = callAgg.length > 0 ? callAgg[0].totalSeconds / 60 : 0;
+    const totalPaidCoins = callAgg.length > 0 ? callAgg[0].totalPaidCoins || 0 : 0;
 
     // Get existing task progress records **for the current period only**
     const taskProgressRecords = await CreatorTaskProgress.find({
@@ -2688,24 +2706,22 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
     // Build tasks array with progress
     const tasks = CREATOR_TASKS.map((taskDef) => {
       const progress = progressMap.get(taskDef.key);
-      const isCompleted = totalMinutes >= taskDef.thresholdMinutes;
+      const isCompleted = totalPaidCoins >= taskDef.thresholdPaidCoins;
       const isClaimed = progress?.claimedAt != null;
-      
-      // progressMinutes = min(totalMinutes, thresholdMinutes)
-      const progressMinutes = Math.min(totalMinutes, taskDef.thresholdMinutes);
+      const progressPaidCoins = Math.min(totalPaidCoins, taskDef.thresholdPaidCoins);
 
       return {
         taskKey: taskDef.key,
-        thresholdMinutes: taskDef.thresholdMinutes,
+        thresholdPaidCoins: taskDef.thresholdPaidCoins,
         rewardCoins: taskDef.rewardCoins,
-        progressMinutes: Math.round(progressMinutes * 100) / 100, // Round to 2 decimals
+        progressPaidCoins: Math.round(progressPaidCoins * 100) / 100,
         isCompleted,
         isClaimed,
       };
     });
 
     const responseData = {
-      totalMinutes: Math.round(totalMinutes * 100) / 100, // Round to 2 decimals
+      totalPaidCoins: Math.round(totalPaidCoins * 100) / 100,
       tasks,
       resetsAt: resetsAt.toISOString(),
     };
@@ -2736,7 +2752,7 @@ export const getCreatorTasks = async (req: Request, res: Response): Promise<void
 /**
  * Claim task reward
  * 
- * Validates task completion, creates coin transaction, and credits coins.
+ * Validates weekly paid-coin target completion, creates coin transaction, and credits coins.
  * Idempotent - safe to retry.
  */
 export const claimTaskReward = async (req: Request, res: Response): Promise<void> => {
@@ -2790,10 +2806,10 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // ── Daily period bounds ─────────────────────────────────────────────
-    const { periodStart, periodEnd } = getDailyPeriodBounds();
+    // ── Weekly period bounds ─────────────────────────────────────────────
+    const { periodStart, periodEnd } = getWeeklyPeriodBounds();
 
-    // Compute total minutes from call history **within the current daily period**
+    // Paid coins earned within the current weekly period
     const claimCallAgg = await CallHistory.aggregate([
       {
         $match: {
@@ -2806,17 +2822,17 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       {
         $group: {
           _id: null,
-          totalSeconds: { $sum: '$durationSeconds' },
+          totalPaidCoins: { $sum: PAID_COINS_EARNED_EXPR },
         },
       },
     ]);
-    const totalMinutes = claimCallAgg.length > 0 ? claimCallAgg[0].totalSeconds / 60 : 0;
+    const totalPaidCoins = claimCallAgg.length > 0 ? claimCallAgg[0].totalPaidCoins || 0 : 0;
 
-    // Check if task is completed (within today's period)
-    if (totalMinutes < taskDef.thresholdMinutes) {
+    // Check if task is completed (within current weekly period)
+    if (totalPaidCoins < taskDef.thresholdPaidCoins) {
       res.status(400).json({
         success: false,
-        error: `Task not completed. Current: ${Math.round(totalMinutes)} minutes, Required: ${taskDef.thresholdMinutes} minutes`,
+        error: `Target not completed. Current: ${Math.round(totalPaidCoins)} paid coins, Required: ${taskDef.thresholdPaidCoins} paid coins`,
       });
       return;
     }
@@ -2824,7 +2840,7 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
     // 🔒 PHASE T1: Atomic claim with race safety
     // Use findOneAndUpdate with condition to prevent double claims
     // This prevents: double taps, retry storms, two devices claiming simultaneously
-    // **periodStart** is included to scope claims to the current daily period.
+    // **periodStart** is included to scope claims to the current weekly period.
     const now = new Date();
     const taskProgress = await CreatorTaskProgress.findOneAndUpdate(
       {
@@ -2843,7 +2859,7 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
           creatorUserId: currentUser._id,
           taskKey,
           periodStart,
-          thresholdMinutes: taskDef.thresholdMinutes,
+          thresholdPaidCoins: taskDef.thresholdPaidCoins,
           rewardCoins: taskDef.rewardCoins,
         },
       },
@@ -2908,7 +2924,7 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       type: 'credit',
       coins: taskDef.rewardCoins,
       source: 'creator_task',
-      description: `Bonus for completing ${taskDef.thresholdMinutes} mins`,
+      description: `Bonus for completing ${taskDef.thresholdPaidCoins} paid coins weekly target`,
       status: 'completed',
     });
 
@@ -2939,8 +2955,8 @@ export const claimTaskReward = async (req: Request, res: Response): Promise<void
       creatorUserId: currentUser._id.toString(),
       taskKey,
       rewardCoins: taskDef.rewardCoins,
-      thresholdMinutes: taskDef.thresholdMinutes,
-      totalMinutes: Math.round(totalMinutes * 100) / 100,
+      thresholdPaidCoins: taskDef.thresholdPaidCoins,
+      totalPaidCoins: Math.round(totalPaidCoins * 100) / 100,
       transactionId,
       coinsBefore: oldCoins,
       coinsAfter: currentUser.coins,
@@ -3058,8 +3074,16 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
 
     // ── Build dashboard data from DB ─────────────────────────────────────
 
-    // ── Daily period bounds (for task progress) ───────────────────────
-    const { periodStart, periodEnd, resetsAt } = getDailyPeriodBounds();
+    // ── Daily period (todayEarnings) + weekly period (targets) ─────────
+    const {
+      periodStart: dailyPeriodStart,
+      periodEnd: dailyPeriodEnd,
+    } = getDailyPeriodBounds();
+    const {
+      periodStart: weeklyPeriodStart,
+      periodEnd: weeklyPeriodEnd,
+      resetsAt: weeklyResetsAt,
+    } = getWeeklyPeriodBounds();
 
     // 1. Earnings summary (all-time) from aggregation instead of full-history in-memory reduction.
     const allTimeSummaryAgg = await CallHistory.aggregate([
@@ -3074,13 +3098,23 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         $group: {
           _id: null,
           totalEarnings: { $sum: '$coinsEarned' },
+          freeCallEarnings: { $sum: FREE_COINS_EARNED_EXPR },
+          paidCallEarnings: { $sum: PAID_COINS_EARNED_EXPR },
           totalSeconds: { $sum: '$durationSeconds' },
           totalCalls: { $sum: 1 },
         },
       },
     ]);
-    const allTimeSummary = allTimeSummaryAgg[0] || { totalEarnings: 0, totalSeconds: 0, totalCalls: 0 };
+    const allTimeSummary = allTimeSummaryAgg[0] || {
+      totalEarnings: 0,
+      freeCallEarnings: 0,
+      paidCallEarnings: 0,
+      totalSeconds: 0,
+      totalCalls: 0,
+    };
     const totalEarnings = allTimeSummary.totalEarnings || 0;
+    const freeCallEarnings = allTimeSummary.freeCallEarnings || 0;
+    const paidCallEarnings = allTimeSummary.paidCallEarnings || 0;
     const totalSeconds = allTimeSummary.totalSeconds || 0;
     const allTimeMinutes = totalSeconds / 60;
     const totalCalls = allTimeSummary.totalCalls || 0;
@@ -3107,18 +3141,20 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         durationFormatted: formatted,
         durationMinutes: Math.round((call.durationSeconds / 60) * 100) / 100,
         earnings: call.coinsEarned,
+        paidCoinsEarned: call.paidCoinsEarned ?? call.coinsEarned,
+        freeCoinsEarned: call.freeCoinsEarned ?? 0,
         endedAt: call.createdAt.toISOString(),
       };
     });
 
-    // 2. Today's earnings + task progress — only count calls from the **current daily period**
+    // 2. Today's earnings — current daily period
     const todayCallAgg = await CallHistory.aggregate([
       {
         $match: {
           ownerUserId: currentUser._id,
           ownerRole: 'creator',
           durationSeconds: { $gt: 0 },
-          createdAt: { $gte: periodStart, $lt: periodEnd },
+          createdAt: { $gte: dailyPeriodStart, $lt: dailyPeriodEnd },
         },
       },
       {
@@ -3134,9 +3170,28 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
     const todayEarnings = todayCallAgg.length > 0 ? todayCallAgg[0].totalEarned : 0;
     const todayCalls = todayCallAgg.length > 0 ? todayCallAgg[0].callCount : 0;
 
+    // Weekly paid-coin targets
+    const weeklyCallAgg = await CallHistory.aggregate([
+      {
+        $match: {
+          ownerUserId: currentUser._id,
+          ownerRole: 'creator',
+          durationSeconds: { $gt: 0 },
+          createdAt: { $gte: weeklyPeriodStart, $lt: weeklyPeriodEnd },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPaidCoins: { $sum: PAID_COINS_EARNED_EXPR },
+        },
+      },
+    ]);
+    const weeklyPaidCoins = weeklyCallAgg.length > 0 ? weeklyCallAgg[0].totalPaidCoins || 0 : 0;
+
     const taskProgressRecords = await CreatorTaskProgress.find({
       creatorUserId: currentUser._id,
-      periodStart,
+      periodStart: weeklyPeriodStart,
     });
     const progressMap = new Map<string, ICreatorTaskProgress>();
     for (const record of taskProgressRecords) {
@@ -3145,14 +3200,14 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
 
     const tasks = CREATOR_TASKS.map((taskDef) => {
       const progress = progressMap.get(taskDef.key);
-      const isCompleted = todayMinutes >= taskDef.thresholdMinutes;
+      const isCompleted = weeklyPaidCoins >= taskDef.thresholdPaidCoins;
       const isClaimed = progress?.claimedAt != null;
-      const progressMinutes = Math.min(todayMinutes, taskDef.thresholdMinutes);
+      const progressPaidCoins = Math.min(weeklyPaidCoins, taskDef.thresholdPaidCoins);
       return {
         taskKey: taskDef.key,
-        thresholdMinutes: taskDef.thresholdMinutes,
+        thresholdPaidCoins: taskDef.thresholdPaidCoins,
         rewardCoins: taskDef.rewardCoins,
-        progressMinutes: Math.round(progressMinutes * 100) / 100,
+        progressPaidCoins: Math.round(progressPaidCoins * 100) / 100,
         isCompleted,
         isClaimed,
       };
@@ -3193,6 +3248,8 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
       // Earnings (all-time)
       earnings: {
         totalEarnings,
+        freeCallEarnings,
+        paidCallEarnings,
         totalMinutes: Math.round(allTimeMinutes * 100) / 100,
         totalCalls,
         avgEarningsPerMinute: Math.round(avgEarningsPerMinute * 100) / 100,
@@ -3207,11 +3264,11 @@ export const getCreatorDashboard = async (req: Request, res: Response): Promise<
         totalMinutes: Math.round(todayMinutes * 100) / 100,
         totalCalls: todayCalls,
       },
-      // Tasks (daily period)
+      // Weekly paid-coin targets
       tasks: {
-        totalMinutes: Math.round(todayMinutes * 100) / 100,
+        totalPaidCoins: Math.round(weeklyPaidCoins * 100) / 100,
         items: tasks,
-        resetsAt: resetsAt.toISOString(),
+        resetsAt: weeklyResetsAt.toISOString(),
       },
       // Account
       coins: coinsForResponse,

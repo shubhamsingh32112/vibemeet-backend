@@ -25,6 +25,7 @@ import { User, IUser } from '../user/user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { CallHistory } from './call-history.model';
+import { splitCreatorEarningsByDebit } from './creator-earnings-split';
 import { Call } from '../video/call.model';
 import { emitCreatorDataUpdated } from '../creator/creator.controller';
 import { verifyUserBalance } from '../../utils/balance-integrity';
@@ -236,6 +237,8 @@ export interface SettlePersistResult {
   totalDeducted: number;
   walletCoinsDeducted: number;
   totalEarnedCreator: number;
+  paidCoinsEarned: number;
+  freeCoinsEarned: number;
   durationSeconds: number;
   userFirebaseUid: string;
   creatorFirebaseUid: string;
@@ -952,6 +955,12 @@ export async function settleCall(
       { upsert: true, new: true, session: dbSession }
     );
 
+    const { paidCoinsEarned, freeCoinsEarned } = splitCreatorEarningsByDebit(
+      totalEarnedCreator,
+      introDeductedMicros,
+      walletDeductedMicros
+    );
+
     if (creatorOwnerUserIdLocal) {
       await CallHistory.findOneAndUpdate(
         { callId, ownerUserId: creatorOwnerUserIdLocal },
@@ -969,6 +978,8 @@ export async function settleCall(
           settlementStatus: 'settled',
           coinsDeducted: 0,
           coinsEarned: totalEarnedCreator,
+          paidCoinsEarned,
+          freeCoinsEarned,
         },
         { upsert: true, new: true, session: dbSession }
       );
@@ -1132,10 +1143,18 @@ export async function settleCall(
     }
   }
 
+  const { paidCoinsEarned, freeCoinsEarned } = splitCreatorEarningsByDebit(
+    totalEarnedCreator,
+    introDeductedMicros,
+    walletDeductedMicros
+  );
+
   const persistResult: SettlePersistResult = {
     totalDeducted,
     walletCoinsDeducted,
     totalEarnedCreator,
+    paidCoinsEarned,
+    freeCoinsEarned,
     durationSeconds,
     userFirebaseUid: session.userFirebaseUid,
     creatorFirebaseUid: session.creatorFirebaseUid,

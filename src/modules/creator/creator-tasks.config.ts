@@ -1,27 +1,34 @@
+import {
+  addIstDays,
+  istDateKey,
+  istDayBounds,
+  IST_TIMEZONE,
+} from '../../utils/ist-time';
+
 /**
  * Creator Task Definitions
  *
  * ⚠️ These values must match UI exactly (no magic numbers in frontend).
  *
- * Tasks are based on total completed video call minutes **within the
- * current daily period**.  The period resets every day at 23:59 (server
- * local time — IST in production).
+ * Tasks are based on **paid-call coins earned** within the current
+ * weekly period (Monday 00:00 → next Monday 00:00, Asia/Kolkata).
  *
- * Only ended calls with duration > 0 that occurred in the current period
- * count towards task progress.
+ * Only settled creator CallHistory rows with duration > 0 in the current
+ * period count. Progress uses paidCoinsEarned (legacy rows fall back to
+ * coinsEarned as all-paid).
  */
 
 export interface CreatorTaskDefinition {
   key: string;
-  thresholdMinutes: number;
+  thresholdPaidCoins: number;
+  /** Claim reward — placeholders until product finalizes amounts. */
   rewardCoins: number;
 }
 
 export const CREATOR_TASKS: CreatorTaskDefinition[] = [
-  { key: 'minutes_200', thresholdMinutes: 200, rewardCoins: 100 },
-  { key: 'minutes_350', thresholdMinutes: 350, rewardCoins: 150 },
-  { key: 'minutes_480', thresholdMinutes: 480, rewardCoins: 300 },
-  { key: 'minutes_600', thresholdMinutes: 600, rewardCoins: 300 },
+  { key: 'paid_coins_15000', thresholdPaidCoins: 15000, rewardCoins: 100 },
+  { key: 'paid_coins_20000', thresholdPaidCoins: 20000, rewardCoins: 150 },
+  { key: 'paid_coins_30000', thresholdPaidCoins: 30000, rewardCoins: 300 },
 ];
 
 /**
@@ -38,41 +45,74 @@ export const isValidTaskKey = (key: string): boolean => {
   return CREATOR_TASKS.some((task) => task.key === key);
 };
 
+const IST_WEEKDAY_SHORT = new Intl.DateTimeFormat('en-US', {
+  timeZone: IST_TIMEZONE,
+  weekday: 'short',
+});
+
+function istDaysSinceMonday(when: Date): number {
+  const dayName = IST_WEEKDAY_SHORT.format(when);
+  const day =
+    dayName === 'Sun'
+      ? 0
+      : dayName === 'Mon'
+        ? 1
+        : dayName === 'Tue'
+          ? 2
+          : dayName === 'Wed'
+            ? 3
+            : dayName === 'Thu'
+              ? 4
+              : dayName === 'Fri'
+                ? 5
+                : 6;
+  return day === 0 ? 6 : day - 1;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
-// DAILY PERIOD HELPERS
+// WEEKLY PERIOD HELPERS (creator targets)
 // ══════════════════════════════════════════════════════════════════════════
 
 /**
- * The daily task period resets at 23:59 server-local time.
+ * Weekly task period: Monday 00:00 → next Monday 00:00 Asia/Kolkata.
+ */
+export function getWeeklyPeriodBoundsForInstant(when: Date): {
+  periodStart: Date;
+  periodEnd: Date;
+  resetsAt: Date;
+} {
+  const mondayKey = addIstDays(istDateKey(when), -istDaysSinceMonday(when));
+  const { start: periodStart } = istDayBounds(mondayKey);
+  const periodEnd = new Date(periodStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+  return { periodStart, periodEnd, resetsAt: periodEnd };
+}
+
+export function getWeeklyPeriodBounds(): {
+  periodStart: Date;
+  periodEnd: Date;
+  resetsAt: Date;
+} {
+  return getWeeklyPeriodBoundsForInstant(new Date());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// DAILY PERIOD HELPERS (online minutes, chat quota, todayEarnings)
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The daily period resets at midnight 00:00 Asia/Kolkata.
  *
  * Period boundaries:
- *   periodStart = yesterday 23:59  (if now < today 23:59)
- *                 today 23:59      (if now >= today 23:59)
- *   periodEnd   = periodStart + 24 h
- *   resetsAt    = periodEnd        (next reset)
+ *   periodStart = today 00:00:00.000 IST
+ *   periodEnd   = tomorrow 00:00:00.000 IST
+ *   resetsAt    = periodEnd
  */
 export function getDailyPeriodBoundsForInstant(when: Date): {
   periodStart: Date;
   periodEnd: Date;
   resetsAt: Date;
 } {
-  const todayReset = new Date(
-    when.getFullYear(),
-    when.getMonth(),
-    when.getDate(),
-    23, 59, 0, 0,
-  );
-
-  let periodStart: Date;
-
-  if (when.getTime() >= todayReset.getTime()) {
-    periodStart = todayReset;
-  } else {
-    periodStart = new Date(todayReset.getTime() - 24 * 60 * 60 * 1000);
-  }
-
-  const periodEnd = new Date(periodStart.getTime() + 24 * 60 * 60 * 1000);
-
+  const { start: periodStart, end: periodEnd } = istDayBounds(istDateKey(when));
   return { periodStart, periodEnd, resetsAt: periodEnd };
 }
 
@@ -82,4 +122,18 @@ export function getDailyPeriodBounds(): {
   resetsAt: Date;
 } {
   return getDailyPeriodBoundsForInstant(new Date());
+}
+
+/**
+ * Pre-midnight-migration CreatorDailyOnline rows used a 23:59 day boundary.
+ * For calendar day starting at `periodStart` (midnight), that legacy key is
+ * `periodStart - 1 minute` (previous calendar day 23:59).
+ */
+export function legacyDailyPeriodStart(periodStart: Date): Date {
+  return new Date(periodStart.getTime() - 60_000);
+}
+
+/** Midnight + legacy 23:59 keys that map to the same calendar day. */
+export function dailyPeriodStartsForLookup(periodStart: Date): Date[] {
+  return [periodStart, legacyDailyPeriodStart(periodStart)];
 }

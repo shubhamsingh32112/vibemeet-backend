@@ -141,6 +141,29 @@ export async function projectCallHistoryFromBillingEvent(
           ? undefined
           : Math.max(0, Number(walletCoinsDeductedRaw) || 0);
       const coinsEarned = Math.max(0, Number(payload.coinsEarned) || 0);
+      const paidCoinsEarnedRaw = payload.paidCoinsEarned;
+      const freeCoinsEarnedRaw = payload.freeCoinsEarned;
+      let paidCoinsEarned: number;
+      let freeCoinsEarned: number;
+      if (paidCoinsEarnedRaw != null || freeCoinsEarnedRaw != null) {
+        paidCoinsEarned = Math.max(0, Number(paidCoinsEarnedRaw) || 0);
+        freeCoinsEarned = Math.max(0, Number(freeCoinsEarnedRaw) || 0);
+      } else {
+        // Derive from wallet vs total user debit when split fields are missing.
+        const wallet = walletCoinsDeducted ?? coinsDeducted;
+        const intro = Math.max(0, coinsDeducted - wallet);
+        const debit = intro + wallet;
+        if (debit <= 0 || wallet >= debit) {
+          paidCoinsEarned = coinsEarned;
+          freeCoinsEarned = 0;
+        } else if (wallet <= 0) {
+          paidCoinsEarned = 0;
+          freeCoinsEarned = coinsEarned;
+        } else {
+          paidCoinsEarned = Math.round(coinsEarned * (wallet / debit));
+          freeCoinsEarned = coinsEarned - paidCoinsEarned;
+        }
+      }
       const settledBase = {
         settlementStatus: 'settled' as const,
         settledAt,
@@ -165,10 +188,18 @@ export async function projectCallHistoryFromBillingEvent(
             ...settledBase,
             coinsDeducted: 0,
             coinsEarned,
+            paidCoinsEarned,
+            freeCoinsEarned,
           },
         }
       );
-      logInfo('call_history_projected_settled', { callId, coinsDeducted, coinsEarned });
+      logInfo('call_history_projected_settled', {
+        callId,
+        coinsDeducted,
+        coinsEarned,
+        paidCoinsEarned,
+        freeCoinsEarned,
+      });
       return;
     }
 

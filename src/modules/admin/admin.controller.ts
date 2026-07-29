@@ -12,7 +12,8 @@ import {
   FREE_MESSAGES_PER_CREATOR,
 } from '../chat/chat-message-quota.model';
 import { getCurrentChatQuotaPeriodStart } from '../chat/chat-quota-period.util';
-import { CREATOR_TASKS, getDailyPeriodBounds } from '../creator/creator-tasks.config';
+import { CREATOR_TASKS, getDailyPeriodBounds, getWeeklyPeriodBounds, legacyDailyPeriodStart, dailyPeriodStartsForLookup } from '../creator/creator-tasks.config';
+import { FREE_COINS_EARNED_EXPR, PAID_COINS_EARNED_EXPR } from '../billing/creator-earnings-split';
 import {
   computeAvgEarningsPerMinute,
   computeEarnDeviationPct,
@@ -326,11 +327,19 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
     SupportTicket.countDocuments({ priority: { $in: ['high', 'urgent'] }, status: { $in: ['open', 'in_progress'] } }),
     (async () => {
       const { periodStart } = getDailyPeriodBounds();
-      const topOnline = await CreatorDailyOnline.find({ periodStart })
-        .sort({ onlineSeconds: -1 })
-        .limit(50)
-        .lean();
-      const uids = topOnline.map((t) => t.creatorFirebaseUid);
+      const periodStarts = dailyPeriodStartsForLookup(periodStart);
+      const topOnlineAgg = await CreatorDailyOnline.aggregate([
+        { $match: { periodStart: { $in: periodStarts } } },
+        {
+          $group: {
+            _id: '$creatorFirebaseUid',
+            onlineSeconds: { $sum: '$onlineSeconds' },
+          },
+        },
+        { $sort: { onlineSeconds: -1 } },
+        { $limit: 50 },
+      ]);
+      const uids = topOnlineAgg.map((t: { _id: string }) => t._id);
       if (uids.length === 0) return [];
       const creatorRows = await Creator.find({ firebaseUid: { $in: uids } })
         .select('firebaseUid name')
@@ -340,9 +349,9 @@ async function computeOverview(from?: Date, to?: Date, fromIso?: string, toIso?:
           .filter((c) => c.firebaseUid)
           .map((c) => [c.firebaseUid as string, c.name] as const)
       );
-      return topOnline.map((row) => ({
-        firebaseUid: row.creatorFirebaseUid,
-        displayName: nameByUid.get(row.creatorFirebaseUid) ?? row.creatorFirebaseUid,
+      return topOnlineAgg.map((row: { _id: string; onlineSeconds: number }) => ({
+        firebaseUid: row._id,
+        displayName: nameByUid.get(row._id) ?? row._id,
         onlineSeconds: row.onlineSeconds,
       }));
     })(),
@@ -475,7 +484,12 @@ function parseCreatorsPerformancePaging(req: Request): {
 }
 
 async function attachLiveOnlineTodaySeconds(
-  creators: Array<{ userId: string; onlineTodaySeconds?: number }>
+  creators: Array<{
+    userId: string;
+    onlineTodaySeconds?: number;
+    online7dSeconds?: number;
+    online30dSeconds?: number;
+  }>
 ): Promise<void> {
   const userIds = creators.map((c) => c.userId).filter(Boolean);
   if (userIds.length === 0) return;
@@ -489,11 +503,60 @@ async function attachLiveOnlineTodaySeconds(
       .map((u) => [u._id.toString(), u.firebaseUid as string] as const)
   );
   const firebaseUids = [...uidByUserId.values()];
-  const onlineMap = await getBatchOnlineTodaySecondsLive(firebaseUids);
+  const onlineTodayMap = await getBatchOnlineTodaySecondsLive(firebaseUids);
+
+  const { periodStart: todayStart } = getDailyPeriodBounds();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const start7 = new Date(todayStart.getTime() - 6 * dayMs);
+  const start30 = new Date(todayStart.getTime() - 29 * dayMs);
+  // Include pre-migration 23:59 periodStart keys for prior calendar days.
+  // Upper bound excludes today's legacy key (todayStart − 1min) so it is not
+  // double-counted when exclToday* is added to live "today" (which already sums it).
+  const matchFrom = legacyDailyPeriodStart(start30);
+  const sevenFrom = legacyDailyPeriodStart(start7);
+  const exclTodayBefore = legacyDailyPeriodStart(todayStart);
+
+  const periodAgg =
+    firebaseUids.length === 0
+      ? []
+      : await CreatorDailyOnline.aggregate([
+          {
+            $match: {
+              creatorFirebaseUid: { $in: firebaseUids },
+              periodStart: { $gte: matchFrom, $lt: exclTodayBefore },
+            },
+          },
+          {
+            $group: {
+              _id: '$creatorFirebaseUid',
+              exclToday30d: { $sum: '$onlineSeconds' },
+              exclToday7d: {
+                $sum: {
+                  $cond: [
+                    { $gte: ['$periodStart', sevenFrom] },
+                    '$onlineSeconds',
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ]);
+
+  const periodMap = new Map(
+    periodAgg.map((r: { _id: string; exclToday7d: number; exclToday30d: number }) => [
+      r._id,
+      { exclToday7d: r.exclToday7d || 0, exclToday30d: r.exclToday30d || 0 },
+    ])
+  );
 
   for (const creator of creators) {
     const firebaseUid = uidByUserId.get(creator.userId);
-    creator.onlineTodaySeconds = firebaseUid ? onlineMap.get(firebaseUid) ?? 0 : 0;
+    const today = firebaseUid ? onlineTodayMap.get(firebaseUid) ?? 0 : 0;
+    const prior = firebaseUid ? periodMap.get(firebaseUid) : undefined;
+    creator.onlineTodaySeconds = today;
+    creator.online7dSeconds = (prior?.exclToday7d ?? 0) + today;
+    creator.online30dSeconds = (prior?.exclToday30d ?? 0) + today;
   }
 }
 
@@ -571,8 +634,13 @@ async function computeCreatorsPerformance(options: {
   presenceStatus?: string;
 }) {
   const { page, limit, search, agencyId, bdId, presenceStatus } = options;
-  const thirtyDaysAgo = daysAgo(30);
-  const { periodStart, periodEnd } = getDailyPeriodBounds();
+  const { periodStart, periodEnd } = getWeeklyPeriodBounds();
+  const { periodStart: dayStart, periodEnd: dayEnd } = getDailyPeriodBounds();
+  const dayMs = 24 * 60 * 60 * 1000;
+  // Align with online mins: last N IST calendar days including today (7 = today−6d, 30 = today−29d).
+  const sevenDaysStart = new Date(dayStart.getTime() - 6 * dayMs);
+  const thirtyDaysStart = new Date(dayStart.getTime() - 29 * dayMs);
+
   // All-time call stats per creator (billable calls only — matches creator dashboard)
   const callStatsPerCreator = await CallHistory.aggregate([
     {
@@ -587,6 +655,8 @@ async function computeCreatorsPerformance(options: {
         totalCalls: { $sum: 1 },
         totalDurationSec: { $sum: '$durationSeconds' },
         totalEarned: { $sum: '$coinsEarned' },
+        freeCallEarnings: { $sum: FREE_COINS_EARNED_EXPR },
+        paidCallEarnings: { $sum: PAID_COINS_EARNED_EXPR },
         avgDurationSec: { $avg: '$durationSeconds' },
         lastCallAt: { $max: '$createdAt' },
       },
@@ -594,28 +664,56 @@ async function computeCreatorsPerformance(options: {
   ]);
   const callMap = new Map(callStatsPerCreator.map((c: any) => [c._id.toString(), c]));
 
-  // 30d call stats per creator (billable only)
-  const callStats30d = await CallHistory.aggregate([
-    {
-      $match: {
-        ownerRole: 'creator',
-        createdAt: { $gte: thirtyDaysAgo },
-        ...CREATOR_BILLABLE_CALL_MATCH,
+  // Today / 7d / 30d call counts (billable only)
+  const [callStatsToday, callStats7d, callStats30d] = await Promise.all([
+    CallHistory.aggregate([
+      {
+        $match: {
+          ownerRole: 'creator',
+          createdAt: { $gte: dayStart, $lt: dayEnd },
+          ...CREATOR_BILLABLE_CALL_MATCH,
+        },
       },
-    },
-    {
-      $group: {
-        _id: '$ownerUserId',
-        calls30d: { $sum: 1 },
-        minutes30d: { $sum: '$durationSeconds' },
-        earned30d: { $sum: '$coinsEarned' },
+      { $group: { _id: '$ownerUserId', callsToday: { $sum: 1 } } },
+    ]),
+    CallHistory.aggregate([
+      {
+        $match: {
+          ownerRole: 'creator',
+          createdAt: { $gte: sevenDaysStart, $lt: dayEnd },
+          ...CREATOR_BILLABLE_CALL_MATCH,
+        },
       },
-    },
+      { $group: { _id: '$ownerUserId', calls7d: { $sum: 1 } } },
+    ]),
+    CallHistory.aggregate([
+      {
+        $match: {
+          ownerRole: 'creator',
+          createdAt: { $gte: thirtyDaysStart, $lt: dayEnd },
+          ...CREATOR_BILLABLE_CALL_MATCH,
+        },
+      },
+      {
+        $group: {
+          _id: '$ownerUserId',
+          calls30d: { $sum: 1 },
+          minutes30d: { $sum: '$durationSeconds' },
+          earned30d: { $sum: '$coinsEarned' },
+        },
+      },
+    ]),
   ]);
+  const callTodayMap = new Map(
+    callStatsToday.map((c: any) => [c._id.toString(), c.callsToday as number])
+  );
+  const call7dMap = new Map(
+    callStats7d.map((c: any) => [c._id.toString(), c.calls7d as number])
+  );
   const call30dMap = new Map(callStats30d.map((c: any) => [c._id.toString(), c]));
 
-  // Task period minutes + claims (current daily period — matches creator tasks UI)
-  const periodMinutesAgg = await CallHistory.aggregate([
+  // Task period paid coins + claims (current weekly period — matches creator targets UI)
+  const periodPaidCoinsAgg = await CallHistory.aggregate([
     {
       $match: {
         ownerRole: 'creator',
@@ -626,12 +724,12 @@ async function computeCreatorsPerformance(options: {
     {
       $group: {
         _id: '$ownerUserId',
-        periodMinutes: { $sum: { $divide: ['$durationSeconds', 60] } },
+        periodPaidCoins: { $sum: PAID_COINS_EARNED_EXPR },
       },
     },
   ]);
-  const periodMinutesMap = new Map(
-    periodMinutesAgg.map((r: any) => [r._id.toString(), r.periodMinutes as number])
+  const periodPaidCoinsMap = new Map(
+    periodPaidCoinsAgg.map((r: any) => [r._id.toString(), r.periodPaidCoins as number])
   );
 
   const taskProgressCurrent = await CreatorTaskProgress.find({
@@ -648,7 +746,7 @@ async function computeCreatorsPerformance(options: {
   // ── Abuse signals (30d) ─────────────────────────────────────────────
   // Per-creator: short call %, refund count, forced-end count (user-side 0-duration)
   const abuseSignalsAgg = await CallHistory.aggregate([
-    { $match: { ownerRole: 'creator', createdAt: { $gte: thirtyDaysAgo } } },
+    { $match: { ownerRole: 'creator', createdAt: { $gte: thirtyDaysStart, $lt: dayEnd } } },
     {
       $group: {
         _id: '$ownerUserId',
@@ -682,7 +780,7 @@ async function computeCreatorsPerformance(options: {
     {
       $match: {
         ownerRole: 'creator',
-        createdAt: { $gte: thirtyDaysAgo },
+        createdAt: { $gte: thirtyDaysStart, $lt: dayEnd },
       },
     },
     { $project: { ownerUserId: 1, callId: 1 } },
@@ -828,14 +926,22 @@ async function computeCreatorsPerformance(options: {
   const performance = creators.map((creator) => {
     const userId = creator.userId.toString();
     const user = userMap.get(userId);
-    const calls = callMap.get(userId) || { totalCalls: 0, totalDurationSec: 0, totalEarned: 0, avgDurationSec: 0, lastCallAt: null };
+    const calls = callMap.get(userId) || {
+      totalCalls: 0,
+      totalDurationSec: 0,
+      totalEarned: 0,
+      freeCallEarnings: 0,
+      paidCallEarnings: 0,
+      avgDurationSec: 0,
+      lastCallAt: null,
+    };
     const c30d = call30dMap.get(userId) || { calls30d: 0, minutes30d: 0, earned30d: 0 };
-    const periodMinutes = periodMinutesMap.get(userId) ?? 0;
+    const periodPaidCoins = periodPaidCoinsMap.get(userId) ?? 0;
     let tasksCompleted = 0;
     let tasksClaimed = 0;
     const claimedKeys = taskClaimedByCreator.get(userId);
     for (const taskDef of CREATOR_TASKS) {
-      if (periodMinutes >= taskDef.thresholdMinutes) tasksCompleted += 1;
+      if (periodPaidCoins >= taskDef.thresholdPaidCoins) tasksCompleted += 1;
       if (claimedKeys?.has(taskDef.key)) tasksClaimed += 1;
     }
     const abuse = abuseMap.get(userId) || {
@@ -902,8 +1008,12 @@ async function computeCreatorsPerformance(options: {
       totalCalls: calls.totalCalls,
       totalMinutes: round2(calls.totalDurationSec / 60),
       totalEarned: calls.totalEarned,
+      freeCallEarnings: calls.freeCallEarnings || 0,
+      paidCallEarnings: calls.paidCallEarnings || 0,
       avgCallDurationSec: round2(calls.avgDurationSec || 0),
       lastCallAt: calls.lastCallAt,
+      callsToday: callTodayMap.get(userId) ?? 0,
+      calls7d: call7dMap.get(userId) ?? 0,
       calls30d: c30d.calls30d,
       minutes30d: round2(c30d.minutes30d / 60),
       earned30d: c30d.earned30d,

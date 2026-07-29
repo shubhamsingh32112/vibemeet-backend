@@ -29,6 +29,10 @@ export interface ICallHistory extends Document {
   coinsDeducted: number;             // Total billable coins (intro promo + wallet)
   walletCoinsDeducted?: number;      // Wallet coins only (0 for intro-only welcome calls)
   coinsEarned: number;               // Coins earned (creator) or 0 (user)
+  /** Creator earnings from user wallet spend (prorated). Missing on legacy rows. */
+  paidCoinsEarned?: number;
+  /** Creator earnings from intro/free-call portion (prorated). Missing on legacy rows. */
+  freeCoinsEarned?: number;
   ratingStars?: number;              // 1-5 star rating submitted by user for creator
   ratingComment?: string;            // Optional feedback message
   ratedAt?: Date;                    // Timestamp for rating submission
@@ -123,6 +127,16 @@ const callHistorySchema = new Schema<ICallHistory>(
       type: Number,
       default: 0,
       min: 0,
+    },
+    paidCoinsEarned: {
+      type: Number,
+      min: 0,
+      sparse: true,
+    },
+    freeCoinsEarned: {
+      type: Number,
+      min: 0,
+      sparse: true,
     },
     ratingStars: {
       type: Number,

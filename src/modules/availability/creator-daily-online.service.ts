@@ -1,11 +1,11 @@
 import { getRedis, creatorAvailOnlineSinceKey, creatorPresenceKey } from '../../config/redis';
-import { getDailyPeriodBounds, getDailyPeriodBoundsForInstant } from '../creator/creator-tasks.config';
+import { getDailyPeriodBounds, getDailyPeriodBoundsForInstant, dailyPeriodStartsForLookup } from '../creator/creator-tasks.config';
 import { CreatorDailyOnline } from './creator-daily-online.model';
 import { logError } from '../../utils/logger';
 
 /**
- * Accumulate whole seconds of "online" (Redis availability = online) per task period,
- * splitting intervals that cross the 23:59 boundary.
+ * Accumulate whole seconds of "online" (Redis availability = online) per day period,
+ * splitting intervals that cross the midnight 00:00 Asia/Kolkata boundary.
  */
 /**
  * Whole seconds of [fromMs, toMs) split by task-day periods (for tests and addOnlineDuration).
@@ -88,15 +88,17 @@ export async function getBatchOnlineTodaySecondsLive(
   if (unique.length === 0) return result;
 
   const { periodStart, periodEnd } = getDailyPeriodBounds();
+  const periodStarts = dailyPeriodStartsForLookup(periodStart);
   const docs = await CreatorDailyOnline.find({
     creatorFirebaseUid: { $in: unique },
-    periodStart,
+    periodStart: { $in: periodStarts },
   })
     .select('creatorFirebaseUid onlineSeconds')
     .lean();
 
   for (const doc of docs) {
-    result.set(doc.creatorFirebaseUid, doc.onlineSeconds ?? 0);
+    const prev = result.get(doc.creatorFirebaseUid) ?? 0;
+    result.set(doc.creatorFirebaseUid, prev + (doc.onlineSeconds ?? 0));
   }
   for (const uid of unique) {
     if (!result.has(uid)) result.set(uid, 0);

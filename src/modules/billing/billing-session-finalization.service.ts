@@ -1581,6 +1581,8 @@ export async function finalizeCallSession(
           coinsDeducted: persistResult.totalDeducted,
           walletCoinsDeducted: persistResult.walletCoinsDeducted,
           coinsEarned: persistResult.totalEarnedCreator,
+          paidCoinsEarned: persistResult.paidCoinsEarned,
+          freeCoinsEarned: persistResult.freeCoinsEarned,
           durationSeconds: persistResult.durationSeconds,
           userMongoId: persistResult.userFirebaseUid,
         },

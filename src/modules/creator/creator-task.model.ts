@@ -3,10 +3,12 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface ICreatorTaskProgress extends Document {
   _id: mongoose.Types.ObjectId;
   creatorUserId: mongoose.Types.ObjectId; // userId of creator
-  taskKey: string; // e.g. "minutes_200"
-  thresholdMinutes: number; // 200, 350, 480, etc.
-  rewardCoins: number; // 100, 150, 300
-  periodStart: Date; // Start of the daily period this record belongs to
+  taskKey: string; // e.g. "paid_coins_15000"
+  /** @deprecated legacy daily minute tasks — kept optional for old docs */
+  thresholdMinutes?: number;
+  thresholdPaidCoins: number; // 15000, 20000, 30000
+  rewardCoins: number;
+  periodStart: Date; // Start of the weekly period this record belongs to
   completedAt?: Date; // when threshold reached
   claimedAt?: Date; // when reward claimed
   createdAt: Date;
@@ -27,6 +29,11 @@ const creatorTaskProgressSchema = new Schema<ICreatorTaskProgress>(
       trim: true,
     },
     thresholdMinutes: {
+      type: Number,
+      min: 0,
+      sparse: true,
+    },
+    thresholdPaidCoins: {
       type: Number,
       required: true,
       min: 0,
@@ -55,7 +62,7 @@ const creatorTaskProgressSchema = new Schema<ICreatorTaskProgress>(
   }
 );
 
-// Compound unique index: one task progress per creator per task per daily period
+// Compound unique index: one task progress per creator per task per period
 creatorTaskProgressSchema.index(
   { creatorUserId: 1, taskKey: 1, periodStart: 1 },
   { unique: true },
