@@ -435,7 +435,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       showWelcomeBackDialog,
     });
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
-    const features = getPublicAppConfig().features;
+    const features = (await getPublicAppConfig()).features;
 
     // If creator exists, return creator details as primary data
     if (creator) {

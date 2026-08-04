@@ -6,6 +6,8 @@ import {
   isFreeCallEnabled,
 } from '../../config/free-call.config';
 import { MIN_COINS_TO_CALL } from '../../config/pricing.config';
+import { isTelegramRewardEnabled } from '../telegram-reward/telegram-reward-config.model';
+import { isConsumerRewardsEnabled } from '../consumer-rewards/consumer-reward-config.model';
 
 export interface PublicAppConfig {
   features: {
@@ -13,6 +15,9 @@ export interface PublicAppConfig {
     vipProfileFrameEnabled: boolean;
     momentsEnabled: boolean;
     momentsAccessMode: 'free' | 'paid';
+    dailyCheckInEnabled: boolean;
+    telegramRewardEnabled: boolean;
+    consumerRewardsEnabled: boolean;
   };
   pricing: {
     freeCallEnabled: boolean;
@@ -22,13 +27,20 @@ export interface PublicAppConfig {
   };
 }
 
-export function getPublicAppConfig(): PublicAppConfig {
+export async function getPublicAppConfig(): Promise<PublicAppConfig> {
+  const [telegramRewardEnabled, consumerRewardsEnabled] = await Promise.all([
+    isTelegramRewardEnabled(),
+    isConsumerRewardsEnabled(),
+  ]);
   return {
     features: {
       vipEnabled: featureFlags.vipEnabled,
       vipProfileFrameEnabled: featureFlags.vipProfileFrameEnabled,
       momentsEnabled: isMomentsEnabled(),
       momentsAccessMode: getMomentsAccessMode(),
+      dailyCheckInEnabled: featureFlags.dailyCheckInEnabled,
+      telegramRewardEnabled,
+      consumerRewardsEnabled,
     },
     pricing: {
       freeCallEnabled: isFreeCallEnabled(),

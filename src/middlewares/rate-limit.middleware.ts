@@ -162,6 +162,88 @@ export const tasksLimiter = rateLimit({
 });
 
 /**
+ * Rate limiter for daily check-in claim.
+ * Tight limit — one legitimate claim per day; retries still need headroom.
+ */
+export const checkInClaimLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: 'Too many check-in attempts. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `checkin:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/** Telegram reward status — 30/min per user. */
+export const telegramStatusLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: 'Too many Telegram reward status requests. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `telegram_status:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/** Telegram link-token issuance — 10 / 15 min per user (anti-abuse). */
+export const telegramLinkTokenLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Too many Telegram link requests. Please wait before trying again.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `telegram_link:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/** Telegram verify/claim — 8/min per user (protects Bot API quota). */
+export const telegramVerifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 8,
+  message: 'Too many Telegram verify attempts. Please wait a moment.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    const firebaseUid = (req as any).auth?.firebaseUid || req.ip;
+    return `telegram_verify:${firebaseUid}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/** Telegram bot webhook — 120/min per IP. */
+export const telegramWebhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  message: 'Too many Telegram webhook requests from this IP.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request): string => {
+    return `telegram_webhook:${req.ip}`;
+  },
+  skip: (_req: Request): boolean => {
+    return process.env.NODE_ENV === 'development' && process.env.DISABLE_RATE_LIMIT === 'true';
+  },
+});
+
+/**
  * Rate limiter for Cloudflare Images direct-upload URL generation.
  * - 30 requests per minute per user covers retries + multi-image flows
  *   without giving abusers a cheap way to spawn upload sessions.

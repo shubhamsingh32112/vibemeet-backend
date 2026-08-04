@@ -22,6 +22,9 @@ import vipRoutes from './modules/vip/vip.routes';
 import momentsPremiumRoutes from './modules/moments-premium/moments-premium.routes';
 import appConfigRoutes from './modules/app-config/app-config.routes';
 import analyticsRoutes from './modules/analytics/analytics.routes';
+import checkInRoutes from './modules/checkin/checkin.routes';
+import telegramRewardRoutes from './modules/telegram-reward/telegram-reward.routes';
+import consumerRewardRoutes from './modules/consumer-rewards/consumer-reward.routes';
 
 const router = Router();
 
@@ -29,6 +32,9 @@ router.use('/auth', authRoutes);
 router.use('/referral', referralRoutes);
 router.use('/analytics', analyticsRoutes);
 router.use('/user', userRoutes);
+router.use('/user/check-in', checkInRoutes);
+router.use('/rewards', telegramRewardRoutes);
+router.use('/rewards', consumerRewardRoutes);
 router.use('/creator', creatorRoutes);
 router.use('/chat', chatRoutes);
 router.use('/video', videoRoutes);

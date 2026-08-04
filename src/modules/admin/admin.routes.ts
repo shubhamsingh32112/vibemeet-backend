@@ -78,6 +78,16 @@ import {
   adminCreatorGalleryReorder,
 } from './admin.controller';
 import {
+  getTelegramRewardConfigAdmin,
+  updateTelegramRewardConfigAdmin,
+} from '../telegram-reward/telegram-reward.controller';
+import {
+  getConsumerRewardsConfigAdmin,
+  updateConsumerRewardsConfigAdmin,
+  getRewardsMonitorAdmin,
+  getRewardsReconAdmin,
+} from '../consumer-rewards/consumer-reward.controller';
+import {
   getCurrentGlobalAppUpdateForAdmin,
   publishGlobalAppUpdate,
 } from '../app-update/app-update.controller';
@@ -203,6 +213,12 @@ router.get('/coins', getCoinEconomy);
 router.get('/wallet-pricing', getWalletPricing);
 router.get('/platform-revenue', getPlatformRevenueConfigAdmin);
 router.put('/platform-revenue', updatePlatformRevenueConfigAdmin);
+router.get('/telegram-reward', getTelegramRewardConfigAdmin);
+router.put('/telegram-reward', updateTelegramRewardConfigAdmin);
+router.get('/consumer-rewards', getConsumerRewardsConfigAdmin);
+router.put('/consumer-rewards', updateConsumerRewardsConfigAdmin);
+router.get('/rewards/monitor', getRewardsMonitorAdmin);
+router.get('/rewards/recon', getRewardsReconAdmin);
 router.get('/calls', getCallsAdmin);
 router.get('/calls/:callId/refund-preview', getRefundPreview);
 router.get('/calls/:callId/settlement-retry-preview', getSettlementRetryPreview);

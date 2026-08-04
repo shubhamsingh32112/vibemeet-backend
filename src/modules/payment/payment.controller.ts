@@ -730,6 +730,12 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
           orderId: razorpay_order_id,
         });
       });
+      try {
+        const { onUserFirstRecharge } = await import('../consumer-rewards/hooks');
+        onUserFirstRecharge(user._id);
+      } catch {
+        // non-fatal
+      }
     }
 
     recordPaymentMetric('web.verify_success', 1, {

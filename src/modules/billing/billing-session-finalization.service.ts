@@ -1653,6 +1653,24 @@ export async function finalizeCallSession(
       ...snapshotMeta,
     });
 
+    // Consumer first-call reward + successful referral on qualified duration
+    try {
+      const durationSec = Math.max(0, Number(persistResult.durationSeconds) || 0);
+      const payerUid = persistResult.userFirebaseUid;
+      if (payerUid && durationSec > 0) {
+        const { User: UserModel } = await import('../user/user.model');
+        const payer = await UserModel.findOne({ firebaseUid: payerUid })
+          .select('_id role')
+          .lean();
+        if (payer?.role === 'user') {
+          const { onUserCallSettled } = await import('../consumer-rewards/hooks');
+          onUserCallSettled(payer._id, durationSec);
+        }
+      }
+    } catch {
+      // never block settlement
+    }
+
     return {
       status: 'settled',
       callId,

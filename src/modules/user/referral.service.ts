@@ -481,6 +481,18 @@ export async function applyReferralCode(
     return { ok: true };
   }
 
+  // Consumer invite reward: referrer must be a plain user (not BD).
+  if (referrer.role === 'user' && applicant.role === 'user') {
+    try {
+      const { onReferralAttached } = await import(
+        '../consumer-rewards/hooks'
+      );
+      onReferralAttached(referrer._id, applicant._id);
+    } catch {
+      // non-fatal
+    }
+  }
+
   // Non-BD creator referrers are rejected before linkage; no invitee promotion path here.
   return { ok: true };
 }
@@ -493,8 +505,19 @@ export async function processReferralRewardOnPurchase(
   referredUserId: Types.ObjectId,
   purchasePriceInr: number
 ): Promise<boolean> {
-  const minInr = getReferralMinPurchaseInr();
-  const rewardCoins = getReferralRewardCoins();
+  let minInr = getReferralMinPurchaseInr();
+  let rewardCoins = getReferralRewardCoins();
+  try {
+    const { getSuccessfulReferralConfig } = await import(
+      '../consumer-rewards/hooks'
+    );
+    const live = await getSuccessfulReferralConfig();
+    if (!live.enabled) return false;
+    minInr = live.minPurchaseInr;
+    rewardCoins = live.coins;
+  } catch {
+    // fall back to env helpers
+  }
 
   if (purchasePriceInr < minInr) return false;
 
@@ -504,6 +527,28 @@ export async function processReferralRewardOnPurchase(
   if (!referredUser?.referredBy) return false;
 
   const referrerId = referredUser.referredBy as Types.ObjectId;
+  const txnId = referralRewardTransactionId(referrerId, referredUserId);
+
+  // Shared with call-path creditOnce (`referral_reward_{referrer}_{referred}`).
+  // If ledger row already exists, never $inc again.
+  const existingTxn = await CoinTransaction.findOne({ transactionId: txnId })
+    .select('_id')
+    .lean();
+  if (existingTxn) {
+    await User.updateOne(
+      {
+        _id: referrerId,
+        referrals: { $elemMatch: { user: referredUserId, rewardGranted: false } },
+      },
+      { $set: { 'referrals.$[r].rewardGranted': true } },
+      { arrayFilters: [{ 'r.user': referredUserId, 'r.rewardGranted': false }] }
+    ).catch(() => {});
+    await ReferralEdge.updateOne(
+      { referredUserId },
+      { $set: { rewardGranted: true } }
+    ).catch(() => {});
+    return false;
+  }
 
   const grant = await User.updateOne(
     {
@@ -528,7 +573,6 @@ export async function processReferralRewardOnPurchase(
     { $set: { rewardGranted: true } }
   ).catch(() => {});
 
-  const txnId = referralRewardTransactionId(referrerId, referredUserId);
   try {
     await CoinTransaction.create({
       transactionId: txnId,
@@ -540,14 +584,47 @@ export async function processReferralRewardOnPurchase(
       status: 'completed',
     });
   } catch (err) {
-    if (!isDuplicateKeyError(err)) {
-      logError('Referral reward CoinTransaction failed', err as Error, {
+    if (isDuplicateKeyError(err)) {
+      // Concurrent call-path claim created the same txn; rewardGranted already set.
+      // Wallet was already credited by the winner of this race path only when that
+      // winner holds the unique txn — purchase path already $inc'd; if call also
+      // won ledger first then our grant.modifiedCount would have been 0.
+      logInfo('Referral reward txn already exists (idempotent)', {
         txnId,
         referrerId: referrerId.toString(),
-        referredUserId: referredUserId.toString(),
       });
-      throw err;
+      return true;
     }
+    logError('Referral reward CoinTransaction failed', err as Error, {
+      txnId,
+      referrerId: referrerId.toString(),
+      referredUserId: referredUserId.toString(),
+    });
+    throw err;
+  }
+
+  // Hub progress key (same as call path) for claim visibility.
+  try {
+    const { ensureUserRewardProgress } = await import(
+      '../consumer-rewards/user-reward-progress.model'
+    );
+    const progress = await ensureUserRewardProgress(referrerId);
+    const progressKey = `successful_referral_${referredUserId.toString()}`;
+    await progress.updateOne({
+      $set: { [`claimed.${progressKey}`]: new Date() },
+    });
+  } catch {
+    // non-fatal
+  }
+
+  try {
+    const { trackRewardIssuance, recordRewardCreditSuccess } = await import(
+      '../consumer-rewards/reward-metrics'
+    );
+    recordRewardCreditSuccess('successful_referral', rewardCoins);
+    void trackRewardIssuance(rewardCoins);
+  } catch {
+    // non-fatal
   }
 
   logInfo('Referral reward granted', {

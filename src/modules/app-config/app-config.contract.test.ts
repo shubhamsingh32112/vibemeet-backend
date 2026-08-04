@@ -4,10 +4,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { getPublicAppConfig } from './app-config.service';
 
-test('getPublicAppConfig exposes feature and pricing fields', () => {
-  const config = getPublicAppConfig();
+test('getPublicAppConfig exposes feature and pricing fields', async () => {
+  const config = await getPublicAppConfig();
   assert.equal(typeof config.features.vipEnabled, 'boolean');
   assert.equal(typeof config.features.momentsEnabled, 'boolean');
+  assert.equal(typeof config.features.telegramRewardEnabled, 'boolean');
   assert.ok(['free', 'paid'].includes(config.features.momentsAccessMode));
   assert.equal(typeof config.pricing.freeCallEnabled, 'boolean');
   assert.equal(typeof config.pricing.freeCallDurationSeconds, 'number');

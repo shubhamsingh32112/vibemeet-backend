@@ -118,6 +118,14 @@ export interface IUser extends Document {
   referredBy?: mongoose.Types.ObjectId;
   /** Referral: users this user referred, with reward status. */
   referrals?: IReferralEntry[];
+  /** Telegram Bot deep-link identity (numeric id as string). Unique across users. */
+  telegramUserId?: string | null;
+  /** When webhook bound telegramUserId to this account. */
+  telegramLinkedAt?: Date | null;
+  /** Lifetime Telegram join reward claim gate. */
+  telegramRewardClaimed?: boolean;
+  /** When Telegram join reward was credited. */
+  telegramRewardClaimedAt?: Date | null;
   /** Bumped when admin edits profile (creator + linked user); clients show toast when this increases. */
   profileRevision: number;
   createdAt: Date;
@@ -439,6 +447,26 @@ const userSchema = new Schema<IUser>(
         },
       },
     ],
+    telegramUserId: {
+      type: String,
+      default: null,
+      sparse: true,
+      trim: true,
+      maxlength: 32,
+    },
+    telegramLinkedAt: {
+      type: Date,
+      default: null,
+    },
+    telegramRewardClaimed: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    telegramRewardClaimedAt: {
+      type: Date,
+      default: null,
+    },
     profileRevision: {
       type: Number,
       default: 0,
@@ -453,6 +481,8 @@ const userSchema = new Schema<IUser>(
 // Cloudflare-Images indexes for orphan-cleanup + moderation lookups.
 userSchema.index({ 'avatar.imageId': 1 }, { sparse: true });
 userSchema.index({ 'avatar.moderationStatus': 1 }, { sparse: true });
+// One Telegram account ↔ one MatchVibe user (anti-farming).
+userSchema.index({ telegramUserId: 1 }, { unique: true, sparse: true });
 // Agent / admin: list users referred by a given agent (User._id)
 userSchema.index({ referredBy: 1 }, { sparse: true });
 // Index for Fast Login lookup (find user by device)

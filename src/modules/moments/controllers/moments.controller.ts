@@ -479,6 +479,13 @@ export async function recordMomentViewHandler(req: Request, res: Response): Prom
       moment,
       access.reason,
     );
+    try {
+      const { onMomentViewed } = await import('../../consumer-rewards/hooks');
+      // Only free-tier access reasons count toward watch reward (see hooks).
+      onMomentViewed(user._id, moment._id.toString(), access.reason);
+    } catch {
+      // non-fatal
+    }
     res.json({ success: true, data: { viewsCount, accessReason: access.reason } });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;
@@ -688,6 +695,12 @@ export async function followCreatorHandler(req: Request, res: Response): Promise
       { $setOnInsert: { createdAt: new Date() } },
       { upsert: true },
     );
+    try {
+      const { onCreatorFollowed } = await import('../../consumer-rewards/hooks');
+      onCreatorFollowed(user._id, creatorId);
+    } catch {
+      // non-fatal
+    }
     const followerCount = await countCreatorFollowers(creatorId);
     await bustPopularFeedCacheForUser(user._id.toString());
     await bustFollowingWarmCacheForUser(user._id.toString());
@@ -1084,6 +1097,12 @@ export async function likeMomentHandler(req: Request, res: Response): Promise<vo
     }
     const momentId = new mongoose.Types.ObjectId(req.params.momentId);
     const data = await likeMoment(user._id, momentId);
+    try {
+      const { onMomentLiked } = await import('../../consumer-rewards/hooks');
+      onMomentLiked(user._id, momentId.toString());
+    } catch {
+      // non-fatal
+    }
     res.json({ success: true, data });
   } catch (error) {
     if (respondMomentsDisabled(error, res)) return;

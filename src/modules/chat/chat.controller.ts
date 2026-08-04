@@ -575,6 +575,20 @@ export const preSendMessage = async (
     // Balance integrity check (fire-and-forget)
     verifyUserBalance(user._id).catch(() => {});
 
+    const canSend =
+      responsePayload &&
+      typeof responsePayload === 'object' &&
+      'data' in responsePayload &&
+      (responsePayload as { data?: { canSend?: boolean } }).data?.canSend === true;
+    if (canSend && user.role === 'user') {
+      try {
+        const { onUserSentMessage } = await import('../consumer-rewards/hooks');
+        onUserSentMessage(user._id);
+      } catch {
+        // non-fatal
+      }
+    }
+
     res.json(responsePayload!);
   } catch (error) {
     console.error('❌ [CHAT] Error in pre-send:', error);

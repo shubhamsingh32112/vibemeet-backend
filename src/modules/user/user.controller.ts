@@ -645,7 +645,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     const hasAgencyAssignment = !!(creator?.assignedAgencyId);
     const vip = await getVipStatus(user._id);
     const momentsPremium = await getMomentsPremiumStatus(user._id);
-    const features = getPublicAppConfig().features;
+    const features = (await getPublicAppConfig()).features;
 
     // If creator exists, return creator details as primary data
     if (creator) {
@@ -1934,6 +1934,14 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
         await invalidateOtherMemberCacheForFirebaseUid(user.firebaseUid);
       } catch (syncErr) {
         console.error('⚠️ [USER] Stream/cache sync after profile update failed:', syncErr);
+      }
+      try {
+        const { onUserProfileMaybeUpdated } = await import(
+          '../consumer-rewards/hooks'
+        );
+        onUserProfileMaybeUpdated(user._id);
+      } catch {
+        // non-fatal
       }
     }
 

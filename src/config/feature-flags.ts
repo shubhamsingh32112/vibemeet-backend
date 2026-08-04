@@ -105,5 +105,7 @@ export const featureFlags = {
   vipProfileFrameEnabled: process.env.VIP_PROFILE_FRAME_ENABLED === 'true',
   /** VIP priority support bump on tickets (opt-in perk). */
   vipSupportEnabled: process.env.VIP_SUPPORT_ENABLED === 'true',
+  /** Consumer daily check-in rewards (opt-in). */
+  dailyCheckInEnabled: process.env.DAILY_CHECKIN_ENABLED === 'true',
 };
 

@@ -30,6 +30,8 @@ import routes from './routes';
 import { cleanupStaleCreatorLocks } from './modules/video/video.webhook';
 import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getWeeklyPeriodBounds } from './modules/creator/creator-tasks.config';
+import { startDailyCheckInReminderJob } from './modules/checkin/checkin-reminder.job';
+import { startRewardReconciliationJob } from './modules/consumer-rewards/reward-reconciliation.job';
 import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { requestContextMiddleware } from './middlewares/request-context.middleware';
 import { requestQueueMiddleware } from './middlewares/request-queue.middleware';
@@ -346,6 +348,9 @@ if (runsApiHygieneIntervals()) {
       logError('Creator lock cleanup failed', err);
     });
   }, 5 * 60 * 1000);
+
+  startDailyCheckInReminderJob();
+  startRewardReconciliationJob();
 }
 
 registerShutdownHandlers();
