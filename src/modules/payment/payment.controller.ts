@@ -22,6 +22,7 @@ import { recordPaymentMetric } from '../../utils/monitoring';
 import { resolveRechargeBenefits } from './recharge-pricing.service';
 import { createPendingBonusCoinTransaction } from './payment-finalization.service';
 import { observeCapturedPaymentBestEffort } from './razorpay-captured-payment-projection.service';
+import { reconcileCapturedWalletPayment } from './wallet-payment-reconcile.service';
 import {
   attachCheckoutOrder,
   buildNeutralReturnTargets,
@@ -424,12 +425,21 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
       },
     });
 
-    await createPendingCoinTransaction(
-      user._id.toString(),
-      order.id,
-      activePack.coins,
-      chargedPriceInr,
-    );
+    try {
+      await createPendingCoinTransaction(
+        user._id.toString(),
+        order.id,
+        activePack.coins,
+        chargedPriceInr,
+      );
+    } catch (pendingError) {
+      logError('payment.orphan_razorpay_order pending tx create failed', pendingError, {
+        orderId: order.id,
+        userId: user._id.toString(),
+      });
+      recordPaymentMetric('web.create_order_failed', 1, { reason: 'pending_tx_create_failed' });
+      throw pendingError;
+    }
     await attachCheckoutOrder(session.checkoutId, order.id);
 
     const sessionBonusCoins =
@@ -452,6 +462,16 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
     recordPaymentMetric('web.create_order_success', 1);
     recordPaymentMetric('web.create_order_duration_ms', Date.now() - startedAt, { status: 'success' });
     const totalCoinsReceived = activePack.coins + sessionBonusCoins;
+    const prefill: { email?: string; contact?: string; name?: string } = {};
+    if (user.email && !String(user.email).toLowerCase().includes('void@')) {
+      prefill.email = String(user.email);
+    }
+    if (user.phone) {
+      prefill.contact = String(user.phone);
+    }
+    if (user.displayName || user.username) {
+      prefill.name = String(user.displayName || user.username);
+    }
     res.json({
       success: true,
       data: {
@@ -464,6 +484,7 @@ export const createWebOrder = async (req: Request, res: Response): Promise<void>
         vipBonusApplied: sessionBonusCoins > 0,
         keyId: process.env.RAZORPAY_KEY_ID,
         checkoutId: session.checkoutId,
+        prefill,
         returnTargets: buildNeutralReturnTargets(
           session,
           (status, reason) => buildPaymentStatusDeepLink(status, { reason }),
@@ -621,19 +642,41 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       }
     }
 
-    const transaction = await findPendingTransactionByOrderId(razorpay_order_id);
+    let transaction = await findPendingTransactionByOrderId(razorpay_order_id);
     if (!transaction) {
-      res.status(404).json({
-        success: false,
-        error: 'Transaction not found',
-        data: {
-          appOpenUrl: buildPaymentStatusDeepLink('failed', {
-            sessionId: checkoutToken,
-            reason: 'txn_not_found',
-          }),
-        },
+      const healed = await reconcileCapturedWalletPayment({
+        orderId: razorpay_order_id,
+        paymentId: razorpay_payment_id,
+        source: 'verify',
+        expectedUserId: user._id.toString(),
       });
-      return;
+      if (healed.outcome !== 'credited' && healed.outcome !== 'already_completed') {
+        res.status(404).json({
+          success: false,
+          error: 'Transaction not found',
+          data: {
+            appOpenUrl: buildPaymentStatusDeepLink('failed', {
+              sessionId: checkoutToken,
+              reason: 'txn_not_found',
+            }),
+          },
+        });
+        return;
+      }
+      transaction = await findPendingTransactionByOrderId(razorpay_order_id);
+      if (!transaction) {
+        res.status(404).json({
+          success: false,
+          error: 'Transaction not found',
+          data: {
+            appOpenUrl: buildPaymentStatusDeepLink('failed', {
+              sessionId: checkoutToken,
+              reason: 'txn_not_found',
+            }),
+          },
+        });
+        return;
+      }
     }
     if (transaction.userId.toString() !== user._id.toString()) {
       res.status(403).json({
@@ -672,29 +715,49 @@ export const verifyWebPayment = async (req: Request, res: Response): Promise<voi
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'UNKNOWN_FINALIZE_ERROR';
-      const statusCode =
-        message === 'TRANSACTION_NOT_FOUND'
-          ? 404
-          : message === 'TRANSACTION_USER_MISMATCH'
-            ? 403
-            : 500;
-      const reason =
-        message === 'TRANSACTION_NOT_FOUND'
-          ? 'txn_not_found'
-          : message === 'TRANSACTION_USER_MISMATCH'
-            ? 'txn_user_mismatch'
-            : 'finalize_error';
-      res.status(statusCode).json({
-        success: false,
-        error: 'Failed to finalize payment',
-        data: {
-          appOpenUrl: buildPaymentStatusDeepLink('failed', {
-            sessionId: checkoutToken,
-            reason,
-          }),
-        },
-      });
-      return;
+      if (message === 'TRANSACTION_NOT_FOUND') {
+        const healed = await reconcileCapturedWalletPayment({
+          orderId: razorpay_order_id,
+          paymentId: razorpay_payment_id,
+          source: 'verify',
+          expectedUserId: user._id.toString(),
+        });
+        if (healed.outcome === 'credited' || healed.outcome === 'already_completed') {
+          finalizeResult = {
+            status: healed.finalizeStatus || 'completed',
+            transaction,
+            updatedUserCoins: healed.updatedUserCoins ?? (user.coins || 0),
+            coinsAdded: healed.coinsAdded ?? 0,
+          };
+        } else {
+          res.status(404).json({
+            success: false,
+            error: 'Failed to finalize payment',
+            data: {
+              appOpenUrl: buildPaymentStatusDeepLink('failed', {
+                sessionId: checkoutToken,
+                reason: 'txn_not_found',
+              }),
+            },
+          });
+          return;
+        }
+      } else {
+        const statusCode = message === 'TRANSACTION_USER_MISMATCH' ? 403 : 500;
+        const reason =
+          message === 'TRANSACTION_USER_MISMATCH' ? 'txn_user_mismatch' : 'finalize_error';
+        res.status(statusCode).json({
+          success: false,
+          error: 'Failed to finalize payment',
+          data: {
+            appOpenUrl: buildPaymentStatusDeepLink('failed', {
+              sessionId: checkoutToken,
+              reason,
+            }),
+          },
+        });
+        return;
+      }
     }
     await observeCapturedPaymentBestEffort(providerPayment, 'wallet_verification');
 
@@ -849,7 +912,11 @@ const isRetriableWebhookFailure = (message: string): boolean => {
   if (!message) return true;
   if (message.startsWith('PAYMENT_ORDER_MISMATCH')) return false;
   if (message.startsWith('TRANSACTION_USER_MISMATCH')) return false;
-  if (message.startsWith('TRANSACTION_NOT_FOUND')) return false;
+  // Missing pending can race create-order; reconcile heals when notes are complete.
+  // Keep briefly retriable for incomplete-note races; permanent skips use explicit reasons.
+  if (message === 'user_not_found' || message === 'user_deleted_after_credit') return false;
+  if (message === 'notes_missing_coins' || message === 'notes_missing_price') return false;
+  if (message === 'not_wallet_product' || message === 'amount_mismatch') return false;
   return true;
 };
 
@@ -930,7 +997,41 @@ async function processStoredRazorpayWebhookEvent(
   const processStartedAt = Date.now();
   try {
     const providerCheck = await verifyProviderPaymentCaptured(orderId, paymentId);
-    const finalizeResult = await finalizePaymentAtomically({ orderId, paymentId });
+    let finalizeResult;
+    try {
+      finalizeResult = await finalizePaymentAtomically({ orderId, paymentId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'webhook_finalize_error';
+      if (!message.startsWith('TRANSACTION_NOT_FOUND')) {
+        throw error;
+      }
+      const healed = await reconcileCapturedWalletPayment({
+        orderId,
+        paymentId,
+        source: 'webhook',
+      });
+      if (healed.outcome === 'credited' || healed.outcome === 'already_completed') {
+        finalizeResult = {
+          status: healed.finalizeStatus || 'completed',
+          coinsAdded: healed.coinsAdded ?? 0,
+          updatedUserCoins: healed.updatedUserCoins ?? 0,
+        };
+      } else if (healed.reason === 'user_deleted_after_credit') {
+        await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
+          status: 'processed',
+          processedAt: new Date(),
+          failureReason: undefined,
+          nextRetryAt: null,
+        });
+        recordPaymentMetric('webhook.processed', 1, {
+          eventType,
+          finalizeStatus: 'user_deleted_after_credit',
+        });
+        return { outcome: 'processed' };
+      } else {
+        throw new Error(healed.reason || 'TRANSACTION_NOT_FOUND');
+      }
+    }
     await observeCapturedPaymentBestEffort(providerCheck.payment, 'wallet_webhook');
     await PaymentWebhookEvent.findByIdAndUpdate(claimed._id, {
       status: 'processed',

@@ -16,6 +16,7 @@ import {
 } from '../modules/video/call-reconciliation';
 import { startVipReconciliationJob } from '../modules/vip/vip-scheduling.reconciliation';
 import { startPaymentWebhookRetryWorker } from '../modules/payment/payment-webhook-retry.service';
+import { startWalletPaymentReconcileSweepWorker } from '../modules/payment/wallet-payment-reconcile-sweep.service';
 import { logInfo, logError } from '../utils/logger';
 
 export function bootstrapBillingWorkers(io: Server): void {
@@ -38,4 +39,5 @@ export function bootstrapBillingWorkers(io: Server): void {
   startCallReconciliationJob(io);
   startVipReconciliationJob();
   startPaymentWebhookRetryWorker();
+  startWalletPaymentReconcileSweepWorker();
 }

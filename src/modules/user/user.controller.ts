@@ -583,8 +583,12 @@ export const deleteAccount = async (req: Request, res: Response): Promise<void> 
       // Continue with deletion even if identity storage fails
     }
 
+    // Preserve payment ledger rows for finance reconciliation (Razorpay captures).
     await Promise.all([
-      CoinTransaction.deleteMany({ userId: user._id }),
+      CoinTransaction.deleteMany({
+        userId: user._id,
+        source: { $nin: ['payment_gateway', 'recharge_bonus'] },
+      }),
       CallHistory.deleteMany({ ownerUserId: user._id }),
       creator ? Creator.deleteOne({ _id: creator._id }) : Promise.resolve(),
       User.deleteOne({ _id: user._id }),

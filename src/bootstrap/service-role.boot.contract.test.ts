@@ -35,6 +35,7 @@ test('billing-worker bootstrap owns BullMQ and reconciliation loops', () => {
   assert.ok(billing.includes('startBillingWatchdog'));
   assert.ok(billing.includes('startCallReconciliationJob'));
   assert.ok(billing.includes('startPaymentWebhookRetryWorker'));
+  assert.ok(billing.includes('startWalletPaymentReconcileSweepWorker'));
 });
 
 test('billing queue respects api-ws role and zero concurrency', () => {
