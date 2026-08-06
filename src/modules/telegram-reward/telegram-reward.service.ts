@@ -222,7 +222,7 @@ export async function handleTelegramWebhook(input: {
   if (!text.startsWith('/start')) {
     await sendTelegramMessage(
       chatId,
-      'Open MatchVibe and tap Link Telegram on the FREE COINS button to connect your account.'
+      'Open MatchVibe → FREE COINS → Join Channel, then tap Connect account so we can link your profile.'
     );
     return { ok: true };
   }
@@ -231,7 +231,7 @@ export async function handleTelegramWebhook(input: {
   if (!startArg) {
     await sendTelegramMessage(
       chatId,
-      'Open MatchVibe and tap Link Telegram to generate a secure link.'
+      'Missing link. Return to MatchVibe, tap Connect account (must open from the app so your account can be verified), then press Start here.'
     );
     return { ok: true };
   }

@@ -6,7 +6,7 @@
  */
 import { validateCreatorPriceForApi, type AllowedCreatorPrice } from './creator-price.config';
 
-const FALLBACK: AllowedCreatorPrice = 60;
+const FALLBACK: AllowedCreatorPrice = 1800;
 
 /**
  * Price forced server-side for BD onboarding and host self-completion — never from client body.

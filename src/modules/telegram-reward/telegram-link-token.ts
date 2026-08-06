@@ -4,9 +4,19 @@ import {
   TELEGRAM_LINK_TOKEN_TTL_MS,
 } from './telegram-reward.config';
 
-function base64UrlEncode(input: Buffer | string): string {
-  const buf = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
-  return buf
+/**
+ * Telegram deep-link `start` payload max length is 64 characters.
+ * Compact binary format (base64url):
+ *   ObjectId(12) || expUnixSec BE u32 (4) || HMAC-SHA256(body)[:10] (10)
+ * → 26 bytes → ~35 base64url chars (fits well under 64).
+ */
+const OBJECT_ID_BYTES = 12;
+const EXP_BYTES = 4;
+const SIG_BYTES = 10;
+const PAYLOAD_BYTES = OBJECT_ID_BYTES + EXP_BYTES + SIG_BYTES;
+
+function base64UrlEncode(input: Buffer): string {
+  return input
     .toString('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
@@ -19,32 +29,46 @@ function base64UrlDecode(input: string): Buffer {
   return Buffer.from(padded + '='.repeat(padLen), 'base64');
 }
 
-function sign(payload: string, secret: string): string {
-  return base64UrlEncode(createHmac('sha256', secret).update(payload).digest());
+function safeEqual(a: Buffer, b: Buffer): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
+function hmacBody(body: Buffer, secret: string): Buffer {
+  return createHmac('sha256', secret).update(body).digest().subarray(0, SIG_BYTES);
+}
+
+function isHexObjectId(userId: string): boolean {
+  return /^[a-f0-9]{24}$/i.test(userId);
 }
 
 /**
- * Payload format (before base64url of whole token):
- *   userId.exp.sig
- * where sig = HMAC-SHA256(userId.exp)
- * Outer deep-link start arg is base64url(userId.exp.sig) without dots escaping issues.
+ * Create a signed start payload for `https://t.me/<bot>?start=<payload>`.
+ * Must stay ≤ 64 characters (Telegram Bot API limit).
  */
 export function createTelegramLinkPayload(userId: string, now = Date.now()): string {
   const secret = getTelegramLinkTokenSecret();
   if (!secret) {
     throw new Error('TELEGRAM_LINK_TOKEN_SECRET (or JWT_SECRET) is not configured');
   }
-  const exp = now + TELEGRAM_LINK_TOKEN_TTL_MS;
-  const body = `${userId}.${exp}`;
-  const sig = sign(body, secret);
-  return base64UrlEncode(`${body}.${sig}`);
+  if (!isHexObjectId(userId)) {
+    throw new Error('userId must be a 24-char hex ObjectId');
+  }
+
+  const idBuf = Buffer.from(userId.toLowerCase(), 'hex');
+  const expSec = Math.floor((now + TELEGRAM_LINK_TOKEN_TTL_MS) / 1000);
+  const expBuf = Buffer.alloc(EXP_BYTES);
+  expBuf.writeUInt32BE(expSec >>> 0, 0);
+
+  const body = Buffer.concat([idBuf, expBuf]);
+  const sig = hmacBody(body, secret);
+  const payload = base64UrlEncode(Buffer.concat([body, sig]));
+
+  if (payload.length > 64) {
+    // Defensive — binary layout must never exceed Telegram's start limit.
+    throw new Error(`Telegram start payload too long (${payload.length})`);
+  }
+  return payload;
 }
 
 export function verifyTelegramLinkPayload(
@@ -54,24 +78,25 @@ export function verifyTelegramLinkPayload(
   const secret = getTelegramLinkTokenSecret();
   if (!secret || !startPayload) return null;
 
-  let decoded: string;
+  let buf: Buffer;
   try {
-    decoded = base64UrlDecode(startPayload.trim()).toString('utf8');
+    buf = base64UrlDecode(startPayload.trim());
   } catch {
     return null;
   }
 
-  const parts = decoded.split('.');
-  if (parts.length !== 3) return null;
-  const [userId, expStr, sig] = parts;
-  if (!userId || !expStr || !sig) return null;
+  if (buf.length !== PAYLOAD_BYTES) return null;
 
-  const exp = Number(expStr);
-  if (!Number.isFinite(exp) || exp < now) return null;
-
-  const body = `${userId}.${expStr}`;
-  const expected = sign(body, secret);
+  const body = buf.subarray(0, OBJECT_ID_BYTES + EXP_BYTES);
+  const sig = buf.subarray(OBJECT_ID_BYTES + EXP_BYTES);
+  const expected = hmacBody(body, secret);
   if (!safeEqual(sig, expected)) return null;
+
+  const expSec = body.readUInt32BE(OBJECT_ID_BYTES);
+  if (!Number.isFinite(expSec) || expSec * 1000 < now) return null;
+
+  const userId = body.subarray(0, OBJECT_ID_BYTES).toString('hex');
+  if (!isHexObjectId(userId)) return null;
 
   return { userId };
 }

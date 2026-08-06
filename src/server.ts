@@ -32,6 +32,7 @@ import { CreatorTaskProgress } from './modules/creator/creator-task.model';
 import { getWeeklyPeriodBounds } from './modules/creator/creator-tasks.config';
 import { startDailyCheckInReminderJob } from './modules/checkin/checkin-reminder.job';
 import { startRewardReconciliationJob } from './modules/consumer-rewards/reward-reconciliation.job';
+import { startTelegramUpdatesPolling } from './modules/telegram-reward/telegram-updates-polling';
 import { logRequest, logError, logWarning, logInfo } from './utils/logger';
 import { requestContextMiddleware } from './middlewares/request-context.middleware';
 import { requestQueueMiddleware } from './middlewares/request-queue.middleware';
@@ -351,6 +352,8 @@ if (runsApiHygieneIntervals()) {
 
   startDailyCheckInReminderJob();
   startRewardReconciliationJob();
+  // Local/dev only: TELEGRAM_UPDATES_POLLING=true (clears webhook on that bot).
+  startTelegramUpdatesPolling();
 }
 
 registerShutdownHandlers();

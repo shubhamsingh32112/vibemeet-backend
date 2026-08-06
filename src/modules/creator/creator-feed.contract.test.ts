@@ -116,7 +116,7 @@ test('public creator DTO is an allowlist without identity, viewer, image IDs, or
       name: 'Display Name',
       about: 'Public biography',
       categories: ['wellness'],
-      price: 60,
+      price: 1800,
       age: 28,
       location: 'Mumbai',
     },

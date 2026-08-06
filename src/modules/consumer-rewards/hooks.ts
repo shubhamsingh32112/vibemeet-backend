@@ -20,6 +20,10 @@ import {
   type CreditResult,
 } from './credit-reward.service';
 import { TASK_REGISTRY } from './task-registry';
+import {
+  hasRewardQualifyingAvatar,
+  isProfileCompleteForReward,
+} from './profile-reward-eligibility';
 
 /** Free-tier view reasons that count toward watch_free_moments (not paid unlocks). */
 const FREE_VIEW_ACCESS_REASONS: ReadonlySet<MomentAccessReason> = new Set([
@@ -34,36 +38,6 @@ export function isFreeTierMomentAccess(
 ): boolean {
   if (!reason) return false;
   return FREE_VIEW_ACCESS_REASONS.has(reason as MomentAccessReason);
-}
-
-function hasApprovedAvatar(user: {
-  avatar?: {
-    imageId?: string | null;
-    moderationStatus?: string | null;
-  } | null;
-}): boolean {
-  if (!user.avatar?.imageId) return false;
-  const status = user.avatar.moderationStatus;
-  if (status == null || status === '' || status === undefined) return true;
-  return status === 'approved' || status === 'auto-ok';
-}
-
-function isProfileComplete(user: {
-  username?: string;
-  age?: number;
-  gender?: string;
-  avatar?: {
-    imageId?: string | null;
-    moderationStatus?: string | null;
-  } | null;
-}): boolean {
-  return (
-    hasApprovedAvatar(user) &&
-    Boolean(user.username && String(user.username).trim().length >= 4) &&
-    typeof user.age === 'number' &&
-    user.age >= 13 &&
-    Boolean(user.gender)
-  );
 }
 
 /**
@@ -97,7 +71,13 @@ export async function tryCreditProfilePhoto(
   const user = await User.findById(userId).select(
     '_id role avatar username age gender'
   );
-  if (!user || user.role !== 'user' || !hasApprovedAvatar(user)) return null;
+  if (
+    !user ||
+    user.role !== 'user' ||
+    !hasRewardQualifyingAvatar(user)
+  ) {
+    return null;
+  }
 
   const progress = await ensureUserRewardProgress(user._id);
   if (getClaimedAt(progress, 'upload_profile_photo')) {
@@ -123,9 +103,15 @@ export async function tryCreditCompleteProfile(
   if (coins < 1) return null;
 
   const user = await User.findById(userId).select(
-    '_id role avatar username age gender coins'
+    '_id role avatar username age gender coins usernameChangeCount'
   );
-  if (!user || user.role !== 'user' || !isProfileComplete(user)) return null;
+  if (
+    !user ||
+    user.role !== 'user' ||
+    !isProfileCompleteForReward(user)
+  ) {
+    return null;
+  }
 
   const progress = await ensureUserRewardProgress(user._id);
   if (getClaimedAt(progress, 'complete_profile')) {
@@ -605,7 +591,7 @@ export async function tryCreditWatchOrLikeDaily(
 
 // test helpers
 export const __test = {
-  hasApprovedAvatar,
-  isProfileComplete,
+  hasRewardQualifyingAvatar,
+  isProfileCompleteForReward,
   isFreeTierMomentAccess,
 };

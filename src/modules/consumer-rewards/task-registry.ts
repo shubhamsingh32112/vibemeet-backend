@@ -44,7 +44,7 @@ export const TASK_REGISTRY: Record<ConsumerRewardTaskKey, TaskMeta> = {
   upload_profile_photo: {
     key: 'upload_profile_photo',
     title: 'Upload Profile Photo',
-    description: 'Add a profile photo to earn coins.',
+    description: 'Upload your own photo (default avatars do not count).',
     cadence: 'once',
     source: 'profile_photo_reward',
     claimMode: 'auto',
@@ -53,7 +53,7 @@ export const TASK_REGISTRY: Record<ConsumerRewardTaskKey, TaskMeta> = {
   complete_profile: {
     key: 'complete_profile',
     title: 'Complete Profile',
-    description: 'Add photo, name, age, and gender.',
+    description: 'Set a custom photo, username, age, and gender.',
     cadence: 'once',
     source: 'profile_complete_reward',
     claimMode: 'auto',

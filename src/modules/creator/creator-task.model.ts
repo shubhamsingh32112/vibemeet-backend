@@ -3,10 +3,10 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface ICreatorTaskProgress extends Document {
   _id: mongoose.Types.ObjectId;
   creatorUserId: mongoose.Types.ObjectId; // userId of creator
-  taskKey: string; // e.g. "paid_coins_15000"
+  taskKey: string; // e.g. "paid_coins_15000" (claim identity; thresholds are live config)
   /** @deprecated legacy daily minute tasks — kept optional for old docs */
   thresholdMinutes?: number;
-  thresholdPaidCoins: number; // 15000, 20000, 30000
+  thresholdPaidCoins: number; // e.g. 450000, 600000, 900000
   rewardCoins: number;
   periodStart: Date; // Start of the weekly period this record belongs to
   completedAt?: Date; // when threshold reached

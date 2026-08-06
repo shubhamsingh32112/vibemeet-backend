@@ -24,6 +24,10 @@ import {
   tryCreditProfilePhoto,
   tryCreditWatchOrLikeDaily,
 } from './hooks';
+import {
+  hasRewardQualifyingAvatar,
+  isProfileCompleteForReward,
+} from './profile-reward-eligibility';
 
 export type HubTaskItem = {
   key: ConsumerRewardTaskKey;
@@ -43,36 +47,6 @@ export type HubPayload = {
   coinsBalance: number;
   tasks: HubTaskItem[];
 };
-
-function hasApprovedAvatar(user: {
-  avatar?: {
-    imageId?: string | null;
-    moderationStatus?: string | null;
-  } | null;
-}): boolean {
-  if (!user.avatar?.imageId) return false;
-  const status = user.avatar.moderationStatus;
-  if (status == null || status === '') return true;
-  return status === 'approved' || status === 'auto-ok';
-}
-
-function isProfileComplete(user: {
-  username?: string;
-  age?: number;
-  gender?: string;
-  avatar?: {
-    imageId?: string | null;
-    moderationStatus?: string | null;
-  } | null;
-}): boolean {
-  return (
-    hasApprovedAvatar(user) &&
-    Boolean(user.username && user.username.trim().length >= 4) &&
-    typeof user.age === 'number' &&
-    user.age >= 13 &&
-    Boolean(user.gender)
-  );
-}
 
 function ensureDailyBucket(
   progress: IUserRewardProgress,
@@ -95,7 +69,7 @@ export async function getRewardsHubForUser(input: {
 }): Promise<HubPayload> {
   const cfg = await getOrCreateConsumerRewardConfig();
   const user = await User.findOne({ firebaseUid: input.firebaseUid }).select(
-    '_id role coins username age gender avatar firebaseUid'
+    '_id role coins username age gender avatar firebaseUid usernameChangeCount'
   );
   if (!user) {
     throw new ConsumerRewardError('User not found', 404);
@@ -256,9 +230,9 @@ export async function getRewardsHubForUser(input: {
     const claimed = Boolean(getClaimedAt(progress, key));
     let eligible = false;
     if (key === 'upload_profile_photo') {
-      eligible = hasApprovedAvatar(user);
+      eligible = hasRewardQualifyingAvatar(user);
     } else if (key === 'complete_profile') {
-      eligible = isProfileComplete(user);
+      eligible = isProfileCompleteForReward(user);
     } else {
       // first_* only claimable after event via auto credit; hub shows claimed/not
       eligible = false;
@@ -288,12 +262,21 @@ export async function getRewardsHubForUser(input: {
   };
 }
 
+function requireCreditResult(
+  result: CreditResultCompat | null,
+  message: string
+): CreditResultCompat {
+  if (result) return result;
+  // Do NOT return alreadyClaimed — that masked ineligible claims as success.
+  throw new ConsumerRewardError(message, 400, 'NOT_ELIGIBLE');
+}
+
 export async function claimRewardsTask(input: {
   firebaseUid: string;
   taskKey: string;
 }): Promise<CreditResultCompat> {
   const user = await User.findOne({ firebaseUid: input.firebaseUid }).select(
-    '_id role coins username age gender avatar'
+    '_id role coins username age gender avatar usernameChangeCount'
   );
   if (!user) throw new ConsumerRewardError('User not found', 404);
   if (user.role !== 'user') {
@@ -304,15 +287,25 @@ export async function claimRewardsTask(input: {
 
   switch (key) {
     case 'upload_profile_photo':
-      return (await tryCreditProfilePhoto(user._id)) ?? already(user.coins ?? 0);
+      return requireCreditResult(
+        await tryCreditProfilePhoto(user._id),
+        'Upload your own profile photo first (default avatars do not qualify)'
+      );
     case 'complete_profile':
-      return (await tryCreditCompleteProfile(user._id)) ?? already(user.coins ?? 0);
+      return requireCreditResult(
+        await tryCreditCompleteProfile(user._id),
+        'Complete your profile: custom photo, username, age, and gender'
+      );
     case 'follow_creators':
-      return (await tryCreditFollowCreators(user._id)) ?? already(user.coins ?? 0);
+      return requireCreditResult(
+        await tryCreditFollowCreators(user._id),
+        'Follow the required number of creators first'
+      );
     case 'watch_free_moments':
     case 'like_moments':
-      return (
-        (await tryCreditWatchOrLikeDaily(user._id, key)) ?? already(user.coins ?? 0)
+      return requireCreditResult(
+        await tryCreditWatchOrLikeDaily(user._id, key),
+        'Complete the daily progress target first'
       );
     case 'first_video_call':
     case 'first_message':
@@ -347,10 +340,6 @@ type CreditResultCompat = {
   coinsCredited: number;
   balance: number;
 };
-
-function already(balance: number): CreditResultCompat {
-  return { success: true, alreadyClaimed: true, coinsCredited: 0, balance };
-}
 
 // re-export helpers used by claim path only
 export { ConsumerRewardError };

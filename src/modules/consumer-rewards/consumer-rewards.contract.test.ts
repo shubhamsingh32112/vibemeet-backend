@@ -5,6 +5,12 @@ import {
   isFreeTierMomentAccess,
   __test as hookTest,
 } from './hooks';
+import {
+  hasRewardQualifyingAvatar,
+  isProfileCompleteForReward,
+  isSystemPresetImageId,
+} from './profile-reward-eligibility';
+import { getDefaultPresetImageId } from '../images/preset-image-ids';
 import { istDateKey, istDayBounds } from '../../utils/ist-time';
 import {
   createTelegramLinkPayload,
@@ -27,43 +33,119 @@ describe('isFreeTierMomentAccess', () => {
   });
 });
 
-describe('hasApprovedAvatar', () => {
-  test('requires imageId and approved/auto-ok/null status', () => {
-    assert.equal(hookTest.hasApprovedAvatar({ avatar: null }), false);
+describe('profile photo reward eligibility', () => {
+  const userId = new mongoose.Types.ObjectId('507f1f77bcf86cd799439011');
+
+  test('rejects null avatar and signup default / system presets', () => {
+    assert.equal(hasRewardQualifyingAvatar({ _id: userId, avatar: null }), false);
+
+    const defaultId = getDefaultPresetImageId();
+    if (defaultId) {
+      assert.equal(isSystemPresetImageId(defaultId), true);
+      // signup default: approved preset + uploadedBy null
+      assert.equal(
+        hasRewardQualifyingAvatar({
+          _id: userId,
+          avatar: {
+            imageId: defaultId,
+            moderationStatus: 'approved',
+            uploadedBy: null,
+          },
+        }),
+        false
+      );
+      // even with uploadedBy set, presets never qualify
+      assert.equal(
+        hasRewardQualifyingAvatar({
+          _id: userId,
+          avatar: {
+            imageId: defaultId,
+            moderationStatus: 'approved',
+            uploadedBy: userId,
+          },
+        }),
+        false
+      );
+    }
+  });
+
+  test('accepts user-owned non-preset upload with auto-ok/approved', () => {
     assert.equal(
-      hookTest.hasApprovedAvatar({ avatar: { imageId: 'img1' } }),
-      true
-    );
-    assert.equal(
-      hookTest.hasApprovedAvatar({
-        avatar: { imageId: 'img1', moderationStatus: 'approved' },
+      hasRewardQualifyingAvatar({
+        _id: userId,
+        avatar: {
+          imageId: 'user-uploaded-cloudflare-id-xyz',
+          moderationStatus: 'auto-ok',
+          uploadedBy: userId,
+        },
       }),
       true
     );
     assert.equal(
-      hookTest.hasApprovedAvatar({
-        avatar: { imageId: 'img1', moderationStatus: 'auto-ok' },
-      }),
-      true
-    );
-    assert.equal(
-      hookTest.hasApprovedAvatar({
-        avatar: { imageId: 'img1', moderationStatus: 'pending' },
+      hasRewardQualifyingAvatar({
+        _id: userId,
+        avatar: {
+          imageId: 'user-uploaded-cloudflare-id-xyz',
+          moderationStatus: 'pending',
+          uploadedBy: userId,
+        },
       }),
       false
     );
     assert.equal(
-      hookTest.hasApprovedAvatar({
-        avatar: { imageId: 'img1', moderationStatus: 'rejected' },
+      hasRewardQualifyingAvatar({
+        _id: userId,
+        avatar: {
+          imageId: 'user-uploaded-cloudflare-id-xyz',
+          moderationStatus: 'approved',
+          uploadedBy: null,
+        },
       }),
       false
     );
+  });
+
+  test('complete profile requires qualifying avatar + real handle + age/gender', () => {
+    const incomplete = {
+      _id: userId,
+      username: 'uabc1234', // auto-looking
+      age: 26,
+      gender: 'male',
+      usernameChangeCount: 0,
+      avatar: {
+        imageId: 'user-uploaded-cloudflare-id-xyz',
+        moderationStatus: 'approved' as const,
+        uploadedBy: userId,
+      },
+    };
+    assert.equal(isProfileCompleteForReward(incomplete), false);
+    assert.equal(
+      isProfileCompleteForReward({
+        ...incomplete,
+        username: 'CoolUser',
+        usernameChangeCount: 1,
+      }),
+      true
+    );
+    // custom name without changeCount also ok if not auto pattern
+    assert.equal(
+      isProfileCompleteForReward({
+        ...incomplete,
+        username: 'CoolUser',
+        usernameChangeCount: 0,
+      }),
+      true
+    );
+  });
+
+  test('hook __test aliases match eligibility helpers', () => {
+    assert.equal(hookTest.hasRewardQualifyingAvatar, hasRewardQualifyingAvatar);
+    assert.equal(hookTest.isProfileCompleteForReward, isProfileCompleteForReward);
   });
 });
 
 describe('first_recharge gate logic', () => {
   test('true-first is exactly one prior gateway credit after finalize', () => {
-    // Documented rule: after payment finalize, count === 1 → credit; count > 1 → skip
     const firstPurchaseCount = 1;
     const legacyRechargeCount = 5;
     assert.equal(firstPurchaseCount === 1, true);
@@ -90,10 +172,9 @@ describe('reward transactionId uniqueness', () => {
   });
 
   test('daily watch txn encodes IST dateKey — midnight boundary', () => {
-    // Instant just before IST midnight and just after → different date keys
-    const preMidnightUtc = new Date('2026-08-01T18:29:59.000Z'); // 23:59:59 IST
-    const midnightUtc = new Date('2026-08-01T18:30:00.000Z'); // 00:00:00 IST
-    const postMidnightUtc = new Date('2026-08-01T18:30:01.000Z'); // 00:00:01 IST
+    const preMidnightUtc = new Date('2026-08-01T18:29:59.000Z');
+    const midnightUtc = new Date('2026-08-01T18:30:00.000Z');
+    const postMidnightUtc = new Date('2026-08-01T18:30:01.000Z');
 
     const d1 = istDateKey(preMidnightUtc);
     const d2 = istDateKey(midnightUtc);
@@ -109,7 +190,6 @@ describe('reward transactionId uniqueness', () => {
     const txnDay2 = `moment_watch_daily_reward_${uid}_${d2}`;
     assert.notEqual(txnDay1, txnDay2);
 
-    // Bounds for day1 end at IST midnight which is day2 start
     const b1 = istDayBounds(d1);
     assert.equal(istDateKey(new Date(b1.end.getTime() - 1)), d1);
     assert.equal(istDateKey(b1.end), d2);
@@ -117,6 +197,14 @@ describe('reward transactionId uniqueness', () => {
 });
 
 describe('telegram link token + webhook idempotency contract', () => {
+  test('start payload fits Telegram 64-char deep-link limit', () => {
+    process.env.TELEGRAM_LINK_TOKEN_SECRET = 'test-secret-for-rewards-hardening';
+    const userId = '507f1f77bcf86cd799439011';
+    const payload = createTelegramLinkPayload(userId, Date.now());
+    assert.ok(payload.length > 0 && payload.length <= 64, `len=${payload.length}`);
+    assert.match(payload, /^[A-Za-z0-9_-]+$/);
+  });
+
   test('same payload verifies 10 times → same userId', () => {
     process.env.TELEGRAM_LINK_TOKEN_SECRET = 'test-secret-for-rewards-hardening';
     const userId = '507f1f77bcf86cd799439011';
@@ -126,6 +214,18 @@ describe('telegram link token + webhook idempotency contract', () => {
       assert.ok(v);
       assert.equal(v!.userId, userId);
     }
+  });
+
+  test('expired and tampered payloads reject', () => {
+    process.env.TELEGRAM_LINK_TOKEN_SECRET = 'test-secret-for-rewards-hardening';
+    const userId = '507f1f77bcf86cd799439011';
+    const past = Date.now() - 60 * 60 * 1000;
+    const expired = createTelegramLinkPayload(userId, past - 31 * 60 * 1000);
+    assert.equal(verifyTelegramLinkPayload(expired, Date.now()), null);
+
+    const good = createTelegramLinkPayload(userId, Date.now());
+    const tampered = `${good.slice(0, -1)}${good.endsWith('a') ? 'b' : 'a'}`;
+    assert.equal(verifyTelegramLinkPayload(tampered, Date.now()), null);
   });
 
   test('telegram claim txn id is stable (10× same = 1 ledger key)', () => {
@@ -159,9 +259,8 @@ describe('reward ledger source list', () => {
 describe('recon window', () => {
   test('detects ~01:30 IST window', () => {
     __resetReconJobState();
-    // 2026-08-02 01:35 IST = 2026-08-01 20:05 UTC
     const inWindow = new Date('2026-08-01T20:05:00.000Z');
-    const outWindow = new Date('2026-08-01T18:00:00.000Z'); // ~23:30 IST
+    const outWindow = new Date('2026-08-01T18:00:00.000Z');
     assert.equal(isInsideReconWindow(inWindow), true);
     assert.equal(isInsideReconWindow(outWindow), false);
   });

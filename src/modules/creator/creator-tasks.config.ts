@@ -26,9 +26,10 @@ export interface CreatorTaskDefinition {
 }
 
 export const CREATOR_TASKS: CreatorTaskDefinition[] = [
-  { key: 'paid_coins_15000', thresholdPaidCoins: 15000, rewardCoins: 100 },
-  { key: 'paid_coins_20000', thresholdPaidCoins: 20000, rewardCoins: 150 },
-  { key: 'paid_coins_30000', thresholdPaidCoins: 30000, rewardCoins: 300 },
+  // Keys kept for claim identity across periods; thresholds scaled ×30 with 1800 CPM.
+  { key: 'paid_coins_15000', thresholdPaidCoins: 450000, rewardCoins: 100 },
+  { key: 'paid_coins_20000', thresholdPaidCoins: 600000, rewardCoins: 150 },
+  { key: 'paid_coins_30000', thresholdPaidCoins: 900000, rewardCoins: 300 },
 ];
 
 /**

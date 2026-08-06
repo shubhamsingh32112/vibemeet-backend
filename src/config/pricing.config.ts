@@ -44,12 +44,12 @@ export const USER_COST_PER_SECOND: number = parseFloat(
 
 /**
  * Minimum coins required to start a call
- * Default: 10 coins
- * 
+ * Default: 450 coins (~15s at 1800 coins/min base tier)
+ *
  * Environment variable: MIN_COINS_TO_CALL
  */
 export const MIN_COINS_TO_CALL: number = parseInt(
-  process.env.MIN_COINS_TO_CALL || '10',
+  process.env.MIN_COINS_TO_CALL || '450',
   10
 );
 

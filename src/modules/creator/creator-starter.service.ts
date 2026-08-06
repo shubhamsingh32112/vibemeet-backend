@@ -8,7 +8,7 @@ import { getSystemDefaultHostPriceForNewHosts } from '../../config/host-price.co
 export const STARTER_CREATOR_ABOUT =
   'Complete your creator profile in the app to start connecting with fans.';
 /** @deprecated Prefer `getSystemDefaultHostPriceForNewHosts()` for new host rows. */
-export const DEFAULT_CREATOR_STARTER_PRICE = 60;
+export const DEFAULT_CREATOR_STARTER_PRICE = 1800;
 
 export function creatorPromotionWalletClearTransactionId(userId: string): string {
   return `creator_promotion_wallet_clear_${userId}`;

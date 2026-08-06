@@ -2,7 +2,7 @@
  * Creator video-call price tiers (coins per minute).
  * Only admin and assigned agent may set these when creating/editing a creator profile.
  */
-export const ALLOWED_CREATOR_PRICES = [60, 90, 120] as const;
+export const ALLOWED_CREATOR_PRICES = [1800, 2700, 3600] as const;
 
 export type AllowedCreatorPrice = (typeof ALLOWED_CREATOR_PRICES)[number];
 
