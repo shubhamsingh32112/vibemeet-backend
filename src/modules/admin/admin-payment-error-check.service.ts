@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { getRazorpayInstance, isRazorpayConfigured } from '../../config/razorpay';
 import { CoinTransaction } from '../user/coin-transaction.model';
 import { User } from '../user/user.model';
+import { CheckoutContext } from '../checkout/checkout-context.model';
 
 export type PaymentErrorCheckRow = {
   username: string | null;
@@ -18,7 +19,12 @@ export type PaymentErrorCheckRow = {
   walletNow: number | null;
   whenUtc: string;
   createdAtIso: string;
-  issue: 'OK_CREDITED' | 'PAID_BUT_PENDING' | 'PAID_BUT_FAILED' | 'NO_COIN_TRANSACTION';
+  issue:
+    | 'OK_CREDITED'
+    | 'PAID_BUT_PENDING'
+    | 'PAID_BUT_FAILED'
+    | 'NO_COIN_TRANSACTION'
+    | 'CREDITED_USER_DELETED';
 };
 
 export type PaymentErrorCheckResult = {
@@ -215,8 +221,20 @@ export async function runPaymentErrorCheck(input: {
     let issue: PaymentErrorCheckRow['issue'];
     let mongoTxLabel: string;
     if (!mainTx) {
-      issue = 'NO_COIN_TRANSACTION';
-      mongoTxLabel = 'missing';
+      const creditedCheckout = orderId
+        ? await CheckoutContext.findOne({ orderId, status: 'success' }).select('_id result').lean()
+        : null;
+      if (creditedCheckout) {
+        issue = 'CREDITED_USER_DELETED';
+        mongoTxLabel = 'credited (user/ledger deleted)';
+      } else if (userIdNote && !user) {
+        // Notes point at a user that no longer exists; without checkout proof treat as missing credit.
+        issue = 'NO_COIN_TRANSACTION';
+        mongoTxLabel = 'missing (user gone)';
+      } else {
+        issue = 'NO_COIN_TRANSACTION';
+        mongoTxLabel = 'missing';
+      }
     } else if (mainTx.status === 'completed') {
       issue = 'OK_CREDITED';
       mongoTxLabel = 'completed';
@@ -249,7 +267,7 @@ export async function runPaymentErrorCheck(input: {
       issue,
     };
 
-    if (issue === 'OK_CREDITED') gotCoins.push(row);
+    if (issue === 'OK_CREDITED' || issue === 'CREDITED_USER_DELETED') gotCoins.push(row);
     else paidNoCoins.push(row);
   }
 
