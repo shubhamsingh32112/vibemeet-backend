@@ -68,11 +68,14 @@ export function startTelegramUpdatesPolling(): void {
     let offset = 0;
     while (!stop) {
       try {
+        type PollUpdate = { update_id: number } & Parameters<
+          typeof handleTelegramWebhook
+        >[0]['update'];
         const updates = (await telegramCall(token, 'getUpdates', {
           offset,
           timeout: 25,
           allowed_updates: ['message'],
-        })) as Array<{ update_id: number } & Record<string, unknown>>;
+        })) as PollUpdate[];
 
         for (const update of updates) {
           offset = update.update_id + 1;
