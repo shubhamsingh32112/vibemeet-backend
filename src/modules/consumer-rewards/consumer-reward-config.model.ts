@@ -108,42 +108,38 @@ function mergeTasks(
   const defaults = buildDefaultTaskConfig();
   if (!raw) return defaults;
   const keys = Object.keys(defaults) as (keyof ConsumerRewardTasksConfig)[];
-  const out = { ...defaults };
+  const out: ConsumerRewardTasksConfig = { ...defaults };
   for (const k of keys) {
     const slice = raw[k];
     if (!slice || typeof slice !== 'object') continue;
-    out[k] = {
+    const def = defaults[k];
+    const merged: TaskConfigSlice = {
       enabled: slice.enabled !== false,
       coins:
         Number.isFinite(Number(slice.coins)) && Number(slice.coins) >= 0
           ? Math.floor(Number(slice.coins))
-          : defaults[k].coins,
-      ...(defaults[k].minSeconds !== undefined
-        ? {
-            minSeconds:
-              Number.isFinite(Number(slice.minSeconds)) && Number(slice.minSeconds) >= 0
-                ? Math.floor(Number(slice.minSeconds))
-                : defaults[k].minSeconds,
-          }
-        : {}),
-      ...(defaults[k].minPurchaseInr !== undefined
-        ? {
-            minPurchaseInr:
-              Number.isFinite(Number(slice.minPurchaseInr)) &&
-              Number(slice.minPurchaseInr) >= 0
-                ? Math.floor(Number(slice.minPurchaseInr))
-                : defaults[k].minPurchaseInr,
-          }
-        : {}),
-      ...(defaults[k].targetCount !== undefined
-        ? {
-            targetCount:
-              Number.isFinite(Number(slice.targetCount)) && Number(slice.targetCount) >= 1
-                ? Math.floor(Number(slice.targetCount))
-                : defaults[k].targetCount,
-          }
-        : {}),
+          : def.coins,
     };
+    if (def.minSeconds !== undefined) {
+      merged.minSeconds =
+        Number.isFinite(Number(slice.minSeconds)) && Number(slice.minSeconds) >= 0
+          ? Math.floor(Number(slice.minSeconds))
+          : def.minSeconds;
+    }
+    if (def.minPurchaseInr !== undefined) {
+      merged.minPurchaseInr =
+        Number.isFinite(Number(slice.minPurchaseInr)) &&
+        Number(slice.minPurchaseInr) >= 0
+          ? Math.floor(Number(slice.minPurchaseInr))
+          : def.minPurchaseInr;
+    }
+    if (def.targetCount !== undefined) {
+      merged.targetCount =
+        Number.isFinite(Number(slice.targetCount)) && Number(slice.targetCount) >= 1
+          ? Math.floor(Number(slice.targetCount))
+          : def.targetCount;
+    }
+    out[k] = merged;
   }
   return out;
 }

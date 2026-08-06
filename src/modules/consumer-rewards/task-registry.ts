@@ -3,6 +3,7 @@ import type {
   CoinTransactionSourceForReward,
   ConsumerRewardCadence,
 } from './task-keys';
+import type { ConsumerRewardTasksConfig } from './consumer-reward-config.model';
 import {
   envRewardCompleteProfileCoins,
   envRewardFirstMessageCoins,
@@ -133,7 +134,7 @@ export const TASK_REGISTRY: Record<ConsumerRewardTaskKey, TaskMeta> = {
   },
 };
 
-export function buildDefaultTaskConfig() {
+export function buildDefaultTaskConfig(): ConsumerRewardTasksConfig {
   return {
     upload_profile_photo: {
       enabled: true,

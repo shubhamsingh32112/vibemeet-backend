@@ -175,29 +175,31 @@ export async function creditOnceTaskReward(input: {
     await session.endSession();
   }
 
-  if (!result) {
+  // Assignments occur inside withTransaction callback; cast for CFA across closure.
+  const credited = result as CreditResult | null;
+  if (!credited) {
     recordRewardCreditFail(input.taskKey, 'WALLET');
     throw new ConsumerRewardError('Failed to credit reward', 500, 'WALLET');
   }
 
-  if (result.alreadyClaimed) {
+  if (credited.alreadyClaimed) {
     recordRewardCreditAlready(input.taskKey);
-  } else if (result.coinsCredited > 0) {
-    recordRewardCreditSuccess(input.taskKey, result.coinsCredited);
-    void trackRewardIssuance(result.coinsCredited);
+  } else if (credited.coinsCredited > 0) {
+    recordRewardCreditSuccess(input.taskKey, credited.coinsCredited);
+    void trackRewardIssuance(credited.coinsCredited);
     if (firebaseUid) {
-      await emitCoinsUpdated(firebaseUid, input.userId, result.balance);
+      await emitCoinsUpdated(firebaseUid, input.userId, credited.balance);
     }
     verifyUserBalance(input.userId).catch(() => {});
     logInfo('Consumer reward credited', {
       userId: input.userId.toString(),
       taskKey: input.taskKey,
-      coins: result.coinsCredited,
+      coins: credited.coinsCredited,
       transactionId: input.transactionId,
     });
   }
 
-  return result;
+  return credited;
 }
 
 /**
@@ -314,23 +316,25 @@ export async function creditDailyTaskReward(input: {
     await session.endSession();
   }
 
-  if (!result) {
+  // Assignments occur inside withTransaction callback; cast for CFA across closure.
+  const credited = result as CreditResult | null;
+  if (!credited) {
     recordRewardCreditFail(input.taskKey, 'WALLET');
     throw new ConsumerRewardError('Failed to credit reward', 500, 'WALLET');
   }
 
-  if (result.alreadyClaimed) {
+  if (credited.alreadyClaimed) {
     recordRewardCreditAlready(input.taskKey);
-  } else if (result.coinsCredited > 0) {
-    recordRewardCreditSuccess(input.taskKey, result.coinsCredited);
-    void trackRewardIssuance(result.coinsCredited);
+  } else if (credited.coinsCredited > 0) {
+    recordRewardCreditSuccess(input.taskKey, credited.coinsCredited);
+    void trackRewardIssuance(credited.coinsCredited);
     if (firebaseUid) {
-      await emitCoinsUpdated(firebaseUid, input.userId, result.balance);
+      await emitCoinsUpdated(firebaseUid, input.userId, credited.balance);
     }
     verifyUserBalance(input.userId).catch(() => {});
   }
 
-  return result;
+  return credited;
 }
 
 export async function assertTaskEnabled(

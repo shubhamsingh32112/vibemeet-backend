@@ -146,6 +146,7 @@ describe('profile photo reward eligibility', () => {
 
 describe('first_recharge gate logic', () => {
   test('true-first is exactly one prior gateway credit after finalize', () => {
+    // Documented rule: after payment finalize, count === 1 → credit; count > 1 → skip
     const firstPurchaseCount = 1;
     const legacyRechargeCount = 5;
     assert.equal(firstPurchaseCount === 1, true);

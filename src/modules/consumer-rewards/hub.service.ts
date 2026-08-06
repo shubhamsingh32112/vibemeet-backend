@@ -250,7 +250,8 @@ export async function getRewardsHubForUser(input: {
           ? 'claimable'
           : 'available',
       claimed,
-      claimable: !claimed && eligible && (key === 'upload_profile_photo' || key === 'complete_profile' || key === 'follow_creators' || key === 'watch_free_moments' || key === 'like_moments'),
+      // follow/watch/like already handled above; only photo/profile are claimable here
+      claimable: !claimed && eligible,
       cta: meta.cta,
     });
   }

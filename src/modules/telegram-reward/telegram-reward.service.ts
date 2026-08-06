@@ -557,12 +557,14 @@ export async function verifyAndClaimTelegramReward(input: {
     await session.endSession();
   }
 
-  if (!payload) {
+  // Assignments occur inside withTransaction callback; cast for CFA across closure.
+  const settled = payload as TelegramVerifyPayload | null;
+  if (!settled) {
     throw new TelegramRewardError('Failed to claim reward', 500, 'WALLET');
   }
 
-  if (!payload.alreadyClaimed && payload.coinsCredited > 0) {
-    await emitCoinsUpdated(user.firebaseUid, user._id, payload.balance);
+  if (!settled.alreadyClaimed && settled.coinsCredited > 0) {
+    await emitCoinsUpdated(user.firebaseUid, user._id, settled.balance);
     verifyUserBalance(user._id).catch((err) => {
       logWarning('telegram reward balance integrity check failed', {
         userId: user._id.toString(),
@@ -576,17 +578,17 @@ export async function verifyAndClaimTelegramReward(input: {
         recordRewardMetric,
       } = await import('../consumer-rewards/reward-metrics');
       recordRewardMetric('telegram_verify_ok', 1);
-      recordRewardCreditSuccess('telegram_join', payload.coinsCredited);
-      void trackRewardIssuance(payload.coinsCredited);
+      recordRewardCreditSuccess('telegram_join', settled.coinsCredited);
+      void trackRewardIssuance(settled.coinsCredited);
     } catch {
       // non-fatal
     }
     logInfo('Telegram join reward claimed', {
       userId: user._id.toString(),
-      coins: payload.coinsCredited,
-      balance: payload.balance,
+      coins: settled.coinsCredited,
+      balance: settled.balance,
     });
-  } else if (payload.alreadyClaimed) {
+  } else if (settled.alreadyClaimed) {
     try {
       const { recordRewardCreditAlready } = await import(
         '../consumer-rewards/reward-metrics'
@@ -597,5 +599,5 @@ export async function verifyAndClaimTelegramReward(input: {
     }
   }
 
-  return payload;
+  return settled;
 }

@@ -453,7 +453,19 @@ export const preSendMessage = async (
 
     // ── Transactional quota + coin + txn update ───────────────────────
     const session = await mongoose.startSession();
-    let responsePayload: object;
+    // Assigned inside withTransaction callback; typed optional for definite-assignment.
+    let responsePayload:
+      | {
+          success: true;
+          data: {
+            canSend: boolean;
+            freeRemaining: number;
+            coinsCharged: number;
+            userCoins: number;
+            error?: string;
+          };
+        }
+      | undefined;
 
     try {
       await session.withTransaction(async () => {
@@ -569,18 +581,20 @@ export const preSendMessage = async (
       await session.endSession();
     }
 
+    if (!responsePayload) {
+      res
+        .status(500)
+        .json({ success: false, error: 'Failed to validate message' });
+      return;
+    }
+
     // ── Cache result in the idempotency key ───────────────────────────
-    await redis.setex(lockKey, PRESEND_LOCK_TTL, JSON.stringify(responsePayload!));
+    await redis.setex(lockKey, PRESEND_LOCK_TTL, JSON.stringify(responsePayload));
 
     // Balance integrity check (fire-and-forget)
     verifyUserBalance(user._id).catch(() => {});
 
-    const canSend =
-      responsePayload &&
-      typeof responsePayload === 'object' &&
-      'data' in responsePayload &&
-      (responsePayload as { data?: { canSend?: boolean } }).data?.canSend === true;
-    if (canSend && user.role === 'user') {
+    if (responsePayload.data.canSend && user.role === 'user') {
       try {
         const { onUserSentMessage } = await import('../consumer-rewards/hooks');
         onUserSentMessage(user._id);
@@ -589,7 +603,7 @@ export const preSendMessage = async (
       }
     }
 
-    res.json(responsePayload!);
+    res.json(responsePayload);
   } catch (error) {
     console.error('❌ [CHAT] Error in pre-send:', error);
     res
