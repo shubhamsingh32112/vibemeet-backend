@@ -19,7 +19,7 @@ export interface ICoinTransaction extends Document {
   userId: mongoose.Types.ObjectId; // User involved in transaction
   type: 'credit' | 'debit'; // credit = coins added, debit = coins deducted
   coins: number; // Amount of coins (always positive, type indicates direction)
-  source: 'manual' | 'payment_gateway' | 'recharge_bonus' | 'admin' | 'video_call' | 'chat_message' | 'creator_task' | 'withdrawal' | 'welcome_bonus' | 'referral_reward' | 'moment_purchase' | 'moment_earnings' | 'moment_upload_reward' | 'vip_moment_free' | 'vip_membership' | 'moments_premium_membership' | 'daily_checkin' | 'telegram_join_reward' | 'profile_photo_reward' | 'profile_complete_reward' | 'first_video_call_reward' | 'first_message_reward' | 'invite_friend_reward' | 'first_recharge_reward' | 'moment_watch_daily_reward' | 'moment_like_daily_reward' | 'follow_creators_reward'; // Source of the transaction
+  source: 'manual' | 'payment_gateway' | 'recharge_bonus' | 'admin' | 'video_call' | 'chat_message' | 'creator_task' | 'withdrawal' | 'welcome_bonus' | 'referral_reward' | 'moment_purchase' | 'moment_earnings' | 'moment_upload_reward' | 'vip_moment_free' | 'vip_membership' | 'moments_premium_membership' | 'daily_checkin' | 'telegram_join_reward' | 'profile_photo_reward' | 'profile_complete_reward' | 'first_video_call_reward' | 'first_message_reward' | 'invite_friend_reward' | 'first_recharge_reward' | 'moment_watch_daily_reward' | 'moment_like_daily_reward' | 'follow_creators_reward' | 'creator_referral_reward'; // Source of the transaction
   description?: string; // Human-readable description
   /** Reason metadata for recharge_bonus (e.g. VIP, Referral, Festival). */
   bonusReason?: string;
@@ -88,6 +88,7 @@ const coinTransactionSchema = new Schema<ICoinTransaction>(
         'moment_watch_daily_reward',
         'moment_like_daily_reward',
         'follow_creators_reward',
+        'creator_referral_reward',
       ],
       default: 'manual',
     },

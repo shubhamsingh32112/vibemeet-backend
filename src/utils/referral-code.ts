@@ -3,12 +3,14 @@
  *
  * Legacy format (6 chars): [First 2 letters of name][4 random digits] e.g. JO4832
  * Current format (8 chars): [First 3 letters of name][5 random digits] e.g. JOE48392
+ * Creator format (9 chars): CR-[6 alphanumeric] e.g. CR-A7K2M9
  * Fallback when name missing: USR + 5 digits
  *
- * Validation accepts both legacy and current formats during transition.
+ * Validation accepts legacy, current, and creator formats.
  */
 
 const DIGITS = '0123456789';
+const CREATOR_CODE_ALPHANUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 /**
  * Extract first two uppercase letters from a name string.
@@ -46,6 +48,14 @@ function randomNDigits(n: number): string {
   return result;
 }
 
+function randomAlnum(n: number): string {
+  let result = '';
+  for (let i = 0; i < n; i++) {
+    result += CREATOR_CODE_ALPHANUM[Math.floor(Math.random() * CREATOR_CODE_ALPHANUM.length)];
+  }
+  return result;
+}
+
 /**
  * @deprecated Legacy 6-character generator — use generateReferralCode for new assignments.
  */
@@ -62,20 +72,39 @@ export function generateReferralCode(name?: string | null): string {
   return `${prefix}${randomNDigits(5)}`;
 }
 
+/**
+ * Generate a creator affiliate referral code: CR- + 6 alphanumeric.
+ */
+export function generateCreatorReferralCode(): string {
+  return `CR-${randomAlnum(6)}`;
+}
+
 /** Legacy: 2 uppercase letters + 4 digits */
 const REFERRAL_CODE_REGEX_V1 = /^[A-Z]{2}\d{4}$/;
 
 /** Current: 3 uppercase letters + 5 digits */
 const REFERRAL_CODE_REGEX_V2 = /^[A-Z]{3}\d{5}$/;
 
+/** Creator affiliate: CR- + 6 alphanumeric */
+const REFERRAL_CODE_REGEX_CREATOR = /^CR-[A-Z0-9]{6}$/;
+
 /**
- * Validate referral code format (legacy 6-char or current 8-char).
+ * True when code matches creator affiliate format (CR-XXXXXX).
+ */
+export function isCreatorReferralCodeFormat(code: string | null | undefined): boolean {
+  if (!code || typeof code !== 'string') return false;
+  return REFERRAL_CODE_REGEX_CREATOR.test(code.trim().toUpperCase());
+}
+
+/**
+ * Validate referral code format (legacy 6-char, current 8-char, or creator CR-).
  */
 export function isValidReferralCodeFormat(code: string | null | undefined): boolean {
   if (!code || typeof code !== 'string') return false;
   const trimmed = code.trim().toUpperCase();
   if (trimmed.length === 6 && REFERRAL_CODE_REGEX_V1.test(trimmed)) return true;
   if (trimmed.length === 8 && REFERRAL_CODE_REGEX_V2.test(trimmed)) return true;
+  if (REFERRAL_CODE_REGEX_CREATOR.test(trimmed)) return true;
   return false;
 }
 
@@ -102,4 +131,18 @@ export async function generateUniqueReferralCode(
     if (!exists) return code;
   }
   throw new Error('Unable to generate unique referral code after retries');
+}
+
+/**
+ * Generate a unique creator CR- referral code.
+ */
+export async function generateUniqueCreatorReferralCode(
+  existsChecker: (code: string) => Promise<boolean>
+): Promise<string> {
+  for (let i = 0; i < MAX_UNIQUE_RETRIES; i++) {
+    const code = generateCreatorReferralCode();
+    const exists = await existsChecker(code);
+    if (!exists) return code;
+  }
+  throw new Error('Unable to generate unique creator referral code after retries');
 }

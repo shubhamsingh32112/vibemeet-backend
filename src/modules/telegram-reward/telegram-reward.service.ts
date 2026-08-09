@@ -588,12 +588,29 @@ export async function verifyAndClaimTelegramReward(input: {
       coins: settled.coinsCredited,
       balance: settled.balance,
     });
+    try {
+      const { onCreatorReferralTelegramClaimed } = await import(
+        '../creator-referral/creator-referral-reward.service'
+      );
+      onCreatorReferralTelegramClaimed(user._id);
+    } catch {
+      // non-fatal
+    }
   } else if (settled.alreadyClaimed) {
     try {
       const { recordRewardCreditAlready } = await import(
         '../consumer-rewards/reward-metrics'
       );
       recordRewardCreditAlready('telegram_join');
+    } catch {
+      // non-fatal
+    }
+    // Already claimed earlier — still mark creator referral edge if present.
+    try {
+      const { onCreatorReferralTelegramClaimed } = await import(
+        '../creator-referral/creator-referral-reward.service'
+      );
+      onCreatorReferralTelegramClaimed(user._id);
     } catch {
       // non-fatal
     }

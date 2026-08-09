@@ -15,6 +15,8 @@ export function referralUserFacingMessage(code: ApplyReferralCodeErrorCode): str
       return 'Referral already used';
     case 'CREATOR_CANNOT_REFER':
       return "This referral code can't be used";
+    case 'CREATOR_DISABLED':
+      return 'This referral code is no longer valid';
     case 'WINDOW_EXPIRED':
       return 'Referral code can no longer be applied (time limit expired)';
     case 'PURCHASE_ALREADY':

@@ -22,6 +22,7 @@ import {
   getBlockedCreatorsCount,
   deleteAccount,
 } from './user.controller';
+import { getMyCreatorReferrals } from '../creator-referral/creator-referral.controller';
 import { verifyFirebaseToken } from '../../middlewares/auth.middleware';
 import { referralApplyLimiter } from '../../middlewares/rate-limit.middleware';
 
@@ -29,6 +30,7 @@ const router = Router();
 
 router.get('/me', verifyFirebaseToken, getMe);
 router.get('/referrals', verifyFirebaseToken, getReferrals);
+router.get('/creator-referrals', verifyFirebaseToken, getMyCreatorReferrals);
 router.post('/referral/apply', verifyFirebaseToken, referralApplyLimiter, applyReferralPost);
 router.post(
   '/referral/apply-agency',

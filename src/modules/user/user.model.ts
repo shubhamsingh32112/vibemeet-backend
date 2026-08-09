@@ -422,7 +422,8 @@ const userSchema = new Schema<IUser>(
       trim: true,
       uppercase: true,
       index: true,
-      maxlength: 8,
+      // Legacy 6/8 + creator CR-XXXXXX (9 chars)
+      maxlength: 16,
     },
     referredBy: {
       type: Schema.Types.ObjectId,

@@ -61,6 +61,7 @@ export const getReferralPreview = async (req: Request, res: Response): Promise<v
       data: {
         code: result.code,
         ...(result.agencyDisplayName ? { agencyDisplayName: result.agencyDisplayName } : {}),
+        ...(result.creatorDisplayName ? { creatorDisplayName: result.creatorDisplayName } : {}),
       },
     });
   } catch (error) {

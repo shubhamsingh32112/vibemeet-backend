@@ -1636,6 +1636,16 @@ export const promoteToCreator = async (req: Request, res: Response): Promise<voi
         await targetUser.save({ session });
         await ensureCreatorPromotionWalletClearedEntry(targetUser, session);
 
+        try {
+          const { assignCreatorReferralCode } = await import('./referral.service');
+          await assignCreatorReferralCode(targetUser, session);
+        } catch (assignErr) {
+          console.error(
+            `[USER] assignCreatorReferralCode failed for ${targetUser._id}`,
+            assignErr
+          );
+        }
+
         const creator = await Creator.create(
           [
             {

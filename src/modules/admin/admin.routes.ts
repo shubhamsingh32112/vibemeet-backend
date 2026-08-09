@@ -88,6 +88,12 @@ import {
   getRewardsReconAdmin,
 } from '../consumer-rewards/consumer-reward.controller';
 import {
+  getCreatorReferralConfigAdmin,
+  updateCreatorReferralConfigAdmin,
+  listCreatorReferralsAdmin,
+  getCreatorReferralDetailAdmin,
+} from '../creator-referral/creator-referral.controller';
+import {
   getCurrentGlobalAppUpdateForAdmin,
   publishGlobalAppUpdate,
 } from '../app-update/app-update.controller';
@@ -217,6 +223,10 @@ router.get('/telegram-reward', getTelegramRewardConfigAdmin);
 router.put('/telegram-reward', updateTelegramRewardConfigAdmin);
 router.get('/consumer-rewards', getConsumerRewardsConfigAdmin);
 router.put('/consumer-rewards', updateConsumerRewardsConfigAdmin);
+router.get('/creator-referrals/config', getCreatorReferralConfigAdmin);
+router.put('/creator-referrals/config', updateCreatorReferralConfigAdmin);
+router.get('/creator-referrals', listCreatorReferralsAdmin);
+router.get('/creator-referrals/:creatorUserId', getCreatorReferralDetailAdmin);
 router.get('/rewards/monitor', getRewardsMonitorAdmin);
 router.get('/rewards/recon', getRewardsReconAdmin);
 router.get('/calls', getCallsAdmin);

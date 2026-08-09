@@ -121,6 +121,18 @@ export async function promoteUserToCreatorWithStarterProfile(
   await user.save({ session });
   await ensureCreatorPromotionWalletClearedEntry(user, session);
 
+  try {
+    const { assignCreatorReferralCode } = await import('../user/referral.service');
+    await assignCreatorReferralCode(user, session);
+  } catch (err) {
+    // Non-fatal for promotion; backfill script can repair.
+    // eslint-disable-next-line no-console
+    console.error(
+      `[creator-starter] assignCreatorReferralCode failed for ${user._id}`,
+      err
+    );
+  }
+
   if (previousCoins > 0) {
     // eslint-disable-next-line no-console
     console.log(

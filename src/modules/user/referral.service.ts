@@ -4,18 +4,20 @@
  * Handles:
  * - Generating unique referral codes for new users
  * - Applying referral code (signup + one-time late attach)
- * - Agent referrals link via User.referredBy (no CreatorApplication); creator-as-referrer is disabled (see applyReferralCode)
- * - Atomic reward when referred user buys coins (≥ min INR)
+ * - Agency referrals link via User.referredBy; creator referrers use CreatorReferralEdge
+ * - Atomic reward when referred user buys coins (≥ min INR) — consumer path only
  */
 
-import { Types } from 'mongoose';
+import { Types, type ClientSession } from 'mongoose';
 import { User, IUser } from './user.model';
 import { Creator } from '../creator/creator.model';
 import { CoinTransaction } from './coin-transaction.model';
 import { ReferralEdge } from './referral-edge.model';
 import { getIO } from '../../config/socket';
 import {
+  generateUniqueCreatorReferralCode,
   generateUniqueReferralCode,
+  isCreatorReferralCodeFormat,
   isValidReferralCodeFormat,
   normalizeReferralCode,
 } from '../../utils/referral-code';
@@ -26,6 +28,7 @@ import {
   getReferralRewardCoins,
 } from './referral-config';
 import { isAgencyRole, isBdRole, isBdStaffDisabled } from '../../utils/staff-roles';
+import { createCreatorReferralEdgeAfterAttach } from '../creator-referral/creator-referral-reward.service';
 
 /**
  * Existing-account login: agency join links use agency_host; consumer codes use late_attach.
@@ -63,6 +66,7 @@ export type ApplyReferralCodeErrorCode =
   | 'AGENT_DISABLED'
   | 'ALREADY_REFERRED'
   | 'CREATOR_CANNOT_REFER'
+  | 'CREATOR_DISABLED'
   | 'WINDOW_EXPIRED'
   | 'PURCHASE_ALREADY'
   | 'NOT_ELIGIBLE_ROLE'
@@ -205,8 +209,53 @@ export async function assignReferralCodeToUser(user: IUser): Promise<string> {
   throw new Error('Unable to assign unique referral code after retries');
 }
 
+/**
+ * Assign (or replace with) a unique CR-XXXXXX code for a creator.
+ * Replaces legacy consumer-format codes. Idempotent if already CR-.
+ */
+export async function assignCreatorReferralCode(
+  user: IUser,
+  session?: ClientSession
+): Promise<string> {
+  if (user.referralCode && isCreatorReferralCodeFormat(user.referralCode)) {
+    return user.referralCode;
+  }
+
+  const maxAttempts = 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const code = await generateUniqueCreatorReferralCode(async (c) => {
+      const q = User.findOne({ referralCode: c }).select('_id');
+      const hit = session ? await q.session(session).lean() : await q.lean();
+      return !!hit;
+    });
+    user.referralCode = code;
+    try {
+      await user.save({ session });
+      logDebug('Creator referral code assigned', {
+        userId: user._id.toString(),
+        referralCode: code,
+      });
+      return code;
+    } catch (err) {
+      if (isDuplicateKeyError(err)) {
+        user.referralCode = undefined;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Unable to assign unique creator referral code after retries');
+}
+
+/** True when referrer should use the creator affiliate program (not agency/BD). */
+export function isCreatorAffiliateReferrer(referrer: {
+  role?: string | null;
+}): boolean {
+  return referrer.role === 'creator';
+}
+
 export type PreviewReferralCodeResult =
-  | { ok: true; code: string; agencyDisplayName?: string }
+  | { ok: true; code: string; agencyDisplayName?: string; creatorDisplayName?: string }
   | { ok: false; code: ApplyReferralCodeErrorCode };
 
 /** Label for agency host referral dialog (username, email local, or fallback). */
@@ -319,7 +368,32 @@ export async function previewReferralCode(
       agencyDisplayName: agencyDisplayNameFromUser(referrer),
     };
   }
+
+  // Role-first: agency/BD already handled above for agency_host; for signup/late_attach
+  // allow creator affiliate referrers; reject only if they have a creator profile but
+  // are not role=creator (legacy edge) — actually: allow role===creator; block other
+  // non-staff users who somehow have a Creator doc without being creators? Keep simple:
+  // allow role === 'creator'; plain users OK; if has Creator profile but role is still
+  // 'user' (shouldn't happen), treat as cannot refer.
   if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
+    if (referrer.role === 'creator') {
+      const creatorProf = await Creator.findOne({ userId: referrer._id })
+        .select('_id isDisabled name')
+        .lean();
+      if (!creatorProf) {
+        return { ok: false, code: 'NOT_FOUND' };
+      }
+      if (creatorProf.isDisabled === true) {
+        return { ok: false, code: 'CREATOR_DISABLED' };
+      }
+      return {
+        ok: true,
+        code,
+        creatorDisplayName:
+          (typeof creatorProf.name === 'string' && creatorProf.name.trim()) ||
+          agencyDisplayNameFromUser(referrer),
+      };
+    }
     const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
       .select('_id')
       .lean();
@@ -401,17 +475,36 @@ export async function applyReferralCode(
     }
   }
 
-  // Creators cannot refer (non-staff). Agency/BD staff may refer even if they have a creator profile.
+  let isCreatorAffiliate = false;
+  // Role-first: agency/BD staff may refer even with a creator profile (agency path).
+  // Plain creators use the creator affiliate program.
   if (!isAgencyRole(referrer.role) && !isBdRole(referrer.role)) {
-    const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
-      .select('_id')
-      .lean();
-    if (referrerCreatorProfile) {
-      logInfo('Referral skipped: creator referrals disabled', {
-        code,
-        referrerId: referrer._id.toString(),
-      });
-      return { ok: false, code: 'CREATOR_CANNOT_REFER' };
+    if (referrer.role === 'creator') {
+      const creatorProf = await Creator.findOne({ userId: referrer._id })
+        .select('_id isDisabled')
+        .lean();
+      if (!creatorProf) {
+        return { ok: false, code: 'NOT_FOUND' };
+      }
+      if (creatorProf.isDisabled === true) {
+        logInfo('Referral skipped: creator disabled', {
+          code,
+          referrerId: referrer._id.toString(),
+        });
+        return { ok: false, code: 'CREATOR_DISABLED' };
+      }
+      isCreatorAffiliate = true;
+    } else {
+      const referrerCreatorProfile = await Creator.findOne({ userId: referrer._id })
+        .select('_id')
+        .lean();
+      if (referrerCreatorProfile) {
+        logInfo('Referral skipped: creator referrals disabled for non-creator role', {
+          code,
+          referrerId: referrer._id.toString(),
+        });
+        return { ok: false, code: 'CREATOR_CANNOT_REFER' };
+      }
     }
   }
 
@@ -471,6 +564,7 @@ export async function applyReferralCode(
     referrerId: referrer._id.toString(),
     referralCode: code,
     mode,
+    isCreatorAffiliate,
   });
 
   if (isAgencyRole(referrer.role)) {
@@ -478,6 +572,24 @@ export async function applyReferralCode(
       newUserId: applicant._id.toString(),
       agencyUserId: referrer._id.toString(),
     });
+    return { ok: true };
+  }
+
+  if (isCreatorAffiliate) {
+    try {
+      await createCreatorReferralEdgeAfterAttach({
+        creatorUserId: referrer._id,
+        referredUserId: applicant._id,
+        referralCodeUsed: code,
+        telegramAlreadyClaimed: Boolean(applicant.telegramRewardClaimed),
+      });
+    } catch (err) {
+      logError('createCreatorReferralEdgeAfterAttach failed', err as Error, {
+        applicantId: applicant._id.toString(),
+        referrerId: referrer._id.toString(),
+      });
+      // Link already established; edge can be repaired later — do not roll back attach.
+    }
     return { ok: true };
   }
 
@@ -493,7 +605,6 @@ export async function applyReferralCode(
     }
   }
 
-  // Non-BD creator referrers are rejected before linkage; no invitee promotion path here.
   return { ok: true };
 }
 
@@ -527,6 +638,14 @@ export async function processReferralRewardOnPurchase(
   if (!referredUser?.referredBy) return false;
 
   const referrerId = referredUser.referredBy as Types.ObjectId;
+
+  // Consumer successful_referral is for plain-user referrers only.
+  // Creator affiliate payouts use CreatorReferralEdge + creator_referral_reward.
+  const referrerRoleDoc = await User.findById(referrerId).select('role').lean();
+  if (!referrerRoleDoc || referrerRoleDoc.role !== 'user') {
+    return false;
+  }
+
   const txnId = referralRewardTransactionId(referrerId, referredUserId);
 
   // Shared with call-path creditOnce (`referral_reward_{referrer}_{referred}`).
