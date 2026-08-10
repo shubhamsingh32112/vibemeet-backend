@@ -9,7 +9,10 @@ import {
   isValidReferralCodeFormat,
   normalizeReferralCode,
 } from '../../utils/referral-code';
-import { creatorReferralRewardTransactionId } from './creator-referral-reward.service';
+import {
+  creatorReferralRewardTransactionId,
+  creatorReferralStageTransactionId,
+} from './creator-referral-reward.service';
 import { CREATOR_REFERRAL_COINS_MAX } from './creator-referral.config';
 
 const referralServiceSrc = fs.readFileSync(
@@ -26,6 +29,21 @@ const rewardServiceSrc = fs.readFileSync(
 );
 const controllerSrc = fs.readFileSync(
   path.join(__dirname, 'creator-referral.controller.ts'),
+  'utf8'
+);
+const paymentFinalizeSrc = fs.readFileSync(
+  path.join(__dirname, '../payment/payment-finalization.service.ts'),
+  'utf8'
+);
+const vipFinalizeSrc = fs.readFileSync(
+  path.join(__dirname, '../vip/vip-purchase-finalization.service.ts'),
+  'utf8'
+);
+const momentsFinalizeSrc = fs.readFileSync(
+  path.join(
+    __dirname,
+    '../moments-premium/moments-premium-purchase-finalization.service.ts'
+  ),
   'utf8'
 );
 
@@ -58,16 +76,24 @@ describe('creator referral code format', () => {
 });
 
 describe('creator referral reward helpers', () => {
-  test('transaction id is stable and unique per pair', () => {
+  test('legacy and stage transaction ids are stable', () => {
     const a = new mongoose.Types.ObjectId();
     const b = new mongoose.Types.ObjectId();
-    const id1 = creatorReferralRewardTransactionId(a, b);
-    const id2 = creatorReferralRewardTransactionId(a, b);
-    assert.equal(id1, id2);
-    assert.match(id1, /^creator_referral_reward_/);
-    assert.notEqual(
+    assert.equal(
       creatorReferralRewardTransactionId(a, b),
-      creatorReferralRewardTransactionId(b, a)
+      `creator_referral_reward_${a}_${b}`
+    );
+    assert.equal(
+      creatorReferralStageTransactionId('attach', a, b),
+      `creator_referral_attach_${a}_${b}`
+    );
+    assert.equal(
+      creatorReferralStageTransactionId('telegram', a, b),
+      `creator_referral_telegram_${a}_${b}`
+    );
+    assert.equal(
+      creatorReferralStageTransactionId('purchase', a, b),
+      `creator_referral_purchase_${a}_${b}`
     );
   });
 
@@ -82,10 +108,6 @@ describe('creator referral payout / apply contracts', () => {
       referralServiceSrc,
       /processReferralRewardOnPurchase[\s\S]*referrerRoleDoc\.role !== 'user'/
     );
-    assert.match(
-      referralServiceSrc,
-      /Creator affiliate payouts use CreatorReferralEdge/
-    );
   });
 
   test('call-path successful_referral still requires referrer.role === user', () => {
@@ -95,30 +117,59 @@ describe('creator referral payout / apply contracts', () => {
     );
   });
 
-  test('creator apply path creates CreatorReferralEdge and skips invite_friend for creators', () => {
+  test('video call no longer wires creator referral payout', () => {
+    assert.doesNotMatch(callHookSrc, /onCreatorReferralCallSettled/);
+  });
+
+  test('attach pays on edge create; telegram and purchase stages exist', () => {
+    assert.match(rewardServiceSrc, /tryCreditAttach/);
+    assert.match(rewardServiceSrc, /tryCreditTelegram/);
+    assert.match(rewardServiceSrc, /tryCreditPurchase/);
+    assert.match(rewardServiceSrc, /createCreatorReferralEdgeAfterAttach/);
+    assert.match(rewardServiceSrc, /source: 'creator_referral_attach_reward'/);
+    assert.match(rewardServiceSrc, /source: 'creator_referral_telegram_reward'/);
+    assert.match(rewardServiceSrc, /source: 'creator_referral_purchase_reward'/);
+  });
+
+  test('purchase finalize hooks call onCreatorReferralPurchase', () => {
+    assert.match(paymentFinalizeSrc, /onCreatorReferralPurchase/);
+    assert.match(vipFinalizeSrc, /onCreatorReferralPurchase/);
+    assert.match(momentsFinalizeSrc, /onCreatorReferralPurchase/);
+  });
+
+  test('creator apply path creates CreatorReferralEdge', () => {
     assert.match(referralServiceSrc, /createCreatorReferralEdgeAfterAttach/);
-    assert.match(referralServiceSrc, /isCreatorAffiliate/);
     assert.match(referralServiceSrc, /CREATOR_DISABLED/);
-    // invite_friend only when referrer.role === 'user'
+  });
+
+  test('admin creator-referral handlers require assertAdmin', () => {
+    assert.match(controllerSrc, /assertAdmin/);
     assert.match(
-      referralServiceSrc,
-      /if \(referrer\.role === 'user' && applicant\.role === 'user'\)/
+      controllerSrc,
+      /getCreatorReferralConfigAdmin[\s\S]*assertAdmin/
+    );
+    assert.match(
+      controllerSrc,
+      /updateCreatorReferralConfigAdmin[\s\S]*assertAdmin/
+    );
+    assert.match(controllerSrc, /listCreatorReferralsAdmin[\s\S]*assertAdmin/);
+    assert.match(
+      controllerSrc,
+      /getCreatorReferralDetailAdmin[\s\S]*assertAdmin/
     );
   });
 
-  test('tryCredit uses dedicated ledger source and CAS rewardedAt', () => {
-    assert.match(rewardServiceSrc, /source: 'creator_referral_reward'/);
-    assert.match(rewardServiceSrc, /creatorRewardedAt: null/);
-    assert.match(rewardServiceSrc, /telegramJoinedAt: \{ \$ne: null \}/);
-    assert.match(rewardServiceSrc, /videoCallCompletedAt: \{ \$ne: null \}/);
+  test('late attach backfills purchase when user already qualified', () => {
+    assert.match(
+      rewardServiceSrc,
+      /createCreatorReferralEdgeAfterAttach[\s\S]*referredUserHasQualifyingPurchase[\s\S]*tryCreditPurchase/
+    );
   });
 
-  test('config save reconciles unpaid when enabled', () => {
-    assert.match(controllerSrc, /reconcileUnpaidCreatorReferrals/);
-  });
-
-  test('preview/apply allow role===creator (not CREATOR_CANNOT_REFER for hosts)', () => {
-    assert.match(referralServiceSrc, /role === 'creator'/);
-    assert.match(referralServiceSrc, /creatorDisplayName/);
+  test('reconcile fetches purchase unpaid separately from attach/telegram', () => {
+    assert.match(
+      rewardServiceSrc,
+      /reconcileUnpaidCreatorReferrals[\s\S]*purchaseRewardedAt: null[\s\S]*sort\(\{ createdAt: 1 \}\)/
+    );
   });
 });

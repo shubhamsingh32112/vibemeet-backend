@@ -10,6 +10,7 @@ import {
 import { CREATOR_REFERRAL_COINS_MAX } from './creator-referral.config';
 import { reconcileUnpaidCreatorReferrals } from './creator-referral-reward.service';
 import { assignCreatorReferralCode } from '../user/referral.service';
+import { assertAdmin } from '../../middlewares/staff.middleware';
 import { logError } from '../../utils/logger';
 
 function displayNameFromUser(u: {
@@ -22,6 +23,60 @@ function displayNameFromUser(u: {
     if (local) return local;
   }
   return 'User';
+}
+
+function stagePaid(edge: {
+  creatorRewardedAt?: Date | null;
+  attachRewardedAt?: Date | null;
+  telegramRewardedAt?: Date | null;
+  purchaseRewardedAt?: Date | null;
+}): {
+  attachRewarded: boolean;
+  telegramRewarded: boolean;
+  purchaseRewarded: boolean;
+  legacy: boolean;
+} {
+  const legacy = !!edge.creatorRewardedAt;
+  return {
+    legacy,
+    attachRewarded: legacy || !!edge.attachRewardedAt,
+    telegramRewarded: legacy || !!edge.telegramRewardedAt,
+    purchaseRewarded: legacy || !!edge.purchaseRewardedAt,
+  };
+}
+
+function edgeCoinsEarned(edge: {
+  creatorRewardedAt?: Date | null;
+  creatorRewardCoins?: number | null;
+  attachRewardCoins?: number | null;
+  telegramRewardCoins?: number | null;
+  purchaseRewardCoins?: number | null;
+}): number {
+  if (edge.creatorRewardedAt) {
+    return edge.creatorRewardCoins ?? 0;
+  }
+  return (
+    (edge.attachRewardCoins ?? 0) +
+    (edge.telegramRewardCoins ?? 0) +
+    (edge.purchaseRewardCoins ?? 0)
+  );
+}
+
+function parseStageCoins(
+  body: Record<string, unknown>,
+  key: string
+): { ok: true; value?: number } | { ok: false; error: string } {
+  if (body[key] === undefined || body[key] === null) {
+    return { ok: true, value: undefined };
+  }
+  const n = Number(body[key]);
+  if (!Number.isFinite(n) || n < 1 || n > CREATOR_REFERRAL_COINS_MAX) {
+    return {
+      ok: false,
+      error: `${key} must be 1–${CREATOR_REFERRAL_COINS_MAX}`,
+    };
+  }
+  return { ok: true, value: Math.floor(n) };
 }
 
 /**
@@ -65,31 +120,33 @@ export const getMyCreatorReferrals = async (req: Request, res: Response): Promis
         : [];
     const userById = new Map(referredUsers.map((u) => [u._id.toString(), u] as const));
 
-    let completedBoth = 0;
-    let rewardedCount = 0;
+    let attachPaidCount = 0;
+    let telegramPaidCount = 0;
+    let purchasePaidCount = 0;
     let coinsEarned = 0;
 
     const referrals = edges.map((edge) => {
       const uid = edge.referredUserId.toString();
       const referred = userById.get(uid);
-      const telegramDone = !!edge.telegramJoinedAt;
-      const callDone = !!edge.videoCallCompletedAt;
-      const rewarded = !!edge.creatorRewardedAt;
-      if (telegramDone && callDone) completedBoth += 1;
-      if (rewarded) {
-        rewardedCount += 1;
-        coinsEarned += edge.creatorRewardCoins ?? 0;
-      }
+      const paid = stagePaid(edge);
+      if (paid.attachRewarded) attachPaidCount += 1;
+      if (paid.telegramRewarded) telegramPaidCount += 1;
+      if (paid.purchaseRewarded) purchasePaidCount += 1;
+      coinsEarned += edgeCoinsEarned(edge);
       return {
         userId: uid,
         name: referred ? displayNameFromUser(referred) : 'User',
-        telegramJoined: telegramDone,
+        attachRewarded: paid.attachRewarded,
+        attachRewardedAt: edge.attachRewardedAt?.toISOString?.() ?? null,
+        attachRewardCoins: edge.attachRewardCoins ?? null,
+        telegramJoined: !!edge.telegramJoinedAt || paid.telegramRewarded,
         telegramJoinedAt: edge.telegramJoinedAt?.toISOString?.() ?? null,
-        videoCallCompleted: callDone,
-        videoCallCompletedAt: edge.videoCallCompletedAt?.toISOString?.() ?? null,
-        rewarded,
-        rewardedAt: edge.creatorRewardedAt?.toISOString?.() ?? null,
-        rewardCoins: edge.creatorRewardCoins ?? null,
+        telegramRewarded: paid.telegramRewarded,
+        telegramRewardedAt: edge.telegramRewardedAt?.toISOString?.() ?? null,
+        telegramRewardCoins: edge.telegramRewardCoins ?? null,
+        purchaseRewarded: paid.purchaseRewarded,
+        purchaseRewardedAt: edge.purchaseRewardedAt?.toISOString?.() ?? null,
+        purchaseRewardCoins: edge.purchaseRewardCoins ?? null,
         joinedAt: edge.createdAt?.toISOString?.() ?? new Date().toISOString(),
       };
     });
@@ -98,12 +155,15 @@ export const getMyCreatorReferrals = async (req: Request, res: Response): Promis
       success: true,
       data: {
         referralCode,
-        rewardCoins: cfg.rewardCoins,
         enabled: cfg.enabled,
+        attachCoins: cfg.attachCoins,
+        telegramCoins: cfg.telegramCoins,
+        purchaseCoins: cfg.purchaseCoins,
         summary: {
           referredCount: edges.length,
-          completedBoth,
-          rewardedCount,
+          attachPaidCount,
+          telegramPaidCount,
+          purchasePaidCount,
           coinsEarned,
         },
         referrals,
@@ -116,10 +176,11 @@ export const getMyCreatorReferrals = async (req: Request, res: Response): Promis
 };
 
 export const getCreatorReferralConfigAdmin = async (
-  _req: Request,
+  req: Request,
   res: Response
 ): Promise<void> => {
   try {
+    if (!(await assertAdmin(req, res))) return;
     const cfg = await getOrCreateCreatorReferralConfig();
     res.json({ success: true, data: cfg });
   } catch (error) {
@@ -133,23 +194,33 @@ export const updateCreatorReferralConfigAdmin = async (
   res: Response
 ): Promise<void> => {
   try {
-    const body = req.body ?? {};
+    if (!(await assertAdmin(req, res))) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const enabled =
       typeof body.enabled === 'boolean' ? (body.enabled as boolean) : undefined;
-    let rewardCoins: number | undefined;
-    if (body.rewardCoins !== undefined && body.rewardCoins !== null) {
-      const n = Number(body.rewardCoins);
-      if (!Number.isFinite(n) || n < 1 || n > CREATOR_REFERRAL_COINS_MAX) {
-        res.status(400).json({
-          success: false,
-          error: `rewardCoins must be 1–${CREATOR_REFERRAL_COINS_MAX}`,
-        });
-        return;
-      }
-      rewardCoins = Math.floor(n);
+
+    const attach = parseStageCoins(body, 'attachCoins');
+    if (!attach.ok) {
+      res.status(400).json({ success: false, error: attach.error });
+      return;
+    }
+    const telegram = parseStageCoins(body, 'telegramCoins');
+    if (!telegram.ok) {
+      res.status(400).json({ success: false, error: telegram.error });
+      return;
+    }
+    const purchase = parseStageCoins(body, 'purchaseCoins');
+    if (!purchase.ok) {
+      res.status(400).json({ success: false, error: purchase.error });
+      return;
     }
 
-    const cfg = await updateCreatorReferralConfig({ enabled, rewardCoins });
+    const cfg = await updateCreatorReferralConfig({
+      enabled,
+      attachCoins: attach.value,
+      telegramCoins: telegram.value,
+      purchaseCoins: purchase.value,
+    });
     if (cfg.enabled) {
       void reconcileUnpaidCreatorReferrals(200).catch(() => {});
     }
@@ -168,6 +239,7 @@ export const listCreatorReferralsAdmin = async (
   res: Response
 ): Promise<void> => {
   try {
+    if (!(await assertAdmin(req, res))) return;
     const page = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
     const skip = (page - 1) * limit;
@@ -204,13 +276,13 @@ export const listCreatorReferralsAdmin = async (
               $group: {
                 _id: '$creatorUserId',
                 referredCount: { $sum: 1 },
-                completedBoth: {
+                attachPaid: {
                   $sum: {
                     $cond: [
                       {
-                        $and: [
-                          { $ne: ['$telegramJoinedAt', null] },
-                          { $ne: ['$videoCallCompletedAt', null] },
+                        $or: [
+                          { $ne: ['$creatorRewardedAt', null] },
+                          { $ne: ['$attachRewardedAt', null] },
                         ],
                       },
                       1,
@@ -218,9 +290,32 @@ export const listCreatorReferralsAdmin = async (
                     ],
                   },
                 },
-                rewardedCount: {
+                telegramPaid: {
                   $sum: {
-                    $cond: [{ $ne: ['$creatorRewardedAt', null] }, 1, 0],
+                    $cond: [
+                      {
+                        $or: [
+                          { $ne: ['$creatorRewardedAt', null] },
+                          { $ne: ['$telegramRewardedAt', null] },
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+                purchasePaid: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $ne: ['$creatorRewardedAt', null] },
+                          { $ne: ['$purchaseRewardedAt', null] },
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
                   },
                 },
                 coinsPaid: {
@@ -228,22 +323,13 @@ export const listCreatorReferralsAdmin = async (
                     $cond: [
                       { $ne: ['$creatorRewardedAt', null] },
                       { $ifNull: ['$creatorRewardCoins', 0] },
-                      0,
-                    ],
-                  },
-                },
-                eligibleUnpaid: {
-                  $sum: {
-                    $cond: [
                       {
-                        $and: [
-                          { $eq: ['$creatorRewardedAt', null] },
-                          { $ne: ['$telegramJoinedAt', null] },
-                          { $ne: ['$videoCallCompletedAt', null] },
+                        $add: [
+                          { $ifNull: ['$attachRewardCoins', 0] },
+                          { $ifNull: ['$telegramRewardCoins', 0] },
+                          { $ifNull: ['$purchaseRewardCoins', 0] },
                         ],
                       },
-                      1,
-                      0,
                     ],
                   },
                 },
@@ -264,10 +350,10 @@ export const listCreatorReferralsAdmin = async (
         isDisabled: c.isDisabled === true,
         referralCode: u?.referralCode ?? null,
         referredCount: s?.referredCount ?? 0,
-        completedBoth: s?.completedBoth ?? 0,
-        rewardedCount: s?.rewardedCount ?? 0,
+        attachPaid: s?.attachPaid ?? 0,
+        telegramPaid: s?.telegramPaid ?? 0,
+        purchasePaid: s?.purchasePaid ?? 0,
         coinsPaid: s?.coinsPaid ?? 0,
-        eligibleUnpaid: s?.eligibleUnpaid ?? 0,
       };
     });
 
@@ -297,6 +383,7 @@ export const getCreatorReferralDetailAdmin = async (
   res: Response
 ): Promise<void> => {
   try {
+    if (!(await assertAdmin(req, res))) return;
     const rawId = req.params.creatorUserId;
     if (!rawId || !mongoose.Types.ObjectId.isValid(rawId)) {
       res.status(400).json({ success: false, error: 'Invalid creatorUserId' });
@@ -332,23 +419,25 @@ export const getCreatorReferralDetailAdmin = async (
     const referrals = edges.map((edge) => {
       const uid = edge.referredUserId.toString();
       const referred = userById.get(uid);
+      const paid = stagePaid(edge);
       return {
         userId: uid,
         name: referred ? displayNameFromUser(referred) : 'User',
         email: referred?.email ?? null,
         referralCodeUsed: edge.referralCodeUsed,
-        telegramJoined: !!edge.telegramJoinedAt,
+        attachRewarded: paid.attachRewarded,
+        attachRewardedAt: edge.attachRewardedAt?.toISOString?.() ?? null,
+        attachRewardCoins: edge.attachRewardCoins ?? null,
+        telegramJoined: !!edge.telegramJoinedAt || paid.telegramRewarded,
         telegramJoinedAt: edge.telegramJoinedAt?.toISOString?.() ?? null,
-        videoCallCompleted: !!edge.videoCallCompletedAt,
-        videoCallCompletedAt: edge.videoCallCompletedAt?.toISOString?.() ?? null,
-        rewarded: !!edge.creatorRewardedAt,
-        rewardedAt: edge.creatorRewardedAt?.toISOString?.() ?? null,
-        rewardCoins: edge.creatorRewardCoins ?? null,
+        telegramRewarded: paid.telegramRewarded,
+        telegramRewardedAt: edge.telegramRewardedAt?.toISOString?.() ?? null,
+        telegramRewardCoins: edge.telegramRewardCoins ?? null,
+        purchaseRewarded: paid.purchaseRewarded,
+        purchaseRewardedAt: edge.purchaseRewardedAt?.toISOString?.() ?? null,
+        purchaseRewardCoins: edge.purchaseRewardCoins ?? null,
+        coinsEarned: edgeCoinsEarned(edge),
         joinedAt: edge.createdAt?.toISOString?.() ?? null,
-        eligibleUnpaid:
-          !edge.creatorRewardedAt &&
-          !!edge.telegramJoinedAt &&
-          !!edge.videoCallCompletedAt,
       };
     });
 
@@ -362,7 +451,9 @@ export const getCreatorReferralDetailAdmin = async (
         name: creator?.name ?? displayNameFromUser(user),
         isDisabled: creator?.isDisabled === true,
         referralCode: user.referralCode ?? null,
-        configRewardCoins: cfg.rewardCoins,
+        attachCoins: cfg.attachCoins,
+        telegramCoins: cfg.telegramCoins,
+        purchaseCoins: cfg.purchaseCoins,
         configEnabled: cfg.enabled,
         referrals,
       },

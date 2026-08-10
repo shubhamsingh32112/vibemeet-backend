@@ -36,6 +36,17 @@ export async function finalizeMomentsPremiumPurchaseAtomically(
     if (!membership) {
       throw new Error('MOMENTS_PREMIUM_MEMBERSHIP_MISSING_AFTER_COMPLETED_TXN');
     }
+    try {
+      const { onCreatorReferralPurchase } = await import(
+        '../creator-referral/creator-referral-reward.service'
+      );
+      const { Types } = await import('mongoose');
+      if (Types.ObjectId.isValid(input.userId)) {
+        onCreatorReferralPurchase(new Types.ObjectId(input.userId));
+      }
+    } catch {
+      // non-fatal
+    }
     return {
       alreadyProcessed: true,
       expiresAt: membership.expiresAt,
@@ -142,6 +153,17 @@ export async function finalizeMomentsPremiumPurchaseAtomically(
   await invalidateMomentsPremiumCache(input.userId);
   await bustPopularFeedCacheForUser(input.userId);
   await bustFollowingWarmCacheForUser(input.userId);
+  try {
+    const { onCreatorReferralPurchase } = await import(
+      '../creator-referral/creator-referral-reward.service'
+    );
+    const { Types } = await import('mongoose');
+    if (Types.ObjectId.isValid(input.userId)) {
+      onCreatorReferralPurchase(new Types.ObjectId(input.userId));
+    }
+  } catch {
+    // non-fatal
+  }
   return result;
 }
 

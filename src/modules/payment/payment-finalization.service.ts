@@ -200,7 +200,28 @@ export async function finalizePaymentAtomically(
       throw new Error('FINALIZE_PAYMENT_UNKNOWN_ERROR');
     }
 
-    return result;
+    const finalized: FinalizePaymentResult = result;
+
+    try {
+      const buyerId = finalized.transaction.userId;
+      if (buyerId) {
+        const { onCreatorReferralPurchase } = await import(
+          '../creator-referral/creator-referral-reward.service'
+        );
+        const { Types } = await import('mongoose');
+        const oid =
+          buyerId instanceof Types.ObjectId
+            ? buyerId
+            : Types.ObjectId.isValid(String(buyerId))
+              ? new Types.ObjectId(String(buyerId))
+              : null;
+        if (oid) onCreatorReferralPurchase(oid);
+      }
+    } catch {
+      // non-fatal
+    }
+
+    return finalized;
   } finally {
     await session.endSession();
   }

@@ -1,19 +1,28 @@
 /**
- * Creator affiliate referral rewards.
- * Qualifiers: telegramRewardClaimed + any settled call (duration > 0).
- * Credits creator User.coins once via unique ledger txn.
+ * Multi-stage creator affiliate referral rewards.
+ * Stages: signup attach, telegram claim, first purchase (coins | VIP | moments premium).
  */
 
 import mongoose, { Types } from 'mongoose';
 import { User } from '../user/user.model';
 import { CoinTransaction } from '../user/coin-transaction.model';
-import { CallHistory } from '../billing/call-history.model';
 import { CreatorReferralEdge } from './creator-referral-edge.model';
 import { getOrCreateCreatorReferralConfig } from './creator-referral-config.model';
 import { getIO } from '../../config/socket';
 import { logError, logInfo } from '../../utils/logger';
 import { verifyUserBalance } from '../../utils/balance-integrity';
 
+export type CreatorReferralStage = 'attach' | 'telegram' | 'purchase';
+
+export function creatorReferralStageTransactionId(
+  stage: CreatorReferralStage,
+  creatorUserId: Types.ObjectId | string,
+  referredUserId: Types.ObjectId | string
+): string {
+  return `creator_referral_${stage}_${creatorUserId.toString()}_${referredUserId.toString()}`;
+}
+
+/** @deprecated Legacy single-payout txn id. */
 export function creatorReferralRewardTransactionId(
   creatorUserId: Types.ObjectId | string,
   referredUserId: Types.ObjectId | string
@@ -28,6 +37,10 @@ function isDuplicateKeyError(err: unknown): boolean {
       'code' in err &&
       (err as { code?: number }).code === 11000
   );
+}
+
+function isLegacyFullyPaid(edge: { creatorRewardedAt?: Date | null }): boolean {
+  return !!edge.creatorRewardedAt;
 }
 
 async function emitCreatorCoinsUpdated(
@@ -48,21 +61,211 @@ async function emitCreatorCoinsUpdated(
   }
 }
 
-async function applicantHasSettledCall(userId: Types.ObjectId): Promise<boolean> {
-  const row = await CallHistory.findOne({
-    ownerUserId: userId,
-    ownerRole: 'user',
-    settlementStatus: 'settled',
-    durationSeconds: { $gt: 0 },
-  })
+type StageMeta = {
+  rewardedAtField: 'attachRewardedAt' | 'telegramRewardedAt' | 'purchaseRewardedAt';
+  rewardCoinsField: 'attachRewardCoins' | 'telegramRewardCoins' | 'purchaseRewardCoins';
+  source:
+    | 'creator_referral_attach_reward'
+    | 'creator_referral_telegram_reward'
+    | 'creator_referral_purchase_reward';
+  description: string;
+  configKey: 'attachCoins' | 'telegramCoins' | 'purchaseCoins';
+};
+
+const STAGE_META: Record<CreatorReferralStage, StageMeta> = {
+  attach: {
+    rewardedAtField: 'attachRewardedAt',
+    rewardCoinsField: 'attachRewardCoins',
+    source: 'creator_referral_attach_reward',
+    description: 'Creator referral — signup',
+    configKey: 'attachCoins',
+  },
+  telegram: {
+    rewardedAtField: 'telegramRewardedAt',
+    rewardCoinsField: 'telegramRewardCoins',
+    source: 'creator_referral_telegram_reward',
+    description: 'Creator referral — Telegram',
+    configKey: 'telegramCoins',
+  },
+  purchase: {
+    rewardedAtField: 'purchaseRewardedAt',
+    rewardCoinsField: 'purchaseRewardCoins',
+    source: 'creator_referral_purchase_reward',
+    description: 'Creator referral — purchase',
+    configKey: 'purchaseCoins',
+  },
+};
+
+async function creditStage(input: {
+  stage: CreatorReferralStage;
+  creatorUserId: Types.ObjectId;
+  referredUserId: Types.ObjectId;
+  edgeId: Types.ObjectId;
+}): Promise<boolean> {
+  const cfg = await getOrCreateCreatorReferralConfig();
+  if (!cfg.enabled) return false;
+
+  const meta = STAGE_META[input.stage];
+  const rewardCoins = cfg[meta.configKey];
+  if (rewardCoins < 1) return false;
+
+  const edge = await CreatorReferralEdge.findById(input.edgeId).lean();
+  if (!edge) return false;
+  if (isLegacyFullyPaid(edge)) return false;
+  if (edge[meta.rewardedAtField]) return false;
+
+  const txnId = creatorReferralStageTransactionId(
+    input.stage,
+    input.creatorUserId,
+    input.referredUserId
+  );
+
+  const existingTxn = await CoinTransaction.findOne({ transactionId: txnId })
     .select('_id')
     .lean();
-  return !!row;
+  if (existingTxn) {
+    await CreatorReferralEdge.updateOne(
+      { _id: edge._id, [meta.rewardedAtField]: null },
+      {
+        $set: {
+          [meta.rewardedAtField]: new Date(),
+          [meta.rewardCoinsField]: rewardCoins,
+        },
+      }
+    );
+    return true;
+  }
+
+  const session = await mongoose.startSession();
+  let credited = false;
+  let newBalance = 0;
+  let creatorFirebaseUid: string | null = null;
+
+  try {
+    await session.withTransaction(async () => {
+      const cas = await CreatorReferralEdge.findOneAndUpdate(
+        {
+          _id: edge._id,
+          creatorRewardedAt: null,
+          [meta.rewardedAtField]: null,
+        },
+        {
+          $set: {
+            [meta.rewardedAtField]: new Date(),
+            [meta.rewardCoinsField]: rewardCoins,
+          },
+        },
+        { new: true, session }
+      );
+      if (!cas) return;
+
+      try {
+        await CoinTransaction.create(
+          [
+            {
+              transactionId: txnId,
+              userId: input.creatorUserId,
+              type: 'credit',
+              coins: rewardCoins,
+              source: meta.source,
+              description: `${meta.description} (${input.referredUserId.toString()})`,
+              status: 'completed',
+            },
+          ],
+          { session }
+        );
+      } catch (err) {
+        if (isDuplicateKeyError(err)) return;
+        throw err;
+      }
+
+      const updated = await User.findOneAndUpdate(
+        { _id: input.creatorUserId },
+        { $inc: { coins: rewardCoins } },
+        { new: true, session }
+      ).select('coins firebaseUid');
+
+      if (!updated) {
+        throw new Error('Creator user not found for referral reward');
+      }
+
+      credited = true;
+      newBalance = updated.coins ?? 0;
+      creatorFirebaseUid = updated.firebaseUid ?? null;
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  if (credited) {
+    await emitCreatorCoinsUpdated(creatorFirebaseUid, input.creatorUserId, newBalance);
+    verifyUserBalance(input.creatorUserId).catch((err) => {
+      logError('creator referral balance integrity check failed', err as Error, {
+        creatorUserId: input.creatorUserId.toString(),
+        stage: input.stage,
+      });
+    });
+    logInfo('Creator referral stage credited', {
+      stage: input.stage,
+      creatorUserId: input.creatorUserId.toString(),
+      referredUserId: input.referredUserId.toString(),
+      coins: rewardCoins,
+      balance: newBalance,
+    });
+  }
+
+  return credited;
+}
+
+export async function tryCreditAttach(
+  creatorUserId: Types.ObjectId,
+  referredUserId: Types.ObjectId
+): Promise<boolean> {
+  const edge = await CreatorReferralEdge.findOne({ creatorUserId, referredUserId })
+    .select('_id')
+    .lean();
+  if (!edge) return false;
+  return creditStage({
+    stage: 'attach',
+    creatorUserId,
+    referredUserId,
+    edgeId: edge._id,
+  });
+}
+
+export async function tryCreditTelegram(
+  creatorUserId: Types.ObjectId,
+  referredUserId: Types.ObjectId
+): Promise<boolean> {
+  const edge = await CreatorReferralEdge.findOne({ creatorUserId, referredUserId })
+    .select('_id telegramJoinedAt')
+    .lean();
+  if (!edge || !edge.telegramJoinedAt) return false;
+  return creditStage({
+    stage: 'telegram',
+    creatorUserId,
+    referredUserId,
+    edgeId: edge._id,
+  });
+}
+
+export async function tryCreditPurchase(referredUserId: Types.ObjectId): Promise<boolean> {
+  const edge = await CreatorReferralEdge.findOne({ referredUserId })
+    .select('_id creatorUserId')
+    .lean();
+  if (!edge) return false;
+  return creditStage({
+    stage: 'purchase',
+    creatorUserId: edge.creatorUserId,
+    referredUserId,
+    edgeId: edge._id,
+  });
 }
 
 /**
  * Create CreatorReferralEdge after a successful creator-code attach.
- * Backfills telegram/call flags from existing user state, then tryCredit.
+ * Pays attach stage immediately; backfills telegram and purchase stages if
+ * the referred user already completed those actions.
  */
 export async function createCreatorReferralEdgeAfterAttach(input: {
   creatorUserId: Types.ObjectId;
@@ -81,20 +284,21 @@ export async function createCreatorReferralEdgeAfterAttach(input: {
     }
   }
 
-  let videoCallCompletedAt: Date | null = null;
-  if (await applicantHasSettledCall(input.referredUserId)) {
-    videoCallCompletedAt = now;
-  }
-
   try {
     await CreatorReferralEdge.create({
       creatorUserId: input.creatorUserId,
       referredUserId: input.referredUserId,
       referralCodeUsed: input.referralCodeUsed,
       telegramJoinedAt,
-      videoCallCompletedAt,
+      videoCallCompletedAt: null,
       creatorRewardedAt: null,
       creatorRewardCoins: null,
+      attachRewardedAt: null,
+      attachRewardCoins: null,
+      telegramRewardedAt: null,
+      telegramRewardCoins: null,
+      purchaseRewardedAt: null,
+      purchaseRewardCoins: null,
     });
   } catch (err) {
     if (!isDuplicateKeyError(err)) {
@@ -106,7 +310,14 @@ export async function createCreatorReferralEdgeAfterAttach(input: {
     }
   }
 
-  await tryCreditCreatorReferral(input.creatorUserId, input.referredUserId);
+  await tryCreditAttach(input.creatorUserId, input.referredUserId);
+  if (telegramJoinedAt) {
+    await tryCreditTelegram(input.creatorUserId, input.referredUserId);
+  }
+  // Late attach: user may already have a qualifying purchase (wallet/VIP/Moments).
+  if (await referredUserHasQualifyingPurchase(input.referredUserId)) {
+    await tryCreditPurchase(input.referredUserId);
+  }
 }
 
 export async function markCreatorReferralTelegramJoined(
@@ -119,158 +330,22 @@ export async function markCreatorReferralTelegramJoined(
   );
   if (!edge) {
     const existing = await CreatorReferralEdge.findOne({ referredUserId })
-      .select('creatorUserId')
+      .select('creatorUserId telegramJoinedAt')
       .lean();
-    if (!existing) return;
-    await tryCreditCreatorReferral(existing.creatorUserId, referredUserId);
+    if (!existing?.telegramJoinedAt) return;
+    await tryCreditTelegram(existing.creatorUserId, referredUserId);
     return;
   }
-  await tryCreditCreatorReferral(edge.creatorUserId, referredUserId);
+  await tryCreditTelegram(edge.creatorUserId, referredUserId);
 }
 
+/** @deprecated Video call is no longer a payout stage. Kept as no-op for callers. */
 export async function markCreatorReferralVideoCallCompleted(
-  referredUserId: Types.ObjectId
+  _referredUserId: Types.ObjectId
 ): Promise<void> {
-  const edge = await CreatorReferralEdge.findOneAndUpdate(
-    { referredUserId, videoCallCompletedAt: null },
-    { $set: { videoCallCompletedAt: new Date() } },
-    { new: true }
-  );
-  if (!edge) {
-    const existing = await CreatorReferralEdge.findOne({ referredUserId })
-      .select('creatorUserId')
-      .lean();
-    if (!existing) return;
-    await tryCreditCreatorReferral(existing.creatorUserId, referredUserId);
-    return;
-  }
-  await tryCreditCreatorReferral(edge.creatorUserId, referredUserId);
+  // no-op
 }
 
-/**
- * Idempotent payout when both qualifiers are met and config is enabled.
- */
-export async function tryCreditCreatorReferral(
-  creatorUserId: Types.ObjectId,
-  referredUserId: Types.ObjectId
-): Promise<boolean> {
-  const cfg = await getOrCreateCreatorReferralConfig();
-  if (!cfg.enabled || cfg.rewardCoins < 1) {
-    return false;
-  }
-
-  const edge = await CreatorReferralEdge.findOne({
-    creatorUserId,
-    referredUserId,
-  }).lean();
-  if (!edge) return false;
-  if (edge.creatorRewardedAt) return false;
-  if (!edge.telegramJoinedAt || !edge.videoCallCompletedAt) return false;
-
-  const rewardCoins = cfg.rewardCoins;
-  const txnId = creatorReferralRewardTransactionId(creatorUserId, referredUserId);
-
-  const existingTxn = await CoinTransaction.findOne({ transactionId: txnId })
-    .select('_id')
-    .lean();
-  if (existingTxn) {
-    await CreatorReferralEdge.updateOne(
-      { _id: edge._id, creatorRewardedAt: null },
-      {
-        $set: {
-          creatorRewardedAt: new Date(),
-          creatorRewardCoins: rewardCoins,
-        },
-      }
-    );
-    return true;
-  }
-
-  const session = await mongoose.startSession();
-  let credited = false;
-  let newBalance = 0;
-  let creatorFirebaseUid: string | null = null;
-
-  try {
-    await session.withTransaction(async () => {
-      const cas = await CreatorReferralEdge.findOneAndUpdate(
-        {
-          _id: edge._id,
-          creatorRewardedAt: null,
-          telegramJoinedAt: { $ne: null },
-          videoCallCompletedAt: { $ne: null },
-        },
-        {
-          $set: {
-            creatorRewardedAt: new Date(),
-            creatorRewardCoins: rewardCoins,
-          },
-        },
-        { new: true, session }
-      );
-      if (!cas) {
-        return;
-      }
-
-      try {
-        await CoinTransaction.create(
-          [
-            {
-              transactionId: txnId,
-              userId: creatorUserId,
-              type: 'credit',
-              coins: rewardCoins,
-              source: 'creator_referral_reward',
-              description: `Creator referral reward (${referredUserId.toString()})`,
-              status: 'completed',
-            },
-          ],
-          { session }
-        );
-      } catch (err) {
-        if (isDuplicateKeyError(err)) {
-          return;
-        }
-        throw err;
-      }
-
-      const updated = await User.findOneAndUpdate(
-        { _id: creatorUserId },
-        { $inc: { coins: rewardCoins } },
-        { new: true, session }
-      ).select('coins firebaseUid');
-
-      if (!updated) {
-        throw new Error('Creator user not found for referral reward');
-      }
-
-      credited = true;
-      newBalance = updated.coins ?? 0;
-      creatorFirebaseUid = updated.firebaseUid ?? null;
-    });
-  } finally {
-    await session.endSession();
-  }
-
-  if (credited) {
-    await emitCreatorCoinsUpdated(creatorFirebaseUid, creatorUserId, newBalance);
-    verifyUserBalance(creatorUserId).catch((err) => {
-      logError('creator referral balance integrity check failed', err as Error, {
-        creatorUserId: creatorUserId.toString(),
-      });
-    });
-    logInfo('Creator referral reward credited', {
-      creatorUserId: creatorUserId.toString(),
-      referredUserId: referredUserId.toString(),
-      coins: rewardCoins,
-      balance: newBalance,
-    });
-  }
-
-  return credited;
-}
-
-/** Non-blocking wrappers for hooks. */
 export function onCreatorReferralTelegramClaimed(referredUserId: Types.ObjectId): void {
   void markCreatorReferralTelegramJoined(referredUserId).catch((err) => {
     logError('markCreatorReferralTelegramJoined failed', err as Error, {
@@ -279,35 +354,87 @@ export function onCreatorReferralTelegramClaimed(referredUserId: Types.ObjectId)
   });
 }
 
+/** @deprecated No-op; video call no longer pays creator referral. */
 export function onCreatorReferralCallSettled(referredUserId: Types.ObjectId): void {
-  void markCreatorReferralVideoCallCompleted(referredUserId).catch((err) => {
-    logError('markCreatorReferralVideoCallCompleted failed', err as Error, {
+  void markCreatorReferralVideoCallCompleted(referredUserId).catch(() => {});
+}
+
+export function onCreatorReferralPurchase(referredUserId: Types.ObjectId): void {
+  void tryCreditPurchase(referredUserId).catch((err) => {
+    logError('tryCreditPurchase failed', err as Error, {
       referredUserId: referredUserId.toString(),
     });
   });
 }
 
+async function referredUserHasQualifyingPurchase(
+  referredUserId: Types.ObjectId
+): Promise<boolean> {
+  const row = await CoinTransaction.findOne({
+    userId: referredUserId,
+    status: 'completed',
+    type: 'credit',
+    source: {
+      $in: ['payment_gateway', 'vip_membership', 'moments_premium_membership'],
+    },
+  })
+    .select('_id')
+    .lean();
+  return !!row;
+}
+
 /**
- * Re-attempt payout for edges that completed both tasks but were unpaid
- * (e.g. config was disabled). Called after admin re-enables config.
+ * Re-attempt unpaid stages (e.g. after config re-enable).
+ * Attach/telegram and purchase candidates are fetched separately so edges that
+ * never purchased do not starve purchase backfill under the limit.
  */
 export async function reconcileUnpaidCreatorReferrals(limit = 200): Promise<number> {
   const cfg = await getOrCreateCreatorReferralConfig();
   if (!cfg.enabled) return 0;
 
-  const unpaid = await CreatorReferralEdge.find({
+  const select =
+    'creatorUserId referredUserId attachRewardedAt telegramJoinedAt telegramRewardedAt purchaseRewardedAt';
+
+  const stageEdges = await CreatorReferralEdge.find({
     creatorRewardedAt: null,
-    telegramJoinedAt: { $ne: null },
-    videoCallCompletedAt: { $ne: null },
+    $or: [
+      { attachRewardedAt: null },
+      { telegramJoinedAt: { $ne: null }, telegramRewardedAt: null },
+    ],
   })
-    .select('creatorUserId referredUserId')
+    .select(select)
+    .sort({ createdAt: 1 })
     .limit(limit)
     .lean();
 
+  const purchaseEdges = await CreatorReferralEdge.find({
+    creatorRewardedAt: null,
+    purchaseRewardedAt: null,
+  })
+    .select(select)
+    .sort({ createdAt: 1 })
+    .limit(limit)
+    .lean();
+
+  const byId = new Map<string, (typeof stageEdges)[number]>();
+  for (const row of stageEdges) byId.set(row._id.toString(), row);
+  for (const row of purchaseEdges) {
+    if (!byId.has(row._id.toString())) byId.set(row._id.toString(), row);
+  }
+
   let paid = 0;
-  for (const row of unpaid) {
-    const ok = await tryCreditCreatorReferral(row.creatorUserId, row.referredUserId);
-    if (ok) paid += 1;
+  for (const row of byId.values()) {
+    if (!row.attachRewardedAt) {
+      if (await tryCreditAttach(row.creatorUserId, row.referredUserId)) paid += 1;
+    }
+    if (row.telegramJoinedAt && !row.telegramRewardedAt) {
+      if (await tryCreditTelegram(row.creatorUserId, row.referredUserId)) paid += 1;
+    }
+    if (!row.purchaseRewardedAt) {
+      if (await referredUserHasQualifyingPurchase(row.referredUserId)) {
+        if (await tryCreditPurchase(row.referredUserId)) paid += 1;
+      }
+    }
   }
   return paid;
 }

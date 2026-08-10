@@ -206,16 +206,6 @@ export function onUserCallSettled(
     await tryCreditFirstVideoCall(userId, durationSeconds);
     await tryCreditSuccessfulReferralOnCall(userId, durationSeconds);
   });
-  // Creator affiliate: any settled call with duration > 0 (no min-seconds gate).
-  if (durationSeconds > 0) {
-    void import('../creator-referral/creator-referral-reward.service')
-      .then(({ onCreatorReferralCallSettled }) => {
-        onCreatorReferralCallSettled(userId);
-      })
-      .catch(() => {
-        // non-fatal
-      });
-  }
 }
 
 /**
